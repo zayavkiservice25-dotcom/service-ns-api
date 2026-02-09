@@ -41,6 +41,8 @@ app.get("/db-ping", async (req, res) => {
 // ===============================
 app.post("/save-request", async (req, res) => {
   try {
+    console.log("SAVE BODY:", req.body); // ✅ ЛОГ что пришло
+
     const {
       login,
       object,
@@ -63,15 +65,15 @@ app.post("/save-request", async (req, res) => {
     `;
 
     const values = [
-      login,
-      object,
-      date,
-      kon,
-      tru,
-      grp,
-      tmc,
-      unit,
-      qty === "" || qty === undefined ? null : qty, // важно для NUMERIC
+      login || "",
+      object || "",
+      date || "",
+      kon || "",
+      tru || "",
+      grp || "",
+      tmc || "",
+      unit || "",
+      qty === "" || qty === undefined ? null : qty,
       note || "",
       deadline || "",
     ];
