@@ -103,5 +103,54 @@ app.get("/requests", async (req, res) => {
 });
 
 // ===============================
+// Batch: сохранить сразу несколько строк
+// ===============================
+app.post("/save-request-batch", async (req, res) => {
+  try {
+    const { header, rows } = req.body;
+
+    if (!rows || !Array.isArray(rows) || rows.length === 0) {
+      return res.status(400).json({ success: false, error: "rows is empty" });
+    }
+
+    const values = [];
+    const chunks = rows.map((r, i) => {
+      const base = i * 11;
+
+      values.push(
+        header?.login || "",
+        header?.object || "",
+        header?.date || "",
+        r.kon || "",
+        r.tru || "",
+        r.grp || "",
+        r.tmc || "",
+        r.unit || "",
+        (r.qty === "" || r.qty === undefined ? null : r.qty),
+        r.note || "",
+        r.deadline || ""
+      );
+
+      return `($${base+1},$${base+2},$${base+3},$${base+4},$${base+5},$${base+6},$${base+7},$${base+8},$${base+9},$${base+10},$${base+11})`;
+    });
+
+    const query = `
+      INSERT INTO requests
+      (login, object, date, kon, tru, grp, tmc, unit, qty, note, deadline)
+      VALUES ${chunks.join(",")}
+      RETURNING id
+    `;
+
+    const result = await pool.query(query, values);
+    res.json({ success: true, ids: result.rows.map(x => x.id) });
+
+  } catch (err) {
+    console.error("BATCH SAVE ERROR:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+
+// ===============================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Server started on port " + PORT));
