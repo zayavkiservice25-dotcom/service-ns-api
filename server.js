@@ -9,7 +9,7 @@ app.use(cors());
 app.use(express.json());
 
 // ===============================
-// Подключение к PostgreSQL (Render)
+// PostgreSQL (Render)
 // ===============================
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -17,95 +17,84 @@ const pool = new Pool({
 });
 
 // ===============================
-// Проверка сервера
+// Init: sequence for FT ids
 // ===============================
-app.get("/", (req, res) => {
-  res.send("Service-NS API работает 🚀");
+async function initDb() {
+  // sequence будет выдавать 1,2,3...
+  await pool.query(`CREATE SEQUENCE IF NOT EXISTS ft_id_seq START 1;`);
+  console.log("DB init OK (ft_id_seq)");
+}
+
+initDb().catch((e) => {
+  console.error("DB init error:", e);
 });
 
 // ===============================
-// Проверка подключения к БД
+// Health
 // ===============================
+app.get("/", (req, res) => res.send("Service-NS FT API работает 🚀"));
+
 app.get("/db-ping", async (req, res) => {
   try {
     const r = await pool.query("SELECT NOW() as now");
     res.json({ ok: true, now: r.rows[0].now });
   } catch (e) {
-    console.error("DB-PING ERROR:", e);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
 // ===============================
-// Сохранение заявки
+// POST: save one FT row
+// body: { input_date, input_name, division, object, contractor, invoice_no, invoice_date, invoice_pdf, amount }
 // ===============================
-app.post("/save-request", async (req, res) => {
+app.post("/save-ft", async (req, res) => {
   try {
-    console.log("SAVE BODY:", req.body); // ✅ ЛОГ что пришло
-
     const {
-      login,
-      object,
-      date,
-      kon,
-      tru,
-      grp,
-      tmc,
-      unit,
-      qty,
-      note,
-      deadline,
+      input_date,
+      input_name,
+      division,
+      object,        // это значение для колонки ft.object
+      contractor,
+      invoice_no,
+      invoice_date,
+      invoice_pdf,
+      amount,
     } = req.body;
 
     const query = `
-      INSERT INTO requests
-      (login, object, date, kon, tru, grp, tmc, unit, qty, note, deadline)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-      RETURNING id
+      INSERT INTO ft
+      (id_ft, input_date, input_name, division, "object", contractor, invoice_no, invoice_date, invoice_pdf, amount)
+      VALUES
+      ('FT' || nextval('ft_id_seq')::text, $1,$2,$3,$4,$5,$6,$7,$8,$9)
+      RETURNING id_ft
     `;
 
     const values = [
-      login || "",
+      input_date || "",
+      input_name || "",
+      division || "",
       object || "",
-      date || "",
-      kon || "",
-      tru || "",
-      grp || "",
-      tmc || "",
-      unit || "",
-      qty === "" || qty === undefined ? null : qty,
-      note || "",
-      deadline || "",
+      contractor || "",
+      invoice_no || "",
+      invoice_date || "",
+      invoice_pdf || "",
+      amount === "" || amount === undefined || amount === null ? null : Number(amount),
     ];
 
     const result = await pool.query(query, values);
-
-    res.json({ success: true, id: result.rows[0].id });
+    res.json({ success: true, id_ft: result.rows[0].id_ft });
   } catch (err) {
-    console.error("SAVE ERROR:", err);
+    console.error("SAVE FT ERROR:", err);
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
 // ===============================
-// Посмотреть последние заявки
+// POST: save many FT rows (batch)
+// body: { header: { input_date, input_name, division, object }, rows: [{ contractor, invoice_no, invoice_date, invoice_pdf, amount }, ...] }
 // ===============================
-app.get("/requests", async (req, res) => {
-  try {
-    const result = await pool.query(
-      "SELECT * FROM requests ORDER BY id DESC LIMIT 20"
-    );
-    res.json(result.rows);
-  } catch (err) {
-    console.error("REQUESTS ERROR:", err);
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// ===============================
-// Batch: сохранить сразу несколько строк
-// ===============================
-app.post("/save-request-batch", async (req, res) => {
+app.post("/save-ft-batch", async (req, res) => {
+  const client = await pool.connect();
   try {
     const { header, rows } = req.body;
 
@@ -113,44 +102,68 @@ app.post("/save-request-batch", async (req, res) => {
       return res.status(400).json({ success: false, error: "rows is empty" });
     }
 
+    const h = header || {};
     const values = [];
     const chunks = rows.map((r, i) => {
-      const base = i * 11;
+      const base = i * 9;
 
       values.push(
-        header?.login || "",
-        header?.object || "",
-        header?.date || "",
-        r.kon || "",
-        r.tru || "",
-        r.grp || "",
-        r.tmc || "",
-        r.unit || "",
-        (r.qty === "" || r.qty === undefined ? null : r.qty),
-        r.note || "",
-        r.deadline || ""
+        h.input_date || "",
+        h.input_name || "",
+        h.division || "",
+        h.object || "",
+        r.contractor || "",
+        r.invoice_no || "",
+        r.invoice_date || "",
+        r.invoice_pdf || "",
+        (r.amount === "" || r.amount === undefined || r.amount === null) ? null : Number(r.amount)
       );
 
-      return `($${base+1},$${base+2},$${base+3},$${base+4},$${base+5},$${base+6},$${base+7},$${base+8},$${base+9},$${base+10},$${base+11})`;
+      // id_ft генерим на каждую строку
+      return `(
+        'FT' || nextval('ft_id_seq')::text,
+        $${base + 1}, $${base + 2}, $${base + 3}, $${base + 4},
+        $${base + 5}, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}
+      )`;
     });
 
     const query = `
-      INSERT INTO requests
-      (login, object, date, kon, tru, grp, tmc, unit, qty, note, deadline)
+      INSERT INTO ft
+      (id_ft, input_date, input_name, division, "object", contractor, invoice_no, invoice_date, invoice_pdf, amount)
       VALUES ${chunks.join(",")}
-      RETURNING id
+      RETURNING id_ft
     `;
 
-    const result = await pool.query(query, values);
-    res.json({ success: true, ids: result.rows.map(x => x.id) });
+    await client.query("BEGIN");
+    const result = await client.query(query, values);
+    await client.query("COMMIT");
 
+    res.json({ success: true, ids: result.rows.map((x) => x.id_ft) });
   } catch (err) {
-    console.error("BATCH SAVE ERROR:", err);
+    await client.query("ROLLBACK");
+    console.error("BATCH FT ERROR:", err);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// ===============================
+// GET: last FT rows
+// ===============================
+app.get("/ft", async (req, res) => {
+  try {
+    const limit = Math.min(Number(req.query.limit || 50), 200);
+    const result = await pool.query(
+      `SELECT * FROM ft ORDER BY id_ft DESC LIMIT $1`,
+      [limit]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error("GET FT ERROR:", err);
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-
-// ===============================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Server started on port " + PORT));
+app.listen(PORT, () => console.log("FT Server started on port " + PORT));
