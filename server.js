@@ -17,22 +17,20 @@ const pool = new Pool({
 });
 
 // ===============================
-// Init: sequence for FT ids
+// Init: sequences for FT and ZVK ids
 // ===============================
 async function initDb() {
-  // sequence будет выдавать 1,2,3...
   await pool.query(`CREATE SEQUENCE IF NOT EXISTS ft_id_seq START 1;`);
-  console.log("DB init OK (ft_id_seq)");
+  await pool.query(`CREATE SEQUENCE IF NOT EXISTS zvk_id_seq START 1;`);
+  console.log("DB init OK (ft_id_seq, zvk_id_seq)");
 }
 
-initDb().catch((e) => {
-  console.error("DB init error:", e);
-});
+initDb().catch((e) => console.error("DB init error:", e));
 
 // ===============================
 // Health
 // ===============================
-app.get("/", (req, res) => res.send("Service-NS FT API работает 🚀"));
+app.get("/", (req, res) => res.send("Service-NS API работает 🚀"));
 
 app.get("/db-ping", async (req, res) => {
   try {
@@ -43,17 +41,19 @@ app.get("/db-ping", async (req, res) => {
   }
 });
 
-// ===============================
+// ===================================================================
+// FT
+// ===================================================================
+
 // POST: save one FT row
 // body: { input_date, input_name, division, object, contractor, invoice_no, invoice_date, invoice_pdf, amount }
-// ===============================
 app.post("/save-ft", async (req, res) => {
   try {
     const {
       input_date,
       input_name,
       division,
-      object,        // это значение для колонки ft.object
+      object,
       contractor,
       invoice_no,
       invoice_date,
@@ -89,10 +89,7 @@ app.post("/save-ft", async (req, res) => {
   }
 });
 
-// ===============================
 // POST: save many FT rows (batch)
-// body: { header: { input_date, input_name, division, object }, rows: [{ contractor, invoice_no, invoice_date, invoice_pdf, amount }, ...] }
-// ===============================
 app.post("/save-ft-batch", async (req, res) => {
   const client = await pool.connect();
   try {
@@ -119,7 +116,6 @@ app.post("/save-ft-batch", async (req, res) => {
         (r.amount === "" || r.amount === undefined || r.amount === null) ? null : Number(r.amount)
       );
 
-      // id_ft генерим на каждую строку
       return `(
         'FT' || nextval('ft_id_seq')::text,
         $${base + 1}, $${base + 2}, $${base + 3}, $${base + 4},
@@ -148,14 +144,15 @@ app.post("/save-ft-batch", async (req, res) => {
   }
 });
 
-// ===============================
-// GET: last FT rows
-// ===============================
+// GET: last FT rows (для таблицы/выбора)
 app.get("/ft", async (req, res) => {
   try {
-    const limit = Math.min(Number(req.query.limit || 50), 200);
+    const limit = Math.min(Number(req.query.limit || 200), 500);
     const result = await pool.query(
-      `SELECT * FROM ft ORDER BY id_ft DESC LIMIT $1`,
+      `SELECT id_ft, input_date, input_name, division, "object", contractor, invoice_no, invoice_date, invoice_pdf, amount
+       FROM ft
+       ORDER BY id_ft DESC
+       LIMIT $1`,
       [limit]
     );
     res.json(result.rows);
@@ -165,5 +162,59 @@ app.get("/ft", async (req, res) => {
   }
 });
 
+// ===================================================================
+// ZVK (привязка к заявке)  -> таблица: id_zvk, zvk_date, zvk_name, id_ft, amount
+// ===================================================================
+
+// POST: создать привязку (Zft1, Zft2...)
+// body: { zvk_name, id_ft, amount }
+app.post("/save-zvk", async (req, res) => {
+  try {
+    const { zvk_name, id_ft, amount } = req.body;
+
+    if (!zvk_name || !id_ft) {
+      return res.status(400).json({ success: false, error: "zvk_name and id_ft are required" });
+    }
+
+    const query = `
+      INSERT INTO zvk
+      (id_zvk, zvk_date, zvk_name, id_ft, amount)
+      VALUES
+      ('Zft' || nextval('zvk_id_seq')::text, NOW(), $1, $2, $3)
+      RETURNING id_zvk, zvk_date
+    `;
+
+    const values = [
+      String(zvk_name),
+      String(id_ft),
+      (amount === "" || amount === undefined || amount === null) ? null : Number(amount),
+    ];
+
+    const result = await pool.query(query, values);
+    res.json({ success: true, id_zvk: result.rows[0].id_zvk, zvk_date: result.rows[0].zvk_date });
+  } catch (err) {
+    console.error("SAVE ZVK ERROR:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET: последние привязки
+app.get("/zvk", async (req, res) => {
+  try {
+    const limit = Math.min(Number(req.query.limit || 200), 500);
+    const result = await pool.query(
+      `SELECT id_zvk, zvk_date, zvk_name, id_ft, amount
+       FROM zvk
+       ORDER BY zvk_date DESC
+       LIMIT $1`,
+      [limit]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error("GET ZVK ERROR:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("FT Server started on port " + PORT));
+app.listen(PORT, () => console.log("Server started on port " + PORT));
