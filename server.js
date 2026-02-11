@@ -32,7 +32,7 @@ initDb().catch((e) => console.error("DB init error:", e));
 // ===============================
 // Health
 // ===============================
-app.get("/", (req, res) => res.send("Service-NS API работает 🚀 v-status-2"));
+app.get("/", (req, res) => res.send("Service-NS API работает 🚀 v-ftzvk-3"));
 
 app.get("/db-ping", async (req, res) => {
   try {
@@ -45,6 +45,8 @@ app.get("/db-ping", async (req, res) => {
 
 // ===================================================================
 // FT
+// columns: id_ft, input_date, input_name, division, object, contractor,
+//          invoice_no, invoice_date, invoice_pdf, sum_ft
 // ===================================================================
 
 // POST: save one FT row
@@ -59,12 +61,12 @@ app.post("/save-ft", async (req, res) => {
       invoice_no,
       invoice_date,
       invoice_pdf,
-      amount,
+      sum_ft,
     } = req.body;
 
     const query = `
       INSERT INTO ft
-      (id_ft, input_date, input_name, division, "object", contractor, invoice_no, invoice_date, invoice_pdf, amount)
+      (id_ft, input_date, input_name, division, "object", contractor, invoice_no, invoice_date, invoice_pdf, sum_ft)
       VALUES
       ('FT' || nextval('ft_id_seq')::text, $1,$2,$3,$4,$5,$6,$7,$8,$9)
       RETURNING id_ft
@@ -79,7 +81,7 @@ app.post("/save-ft", async (req, res) => {
       invoice_no || "",
       invoice_date || "",
       invoice_pdf || "",
-      amount === "" || amount === undefined || amount === null ? null : Number(amount),
+      (sum_ft === "" || sum_ft === undefined || sum_ft === null) ? null : Number(sum_ft),
     ];
 
     const result = await pool.query(query, values);
@@ -114,9 +116,9 @@ app.post("/save-ft-batch", async (req, res) => {
         r.invoice_no || "",
         r.invoice_date || "",
         r.invoice_pdf || "",
-        (r.amount === "" || r.amount === undefined || r.amount === null)
+        (r.sum_ft === "" || r.sum_ft === undefined || r.sum_ft === null)
           ? null
-          : Number(r.amount)
+          : Number(r.sum_ft)
       );
 
       return `(
@@ -128,7 +130,7 @@ app.post("/save-ft-batch", async (req, res) => {
 
     const query = `
       INSERT INTO ft
-      (id_ft, input_date, input_name, division, "object", contractor, invoice_no, invoice_date, invoice_pdf, amount)
+      (id_ft, input_date, input_name, division, "object", contractor, invoice_no, invoice_date, invoice_pdf, sum_ft)
       VALUES ${chunks.join(",")}
       RETURNING id_ft
     `;
@@ -147,8 +149,7 @@ app.post("/save-ft-batch", async (req, res) => {
   }
 });
 
-// GET: last FT rows
-// GET: FT list (admin all / user own)
+// GET: FT list (admin all / user own)  <-- user filtered by input_name=login
 app.get("/ft", async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit || 200), 500);
@@ -156,12 +157,12 @@ app.get("/ft", async (req, res) => {
     const admin = String(req.query.is_admin || "0") === "1";
 
     if (!login) {
-      return res.status(400).json({ success:false, error:"login is required" });
+      return res.status(400).json({ success: false, error: "login is required" });
     }
 
     const qAdmin = `
       SELECT id_ft, input_date, input_name, division, "object",
-             contractor, invoice_no, invoice_date, invoice_pdf, amount
+             contractor, invoice_no, invoice_date, invoice_pdf, sum_ft
       FROM ft
       ORDER BY COALESCE(NULLIF(regexp_replace(id_ft,'\\D','','g'),''),'0')::int DESC
       LIMIT $1
@@ -169,7 +170,7 @@ app.get("/ft", async (req, res) => {
 
     const qUser = `
       SELECT id_ft, input_date, input_name, division, "object",
-             contractor, invoice_no, invoice_date, invoice_pdf, amount
+             contractor, invoice_no, invoice_date, invoice_pdf, sum_ft
       FROM ft
       WHERE input_name = $2
       ORDER BY COALESCE(NULLIF(regexp_replace(id_ft,'\\D','','g'),''),'0')::int DESC
@@ -180,33 +181,33 @@ app.get("/ft", async (req, res) => {
       ? await pool.query(qAdmin, [limit])
       : await pool.query(qUser, [limit, login]);
 
-    res.json({ success:true, rows:r.rows, admin });
+    res.json({ success: true, rows: r.rows, admin });
   } catch (e) {
     console.error("GET FT ERROR:", e);
-    res.status(500).json({ success:false, error:e.message });
+    res.status(500).json({ success: false, error: e.message });
   }
 });
 
-
 // ===================================================================
 // ZVK
+// columns: id_zvk, zvk_date, zvk_name, id_ft, sum_zvk, status_zvk
 // ===================================================================
 
-// POST: create ZVK
+// POST: create ZVK (без creator_login)
 app.post("/save-zvk", async (req, res) => {
   try {
-    const { creator_login, zvk_name, id_ft, amount } = req.body;
+    const { zvk_name, id_ft, sum_zvk, status_zvk } = req.body;
 
-    if (!creator_login || !zvk_name || !id_ft) {
+    if (!zvk_name || !id_ft) {
       return res.status(400).json({
         success: false,
-        error: "creator_login, zvk_name and id_ft are required"
+        error: "zvk_name and id_ft are required",
       });
     }
 
     const query = `
       INSERT INTO zvk
-      (id_zvk, zvk_date, zvk_name, id_ft, amount, creator_login)
+      (id_zvk, zvk_date, zvk_name, id_ft, sum_zvk, status_zvk)
       VALUES
       ('ZFT' || nextval('zvk_id_seq')::text, NOW(), $1, $2, $3, $4)
       RETURNING id_zvk, zvk_date
@@ -215,8 +216,8 @@ app.post("/save-zvk", async (req, res) => {
     const values = [
       String(zvk_name).trim(),
       String(id_ft).trim(),
-      (amount === "" || amount === undefined || amount === null) ? null : Number(amount),
-      String(creator_login).trim()
+      (sum_zvk === "" || sum_zvk === undefined || sum_zvk === null) ? null : Number(sum_zvk),
+      (status_zvk ?? null) ? String(status_zvk).trim() : null,
     ];
 
     const r = await pool.query(query, values);
@@ -227,32 +228,20 @@ app.post("/save-zvk", async (req, res) => {
   }
 });
 
-// GET: ZVK list (admin all / user own)  <-- admin comes from is_admin
+// GET: ZVK list (всем одинаково, без фильтра по автору)
 app.get("/zvk", async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit || 200), 500);
-    const login = String(req.query.login || "").trim();
-    const admin = String(req.query.is_admin || "0") === "1";
 
-    if (!login) {
-      return res.status(400).json({ success:false, error:"login is required" });
-    }
+    const result = await pool.query(
+      `SELECT id_zvk, zvk_date, zvk_name, id_ft, sum_zvk, status_zvk
+       FROM zvk
+       ORDER BY zvk_date DESC
+       LIMIT $1`,
+      [limit]
+    );
 
-    const query = admin
-      ? `SELECT id_zvk, zvk_date, zvk_name, id_ft, amount, creator_login
-         FROM zvk
-         ORDER BY zvk_date DESC
-         LIMIT $1`
-      : `SELECT id_zvk, zvk_date, zvk_name, id_ft, amount, creator_login
-         FROM zvk
-         WHERE creator_login = $2
-         ORDER BY zvk_date DESC
-         LIMIT $1`;
-
-    const params = admin ? [limit] : [limit, login];
-
-    const result = await pool.query(query, params);
-    res.json({ success:true, rows: result.rows, admin });
+    res.json({ success: true, rows: result.rows });
   } catch (err) {
     console.error("GET ZVK ERROR:", err);
     res.status(500).json({ success: false, error: err.message });
@@ -260,34 +249,29 @@ app.get("/zvk", async (req, res) => {
 });
 
 // ===================================================================
-// ZVK STATUS
+// FT + ZVK FULL (из VIEW ft_zvk_full)  ← ДЛЯ WEB APP ТАБЛИЦЫ
+// Фильтр пользователя: по ft.input_name = login (т.к. creator_login нет)
 // ===================================================================
-
-// GET: ZVK + status (admin all / user own)  <-- admin comes from is_admin
-app.get("/zvk-with-status", async (req, res) => {
+app.get("/ft-zvk-full", async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit || 300), 500);
     const login = String(req.query.login || "").trim();
     const admin = String(req.query.is_admin || "0") === "1";
 
-    if (!login) return res.status(400).json({ success:false, error:"login is required" });
+    if (!login) return res.status(400).json({ success: false, error: "login is required" });
 
     const qAdmin = `
-      SELECT z.id_zvk, z.zvk_date, z.zvk_name, z.id_ft, z.amount,
-             s.stat_date, s.status, s.src_d, s.src_o
-      FROM zvk z
-      LEFT JOIN zvk_status s ON s.id_zvk = z.id_zvk
-      ORDER BY z.zvk_date DESC
+      SELECT *
+      FROM ft_zvk_full
+      ORDER BY COALESCE(NULLIF(regexp_replace(id_ft,'\\D','','g'),''),'0')::int DESC
       LIMIT $1
     `;
 
     const qUser = `
-      SELECT z.id_zvk, z.zvk_date, z.zvk_name, z.id_ft, z.amount,
-             s.stat_date, s.status, s.src_d, s.src_o
-      FROM zvk z
-      LEFT JOIN zvk_status s ON s.id_zvk = z.id_zvk
-      WHERE z.creator_login = $2
-      ORDER BY z.zvk_date DESC
+      SELECT *
+      FROM ft_zvk_full
+      WHERE COALESCE(input_name,'') = $2
+      ORDER BY COALESCE(NULLIF(regexp_replace(id_ft,'\\D','','g'),''),'0')::int DESC
       LIMIT $1
     `;
 
@@ -295,35 +279,53 @@ app.get("/zvk-with-status", async (req, res) => {
       ? await pool.query(qAdmin, [limit])
       : await pool.query(qUser, [limit, login]);
 
-    res.json({ success:true, rows:r.rows, admin });
+    res.json({ success: true, rows: r.rows, admin });
   } catch (e) {
-    console.error("ZVK-WITH-STATUS ERROR:", e);
-    res.status(500).json({ success:false, error:e.message });
+    console.error("FT-ZVK-FULL ERROR:", e);
+    res.status(500).json({ success: false, error: e.message });
   }
 });
 
-// POST: upsert status (admin can edit all / user only own) <-- admin comes from is_admin
-app.post("/upsert-zvk-status", async (req, res) => {
+// ===================================================================
+// ZVK STATUS (таблица zvk_status) + синхронизация в zvk.status_zvk
+// ===================================================================
+
+// GET: ZVK + status (берём из zvk_status, плюс поля zvk)
+app.get("/zvk-with-status", async (req, res) => {
   try {
-    const { login, is_admin, id_zvk, status, src_d, src_o } = req.body;
-    const admin = String(is_admin || "0") === "1";
+    const limit = Math.min(Number(req.query.limit || 300), 500);
 
+    const q = `
+      SELECT z.id_zvk, z.zvk_date, z.zvk_name, z.id_ft, z.sum_zvk, z.status_zvk,
+             s.stat_date, s.status, s.src_d, s.src_o
+      FROM zvk z
+      LEFT JOIN zvk_status s ON s.id_zvk = z.id_zvk
+      ORDER BY z.zvk_date DESC
+      LIMIT $1
+    `;
+
+    const r = await pool.query(q, [limit]);
+    res.json({ success: true, rows: r.rows });
+  } catch (e) {
+    console.error("ZVK-WITH-STATUS ERROR:", e);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// POST: upsert status -> пишет в zvk_status и обновляет zvk.status_zvk
+app.post("/upsert-zvk-status", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { login, id_zvk, status, src_d, src_o } = req.body;
+
+    // login тут просто для твоей логики (кто нажал сохранить), в БД не пишем
     if (!login || !id_zvk || !status) {
-      return res.status(400).json({ success:false, error:"login, id_zvk, status required" });
+      return res.status(400).json({ success: false, error: "login, id_zvk, status required" });
     }
 
-    // ✅ Access: non-admin can edit only own ZVK
-    if (!admin) {
-      const own = await pool.query(
-        `SELECT 1 FROM zvk WHERE id_zvk=$1 AND creator_login=$2 LIMIT 1`,
-        [String(id_zvk).trim(), String(login).trim()]
-      );
-      if (own.rowCount === 0) {
-        return res.status(403).json({ success:false, error:"Нет доступа к этому ID ZVK" });
-      }
-    }
+    await client.query("BEGIN");
 
-    const r = await pool.query(
+    const r = await client.query(
       `INSERT INTO zvk_status (id_zvk, status, src_d, src_o, stat_date)
        VALUES ($1,$2,$3,$4,NOW())
        ON CONFLICT (id_zvk)
@@ -337,10 +339,21 @@ app.post("/upsert-zvk-status", async (req, res) => {
       ]
     );
 
-    res.json({ success:true, row:r.rows[0], admin });
+    // ✅ синхронизируем "быстрый статус" в таблице zvk
+    await client.query(
+      `UPDATE zvk SET status_zvk = $2 WHERE id_zvk = $1`,
+      [String(id_zvk).trim(), String(status).trim()]
+    );
+
+    await client.query("COMMIT");
+
+    res.json({ success: true, row: r.rows[0] });
   } catch (e) {
+    await client.query("ROLLBACK");
     console.error("UPSERT-ZVK-STATUS ERROR:", e);
-    res.status(500).json({ success:false, error:e.message });
+    res.status(500).json({ success: false, error: e.message });
+  } finally {
+    client.release();
   }
 });
 
