@@ -7,6 +7,18 @@ const { Pool } = require("pg");
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.options("*", cors()); // ✅ чтобы POST не ломался из браузера
+
+const ADMINS = new Set([
+  "R_Kasymkhan",
+  "K_Ermek",
+  "B_Erkin",
+  "1"
+]);
+
+function isAdmin(login) {
+  return ADMINS.has(String(login || "").trim());
+}
 
 // ===============================
 // PostgreSQL (Render)
@@ -46,7 +58,6 @@ app.get("/db-ping", async (req, res) => {
 // ===================================================================
 
 // POST: save one FT row
-// body: { input_date, input_name, division, object, contractor, invoice_no, invoice_date, invoice_pdf, amount }
 app.post("/save-ft", async (req, res) => {
   try {
     const {
@@ -148,14 +159,18 @@ app.post("/save-ft-batch", async (req, res) => {
 app.get("/ft", async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit || 200), 500);
+
     const result = await pool.query(
-      `SELECT id_ft, input_date, input_name, division, "object", contractor, invoice_no, invoice_date, invoice_pdf, amount
+      `SELECT id_ft, input_date, input_name, division, "object",
+              contractor, invoice_no, invoice_date, invoice_pdf, amount
        FROM ft
-       ORDER BY id_ft DESC
+       ORDER BY
+         COALESCE(NULLIF(regexp_replace(id_ft,'\\D','','g'),''),'0')::int DESC
        LIMIT $1`,
       [limit]
     );
-    res.json(result.rows);
+
+    res.json({ success: true, rows: result.rows });
   } catch (err) {
     console.error("GET FT ERROR:", err);
     res.status(500).json({ success: false, error: err.message });
@@ -163,58 +178,168 @@ app.get("/ft", async (req, res) => {
 });
 
 // ===================================================================
-// ZVK (привязка к заявке)  -> таблица: id_zvk, zvk_date, zvk_name, id_ft, amount
+// ZVK (привязка к заявке)
 // ===================================================================
 
-// POST: создать привязку (Zft1, Zft2...)
-// body: { zvk_name, id_ft, amount }
+// POST: создать привязку (ZFT1, ZFT2...)
+// body: { creator_login, zvk_name, id_ft, amount }
 app.post("/save-zvk", async (req, res) => {
   try {
-    const { zvk_name, id_ft, amount } = req.body;
+    const { creator_login, zvk_name, id_ft, amount } = req.body;
 
-    if (!zvk_name || !id_ft) {
-      return res.status(400).json({ success: false, error: "zvk_name and id_ft are required" });
+    if (!creator_login || !zvk_name || !id_ft) {
+      return res.status(400).json({
+        success: false,
+        error: "creator_login, zvk_name and id_ft are required"
+      });
     }
 
     const query = `
       INSERT INTO zvk
-      (id_zvk, zvk_date, zvk_name, id_ft, amount)
+      (id_zvk, zvk_date, zvk_name, id_ft, amount, creator_login)
       VALUES
-      ('Zft' || nextval('zvk_id_seq')::text, NOW(), $1, $2, $3)
+      ('ZFT' || nextval('zvk_id_seq')::text, NOW(), $1, $2, $3, $4)
       RETURNING id_zvk, zvk_date
     `;
 
     const values = [
-      String(zvk_name),
-      String(id_ft),
+      String(zvk_name).trim(),
+      String(id_ft).trim(),
       (amount === "" || amount === undefined || amount === null) ? null : Number(amount),
+      String(creator_login).trim()
     ];
 
-    const result = await pool.query(query, values);
-    res.json({ success: true, id_zvk: result.rows[0].id_zvk, zvk_date: result.rows[0].zvk_date });
+    const r = await pool.query(query, values);
+    res.json({ success: true, id_zvk: r.rows[0].id_zvk, zvk_date: r.rows[0].zvk_date });
   } catch (err) {
     console.error("SAVE ZVK ERROR:", err);
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// GET: последние привязки
+// GET: последние привязки (только свои, админ — все)
 app.get("/zvk", async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit || 200), 500);
-    const result = await pool.query(
-      `SELECT id_zvk, zvk_date, zvk_name, id_ft, amount
-       FROM zvk
-       ORDER BY zvk_date DESC
-       LIMIT $1`,
-      [limit]
-    );
-    res.json(result.rows);
+    const login = String(req.query.login || "").trim();
+
+    if (!login) {
+      return res.status(400).json({ success:false, error:"login is required" });
+    }
+
+    const admin = isAdmin(login);
+
+    const query = admin
+      ? `SELECT id_zvk, zvk_date, zvk_name, id_ft, amount, creator_login
+         FROM zvk
+         ORDER BY zvk_date DESC
+         LIMIT $1`
+      : `SELECT id_zvk, zvk_date, zvk_name, id_ft, amount, creator_login
+         FROM zvk
+         WHERE creator_login = $2
+         ORDER BY zvk_date DESC
+         LIMIT $1`;
+
+    const params = admin ? [limit] : [limit, login];
+
+    const result = await pool.query(query, params);
+    res.json({ success:true, rows: result.rows, admin });
   } catch (err) {
     console.error("GET ZVK ERROR:", err);
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
+// ===================================================================
+// ZVK STATUS (3-я таблица)
+// таблица: public.zvk_status (id_zvk PK, stat_date auto, status, src_d, src_o)
+// ===================================================================
+
+// GET: ZVK + текущий статус (только свои, админ — все)
+app.get("/zvk-with-status", async (req, res) => {
+  try {
+    const limit = Math.min(Number(req.query.limit || 300), 500);
+    const login = String(req.query.login || "").trim();
+
+    if (!login) return res.status(400).json({ success:false, error:"login is required" });
+
+    const admin = isAdmin(login);
+
+    const qAdmin = `
+      SELECT z.id_zvk, z.zvk_date, z.zvk_name, z.id_ft, z.amount,
+             s.stat_date, s.status, s.src_d, s.src_o
+      FROM zvk z
+      LEFT JOIN zvk_status s ON s.id_zvk = z.id_zvk
+      ORDER BY z.zvk_date DESC
+      LIMIT $1
+    `;
+
+    const qUser = `
+      SELECT z.id_zvk, z.zvk_date, z.zvk_name, z.id_ft, z.amount,
+             s.stat_date, s.status, s.src_d, s.src_o
+      FROM zvk z
+      LEFT JOIN zvk_status s ON s.id_zvk = z.id_zvk
+      WHERE z.creator_login = $2
+      ORDER BY z.zvk_date DESC
+      LIMIT $1
+    `;
+
+    const r = admin
+      ? await pool.query(qAdmin, [limit])
+      : await pool.query(qUser, [limit, login]);
+
+    res.json({ success:true, rows:r.rows, admin });
+  } catch (e) {
+    console.error("ZVK-WITH-STATUS ERROR:", e);
+    res.status(500).json({ success:false, error:e.message });
+  }
+});
+
+// POST: создать/обновить текущий статус (СтатДата авто NOW)
+app.post("/upsert-zvk-status", async (req, res) => {
+  try {
+    const { login, id_zvk, status, src_d, src_o } = req.body;
+
+    if (!login || !id_zvk || !status) {
+      return res.status(400).json({ success:false, error:"login, id_zvk, status required" });
+    }
+
+    const admin = isAdmin(login);
+
+    // ✅ Проверка доступа: пользователь меняет только свои ZVK
+    if (!admin) {
+      const own = await pool.query(
+        `SELECT 1 FROM zvk WHERE id_zvk=$1 AND creator_login=$2 LIMIT 1`,
+        [String(id_zvk).trim(), String(login).trim()]
+      );
+      if (own.rowCount === 0) {
+        return res.status(403).json({ success:false, error:"Нет доступа к этому ID ZVK" });
+      }
+    }
+
+    const r = await pool.query(
+      `INSERT INTO zvk_status (id_zvk, status, src_d, src_o, stat_date)
+       VALUES ($1,$2,$3,$4,NOW())
+       ON CONFLICT (id_zvk)
+       DO UPDATE SET status=EXCLUDED.status, src_d=EXCLUDED.src_d, src_o=EXCLUDED.src_o, stat_date=NOW()
+       RETURNING id_zvk, stat_date, status, src_d, src_o`,
+      [
+        String(id_zvk).trim(),
+        String(status).trim(),
+        (src_d ?? "").toString().trim(),
+        (src_o ?? "").toString().trim(),
+      ]
+    );
+
+    res.json({ success:true, row:r.rows[0], admin });
+  } catch (e) {
+    console.error("UPSERT-ZVK-STATUS ERROR:", e);
+    res.status(500).json({ success:false, error:e.message });
+  }
+});
+
+// ===============================
+// Start
+// ===============================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Server started on port " + PORT));
