@@ -42,7 +42,8 @@ initDb().catch((e) => console.error("DB init error:", e));
 // ===============================
 // Health
 // ===============================
-app.get("/", (req, res) => res.send("Service-NS API работает 🚀"));
+app.get("/", (req, res) => res.send("Service-NS API работает 🚀 v-status-1"));
+
 
 app.get("/db-ping", async (req, res) => {
   try {
