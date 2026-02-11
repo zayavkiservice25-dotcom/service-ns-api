@@ -8,20 +8,8 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ✅ вместо app.options("*", cors());
+// ✅ CORS preflight
 app.options(/.*/, cors());
-
-
-const ADMINS = new Set([
-  "R_Kasymkhan",
-  "K_Ermek",
-  "B_Erkin",
-  "1"
-]);
-
-function isAdmin(login) {
-  return ADMINS.has(String(login || "").trim());
-}
 
 // ===============================
 // PostgreSQL (Render)
@@ -39,14 +27,12 @@ async function initDb() {
   await pool.query(`CREATE SEQUENCE IF NOT EXISTS zvk_id_seq START 1;`);
   console.log("DB init OK (ft_id_seq, zvk_id_seq)");
 }
-
 initDb().catch((e) => console.error("DB init error:", e));
 
 // ===============================
 // Health
 // ===============================
-app.get("/", (req, res) => res.send("Service-NS API работает 🚀 v-status-1"));
-
+app.get("/", (req, res) => res.send("Service-NS API работает 🚀 v-status-2"));
 
 app.get("/db-ping", async (req, res) => {
   try {
@@ -128,7 +114,9 @@ app.post("/save-ft-batch", async (req, res) => {
         r.invoice_no || "",
         r.invoice_date || "",
         r.invoice_pdf || "",
-        (r.amount === "" || r.amount === undefined || r.amount === null) ? null : Number(r.amount)
+        (r.amount === "" || r.amount === undefined || r.amount === null)
+          ? null
+          : Number(r.amount)
       );
 
       return `(
@@ -159,34 +147,52 @@ app.post("/save-ft-batch", async (req, res) => {
   }
 });
 
-// GET: last FT rows (для таблицы/выбора)
+// GET: last FT rows
+// GET: FT list (admin all / user own)
 app.get("/ft", async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit || 200), 500);
+    const login = String(req.query.login || "").trim();
+    const admin = String(req.query.is_admin || "0") === "1";
 
-    const result = await pool.query(
-      `SELECT id_ft, input_date, input_name, division, "object",
-              contractor, invoice_no, invoice_date, invoice_pdf, amount
-       FROM ft
-       ORDER BY
-         COALESCE(NULLIF(regexp_replace(id_ft,'\\D','','g'),''),'0')::int DESC
-       LIMIT $1`,
-      [limit]
-    );
+    if (!login) {
+      return res.status(400).json({ success:false, error:"login is required" });
+    }
 
-    res.json({ success: true, rows: result.rows });
-  } catch (err) {
-    console.error("GET FT ERROR:", err);
-    res.status(500).json({ success: false, error: err.message });
+    const qAdmin = `
+      SELECT id_ft, input_date, input_name, division, "object",
+             contractor, invoice_no, invoice_date, invoice_pdf, amount
+      FROM ft
+      ORDER BY COALESCE(NULLIF(regexp_replace(id_ft,'\\D','','g'),''),'0')::int DESC
+      LIMIT $1
+    `;
+
+    const qUser = `
+      SELECT id_ft, input_date, input_name, division, "object",
+             contractor, invoice_no, invoice_date, invoice_pdf, amount
+      FROM ft
+      WHERE input_name = $2
+      ORDER BY COALESCE(NULLIF(regexp_replace(id_ft,'\\D','','g'),''),'0')::int DESC
+      LIMIT $1
+    `;
+
+    const r = admin
+      ? await pool.query(qAdmin, [limit])
+      : await pool.query(qUser, [limit, login]);
+
+    res.json({ success:true, rows:r.rows, admin });
+  } catch (e) {
+    console.error("GET FT ERROR:", e);
+    res.status(500).json({ success:false, error:e.message });
   }
 });
 
+
 // ===================================================================
-// ZVK (привязка к заявке)
+// ZVK
 // ===================================================================
 
-// POST: создать привязку (ZFT1, ZFT2...)
-// body: { creator_login, zvk_name, id_ft, amount }
+// POST: create ZVK
 app.post("/save-zvk", async (req, res) => {
   try {
     const { creator_login, zvk_name, id_ft, amount } = req.body;
@@ -221,17 +227,16 @@ app.post("/save-zvk", async (req, res) => {
   }
 });
 
-// GET: последние привязки (только свои, админ — все)
+// GET: ZVK list (admin all / user own)  <-- admin comes from is_admin
 app.get("/zvk", async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit || 200), 500);
     const login = String(req.query.login || "").trim();
+    const admin = String(req.query.is_admin || "0") === "1";
 
     if (!login) {
       return res.status(400).json({ success:false, error:"login is required" });
     }
-
-    const admin = isAdmin(login);
 
     const query = admin
       ? `SELECT id_zvk, zvk_date, zvk_name, id_ft, amount, creator_login
@@ -255,19 +260,17 @@ app.get("/zvk", async (req, res) => {
 });
 
 // ===================================================================
-// ZVK STATUS (3-я таблица)
-// таблица: public.zvk_status (id_zvk PK, stat_date auto, status, src_d, src_o)
+// ZVK STATUS
 // ===================================================================
 
-// GET: ZVK + текущий статус (только свои, админ — все)
+// GET: ZVK + status (admin all / user own)  <-- admin comes from is_admin
 app.get("/zvk-with-status", async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit || 300), 500);
     const login = String(req.query.login || "").trim();
+    const admin = String(req.query.is_admin || "0") === "1";
 
     if (!login) return res.status(400).json({ success:false, error:"login is required" });
-
-    const admin = isAdmin(login);
 
     const qAdmin = `
       SELECT z.id_zvk, z.zvk_date, z.zvk_name, z.id_ft, z.amount,
@@ -299,18 +302,17 @@ app.get("/zvk-with-status", async (req, res) => {
   }
 });
 
-// POST: создать/обновить текущий статус (СтатДата авто NOW)
+// POST: upsert status (admin can edit all / user only own) <-- admin comes from is_admin
 app.post("/upsert-zvk-status", async (req, res) => {
   try {
-    const { login, id_zvk, status, src_d, src_o } = req.body;
+    const { login, is_admin, id_zvk, status, src_d, src_o } = req.body;
+    const admin = String(is_admin || "0") === "1";
 
     if (!login || !id_zvk || !status) {
       return res.status(400).json({ success:false, error:"login, id_zvk, status required" });
     }
 
-    const admin = isAdmin(login);
-
-    // ✅ Проверка доступа: пользователь меняет только свои ZVK
+    // ✅ Access: non-admin can edit only own ZVK
     if (!admin) {
       const own = await pool.query(
         `SELECT 1 FROM zvk WHERE id_zvk=$1 AND creator_login=$2 LIMIT 1`,
