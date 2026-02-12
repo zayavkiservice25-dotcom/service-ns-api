@@ -226,7 +226,9 @@ app.post("/upsert-zvk-approve-pay", async (req, res) => {
   const client = await pool.connect();
   try {
     const { login, id_zvk, agree_name, is_paid } = req.body;
-    if (!login || !id_zvk) return res.status(400).json({ success: false, error: "login, id_zvk required" });
+    if (!login || !id_zvk) {
+      return res.status(400).json({ success: false, error: "login, id_zvk required" });
+    }
 
     // защита
     if (String(login).trim().toLowerCase() !== "b_erkin") {
@@ -235,7 +237,7 @@ app.post("/upsert-zvk-approve-pay", async (req, res) => {
 
     await client.query("BEGIN");
 
-    // 1) agree (БЕЗ created_at!)
+    // 1) agree (БЕЗ created_at)
     await client.query(
       `INSERT INTO zvk_agree (id_zvk, agree_name)
        VALUES ($1,$2)
@@ -245,22 +247,30 @@ app.post("/upsert-zvk-approve-pay", async (req, res) => {
     );
 
     // 2) pay (created_at = ОплатДата)
-await client.query(
-  `INSERT INTO zvk_pay (id_zvk, is_paid, created_at)
-   VALUES ($1, $2, CASE WHEN $2 = 'Да' THEN NOW() ELSE NULL END)
-   ON CONFLICT (id_zvk)
-   DO UPDATE SET
-     is_paid = EXCLUDED.is_paid,
-     created_at = CASE
-       -- поставили "Да" впервые -> ставим дату
-       WHEN EXCLUDED.is_paid = 'Да' AND zvk_pay.created_at IS NULL THEN NOW()
-       -- поставили "Нет" -> очищаем дату
-       WHEN EXCLUDED.is_paid <> 'Да' THEN NULL
-       -- если уже было "Да" и дата есть -> не трогаем
-       ELSE zvk_pay.created_at
-     END`,
-  [String(id_zvk).trim(), (is_paid ?? "").toString().trim() || null]
-);
+    await client.query(
+      `INSERT INTO zvk_pay (id_zvk, is_paid, created_at)
+       VALUES ($1, $2, CASE WHEN $2 = 'Да' THEN NOW() ELSE NULL END)
+       ON CONFLICT (id_zvk)
+       DO UPDATE SET
+         is_paid = EXCLUDED.is_paid,
+         created_at = CASE
+           WHEN EXCLUDED.is_paid = 'Да' AND zvk_pay.created_at IS NULL THEN NOW()
+           WHEN EXCLUDED.is_paid <> 'Да' THEN NULL
+           ELSE zvk_pay.created_at
+         END`,
+      [String(id_zvk).trim(), (is_paid ?? "").toString().trim() || null]
+    );
+
+    await client.query("COMMIT");
+    res.json({ success: true });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("UPSERT-APPROVE-PAY ERROR:", e);
+    res.status(500).json({ success: false, error: e.message });
+  } finally {
+    client.release();
+  }
+});
 
 
 // ===============================
