@@ -21,7 +21,7 @@ async function initDb() {
 }
 initDb().catch(console.error);
 
-app.get("/", (req, res) => res.send("Service-NS API работает 🚀 v-ftzvk-final"));
+app.get("/", (req, res) => res.send("Service-NS API работает 🚀 v-ftzvk-final-2"));
 app.get("/db-ping", async (req, res) => {
   try {
     const r = await pool.query("SELECT NOW() as now");
@@ -31,12 +31,15 @@ app.get("/db-ping", async (req, res) => {
   }
 });
 
-// ==========================
-// FT (как у тебя)
-// ==========================
+// =====================================================
+// FT
+// =====================================================
 app.post("/save-ft", async (req, res) => {
   try {
-    const { input_date, input_name, division, object, contractor, invoice_no, invoice_date, invoice_pdf, sum_ft } = req.body;
+    const {
+      input_date, input_name, division, object,
+      contractor, invoice_no, invoice_date, invoice_pdf, sum_ft
+    } = req.body;
 
     const q = `
       INSERT INTO ft
@@ -70,7 +73,11 @@ app.get("/ft", async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit || 200), 500);
     const login = String(req.query.login || "").trim();
-    const admin = String(req.query.is_admin || "0") === "1";
+    const loginNorm = login.toLowerCase();
+    const admin =
+      String(req.query.is_admin || "0") === "1" ||
+      loginNorm === "b_erkin"; // ✅ B_Erkin всегда админ
+
     if (!login) return res.status(400).json({ success: false, error: "login is required" });
 
     const qAdmin = `
@@ -97,9 +104,9 @@ app.get("/ft", async (req, res) => {
   }
 });
 
-// ==========================
-// ZVK (если надо создавать)
-// ==========================
+// =====================================================
+// ZVK (создание)
+// =====================================================
 app.post("/save-zvk", async (req, res) => {
   try {
     const { id_ft, sum_zvk, status_zvk } = req.body;
@@ -124,17 +131,17 @@ app.post("/save-zvk", async (req, res) => {
   }
 });
 
-// ==========================
-// VIEW ft_zvk_full
-// ==========================
+// =====================================================
+// FT+ZVK FULL (VIEW) — B_Erkin видит все
+// =====================================================
 app.get("/ft-zvk-full", async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit || 300), 500);
     const login = String(req.query.login || "").trim();
     const loginNorm = login.toLowerCase();
     const admin =
-    String(req.query.is_admin || "0") === "1" ||
-    loginNorm === "b_erkin"; // админ по логину
+      String(req.query.is_admin || "0") === "1" ||
+      loginNorm === "b_erkin"; // ✅
 
     if (!login) return res.status(400).json({ success: false, error: "login is required" });
 
@@ -159,7 +166,7 @@ app.get("/ft-zvk-full", async (req, res) => {
 });
 
 // =====================================================
-// 1) Инициатор: сохраняет src_d / src_o
+// 1) Инициатор: src_d / src_o   (created_at авто в БД)
 // =====================================================
 app.post("/upsert-zvk-src", async (req, res) => {
   const client = await pool.connect();
@@ -170,11 +177,11 @@ app.post("/upsert-zvk-src", async (req, res) => {
     await client.query("BEGIN");
 
     const r = await client.query(
-      `INSERT INTO zvk_status (id_zvk, src_d, src_o)
-       VALUES ($1,$2,$3)
+      `INSERT INTO zvk_status (id_zvk, src_d, src_o, created_at)
+       VALUES ($1,$2,$3, NOW())
        ON CONFLICT (id_zvk)
-       DO UPDATE SET src_d=EXCLUDED.src_d, src_o=EXCLUDED.src_o
-       RETURNING id_zvk, src_d, src_o`,
+       DO UPDATE SET src_d=EXCLUDED.src_d, src_o=EXCLUDED.src_o, created_at=NOW()
+       RETURNING id_zvk, src_d, src_o, created_at`,
       [
         String(id_zvk).trim(),
         (src_d ?? "").toString().trim(),
@@ -194,39 +201,38 @@ app.post("/upsert-zvk-src", async (req, res) => {
 });
 
 // =====================================================
-// 2) B_Erkin: согласование + оплата
+// 2) B_Erkin: agree + pay   (created_at авто в БД)
+// ВАЖНО: pay_date больше не обязателен — будет NOW() в created_at
 // =====================================================
 app.post("/upsert-zvk-approve-pay", async (req, res) => {
   const client = await pool.connect();
   try {
-    const { login, id_zvk, agree_name, pay_date, is_paid } = req.body;
+    const { login, id_zvk, agree_name, is_paid } = req.body;
     if (!login || !id_zvk) return res.status(400).json({ success:false, error:"login, id_zvk required" });
 
-    // простая защита
-    if (String(login).trim() !== "B_Erkin") {
+    if (String(login).trim().toLowerCase() !== "b_erkin") {
       return res.status(403).json({ success:false, error:"only B_Erkin allowed" });
     }
 
     await client.query("BEGIN");
 
-    // agree
+    // agree (created_at авто)
     await client.query(
-      `INSERT INTO zvk_agree (id_zvk, agree_name)
-       VALUES ($1,$2)
+      `INSERT INTO zvk_agree (id_zvk, agree_name, created_at)
+       VALUES ($1,$2, NOW())
        ON CONFLICT (id_zvk)
-       DO UPDATE SET agree_name=EXCLUDED.agree_name`,
+       DO UPDATE SET agree_name=EXCLUDED.agree_name, created_at=NOW()`,
       [String(id_zvk).trim(), (agree_name ?? "").toString().trim() || null]
     );
 
-    // pay (pay_date = date)
+    // pay (created_at авто)
     await client.query(
-      `INSERT INTO zvk_pay (id_zvk, pay_date, is_paid)
-       VALUES ($1,$2,$3)
+      `INSERT INTO zvk_pay (id_zvk, is_paid, created_at)
+       VALUES ($1,$2, NOW())
        ON CONFLICT (id_zvk)
-       DO UPDATE SET pay_date=EXCLUDED.pay_date, is_paid=EXCLUDED.is_paid`,
+       DO UPDATE SET is_paid=EXCLUDED.is_paid, created_at=NOW()`,
       [
         String(id_zvk).trim(),
-        pay_date ? String(pay_date).trim() : null,
         (is_paid ?? "").toString().trim() || null
       ]
     );
