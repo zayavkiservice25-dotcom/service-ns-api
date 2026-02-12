@@ -14,6 +14,9 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
+// ===============================
+// Init
+// ===============================
 async function initDb() {
   await pool.query(`CREATE SEQUENCE IF NOT EXISTS ft_id_seq START 1;`);
   await pool.query(`CREATE SEQUENCE IF NOT EXISTS zvk_id_seq START 1;`);
@@ -21,7 +24,11 @@ async function initDb() {
 }
 initDb().catch(console.error);
 
-app.get("/", (req, res) => res.send("Service-NS API работает 🚀 v-ftzvk-final-2"));
+// ===============================
+// Health
+// ===============================
+app.get("/", (req, res) => res.send("Service-NS API работает 🚀 v-ftzvk-final-fixed"));
+
 app.get("/db-ping", async (req, res) => {
   try {
     const r = await pool.query("SELECT NOW() as now");
@@ -37,8 +44,15 @@ app.get("/db-ping", async (req, res) => {
 app.post("/save-ft", async (req, res) => {
   try {
     const {
-      input_date, input_name, division, object,
-      contractor, invoice_no, invoice_date, invoice_pdf, sum_ft
+      input_date,
+      input_name,
+      division,
+      object,
+      contractor,
+      invoice_no,
+      invoice_date,
+      invoice_pdf,
+      sum_ft,
     } = req.body;
 
     const q = `
@@ -58,7 +72,7 @@ app.post("/save-ft", async (req, res) => {
       invoice_no || "",
       invoice_date || "",
       invoice_pdf || "",
-      (sum_ft === "" || sum_ft === undefined || sum_ft === null) ? null : Number(sum_ft),
+      sum_ft === "" || sum_ft === undefined || sum_ft === null ? null : Number(sum_ft),
     ];
 
     const r = await pool.query(q, values);
@@ -87,6 +101,7 @@ app.get("/ft", async (req, res) => {
       ORDER BY COALESCE(NULLIF(regexp_replace(id_ft,'\\D','','g'),''),'0')::int DESC
       LIMIT $1
     `;
+
     const qUser = `
       SELECT id_ft, input_date, input_name, division, "object",
              contractor, invoice_no, invoice_date, invoice_pdf, sum_ft
@@ -105,7 +120,7 @@ app.get("/ft", async (req, res) => {
 });
 
 // =====================================================
-// ZVK (создание)
+// ZVK (создание если нужно)
 // =====================================================
 app.post("/save-zvk", async (req, res) => {
   try {
@@ -117,9 +132,10 @@ app.post("/save-zvk", async (req, res) => {
       VALUES ('ZFT' || nextval('zvk_id_seq')::text, $1, $2, $3)
       RETURNING id_zvk
     `;
+
     const values = [
       String(id_ft).trim(),
-      (sum_zvk === "" || sum_zvk === undefined || sum_zvk === null) ? null : Number(sum_zvk),
+      sum_zvk === "" || sum_zvk === undefined || sum_zvk === null ? null : Number(sum_zvk),
       status_zvk ? String(status_zvk).trim() : null,
     ];
 
@@ -141,7 +157,7 @@ app.get("/ft-zvk-full", async (req, res) => {
     const loginNorm = login.toLowerCase();
     const admin =
       String(req.query.is_admin || "0") === "1" ||
-      loginNorm === "b_erkin"; // ✅
+      loginNorm === "b_erkin";
 
     if (!login) return res.status(400).json({ success: false, error: "login is required" });
 
@@ -150,6 +166,7 @@ app.get("/ft-zvk-full", async (req, res) => {
       ORDER BY COALESCE(NULLIF(regexp_replace(id_ft,'\\D','','g'),''),'0')::int DESC
       LIMIT $1
     `;
+
     const qUser = `
       SELECT * FROM ft_zvk_full
       WHERE COALESCE(input_name,'') = $2
@@ -166,22 +183,22 @@ app.get("/ft-zvk-full", async (req, res) => {
 });
 
 // =====================================================
-// 1) Инициатор: src_d / src_o   (created_at авто в БД)
+// 1) Инициатор: сохраняет src_d / src_o (БЕЗ created_at)
 // =====================================================
 app.post("/upsert-zvk-src", async (req, res) => {
   const client = await pool.connect();
   try {
     const { login, id_zvk, src_d, src_o } = req.body;
-    if (!login || !id_zvk) return res.status(400).json({ success:false, error:"login, id_zvk required" });
+    if (!login || !id_zvk) return res.status(400).json({ success: false, error: "login, id_zvk required" });
 
     await client.query("BEGIN");
 
     const r = await client.query(
-      `INSERT INTO zvk_status (id_zvk, src_d, src_o, created_at)
-       VALUES ($1,$2,$3, NOW())
+      `INSERT INTO zvk_status (id_zvk, src_d, src_o)
+       VALUES ($1,$2,$3)
        ON CONFLICT (id_zvk)
-       DO UPDATE SET src_d=EXCLUDED.src_d, src_o=EXCLUDED.src_o, created_at=NOW()
-       RETURNING id_zvk, src_d, src_o, created_at`,
+       DO UPDATE SET src_d=EXCLUDED.src_d, src_o=EXCLUDED.src_o
+       RETURNING id_zvk, src_d, src_o`,
       [
         String(id_zvk).trim(),
         (src_d ?? "").toString().trim(),
@@ -190,63 +207,65 @@ app.post("/upsert-zvk-src", async (req, res) => {
     );
 
     await client.query("COMMIT");
-    res.json({ success:true, row:r.rows[0] });
+    res.json({ success: true, row: r.rows[0] });
   } catch (e) {
     await client.query("ROLLBACK");
     console.error("UPSERT-ZVK-SRC ERROR:", e);
-    res.status(500).json({ success:false, error:e.message });
+    res.status(500).json({ success: false, error: e.message });
   } finally {
     client.release();
   }
 });
 
 // =====================================================
-// 2) B_Erkin: agree + pay   (created_at авто в БД)
-// ВАЖНО: pay_date больше не обязателен — будет NOW() в created_at
+// 2) B_Erkin: согласование + оплата
+// - agree_name -> zvk_agree (без created_at)
+// - is_paid + created_at авто -> zvk_pay (created_at обновляем NOW())
 // =====================================================
 app.post("/upsert-zvk-approve-pay", async (req, res) => {
   const client = await pool.connect();
   try {
     const { login, id_zvk, agree_name, is_paid } = req.body;
-    if (!login || !id_zvk) return res.status(400).json({ success:false, error:"login, id_zvk required" });
+    if (!login || !id_zvk) return res.status(400).json({ success: false, error: "login, id_zvk required" });
 
+    // защита
     if (String(login).trim().toLowerCase() !== "b_erkin") {
-      return res.status(403).json({ success:false, error:"only B_Erkin allowed" });
+      return res.status(403).json({ success: false, error: "only B_Erkin allowed" });
     }
 
     await client.query("BEGIN");
 
-    // agree (created_at авто)
+    // 1) agree (БЕЗ created_at!)
     await client.query(
-      `INSERT INTO zvk_agree (id_zvk, agree_name, created_at)
-       VALUES ($1,$2, NOW())
+      `INSERT INTO zvk_agree (id_zvk, agree_name)
+       VALUES ($1,$2)
        ON CONFLICT (id_zvk)
-       DO UPDATE SET agree_name=EXCLUDED.agree_name, created_at=NOW()`,
+       DO UPDATE SET agree_name=EXCLUDED.agree_name`,
       [String(id_zvk).trim(), (agree_name ?? "").toString().trim() || null]
     );
 
-    // pay (created_at авто)
+    // 2) pay (created_at только тут)
     await client.query(
-      `INSERT INTO zvk_pay (id_zvk, is_paid, created_at)
-       VALUES ($1,$2, NOW())
+      `INSERT INTO zvk_pay (id_zvk, is_paid)
+       VALUES ($1,$2)
        ON CONFLICT (id_zvk)
        DO UPDATE SET is_paid=EXCLUDED.is_paid, created_at=NOW()`,
-      [
-        String(id_zvk).trim(),
-        (is_paid ?? "").toString().trim() || null
-      ]
+      [String(id_zvk).trim(), (is_paid ?? "").toString().trim() || null]
     );
 
     await client.query("COMMIT");
-    res.json({ success:true });
+    res.json({ success: true });
   } catch (e) {
     await client.query("ROLLBACK");
     console.error("UPSERT-APPROVE-PAY ERROR:", e);
-    res.status(500).json({ success:false, error:e.message });
+    res.status(500).json({ success: false, error: e.message });
   } finally {
     client.release();
   }
 });
 
+// ===============================
+// Start
+// ===============================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Server started on port " + PORT));
