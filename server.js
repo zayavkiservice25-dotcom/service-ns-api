@@ -247,19 +247,20 @@ app.post("/upsert-zvk-approve-pay", async (req, res) => {
     );
 
     // 2) pay (created_at = ОплатДата)
-    await client.query(
-      `INSERT INTO zvk_pay (id_zvk, is_paid, created_at)
-       VALUES ($1, $2, CASE WHEN $2 = 'Да' THEN NOW() ELSE NULL END)
-       ON CONFLICT (id_zvk)
-       DO UPDATE SET
-         is_paid = EXCLUDED.is_paid,
-         created_at = CASE
-           WHEN EXCLUDED.is_paid = 'Да' AND zvk_pay.created_at IS NULL THEN NOW()
-           WHEN EXCLUDED.is_paid <> 'Да' THEN NULL
-           ELSE zvk_pay.created_at
-         END`,
-      [String(id_zvk).trim(), (is_paid ?? "").toString().trim() || null]
-    );
+   await client.query(
+  `INSERT INTO zvk_pay (id_zvk, is_paid, created_at)
+   VALUES ($1, $2, CASE WHEN $2 = 'Да' THEN (NOW() AT TIME ZONE 'Asia/Almaty') ELSE NULL END)
+   ON CONFLICT (id_zvk)
+   DO UPDATE SET
+     is_paid = EXCLUDED.is_paid,
+     created_at = CASE
+       WHEN EXCLUDED.is_paid = 'Да' AND zvk_pay.created_at IS NULL THEN (NOW() AT TIME ZONE 'Asia/Almaty')
+       WHEN EXCLUDED.is_paid <> 'Да' THEN NULL
+       ELSE zvk_pay.created_at
+     END`,
+  [String(id_zvk).trim(), (is_paid ?? "").toString().trim() || null]
+);
+
 
     await client.query("COMMIT");
     res.json({ success: true });
