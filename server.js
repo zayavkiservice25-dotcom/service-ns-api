@@ -131,7 +131,11 @@ app.get("/ft-zvk-full", async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit || 300), 500);
     const login = String(req.query.login || "").trim();
-    const admin = String(req.query.is_admin || "0") === "1";
+    const loginNorm = login.toLowerCase();
+    const admin =
+    String(req.query.is_admin || "0") === "1" ||
+    loginNorm === "b_erkin"; // админ по логину
+
     if (!login) return res.status(400).json({ success: false, error: "login is required" });
 
     const qAdmin = `
