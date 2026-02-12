@@ -250,7 +250,6 @@ app.get("/zvk", async (req, res) => {
 
 // ===================================================================
 // FT + ZVK FULL (из VIEW ft_zvk_full)  ← ДЛЯ WEB APP ТАБЛИЦЫ
-// Фильтр пользователя: по ft.input_name = login (т.к. creator_login нет)
 // ===================================================================
 app.get("/ft-zvk-full", async (req, res) => {
   try {
@@ -287,10 +286,11 @@ app.get("/ft-zvk-full", async (req, res) => {
 });
 
 // ===================================================================
-// ZVK STATUS (таблица zvk_status) + синхронизация в zvk.status_zvk
+// ZVK STATUS
+// status теперь НЕ обязателен
 // ===================================================================
 
-// GET: ZVK + status (берём из zvk_status, плюс поля zvk)
+// GET: ZVK + status
 app.get("/zvk-with-status", async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit || 300), 500);
@@ -312,41 +312,51 @@ app.get("/zvk-with-status", async (req, res) => {
   }
 });
 
-// POST: upsert status -> пишет в zvk_status и обновляет zvk.status_zvk
+// POST: upsert -> login/id_zvk required, status optional
 app.post("/upsert-zvk-status", async (req, res) => {
   const client = await pool.connect();
   try {
     const { login, id_zvk, status, src_d, src_o } = req.body;
 
-    // login тут просто для твоей логики (кто нажал сохранить), в БД не пишем
-    if (!login || !id_zvk || !status) {
-      return res.status(400).json({ success: false, error: "login, id_zvk, status required" });
+    if (!login || !id_zvk) {
+      return res.status(400).json({ success: false, error: "login, id_zvk required" });
     }
+
+    const id = String(id_zvk).trim();
+    const st =
+      status === undefined || status === null || String(status).trim() === ""
+        ? null
+        : String(status).trim();
 
     await client.query("BEGIN");
 
     const r = await client.query(
       `INSERT INTO zvk_status (id_zvk, status, src_d, src_o, stat_date)
-       VALUES ($1,$2,$3,$4,NOW())
+       VALUES ($1, $2, $3, $4, NOW())
        ON CONFLICT (id_zvk)
-       DO UPDATE SET status=EXCLUDED.status, src_d=EXCLUDED.src_d, src_o=EXCLUDED.src_o, stat_date=NOW()
+       DO UPDATE SET
+         status    = COALESCE(EXCLUDED.status, zvk_status.status),
+         src_d     = EXCLUDED.src_d,
+         src_o     = EXCLUDED.src_o,
+         stat_date = NOW()
        RETURNING id_zvk, stat_date, status, src_d, src_o`,
       [
-        String(id_zvk).trim(),
-        String(status).trim(),
+        id,
+        st,
         (src_d ?? "").toString().trim(),
         (src_o ?? "").toString().trim(),
       ]
     );
 
-    // ✅ синхронизируем "быстрый статус" в таблице zvk
-    await client.query(
-      `UPDATE zvk SET status_zvk = $2 WHERE id_zvk = $1`,
-      [String(id_zvk).trim(), String(status).trim()]
-    );
+    // обновляем быстрый статус только если пришёл
+    if (st !== null) {
+      await client.query(
+        `UPDATE zvk SET status_zvk = $2 WHERE id_zvk = $1`,
+        [id, st]
+      );
+    }
 
     await client.query("COMMIT");
-
     res.json({ success: true, row: r.rows[0] });
   } catch (e) {
     await client.query("ROLLBACK");
