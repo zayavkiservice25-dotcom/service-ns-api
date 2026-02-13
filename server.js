@@ -103,45 +103,31 @@ app.get("/ft", async (req, res) => {
     }
 
     // ✅ Админ видит все FT + остаток
-    const qAdmin = `
-      SELECT
-        f.id_ft,
-        f.input_date,
-        f.input_name,
-        f.division,
-        f."object",
-        f.contractor,
-        f.invoice_no,
-        f.invoice_date,
-        f.invoice_pdf,
-        f.sum_ft,
-        b.balance_ft
-      FROM ft f
-      LEFT JOIN ft_balance b ON b.id_ft = f.id_ft
-      ORDER BY COALESCE(NULLIF(regexp_replace(f.id_ft,'\\D','','g'),''),'0')::int DESC
-      LIMIT $1
-    `;
+   const qAdmin = `
+  SELECT
+    f.id_ft, f.input_date, f.input_name, f.division, f."object",
+    f.contractor, f.invoice_no, f.invoice_date, f.invoice_pdf, f.sum_ft,
+    b.balance_ft
+  FROM ft f
+  LEFT JOIN ft_balance b ON b.id_ft = f.id_ft
+  ORDER BY COALESCE(NULLIF(regexp_replace(f.id_ft,'\\D','','g'),''),'0')::int DESC
+  LIMIT $1
+`;
+
 
     // ✅ Пользователь видит только свои FT + остаток
-    const qUser = `
-      SELECT
-        f.id_ft,
-        f.input_date,
-        f.input_name,
-        f.division,
-        f."object",
-        f.contractor,
-        f.invoice_no,
-        f.invoice_date,
-        f.invoice_pdf,
-        f.sum_ft,
-        b.balance_ft
-      FROM ft f
-      LEFT JOIN ft_balance b ON b.id_ft = f.id_ft
-      WHERE f.input_name = $2
-      ORDER BY COALESCE(NULLIF(regexp_replace(f.id_ft,'\\D','','g'),''),'0')::int DESC
-      LIMIT $1
-    `;
+ const qUser = `
+  SELECT
+    f.id_ft, f.input_date, f.input_name, f.division, f."object",
+    f.contractor, f.invoice_no, f.invoice_date, f.invoice_pdf, f.sum_ft,
+    b.balance_ft
+  FROM ft f
+  LEFT JOIN ft_balance b ON b.id_ft = f.id_ft
+  WHERE f.input_name = $2
+  ORDER BY COALESCE(NULLIF(regexp_replace(f.id_ft,'\\D','','g'),''),'0')::int DESC
+  LIMIT $1
+`;
+
 
     const r = admin
       ? await pool.query(qAdmin, [limit])
