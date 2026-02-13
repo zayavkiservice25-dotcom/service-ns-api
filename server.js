@@ -18,8 +18,13 @@ const pool = new Pool({
 // Init
 // ===============================
 async function initDb() {
+  // Создаём последовательности, если их нет
   await pool.query(`CREATE SEQUENCE IF NOT EXISTS ft_id_seq START 1;`);
   await pool.query(`CREATE SEQUENCE IF NOT EXISTS zvk_id_seq START 1;`);
+  
+  // НЕ сбрасываем автоматически при старте, чтобы не затереть данные
+  // Сброс делается через специальные endpoint'ы
+  
   console.log("DB init OK");
 }
 initDb().catch(console.error);
@@ -261,7 +266,6 @@ app.post("/upsert-zvk-approve-pay", async (req, res) => {
   [String(id_zvk).trim(), (is_paid ?? "").toString().trim() || null]
 );
 
-
     await client.query("COMMIT");
     res.json({ success: true });
   } catch (e) {
@@ -273,6 +277,227 @@ app.post("/upsert-zvk-approve-pay", async (req, res) => {
   }
 });
 
+// =====================================================
+// НОВЫЕ ENDPOINT'Ы ДЛЯ УПРАВЛЕНИЯ ДАННЫМИ
+// =====================================================
+
+/**
+ * ПРОВЕРКА ТЕКУЩИХ ЗНАЧЕНИЙ ПОСЛЕДОВАТЕЛЬНОСТЕЙ
+ * GET /check-sequences?login=b_erkin
+ */
+app.get("/check-sequences", async (req, res) => {
+  try {
+    const login = String(req.query.login || "").trim().toLowerCase();
+    
+    // Только для админа
+    if (login !== "b_erkin") {
+      return res.status(403).json({ success: false, error: "Только B_Erkin может просматривать последовательности" });
+    }
+
+    const ftSeq = await pool.query("SELECT last_value, is_called FROM ft_id_seq;");
+    const zvkSeq = await pool.query("SELECT last_value, is_called FROM zvk_id_seq;");
+    
+    // Получаем максимальные ID из таблиц для информации
+    const maxFt = await pool.query("SELECT MAX(CAST(REGEXP_REPLACE(id_ft, '\\D', '', 'g') AS INTEGER)) as max_id FROM ft;");
+    const maxZvk = await pool.query("SELECT MAX(CAST(REGEXP_REPLACE(id_zvk, '\\D', '', 'g') AS INTEGER)) as max_id FROM zvk;");
+    
+    res.json({
+      success: true,
+      ft_sequence: {
+        last_value: ftSeq.rows[0].last_value,
+        is_called: ftSeq.rows[0].is_called,
+        next_id: ftSeq.rows[0].is_called ? Number(ftSeq.rows[0].last_value) + 1 : ftSeq.rows[0].last_value,
+        max_id_in_table: maxFt.rows[0].max_id || 0
+      },
+      zvk_sequence: {
+        last_value: zvkSeq.rows[0].last_value,
+        is_called: zvkSeq.rows[0].is_called,
+        next_id: zvkSeq.rows[0].is_called ? Number(zvkSeq.rows[0].last_value) + 1 : zvkSeq.rows[0].last_value,
+        max_id_in_table: maxZvk.rows[0].max_id || 0
+      }
+    });
+  } catch (e) {
+    console.error("CHECK SEQUENCES ERROR:", e);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/**
+ * СБРОС ПОСЛЕДОВАТЕЛЬНОСТЕЙ (без удаления данных)
+ * POST /reset-sequences
+ * Body: { "login": "b_erkin" }
+ */
+app.post("/reset-sequences", async (req, res) => {
+  try {
+    const { login } = req.body;
+    
+    // Проверяем, что это админ
+    if (String(login || "").trim().toLowerCase() !== "b_erkin") {
+      return res.status(403).json({ success: false, error: "Только B_Erkin может сбрасывать счётчики" });
+    }
+
+    // Сбрасываем последовательности на 1
+    await pool.query("ALTER SEQUENCE ft_id_seq RESTART WITH 1;");
+    await pool.query("ALTER SEQUENCE zvk_id_seq RESTART WITH 1;");
+    
+    res.json({ 
+      success: true, 
+      message: "✅ Счётчики сброшены. Следующий FT будет FT1, следующий ZVK будет ZFT1" 
+    });
+  } catch (e) {
+    console.error("RESET SEQUENCES ERROR:", e);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/**
+ * ПОЛНАЯ ОЧИСТКА ВСЕХ ДАННЫХ + СБРОС ПОСЛЕДОВАТЕЛЬНОСТЕЙ
+ * POST /reset-all-data
+ * Body: { "login": "b_erkin" }
+ */
+app.post("/reset-all-data", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { login } = req.body;
+    
+    if (String(login || "").trim().toLowerCase() !== "b_erkin") {
+      return res.status(403).json({ success: false, error: "Только B_Erkin может выполнить полную очистку" });
+    }
+
+    await client.query("BEGIN");
+    
+    // Очищаем все таблицы в правильном порядке (от дочерних к родительским)
+    console.log("Очищаем zvk_pay...");
+    await client.query("TRUNCATE TABLE zvk_pay CASCADE;");
+    
+    console.log("Очищаем zvk_agree...");
+    await client.query("TRUNCATE TABLE zvk_agree CASCADE;");
+    
+    console.log("Очищаем zvk_status...");
+    await client.query("TRUNCATE TABLE zvk_status CASCADE;");
+    
+    console.log("Очищаем zvk...");
+    await client.query("TRUNCATE TABLE zvk CASCADE;");
+    
+    console.log("Очищаем ft...");
+    await client.query("TRUNCATE TABLE ft CASCADE;");
+    
+    // Сбрасываем последовательности
+    console.log("Сбрасываем ft_id_seq...");
+    await client.query("ALTER SEQUENCE ft_id_seq RESTART WITH 1;");
+    
+    console.log("Сбрасываем zvk_id_seq...");
+    await client.query("ALTER SEQUENCE zvk_id_seq RESTART WITH 1;");
+    
+    await client.query("COMMIT");
+    
+    res.json({ 
+      success: true, 
+      message: "✅ Все данные удалены, счётчики сброшены. Следующий FT будет FT1, следующий ZVK будет ZFT1" 
+    });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("RESET ALL DATA ERROR:", e);
+    res.status(500).json({ success: false, error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * ОЧИСТКА ТОЛЬКО ОДНОЙ ТАБЛИЦЫ FT (с каскадным удалением связанных данных)
+ * POST /reset-ft-only
+ * Body: { "login": "b_erkin" }
+ */
+app.post("/reset-ft-only", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { login } = req.body;
+    
+    if (String(login || "").trim().toLowerCase() !== "b_erkin") {
+      return res.status(403).json({ success: false, error: "Только B_Erkin" });
+    }
+
+    await client.query("BEGIN");
+    
+    // Очищаем ft с каскадом (автоматически удалит все связанные записи)
+    await client.query("TRUNCATE TABLE ft RESTART IDENTITY CASCADE;");
+    
+    // Сбрасываем последовательность ft (на всякий случай)
+    await client.query("ALTER SEQUENCE ft_id_seq RESTART WITH 1;");
+    
+    await client.query("COMMIT");
+    
+    res.json({ 
+      success: true, 
+      message: "✅ Таблица FT очищена, все связанные данные удалены. Следующий FT будет FT1" 
+    });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("RESET FT ONLY ERROR:", e);
+    res.status(500).json({ success: false, error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * ИСПРАВЛЕНИЕ ПОСЛЕДОВАТЕЛЬНОСТИ (если ID скакнул, но данные удалены)
+ * Автоматически устанавливает последовательность на 1, если таблица пуста
+ * POST /fix-sequence
+ * Body: { "login": "b_erkin" }
+ */
+app.post("/fix-sequence", async (req, res) => {
+  try {
+    const { login } = req.body;
+    
+    if (String(login || "").trim().toLowerCase() !== "b_erkin") {
+      return res.status(403).json({ success: false, error: "Только B_Erkin" });
+    }
+
+    // Проверяем, пустая ли таблица ft
+    const ftCheck = await pool.query("SELECT COUNT(*) as count FROM ft;");
+    const ftEmpty = parseInt(ftCheck.rows[0].count) === 0;
+    
+    // Проверяем, пустая ли таблица zvk
+    const zvkCheck = await pool.query("SELECT COUNT(*) as count FROM zvk;");
+    const zvkEmpty = parseInt(zvkCheck.rows[0].count) === 0;
+    
+    const fixes = [];
+    
+    if (ftEmpty) {
+      await pool.query("ALTER SEQUENCE ft_id_seq RESTART WITH 1;");
+      fixes.push("ft_id_seq сброшена на 1");
+    } else {
+      // Если таблица не пустая, устанавливаем последовательность на max+1
+      const maxFt = await pool.query("SELECT MAX(CAST(REGEXP_REPLACE(id_ft, '\\D', '', 'g') AS INTEGER)) as max_id FROM ft;");
+      const nextVal = (maxFt.rows[0].max_id || 0) + 1;
+      await pool.query(`ALTER SEQUENCE ft_id_seq RESTART WITH ${nextVal};`);
+      fixes.push(`ft_id_seq установлена на ${nextVal} (max+1)`);
+    }
+    
+    if (zvkEmpty) {
+      await pool.query("ALTER SEQUENCE zvk_id_seq RESTART WITH 1;");
+      fixes.push("zvk_id_seq сброшена на 1");
+    } else {
+      const maxZvk = await pool.query("SELECT MAX(CAST(REGEXP_REPLACE(id_zvk, '\\D', '', 'g') AS INTEGER)) as max_id FROM zvk;");
+      const nextVal = (maxZvk.rows[0].max_id || 0) + 1;
+      await pool.query(`ALTER SEQUENCE zvk_id_seq RESTART WITH ${nextVal};`);
+      fixes.push(`zvk_id_seq установлена на ${nextVal} (max+1)`);
+    }
+    
+    res.json({ 
+      success: true, 
+      message: "✅ Последовательности исправлены",
+      fixes: fixes,
+      ft_empty: ftEmpty,
+      zvk_empty: zvkEmpty
+    });
+  } catch (e) {
+    console.error("FIX SEQUENCE ERROR:", e);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
 
 // ===============================
 // Start
