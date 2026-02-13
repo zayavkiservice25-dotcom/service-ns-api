@@ -90,39 +90,70 @@ app.post("/save-ft", async (req, res) => {
 
 app.get("/ft", async (req, res) => {
   try {
-    const limit = Math.min(Number(req.query.limit || 200), 500);
+    const limit = Math.min(Number(req.query.limit || 500), 500); // максимум 500
     const login = String(req.query.login || "").trim();
     const loginNorm = login.toLowerCase();
+
     const admin =
       String(req.query.is_admin || "0") === "1" ||
-      loginNorm === "b_erkin"; // ✅ B_Erkin всегда админ
+      loginNorm === "b_erkin"; // B_Erkin всегда админ
 
-    if (!login) return res.status(400).json({ success: false, error: "login is required" });
+    if (!login) {
+      return res.status(400).json({ success: false, error: "login is required" });
+    }
 
+    // ✅ Админ видит все FT + остаток
     const qAdmin = `
-      SELECT id_ft, input_date, input_name, division, "object",
-             contractor, invoice_no, invoice_date, invoice_pdf, sum_ft
-      FROM ft
-      ORDER BY COALESCE(NULLIF(regexp_replace(id_ft,'\\D','','g'),''),'0')::int DESC
+      SELECT
+        f.id_ft,
+        f.input_date,
+        f.input_name,
+        f.division,
+        f."object",
+        f.contractor,
+        f.invoice_no,
+        f.invoice_date,
+        f.invoice_pdf,
+        f.sum_ft,
+        b.balance_ft
+      FROM ft f
+      LEFT JOIN ft_balance b ON b.id_ft = f.id_ft
+      ORDER BY COALESCE(NULLIF(regexp_replace(f.id_ft,'\\D','','g'),''),'0')::int DESC
       LIMIT $1
     `;
 
+    // ✅ Пользователь видит только свои FT + остаток
     const qUser = `
-      SELECT id_ft, input_date, input_name, division, "object",
-             contractor, invoice_no, invoice_date, invoice_pdf, sum_ft
-      FROM ft
-      WHERE input_name = $2
-      ORDER BY COALESCE(NULLIF(regexp_replace(id_ft,'\\D','','g'),''),'0')::int DESC
+      SELECT
+        f.id_ft,
+        f.input_date,
+        f.input_name,
+        f.division,
+        f."object",
+        f.contractor,
+        f.invoice_no,
+        f.invoice_date,
+        f.invoice_pdf,
+        f.sum_ft,
+        b.balance_ft
+      FROM ft f
+      LEFT JOIN ft_balance b ON b.id_ft = f.id_ft
+      WHERE f.input_name = $2
+      ORDER BY COALESCE(NULLIF(regexp_replace(f.id_ft,'\\D','','g'),''),'0')::int DESC
       LIMIT $1
     `;
 
-    const r = admin ? await pool.query(qAdmin, [limit]) : await pool.query(qUser, [limit, login]);
+    const r = admin
+      ? await pool.query(qAdmin, [limit])
+      : await pool.query(qUser, [limit, login]);
+
     res.json({ success: true, rows: r.rows, admin });
   } catch (e) {
     console.error("GET FT ERROR:", e);
     res.status(500).json({ success: false, error: e.message });
   }
 });
+
 
 // =====================================================
 // ZVK (создание если нужно)
