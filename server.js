@@ -1,3 +1,18 @@
+// server.js (FULL) — Service-NS API 🚀
+// Логика:
+// 1) FT хранится в ft
+// 2) ZVK (zvk) хранит "историю строк" внутри одного цикла id_zvk (ZFT1 повторяется)
+// 3) Пока zvk_admin.is_paid != 'Да' -> новые сохранения пишутся с тем же id_zvk
+// 4) Когда zvk_admin.is_paid = 'Да' -> следующий save создаёт новый цикл id_zvk = ZFT2
+//
+// ВАЖНО ПРО БАЗУ:
+// - Чтобы разрешить повторение id_zvk (ZFT1 много строк), В БД должен быть скрытый PK "id" (bigserial)
+//   и id_zvk НЕ должен быть PRIMARY KEY.
+//   Сделай миграцию один раз:
+//     ALTER TABLE zvk DROP CONSTRAINT IF EXISTS zvk_pkey;
+//     ALTER TABLE zvk ADD COLUMN IF NOT EXISTS id bigserial;
+//     ALTER TABLE zvk ADD CONSTRAINT zvk_pkey PRIMARY KEY (id);
+
 require("dotenv").config();
 
 const express = require("express");
@@ -36,10 +51,12 @@ async function initDb() {
     );
   `);
 
-  // ZVK/ZFT (история: допускаем много строк на один FT)
+  // ZVK/ZFT (история)
+  // ⚠️ НЕ создаём тут PRIMARY KEY на id_zvk.
+  // Если таблица уже существует со старым PK — миграцию делай вручную (см. комментарий вверху).
   await pool.query(`
     CREATE TABLE IF NOT EXISTS zvk (
-      id_zvk text PRIMARY KEY,
+      id_zvk text,
       id_ft text,
       zvk_date timestamptz,
       zvk_name text,
@@ -77,6 +94,10 @@ async function initDb() {
     );
   `);
 
+  // Индексы для скорости
+  await pool.query(`CREATE INDEX IF NOT EXISTS zvk_idx_ft_date ON zvk (id_ft, zvk_date DESC);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS zvk_idx_zvk_date ON zvk (id_zvk, zvk_date DESC);`);
+
   console.log("DB init OK");
 }
 initDb().catch(console.error);
@@ -84,7 +105,7 @@ initDb().catch(console.error);
 // ===============================
 // Health
 // ===============================
-app.get("/", (req, res) => res.send("Service-NS API работает 🚀 v-ftzvk-history-final"));
+app.get("/", (req, res) => res.send("Service-NS API работает 🚀 v-ftzvk-history-final-2"));
 
 app.get("/db-ping", async (req, res) => {
   try {
@@ -96,7 +117,7 @@ app.get("/db-ping", async (req, res) => {
 });
 
 // =====================================================
-// GET FT (+ balance view)
+// GET FT
 // =====================================================
 app.get("/ft", async (req, res) => {
   try {
@@ -107,19 +128,17 @@ app.get("/ft", async (req, res) => {
     if (!login) return res.status(400).json({ success: false, error: "login is required" });
 
     const qAdmin = `
-      SELECT f.*, b.balance_ft
+      SELECT f.*
       FROM ft f
-      LEFT JOIN ft_balance b ON b.id_ft = f.id_ft
-      ORDER BY COALESCE(NULLIF(regexp_replace(f.id_ft,'\\D','','g'),''),'0')::int DESC
+      ORDER BY COALESCE(NULLIF(substring(f.id_ft from '\\d+'), ''), '0')::int DESC
       LIMIT $1
     `;
 
     const qUser = `
-      SELECT f.*, b.balance_ft
+      SELECT f.*
       FROM ft f
-      LEFT JOIN ft_balance b ON b.id_ft = f.id_ft
       WHERE f.input_name = $2
-      ORDER BY COALESCE(NULLIF(regexp_replace(f.id_ft,'\\D','','g'),''),'0')::int DESC
+      ORDER BY COALESCE(NULLIF(substring(f.id_ft from '\\d+'), ''), '0')::int DESC
       LIMIT $1
     `;
 
@@ -135,27 +154,33 @@ app.get("/ft", async (req, res) => {
 });
 
 // =====================================================
-// CREATE ZFT (история): новая строка в zvk для выбранного FT
+// SAVE (история) — /zvk-save
+// Пока is_paid != 'Да' -> пишем в тот же id_zvk
+// После is_paid = 'Да' -> создаём новый id_zvk (ZFT2...)
 // =====================================================
 app.post("/zvk-save", async (req, res) => {
   try {
     const { id_ft, user_name, to_pay, request_flag } = req.body;
-    if (!id_ft) return res.status(400).json({ success:false, error:"id_ft is required" });
+    if (!id_ft) return res.status(400).json({ success: false, error: "id_ft is required" });
 
     const ft = String(id_ft).trim();
     const name = (user_name || "СИСТЕМА").toString().trim();
     const flag = (request_flag || "Нет").toString().trim();
-    const toPayNum = (to_pay === "" || to_pay === undefined || to_pay === null) ? 0 : Number(to_pay);
-    if (Number.isNaN(toPayNum)) return res.status(400).json({ success:false, error:"to_pay must be number" });
 
-    // 1) найти последний цикл ZFT по FT (последний id_zvk)
+    const toPayNum =
+      (to_pay === "" || to_pay === undefined || to_pay === null) ? 0 : Number(to_pay);
+    if (Number.isNaN(toPayNum)) {
+      return res.status(400).json({ success: false, error: "to_pay must be number" });
+    }
+
+    // 1) последний цикл ZFT по FT
     const lastCycle = await pool.query(
       `
       SELECT z.id_zvk
       FROM zvk z
       WHERE z.id_ft = $1
       ORDER BY
-        COALESCE(NULLIF(regexp_replace(z.id_zvk,'\\D','','g'),''),'0')::int DESC,
+        COALESCE(NULLIF(substring(z.id_zvk from '\\d+'), ''), '0')::int DESC,
         z.zvk_date DESC NULLS LAST
       LIMIT 1
       `,
@@ -164,20 +189,17 @@ app.post("/zvk-save", async (req, res) => {
 
     let id_zvk = lastCycle.rows[0]?.id_zvk || null;
 
-    // 2) если цикл есть — проверить оплачено ли
+    // 2) если есть цикл — проверяем оплату
     if (id_zvk) {
       const paid = await pool.query(`SELECT is_paid FROM zvk_admin WHERE id_zvk=$1`, [id_zvk]);
-      if (paid.rows[0]?.is_paid === "Да") id_zvk = null; // цикл закрыт → стартуем новый
+      if (paid.rows[0]?.is_paid === "Да") id_zvk = null; // цикл закрыт
     }
 
-    // 3) если активного цикла нет → создаём новый ZFT (ZFT2, ZFT3...)
+    // 3) если цикла нет — создаём новый id_zvk и первую строку "СИСТЕМА/Нет/sum_ft"
     if (!id_zvk) {
-      const created = await pool.query(
-        `SELECT 'ZFT' || nextval('zvk_id_seq')::text AS id_zvk`
-      );
+      const created = await pool.query(`SELECT 'ZFT' || nextval('zvk_id_seq')::text AS id_zvk`);
       id_zvk = created.rows[0].id_zvk;
 
-      // первая строка цикла: СИСТЕМА / Нет / sum_ft (как у тебя)
       const sumFtRow = await pool.query(`SELECT sum_ft FROM ft WHERE id_ft=$1`, [ft]);
       const sumFt = Number(sumFtRow.rows[0]?.sum_ft || 0);
 
@@ -190,7 +212,7 @@ app.post("/zvk-save", async (req, res) => {
       );
     }
 
-    // 4) добавить НОВУЮ строку истории в этом же цикле (id_zvk тот же)
+    // 4) добавляем новую строку истории (тот же id_zvk)
     const r = await pool.query(
       `
       INSERT INTO zvk (id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag)
@@ -200,17 +222,15 @@ app.post("/zvk-save", async (req, res) => {
       [id_zvk, ft, name, toPayNum, flag]
     );
 
-    res.json({ success:true, row:r.rows[0], id_zvk });
+    res.json({ success: true, row: r.rows[0], id_zvk });
   } catch (e) {
     console.error("ZVK-SAVE ERROR:", e);
-    res.status(500).json({ success:false, error:e.message });
+    res.status(500).json({ success: false, error: e.message });
   }
 });
 
-
 // =====================================================
-// Инициатор: Источник Див / Источник Объект (+status_time авто)
-// Пишем на конкретный id_zvk (обычно на последний ZFT)
+// Инициатор: Источник Див / Источник Объект
 // =====================================================
 app.post("/upsert-zvk-src", async (req, res) => {
   const client = await pool.connect();
@@ -250,7 +270,7 @@ app.post("/upsert-zvk-src", async (req, res) => {
 });
 
 // =====================================================
-// Админ: Реестр + Оплачено (pay_time авто если Да)
+// Админ: Реестр + Оплачено
 // =====================================================
 app.post("/upsert-zvk-admin", async (req, res) => {
   const client = await pool.connect();
@@ -303,18 +323,19 @@ app.post("/upsert-zvk-admin", async (req, res) => {
 });
 
 // =====================================================
-// JOIN: читаем из VIEW (там уже “последний ZFT”)
+// JOIN: читаем из VIEW ft_zvk_full
+// Важно: сортировка безопасная через substring(... '\d+')
 // =====================================================
 app.get("/ft-zvk-join", async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit || 500), 500);
 
     const q = `
-      SELECT v.*, b.balance_ft
+      SELECT v.*
       FROM ft_zvk_full v
-      LEFT JOIN ft_balance b ON b.id_ft = v.id_ft
       ORDER BY
-        COALESCE(NULLIF(regexp_replace(v.id_ft,'\\D','','g'),''),'0')::int DESC
+        COALESCE(NULLIF(substring(v.id_ft from '\\d+'), ''), '0')::int DESC,
+        v.zvk_date DESC NULLS LAST
       LIMIT $1
     `;
 
