@@ -137,42 +137,76 @@ app.get("/ft", async (req, res) => {
 // =====================================================
 // CREATE ZFT (история): новая строка в zvk для выбранного FT
 // =====================================================
-app.post("/create-zft", async (req, res) => {
+app.post("/zvk-save", async (req, res) => {
   try {
     const { id_ft, user_name, to_pay, request_flag } = req.body;
+    if (!id_ft) return res.status(400).json({ success:false, error:"id_ft is required" });
 
-    if (!id_ft) return res.status(400).json({ success: false, error: "id_ft is required" });
-
+    const ft = String(id_ft).trim();
+    const name = (user_name || "СИСТЕМА").toString().trim();
+    const flag = (request_flag || "Нет").toString().trim();
     const toPayNum = (to_pay === "" || to_pay === undefined || to_pay === null) ? 0 : Number(to_pay);
-    if (Number.isNaN(toPayNum)) return res.status(400).json({ success: false, error: "to_pay must be number" });
+    if (Number.isNaN(toPayNum)) return res.status(400).json({ success:false, error:"to_pay must be number" });
 
+    // 1) найти последний цикл ZFT по FT (последний id_zvk)
+    const lastCycle = await pool.query(
+      `
+      SELECT z.id_zvk
+      FROM zvk z
+      WHERE z.id_ft = $1
+      ORDER BY
+        COALESCE(NULLIF(regexp_replace(z.id_zvk,'\\D','','g'),''),'0')::int DESC,
+        z.zvk_date DESC NULLS LAST
+      LIMIT 1
+      `,
+      [ft]
+    );
+
+    let id_zvk = lastCycle.rows[0]?.id_zvk || null;
+
+    // 2) если цикл есть — проверить оплачено ли
+    if (id_zvk) {
+      const paid = await pool.query(`SELECT is_paid FROM zvk_admin WHERE id_zvk=$1`, [id_zvk]);
+      if (paid.rows[0]?.is_paid === "Да") id_zvk = null; // цикл закрыт → стартуем новый
+    }
+
+    // 3) если активного цикла нет → создаём новый ZFT (ZFT2, ZFT3...)
+    if (!id_zvk) {
+      const created = await pool.query(
+        `SELECT 'ZFT' || nextval('zvk_id_seq')::text AS id_zvk`
+      );
+      id_zvk = created.rows[0].id_zvk;
+
+      // первая строка цикла: СИСТЕМА / Нет / sum_ft (как у тебя)
+      const sumFtRow = await pool.query(`SELECT sum_ft FROM ft WHERE id_ft=$1`, [ft]);
+      const sumFt = Number(sumFtRow.rows[0]?.sum_ft || 0);
+
+      await pool.query(
+        `
+        INSERT INTO zvk (id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag)
+        VALUES ($1, $2, NOW(), 'СИСТЕМА', $3, 'Нет')
+        `,
+        [id_zvk, ft, sumFt]
+      );
+    }
+
+    // 4) добавить НОВУЮ строку истории в этом же цикле (id_zvk тот же)
     const r = await pool.query(
       `
       INSERT INTO zvk (id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag)
-      VALUES (
-        'ZFT' || nextval('zvk_id_seq')::text,
-        $1,
-        NOW(),
-        COALESCE($2,'СИСТЕМА'),
-        $3,
-        COALESCE($4,'Нет')
-      )
-      RETURNING *
+      VALUES ($1, $2, NOW(), $3, $4, $5)
+      RETURNING id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag
       `,
-      [
-        String(id_ft).trim(),
-        (user_name || "СИСТЕМА").toString().trim(),
-        toPayNum,
-        (request_flag || "Нет").toString().trim(),
-      ]
+      [id_zvk, ft, name, toPayNum, flag]
     );
 
-    res.json({ success: true, row: r.rows[0] });
+    res.json({ success:true, row:r.rows[0], id_zvk });
   } catch (e) {
-    console.error("CREATE ZFT ERROR:", e);
-    res.status(500).json({ success: false, error: e.message });
+    console.error("ZVK-SAVE ERROR:", e);
+    res.status(500).json({ success:false, error:e.message });
   }
 });
+
 
 // =====================================================
 // Инициатор: Источник Див / Источник Объект (+status_time авто)
