@@ -399,15 +399,7 @@ app.post("/save-ft", async (req, res) => {
       ]
     );
 
-    // balance_ft (если используешь)
-    await pool.query(
-      `
-      INSERT INTO ft_balance (id_ft, balance_ft)
-      VALUES ($1, $2)
-      ON CONFLICT (id_ft) DO UPDATE SET balance_ft = EXCLUDED.balance_ft
-      `,
-      [id_ft, sumNum]
-    );
+
 
     // ✅ если у тебя НЕТ триггера на авто ZFT1 — создадим ZFT1 тут
     await pool.query(
