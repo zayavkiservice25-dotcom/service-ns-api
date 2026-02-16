@@ -15,30 +15,19 @@ const pool = new Pool({
 });
 
 // ===============================
-// Init
+// Init (только sequence, без таблицы ft_balance!)
 // ===============================
 async function initDb() {
   await pool.query(`CREATE SEQUENCE IF NOT EXISTS ft_id_seq START 1;`);
   await pool.query(`CREATE SEQUENCE IF NOT EXISTS zvk_id_seq START 1;`);
-
-  // Остаток по FT (если вдруг ещё не было)
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS ft_balance (
-      id_ft text PRIMARY KEY,
-      balance_ft numeric NOT NULL DEFAULT 0
-    );
-  `);
-
-  console.log("DB init OK");
+  console.log("DB init OK (sequences)");
 }
 initDb().catch(console.error);
 
 // ===============================
 // Health
 // ===============================
-app.get("/", (req, res) =>
-  res.send("Service-NS API работает 🚀 v-ftzvk-auto-zft")
-);
+app.get("/", (req, res) => res.send("Service-NS API работает 🚀 v-ftzvk-view-card"));
 
 app.get("/db-ping", async (req, res) => {
   try {
@@ -50,7 +39,7 @@ app.get("/db-ping", async (req, res) => {
 });
 
 // =====================================================
-// FT + авто ZFT + авто Остаток
+// SAVE FT  + авто создание ZFT (СИСТЕМА)
 // =====================================================
 app.post("/save-ft", async (req, res) => {
   const client = await pool.connect();
@@ -68,13 +57,11 @@ app.post("/save-ft", async (req, res) => {
     } = req.body;
 
     const sumNum =
-      sum_ft === "" || sum_ft === undefined || sum_ft === null
-        ? null
-        : Number(sum_ft);
+      sum_ft === "" || sum_ft === undefined || sum_ft === null ? null : Number(sum_ft);
 
     await client.query("BEGIN");
 
-    // 1) создаём FT
+    // 1) FT
     const rFT = await client.query(
       `
       INSERT INTO ft
@@ -99,8 +86,7 @@ app.post("/save-ft", async (req, res) => {
     const id_ft = rFT.rows[0].id_ft;
     const ft_sum = Number(rFT.rows[0].sum_ft || 0);
 
-    // 2) ✅ авто создаём ZFT в ТВОЮ таблицу zvk
-    // zvk: id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag
+    // 2) авто ZFT
     const rZ = await client.query(
       `
       INSERT INTO zvk (id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag)
@@ -110,26 +96,14 @@ app.post("/save-ft", async (req, res) => {
         (NOW() AT TIME ZONE 'Asia/Almaty'),
         'СИСТЕМА',
         $2,
-        'нет'
+        'Нет'
       )
       RETURNING id_zvk
       `,
       [id_ft, ft_sum]
     );
 
-    // 3) ✅ авто записываем остаток (равен сумме счета)
-    await client.query(
-      `
-      INSERT INTO ft_balance (id_ft, balance_ft)
-      VALUES ($1, $2)
-      ON CONFLICT (id_ft)
-      DO UPDATE SET balance_ft = EXCLUDED.balance_ft
-      `,
-      [id_ft, ft_sum]
-    );
-
     await client.query("COMMIT");
-
     res.json({ success: true, id_ft, id_zvk: rZ.rows[0].id_zvk });
   } catch (e) {
     await client.query("ROLLBACK");
@@ -141,94 +115,48 @@ app.post("/save-ft", async (req, res) => {
 });
 
 // =====================================================
-// GET FT (+ остаток)
+// VIEW: ft_zvk_full (главная таблица для 2-го вебаппа)
 // =====================================================
-app.get("/ft", async (req, res) => {
+app.get("/view-ftzvk", async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit || 500), 500);
     const login = String(req.query.login || "").trim();
-    const loginNorm = login.toLowerCase();
+    const role  = String(req.query.role || "").trim().toLowerCase();
 
-    const admin =
-      String(req.query.is_admin || "0") === "1" || loginNorm === "b_erkin";
+    if (!login) return res.status(400).json({ success:false, error:"login is required" });
 
-    if (!login) {
-      return res.status(400).json({ success: false, error: "login is required" });
-    }
+    const isAdmin = role.includes("админ") || login.toLowerCase() === "b_erkin";
 
     const qAdmin = `
-      SELECT
-        f.id_ft, f.input_date, f.input_name, f.division, f."object",
-        f.contractor, f.invoice_no, f.invoice_date, f.invoice_pdf, f.sum_ft,
-        b.balance_ft
-      FROM ft f
-      LEFT JOIN ft_balance b ON b.id_ft = f.id_ft
-      ORDER BY COALESCE(NULLIF(regexp_replace(f.id_ft,'\\D','','g'),''),'0')::int DESC
+      SELECT * FROM ft_zvk_full
+      ORDER BY
+        COALESCE(NULLIF(regexp_replace(id_ft,'\\D','','g'),''),'0')::int DESC,
+        COALESCE(NULLIF(regexp_replace(id_zvk,'\\D','','g'),''),'0')::int DESC
       LIMIT $1
     `;
 
     const qUser = `
-      SELECT
-        f.id_ft, f.input_date, f.input_name, f.division, f."object",
-        f.contractor, f.invoice_no, f.invoice_date, f.invoice_pdf, f.sum_ft,
-        b.balance_ft
-      FROM ft f
-      LEFT JOIN ft_balance b ON b.id_ft = f.id_ft
-      WHERE f.input_name = $2
-      ORDER BY COALESCE(NULLIF(regexp_replace(f.id_ft,'\\D','','g'),''),'0')::int DESC
+      SELECT * FROM ft_zvk_full
+      WHERE COALESCE(input_name,'') = $2
+      ORDER BY
+        COALESCE(NULLIF(regexp_replace(id_ft,'\\D','','g'),''),'0')::int DESC,
+        COALESCE(NULLIF(regexp_replace(id_zvk,'\\D','','g'),''),'0')::int DESC
       LIMIT $1
     `;
 
-    const r = admin
+    const r = isAdmin
       ? await pool.query(qAdmin, [limit])
       : await pool.query(qUser, [limit, login]);
 
-    res.json({ success: true, rows: r.rows, admin });
+    res.json({ success:true, rows:r.rows, admin:isAdmin });
   } catch (e) {
-    console.error("GET FT ERROR:", e);
-    res.status(500).json({ success: false, error: e.message });
+    console.error("VIEW FTZVK ERROR:", e);
+    res.status(500).json({ success:false, error:e.message });
   }
 });
 
 // =====================================================
-// ZVK: создать вручную (если нужно)
-// (под твою таблицу zvk)
-// =====================================================
-app.post("/save-zvk", async (req, res) => {
-  try {
-    const { id_ft, to_pay, request_flag, zvk_name } = req.body;
-    if (!id_ft) return res.status(400).json({ success: false, error: "id_ft is required" });
-
-    const r = await pool.query(
-      `
-      INSERT INTO zvk (id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag)
-      VALUES (
-        'ZFT' || nextval('zvk_id_seq')::text,
-        $1,
-        (NOW() AT TIME ZONE 'Asia/Almaty'),
-        COALESCE($2, 'СИСТЕМА'),
-        COALESCE($3, 0),
-        COALESCE($4, 'нет')
-      )
-      RETURNING id_zvk
-      `,
-      [
-        String(id_ft).trim(),
-        zvk_name ? String(zvk_name).trim() : null,
-        (to_pay === "" || to_pay === undefined || to_pay === null) ? 0 : Number(to_pay),
-        request_flag ? String(request_flag).trim() : null,
-      ]
-    );
-
-    res.json({ success: true, id_zvk: r.rows[0].id_zvk });
-  } catch (e) {
-    console.error("SAVE ZVK ERROR:", e);
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// =====================================================
-// UPDATE ZFT: поменять "К оплате" и "Заявка да/нет" по выбранному ZFT
+// UPDATE ZFT (инициатор): К оплате + Заявка + ЗаявИмя
 // =====================================================
 app.post("/update-zft", async (req, res) => {
   try {
@@ -241,7 +169,8 @@ app.post("/update-zft", async (req, res) => {
       SET
         to_pay = COALESCE($2, to_pay),
         request_flag = COALESCE($3, request_flag),
-        zvk_name = COALESCE($4, zvk_name)
+        zvk_name = COALESCE($4, zvk_name),
+        zvk_date = (NOW() AT TIME ZONE 'Asia/Almaty')
       WHERE id_zvk = $1
       RETURNING *
       `,
@@ -261,40 +190,7 @@ app.post("/update-zft", async (req, res) => {
 });
 
 // =====================================================
-// JOIN (то, что ты называешь "2-й вебапп = соединение")
-// FT + ZFT + Остаток
-// =====================================================
-app.get("/ft-zvk-join", async (req, res) => {
-  try {
-    const limit = Math.min(Number(req.query.limit || 500), 500);
-
-    const q = `
-      SELECT
-        f.id_ft, f.input_date, f.input_name, f.division, f."object",
-        f.contractor, f.invoice_no, f.invoice_date, f.invoice_pdf, f.sum_ft,
-
-        z.id_zvk, z.zvk_date, z.zvk_name, z.to_pay, z.request_flag,
-
-        b.balance_ft
-      FROM ft f
-      LEFT JOIN zvk z ON trim(z.id_ft) = trim(f.id_ft)
-      LEFT JOIN ft_balance b ON b.id_ft = f.id_ft
-      ORDER BY
-        COALESCE(NULLIF(regexp_replace(f.id_ft,'\\D','','g'),''),'0')::int DESC,
-        COALESCE(z.zvk_date, NOW()) DESC
-      LIMIT $1
-    `;
-
-    const r = await pool.query(q, [limit]);
-    res.json({ success: true, rows: r.rows });
-  } catch (e) {
-    console.error("FT-ZVK-JOIN ERROR:", e);
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// =====================================================
-// 1) Инициатор: сохраняет src_d / src_o (таблица zvk_status)
+// Инициатор: Источник Див/Объект (zvk_status)
 // =====================================================
 app.post("/upsert-zvk-src", async (req, res) => {
   const client = await pool.connect();
@@ -305,11 +201,14 @@ app.post("/upsert-zvk-src", async (req, res) => {
     await client.query("BEGIN");
 
     const r = await client.query(
-      `INSERT INTO zvk_status (id_zvk, src_d, src_o)
-       VALUES ($1,$2,$3)
+      `INSERT INTO zvk_status (id_zvk, src_d, src_o, created_at)
+       VALUES ($1,$2,$3,(NOW() AT TIME ZONE 'Asia/Almaty'))
        ON CONFLICT (id_zvk)
-       DO UPDATE SET src_d=EXCLUDED.src_d, src_o=EXCLUDED.src_o
-       RETURNING id_zvk, src_d, src_o`,
+       DO UPDATE SET
+         src_d=EXCLUDED.src_d,
+         src_o=EXCLUDED.src_o,
+         created_at=EXCLUDED.created_at
+       RETURNING id_zvk, src_d, src_o, created_at`,
       [
         String(id_zvk).trim(),
         (src_d ?? "").toString().trim(),
@@ -329,7 +228,7 @@ app.post("/upsert-zvk-src", async (req, res) => {
 });
 
 // =====================================================
-// 2) B_Erkin: согласование + оплата
+// Админ (B_Erkin): Реестр + Оплата (zvk_agree, zvk_pay)
 // =====================================================
 app.post("/upsert-zvk-approve-pay", async (req, res) => {
   const client = await pool.connect();
@@ -345,14 +244,16 @@ app.post("/upsert-zvk-approve-pay", async (req, res) => {
 
     await client.query("BEGIN");
 
+    // Реестр (agree_name = Да/Нет/Обнуление)
     await client.query(
-      `INSERT INTO zvk_agree (id_zvk, agree_name)
-       VALUES ($1,$2)
+      `INSERT INTO zvk_agree (id_zvk, agree_name, created_at)
+       VALUES ($1,$2,(NOW() AT TIME ZONE 'Asia/Almaty'))
        ON CONFLICT (id_zvk)
-       DO UPDATE SET agree_name=EXCLUDED.agree_name`,
+       DO UPDATE SET agree_name=EXCLUDED.agree_name, created_at=EXCLUDED.created_at`,
       [String(id_zvk).trim(), (agree_name ?? "").toString().trim() || null]
     );
 
+    // Оплата (is_paid = Да/Нет) + created_at только если Да
     await client.query(
       `INSERT INTO zvk_pay (id_zvk, is_paid, created_at)
        VALUES ($1, $2, CASE WHEN $2 = 'Да' THEN (NOW() AT TIME ZONE 'Asia/Almaty') ELSE NULL END)
@@ -360,9 +261,8 @@ app.post("/upsert-zvk-approve-pay", async (req, res) => {
        DO UPDATE SET
          is_paid = EXCLUDED.is_paid,
          created_at = CASE
-           WHEN EXCLUDED.is_paid = 'Да' AND zvk_pay.created_at IS NULL THEN (NOW() AT TIME ZONE 'Asia/Almaty')
-           WHEN EXCLUDED.is_paid <> 'Да' THEN NULL
-           ELSE zvk_pay.created_at
+           WHEN EXCLUDED.is_paid = 'Да' THEN (NOW() AT TIME ZONE 'Asia/Almaty')
+           ELSE NULL
          END`,
       [String(id_zvk).trim(), (is_paid ?? "").toString().trim() || null]
     );
@@ -379,7 +279,7 @@ app.post("/upsert-zvk-approve-pay", async (req, res) => {
 });
 
 // =====================================================
-// Проверка последовательностей (для админа)
+// sequences check (admin)
 // =====================================================
 app.get("/check-sequences", async (req, res) => {
   try {
@@ -391,23 +291,10 @@ app.get("/check-sequences", async (req, res) => {
     const ftSeq = await pool.query("SELECT last_value, is_called FROM ft_id_seq;");
     const zvkSeq = await pool.query("SELECT last_value, is_called FROM zvk_id_seq;");
 
-    const maxFt = await pool.query("SELECT MAX(CAST(REGEXP_REPLACE(id_ft, '\\D', '', 'g') AS INTEGER)) as max_id FROM ft;");
-    const maxZvk = await pool.query("SELECT MAX(CAST(REGEXP_REPLACE(id_zvk, '\\D', '', 'g') AS INTEGER)) as max_id FROM zvk;");
-
     res.json({
       success: true,
-      ft_sequence: {
-        last_value: ftSeq.rows[0].last_value,
-        is_called: ftSeq.rows[0].is_called,
-        next_id: ftSeq.rows[0].is_called ? Number(ftSeq.rows[0].last_value) + 1 : ftSeq.rows[0].last_value,
-        max_id_in_table: maxFt.rows[0].max_id || 0
-      },
-      zvk_sequence: {
-        last_value: zvkSeq.rows[0].last_value,
-        is_called: zvkSeq.rows[0].is_called,
-        next_id: zvkSeq.rows[0].is_called ? Number(zvkSeq.rows[0].last_value) + 1 : zvkSeq.rows[0].last_value,
-        max_id_in_table: maxZvk.rows[0].max_id || 0
-      }
+      ft_sequence: ftSeq.rows[0],
+      zvk_sequence: zvkSeq.rows[0],
     });
   } catch (e) {
     console.error("CHECK SEQUENCES ERROR:", e);
