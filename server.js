@@ -18,13 +18,17 @@ const pool = new Pool({
 // Init
 // ===============================
 async function initDb() {
-  // Создаём последовательности, если их нет
   await pool.query(`CREATE SEQUENCE IF NOT EXISTS ft_id_seq START 1;`);
   await pool.query(`CREATE SEQUENCE IF NOT EXISTS zvk_id_seq START 1;`);
-  
-  // НЕ сбрасываем автоматически при старте, чтобы не затереть данные
-  // Сброс делается через специальные endpoint'ы
-  
+
+  // Остаток по FT (если вдруг ещё не было)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ft_balance (
+      id_ft text PRIMARY KEY,
+      balance_ft numeric NOT NULL DEFAULT 0
+    );
+  `);
+
   console.log("DB init OK");
 }
 initDb().catch(console.error);
@@ -32,7 +36,9 @@ initDb().catch(console.error);
 // ===============================
 // Health
 // ===============================
-app.get("/", (req, res) => res.send("Service-NS API работает 🚀 v-ftzvk-final-fixed"));
+app.get("/", (req, res) =>
+  res.send("Service-NS API работает 🚀 v-ftzvk-auto-zft")
+);
 
 app.get("/db-ping", async (req, res) => {
   try {
@@ -44,9 +50,10 @@ app.get("/db-ping", async (req, res) => {
 });
 
 // =====================================================
-// FT
+// FT + авто ZFT + авто Остаток
 // =====================================================
 app.post("/save-ft", async (req, res) => {
+  const client = await pool.connect();
   try {
     const {
       input_date,
@@ -60,74 +67,117 @@ app.post("/save-ft", async (req, res) => {
       sum_ft,
     } = req.body;
 
-    const q = `
+    const sumNum =
+      sum_ft === "" || sum_ft === undefined || sum_ft === null
+        ? null
+        : Number(sum_ft);
+
+    await client.query("BEGIN");
+
+    // 1) создаём FT
+    const rFT = await client.query(
+      `
       INSERT INTO ft
       (id_ft, input_date, input_name, division, "object", contractor, invoice_no, invoice_date, invoice_pdf, sum_ft)
       VALUES
       ('FT' || nextval('ft_id_seq')::text, $1,$2,$3,$4,$5,$6,$7,$8,$9)
-      RETURNING id_ft
-    `;
+      RETURNING id_ft, sum_ft
+      `,
+      [
+        input_date || "",
+        input_name || "",
+        division || "",
+        object || "",
+        contractor || "",
+        invoice_no || "",
+        invoice_date || "",
+        invoice_pdf || "",
+        sumNum,
+      ]
+    );
 
-    const values = [
-      input_date || "",
-      input_name || "",
-      division || "",
-      object || "",
-      contractor || "",
-      invoice_no || "",
-      invoice_date || "",
-      invoice_pdf || "",
-      sum_ft === "" || sum_ft === undefined || sum_ft === null ? null : Number(sum_ft),
-    ];
+    const id_ft = rFT.rows[0].id_ft;
+    const ft_sum = Number(rFT.rows[0].sum_ft || 0);
 
-    const r = await pool.query(q, values);
-    res.json({ success: true, id_ft: r.rows[0].id_ft });
+    // 2) ✅ авто создаём ZFT в ТВОЮ таблицу zvk
+    // zvk: id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag
+    const rZ = await client.query(
+      `
+      INSERT INTO zvk (id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag)
+      VALUES (
+        'ZFT' || nextval('zvk_id_seq')::text,
+        $1,
+        (NOW() AT TIME ZONE 'Asia/Almaty'),
+        'СИСТЕМА',
+        $2,
+        'нет'
+      )
+      RETURNING id_zvk
+      `,
+      [id_ft, ft_sum]
+    );
+
+    // 3) ✅ авто записываем остаток (равен сумме счета)
+    await client.query(
+      `
+      INSERT INTO ft_balance (id_ft, balance_ft)
+      VALUES ($1, $2)
+      ON CONFLICT (id_ft)
+      DO UPDATE SET balance_ft = EXCLUDED.balance_ft
+      `,
+      [id_ft, ft_sum]
+    );
+
+    await client.query("COMMIT");
+
+    res.json({ success: true, id_ft, id_zvk: rZ.rows[0].id_zvk });
   } catch (e) {
+    await client.query("ROLLBACK");
     console.error("SAVE FT ERROR:", e);
     res.status(500).json({ success: false, error: e.message });
+  } finally {
+    client.release();
   }
 });
 
+// =====================================================
+// GET FT (+ остаток)
+// =====================================================
 app.get("/ft", async (req, res) => {
   try {
-    const limit = Math.min(Number(req.query.limit || 500), 500); // максимум 500
+    const limit = Math.min(Number(req.query.limit || 500), 500);
     const login = String(req.query.login || "").trim();
     const loginNorm = login.toLowerCase();
 
     const admin =
-      String(req.query.is_admin || "0") === "1" ||
-      loginNorm === "b_erkin"; // B_Erkin всегда админ
+      String(req.query.is_admin || "0") === "1" || loginNorm === "b_erkin";
 
     if (!login) {
       return res.status(400).json({ success: false, error: "login is required" });
     }
 
-    // ✅ Админ видит все FT + остаток
-   const qAdmin = `
-  SELECT
-    f.id_ft, f.input_date, f.input_name, f.division, f."object",
-    f.contractor, f.invoice_no, f.invoice_date, f.invoice_pdf, f.sum_ft,
-    b.balance_ft
-  FROM ft f
-  LEFT JOIN ft_balance b ON b.id_ft = f.id_ft
-  ORDER BY COALESCE(NULLIF(regexp_replace(f.id_ft,'\\D','','g'),''),'0')::int DESC
-  LIMIT $1
-`;
+    const qAdmin = `
+      SELECT
+        f.id_ft, f.input_date, f.input_name, f.division, f."object",
+        f.contractor, f.invoice_no, f.invoice_date, f.invoice_pdf, f.sum_ft,
+        b.balance_ft
+      FROM ft f
+      LEFT JOIN ft_balance b ON b.id_ft = f.id_ft
+      ORDER BY COALESCE(NULLIF(regexp_replace(f.id_ft,'\\D','','g'),''),'0')::int DESC
+      LIMIT $1
+    `;
 
-
-    // ✅ Пользователь видит только свои FT + остаток
- const qUser = `
-  SELECT
-    f.id_ft, f.input_date, f.input_name, f.division, f."object",
-    f.contractor, f.invoice_no, f.invoice_date, f.invoice_pdf, f.sum_ft,
-    b.balance_ft
-  FROM ft f
-  LEFT JOIN ft_balance b ON b.id_ft = f.id_ft
-  WHERE f.input_name = $2
-  ORDER BY COALESCE(NULLIF(regexp_replace(f.id_ft,'\\D','','g'),''),'0')::int DESC
-  LIMIT $1
-`;
-
+    const qUser = `
+      SELECT
+        f.id_ft, f.input_date, f.input_name, f.division, f."object",
+        f.contractor, f.invoice_no, f.invoice_date, f.invoice_pdf, f.sum_ft,
+        b.balance_ft
+      FROM ft f
+      LEFT JOIN ft_balance b ON b.id_ft = f.id_ft
+      WHERE f.input_name = $2
+      ORDER BY COALESCE(NULLIF(regexp_replace(f.id_ft,'\\D','','g'),''),'0')::int DESC
+      LIMIT $1
+    `;
 
     const r = admin
       ? await pool.query(qAdmin, [limit])
@@ -140,28 +190,36 @@ app.get("/ft", async (req, res) => {
   }
 });
 
-
 // =====================================================
-// ZVK (создание если нужно)
+// ZVK: создать вручную (если нужно)
+// (под твою таблицу zvk)
 // =====================================================
 app.post("/save-zvk", async (req, res) => {
   try {
-    const { id_ft, sum_zvk, status_zvk } = req.body;
+    const { id_ft, to_pay, request_flag, zvk_name } = req.body;
     if (!id_ft) return res.status(400).json({ success: false, error: "id_ft is required" });
 
-    const q = `
-      INSERT INTO zvk (id_zvk, id_ft, sum_zvk, status_zvk)
-      VALUES ('ZFT' || nextval('zvk_id_seq')::text, $1, $2, $3)
+    const r = await pool.query(
+      `
+      INSERT INTO zvk (id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag)
+      VALUES (
+        'ZFT' || nextval('zvk_id_seq')::text,
+        $1,
+        (NOW() AT TIME ZONE 'Asia/Almaty'),
+        COALESCE($2, 'СИСТЕМА'),
+        COALESCE($3, 0),
+        COALESCE($4, 'нет')
+      )
       RETURNING id_zvk
-    `;
+      `,
+      [
+        String(id_ft).trim(),
+        zvk_name ? String(zvk_name).trim() : null,
+        (to_pay === "" || to_pay === undefined || to_pay === null) ? 0 : Number(to_pay),
+        request_flag ? String(request_flag).trim() : null,
+      ]
+    );
 
-    const values = [
-      String(id_ft).trim(),
-      sum_zvk === "" || sum_zvk === undefined || sum_zvk === null ? null : Number(sum_zvk),
-      status_zvk ? String(status_zvk).trim() : null,
-    ];
-
-    const r = await pool.query(q, values);
     res.json({ success: true, id_zvk: r.rows[0].id_zvk });
   } catch (e) {
     console.error("SAVE ZVK ERROR:", e);
@@ -170,42 +228,73 @@ app.post("/save-zvk", async (req, res) => {
 });
 
 // =====================================================
-// FT+ZVK FULL (VIEW) — B_Erkin видит все
+// UPDATE ZFT: поменять "К оплате" и "Заявка да/нет" по выбранному ZFT
 // =====================================================
-app.get("/ft-zvk-full", async (req, res) => {
+app.post("/update-zft", async (req, res) => {
   try {
-    const limit = Math.min(Number(req.query.limit || 300), 500);
-    const login = String(req.query.login || "").trim();
-    const loginNorm = login.toLowerCase();
-    const admin =
-      String(req.query.is_admin || "0") === "1" ||
-      loginNorm === "b_erkin";
+    const { id_zvk, to_pay, request_flag, zvk_name } = req.body;
+    if (!id_zvk) return res.status(400).json({ success: false, error: "id_zvk is required" });
 
-    if (!login) return res.status(400).json({ success: false, error: "login is required" });
+    const r = await pool.query(
+      `
+      UPDATE zvk
+      SET
+        to_pay = COALESCE($2, to_pay),
+        request_flag = COALESCE($3, request_flag),
+        zvk_name = COALESCE($4, zvk_name)
+      WHERE id_zvk = $1
+      RETURNING *
+      `,
+      [
+        String(id_zvk).trim(),
+        (to_pay === "" || to_pay === undefined || to_pay === null) ? null : Number(to_pay),
+        request_flag ? String(request_flag).trim() : null,
+        zvk_name ? String(zvk_name).trim() : null,
+      ]
+    );
 
-    const qAdmin = `
-      SELECT * FROM ft_zvk_full
-      ORDER BY COALESCE(NULLIF(regexp_replace(id_ft,'\\D','','g'),''),'0')::int DESC
-      LIMIT $1
-    `;
-
-    const qUser = `
-      SELECT * FROM ft_zvk_full
-      WHERE COALESCE(input_name,'') = $2
-      ORDER BY COALESCE(NULLIF(regexp_replace(id_ft,'\\D','','g'),''),'0')::int DESC
-      LIMIT $1
-    `;
-
-    const r = admin ? await pool.query(qAdmin, [limit]) : await pool.query(qUser, [limit, login]);
-    res.json({ success: true, rows: r.rows, admin });
+    res.json({ success: true, row: r.rows[0] || null });
   } catch (e) {
-    console.error("FT-ZVK-FULL ERROR:", e);
+    console.error("UPDATE ZFT ERROR:", e);
     res.status(500).json({ success: false, error: e.message });
   }
 });
 
 // =====================================================
-// 1) Инициатор: сохраняет src_d / src_o (БЕЗ created_at)
+// JOIN (то, что ты называешь "2-й вебапп = соединение")
+// FT + ZFT + Остаток
+// =====================================================
+app.get("/ft-zvk-join", async (req, res) => {
+  try {
+    const limit = Math.min(Number(req.query.limit || 500), 500);
+
+    const q = `
+      SELECT
+        f.id_ft, f.input_date, f.input_name, f.division, f."object",
+        f.contractor, f.invoice_no, f.invoice_date, f.invoice_pdf, f.sum_ft,
+
+        z.id_zvk, z.zvk_date, z.zvk_name, z.to_pay, z.request_flag,
+
+        b.balance_ft
+      FROM ft f
+      LEFT JOIN zvk z ON trim(z.id_ft) = trim(f.id_ft)
+      LEFT JOIN ft_balance b ON b.id_ft = f.id_ft
+      ORDER BY
+        COALESCE(NULLIF(regexp_replace(f.id_ft,'\\D','','g'),''),'0')::int DESC,
+        COALESCE(z.zvk_date, NOW()) DESC
+      LIMIT $1
+    `;
+
+    const r = await pool.query(q, [limit]);
+    res.json({ success: true, rows: r.rows });
+  } catch (e) {
+    console.error("FT-ZVK-JOIN ERROR:", e);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// =====================================================
+// 1) Инициатор: сохраняет src_d / src_o (таблица zvk_status)
 // =====================================================
 app.post("/upsert-zvk-src", async (req, res) => {
   const client = await pool.connect();
@@ -241,8 +330,6 @@ app.post("/upsert-zvk-src", async (req, res) => {
 
 // =====================================================
 // 2) B_Erkin: согласование + оплата
-// - agree_name -> zvk_agree (без created_at)
-// - is_paid + created_at авто -> zvk_pay (created_at обновляем NOW())
 // =====================================================
 app.post("/upsert-zvk-approve-pay", async (req, res) => {
   const client = await pool.connect();
@@ -252,14 +339,12 @@ app.post("/upsert-zvk-approve-pay", async (req, res) => {
       return res.status(400).json({ success: false, error: "login, id_zvk required" });
     }
 
-    // защита
     if (String(login).trim().toLowerCase() !== "b_erkin") {
       return res.status(403).json({ success: false, error: "only B_Erkin allowed" });
     }
 
     await client.query("BEGIN");
 
-    // 1) agree (БЕЗ created_at)
     await client.query(
       `INSERT INTO zvk_agree (id_zvk, agree_name)
        VALUES ($1,$2)
@@ -268,20 +353,19 @@ app.post("/upsert-zvk-approve-pay", async (req, res) => {
       [String(id_zvk).trim(), (agree_name ?? "").toString().trim() || null]
     );
 
-    // 2) pay (created_at = ОплатДата)
-   await client.query(
-  `INSERT INTO zvk_pay (id_zvk, is_paid, created_at)
-   VALUES ($1, $2, CASE WHEN $2 = 'Да' THEN (NOW() AT TIME ZONE 'Asia/Almaty') ELSE NULL END)
-   ON CONFLICT (id_zvk)
-   DO UPDATE SET
-     is_paid = EXCLUDED.is_paid,
-     created_at = CASE
-       WHEN EXCLUDED.is_paid = 'Да' AND zvk_pay.created_at IS NULL THEN (NOW() AT TIME ZONE 'Asia/Almaty')
-       WHEN EXCLUDED.is_paid <> 'Да' THEN NULL
-       ELSE zvk_pay.created_at
-     END`,
-  [String(id_zvk).trim(), (is_paid ?? "").toString().trim() || null]
-);
+    await client.query(
+      `INSERT INTO zvk_pay (id_zvk, is_paid, created_at)
+       VALUES ($1, $2, CASE WHEN $2 = 'Да' THEN (NOW() AT TIME ZONE 'Asia/Almaty') ELSE NULL END)
+       ON CONFLICT (id_zvk)
+       DO UPDATE SET
+         is_paid = EXCLUDED.is_paid,
+         created_at = CASE
+           WHEN EXCLUDED.is_paid = 'Да' AND zvk_pay.created_at IS NULL THEN (NOW() AT TIME ZONE 'Asia/Almaty')
+           WHEN EXCLUDED.is_paid <> 'Да' THEN NULL
+           ELSE zvk_pay.created_at
+         END`,
+      [String(id_zvk).trim(), (is_paid ?? "").toString().trim() || null]
+    );
 
     await client.query("COMMIT");
     res.json({ success: true });
@@ -295,29 +379,21 @@ app.post("/upsert-zvk-approve-pay", async (req, res) => {
 });
 
 // =====================================================
-// НОВЫЕ ENDPOINT'Ы ДЛЯ УПРАВЛЕНИЯ ДАННЫМИ
+// Проверка последовательностей (для админа)
 // =====================================================
-
-/**
- * ПРОВЕРКА ТЕКУЩИХ ЗНАЧЕНИЙ ПОСЛЕДОВАТЕЛЬНОСТЕЙ
- * GET /check-sequences?login=b_erkin
- */
 app.get("/check-sequences", async (req, res) => {
   try {
     const login = String(req.query.login || "").trim().toLowerCase();
-    
-    // Только для админа
     if (login !== "b_erkin") {
-      return res.status(403).json({ success: false, error: "Только B_Erkin может просматривать последовательности" });
+      return res.status(403).json({ success: false, error: "Только B_Erkin" });
     }
 
     const ftSeq = await pool.query("SELECT last_value, is_called FROM ft_id_seq;");
     const zvkSeq = await pool.query("SELECT last_value, is_called FROM zvk_id_seq;");
-    
-    // Получаем максимальные ID из таблиц для информации
+
     const maxFt = await pool.query("SELECT MAX(CAST(REGEXP_REPLACE(id_ft, '\\D', '', 'g') AS INTEGER)) as max_id FROM ft;");
     const maxZvk = await pool.query("SELECT MAX(CAST(REGEXP_REPLACE(id_zvk, '\\D', '', 'g') AS INTEGER)) as max_id FROM zvk;");
-    
+
     res.json({
       success: true,
       ft_sequence: {
@@ -335,183 +411,6 @@ app.get("/check-sequences", async (req, res) => {
     });
   } catch (e) {
     console.error("CHECK SEQUENCES ERROR:", e);
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-/**
- * СБРОС ПОСЛЕДОВАТЕЛЬНОСТЕЙ (без удаления данных)
- * POST /reset-sequences
- * Body: { "login": "b_erkin" }
- */
-app.post("/reset-sequences", async (req, res) => {
-  try {
-    const { login } = req.body;
-    
-    // Проверяем, что это админ
-    if (String(login || "").trim().toLowerCase() !== "b_erkin") {
-      return res.status(403).json({ success: false, error: "Только B_Erkin может сбрасывать счётчики" });
-    }
-
-    // Сбрасываем последовательности на 1
-    await pool.query("ALTER SEQUENCE ft_id_seq RESTART WITH 1;");
-    await pool.query("ALTER SEQUENCE zvk_id_seq RESTART WITH 1;");
-    
-    res.json({ 
-      success: true, 
-      message: "✅ Счётчики сброшены. Следующий FT будет FT1, следующий ZVK будет ZFT1" 
-    });
-  } catch (e) {
-    console.error("RESET SEQUENCES ERROR:", e);
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-/**
- * ПОЛНАЯ ОЧИСТКА ВСЕХ ДАННЫХ + СБРОС ПОСЛЕДОВАТЕЛЬНОСТЕЙ
- * POST /reset-all-data
- * Body: { "login": "b_erkin" }
- */
-app.post("/reset-all-data", async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const { login } = req.body;
-    
-    if (String(login || "").trim().toLowerCase() !== "b_erkin") {
-      return res.status(403).json({ success: false, error: "Только B_Erkin может выполнить полную очистку" });
-    }
-
-    await client.query("BEGIN");
-    
-    // Очищаем все таблицы в правильном порядке (от дочерних к родительским)
-    console.log("Очищаем zvk_pay...");
-    await client.query("TRUNCATE TABLE zvk_pay CASCADE;");
-    
-    console.log("Очищаем zvk_agree...");
-    await client.query("TRUNCATE TABLE zvk_agree CASCADE;");
-    
-    console.log("Очищаем zvk_status...");
-    await client.query("TRUNCATE TABLE zvk_status CASCADE;");
-    
-    console.log("Очищаем zvk...");
-    await client.query("TRUNCATE TABLE zvk CASCADE;");
-    
-    console.log("Очищаем ft...");
-    await client.query("TRUNCATE TABLE ft CASCADE;");
-    
-    // Сбрасываем последовательности
-    console.log("Сбрасываем ft_id_seq...");
-    await client.query("ALTER SEQUENCE ft_id_seq RESTART WITH 1;");
-    
-    console.log("Сбрасываем zvk_id_seq...");
-    await client.query("ALTER SEQUENCE zvk_id_seq RESTART WITH 1;");
-    
-    await client.query("COMMIT");
-    
-    res.json({ 
-      success: true, 
-      message: "✅ Все данные удалены, счётчики сброшены. Следующий FT будет FT1, следующий ZVK будет ZFT1" 
-    });
-  } catch (e) {
-    await client.query("ROLLBACK");
-    console.error("RESET ALL DATA ERROR:", e);
-    res.status(500).json({ success: false, error: e.message });
-  } finally {
-    client.release();
-  }
-});
-
-/**
- * ОЧИСТКА ТОЛЬКО ОДНОЙ ТАБЛИЦЫ FT (с каскадным удалением связанных данных)
- * POST /reset-ft-only
- * Body: { "login": "b_erkin" }
- */
-app.post("/reset-ft-only", async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const { login } = req.body;
-    
-    if (String(login || "").trim().toLowerCase() !== "b_erkin") {
-      return res.status(403).json({ success: false, error: "Только B_Erkin" });
-    }
-
-    await client.query("BEGIN");
-    
-    // Очищаем ft с каскадом (автоматически удалит все связанные записи)
-    await client.query("TRUNCATE TABLE ft RESTART IDENTITY CASCADE;");
-    
-    // Сбрасываем последовательность ft (на всякий случай)
-    await client.query("ALTER SEQUENCE ft_id_seq RESTART WITH 1;");
-    
-    await client.query("COMMIT");
-    
-    res.json({ 
-      success: true, 
-      message: "✅ Таблица FT очищена, все связанные данные удалены. Следующий FT будет FT1" 
-    });
-  } catch (e) {
-    await client.query("ROLLBACK");
-    console.error("RESET FT ONLY ERROR:", e);
-    res.status(500).json({ success: false, error: e.message });
-  } finally {
-    client.release();
-  }
-});
-
-/**
- * ИСПРАВЛЕНИЕ ПОСЛЕДОВАТЕЛЬНОСТИ (если ID скакнул, но данные удалены)
- * Автоматически устанавливает последовательность на 1, если таблица пуста
- * POST /fix-sequence
- * Body: { "login": "b_erkin" }
- */
-app.post("/fix-sequence", async (req, res) => {
-  try {
-    const { login } = req.body;
-    
-    if (String(login || "").trim().toLowerCase() !== "b_erkin") {
-      return res.status(403).json({ success: false, error: "Только B_Erkin" });
-    }
-
-    // Проверяем, пустая ли таблица ft
-    const ftCheck = await pool.query("SELECT COUNT(*) as count FROM ft;");
-    const ftEmpty = parseInt(ftCheck.rows[0].count) === 0;
-    
-    // Проверяем, пустая ли таблица zvk
-    const zvkCheck = await pool.query("SELECT COUNT(*) as count FROM zvk;");
-    const zvkEmpty = parseInt(zvkCheck.rows[0].count) === 0;
-    
-    const fixes = [];
-    
-    if (ftEmpty) {
-      await pool.query("ALTER SEQUENCE ft_id_seq RESTART WITH 1;");
-      fixes.push("ft_id_seq сброшена на 1");
-    } else {
-      // Если таблица не пустая, устанавливаем последовательность на max+1
-      const maxFt = await pool.query("SELECT MAX(CAST(REGEXP_REPLACE(id_ft, '\\D', '', 'g') AS INTEGER)) as max_id FROM ft;");
-      const nextVal = (maxFt.rows[0].max_id || 0) + 1;
-      await pool.query(`ALTER SEQUENCE ft_id_seq RESTART WITH ${nextVal};`);
-      fixes.push(`ft_id_seq установлена на ${nextVal} (max+1)`);
-    }
-    
-    if (zvkEmpty) {
-      await pool.query("ALTER SEQUENCE zvk_id_seq RESTART WITH 1;");
-      fixes.push("zvk_id_seq сброшена на 1");
-    } else {
-      const maxZvk = await pool.query("SELECT MAX(CAST(REGEXP_REPLACE(id_zvk, '\\D', '', 'g') AS INTEGER)) as max_id FROM zvk;");
-      const nextVal = (maxZvk.rows[0].max_id || 0) + 1;
-      await pool.query(`ALTER SEQUENCE zvk_id_seq RESTART WITH ${nextVal};`);
-      fixes.push(`zvk_id_seq установлена на ${nextVal} (max+1)`);
-    }
-    
-    res.json({ 
-      success: true, 
-      message: "✅ Последовательности исправлены",
-      fixes: fixes,
-      ft_empty: ftEmpty,
-      zvk_empty: zvkEmpty
-    });
-  } catch (e) {
-    console.error("FIX SEQUENCE ERROR:", e);
     res.status(500).json({ success: false, error: e.message });
   }
 });
