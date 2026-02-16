@@ -225,7 +225,7 @@ app.get("/ft-zvk-join", async (req, res) => {
 
         z.id_zvk, z.zvk_date, z.zvk_name, z.to_pay, z.request_flag,
 
-        zs.stat_date,
+       
         zs.src_d,
         zs.src_o,
 
