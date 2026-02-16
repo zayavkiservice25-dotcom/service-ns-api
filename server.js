@@ -15,12 +15,41 @@ const pool = new Pool({
 });
 
 // ===============================
-// Init
+// Init DB (создаём если нет)
 // ===============================
 async function initDb() {
   await pool.query(`CREATE SEQUENCE IF NOT EXISTS ft_id_seq START 1;`);
   await pool.query(`CREATE SEQUENCE IF NOT EXISTS zvk_id_seq START 1;`);
 
+  // FT (если у тебя уже есть — просто пропустит)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ft (
+      id_ft text PRIMARY KEY,
+      input_date timestamptz,
+      input_name text,
+      division text,
+      "object" text,
+      contractor text,
+      invoice_no text,
+      invoice_date date,
+      invoice_pdf text,
+      sum_ft numeric
+    );
+  `);
+
+  // ZVK/ZFT
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS zvk (
+      id_zvk text PRIMARY KEY,
+      id_ft text,
+      zvk_date timestamptz,
+      zvk_name text,
+      to_pay numeric,
+      request_flag text
+    );
+  `);
+
+  // Остаток FT
   await pool.query(`
     CREATE TABLE IF NOT EXISTS ft_balance (
       id_ft text PRIMARY KEY,
@@ -28,26 +57,26 @@ async function initDb() {
     );
   `);
 
-  // ---- справка: источники / статус
+  // Статус/источники (без stat_date!)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS zvk_status (
       id_zvk text PRIMARY KEY,
-      stat_date timestamptz,
+      status_time timestamptz,
       src_d text,
       src_o text
     );
   `);
 
-  // ---- согласование
+  // Согласование
   await pool.query(`
     CREATE TABLE IF NOT EXISTS zvk_agree (
       id_zvk text PRIMARY KEY,
       agree_name text,
-      agree_date timestamptz
+      agree_time timestamptz
     );
   `);
 
-  // ---- админ поля: реестр / оплачено
+  // Админ: реестр / оплачено
   await pool.query(`
     CREATE TABLE IF NOT EXISTS zvk_admin (
       id_zvk text PRIMARY KEY,
@@ -64,9 +93,7 @@ initDb().catch(console.error);
 // ===============================
 // Health
 // ===============================
-app.get("/", (req, res) =>
-  res.send("Service-NS API работает 🚀 v-ftzvk-card-join")
-);
+app.get("/", (req, res) => res.send("Service-NS API работает 🚀 v-ftzvk-fixed-join"));
 
 app.get("/db-ping", async (req, res) => {
   try {
@@ -78,18 +105,112 @@ app.get("/db-ping", async (req, res) => {
 });
 
 // =====================================================
-// UPDATE ZFT: to_pay + request_flag (по выбранному ZFT)
+// GET FT (+ balance)
+// =====================================================
+app.get("/ft", async (req, res) => {
+  try {
+    const limit = Math.min(Number(req.query.limit || 500), 500);
+    const login = String(req.query.login || "").trim();
+    const isAdmin = String(req.query.is_admin || "0") === "1";
+
+    if (!login) return res.status(400).json({ success: false, error: "login is required" });
+
+    const qAdmin = `
+      SELECT
+        f.*,
+        b.balance_ft
+      FROM ft f
+      LEFT JOIN ft_balance b ON b.id_ft = f.id_ft
+      ORDER BY COALESCE(NULLIF(regexp_replace(f.id_ft,'\\D','','g'),''),'0')::int DESC
+      LIMIT $1
+    `;
+
+    const qUser = `
+      SELECT
+        f.*,
+        b.balance_ft
+      FROM ft f
+      LEFT JOIN ft_balance b ON b.id_ft = f.id_ft
+      WHERE f.input_name = $2
+      ORDER BY COALESCE(NULLIF(regexp_replace(f.id_ft,'\\D','','g'),''),'0')::int DESC
+      LIMIT $1
+    `;
+
+    const r = isAdmin
+      ? await pool.query(qAdmin, [limit])
+      : await pool.query(qUser, [limit, login]);
+
+    res.json({ success: true, rows: r.rows, admin: isAdmin });
+  } catch (e) {
+    console.error("GET FT ERROR:", e);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// =====================================================
+// SAVE ZVK (создать)
+// =====================================================
+app.post("/save-zvk", async (req, res) => {
+  try {
+    const { id_ft, zvk_name, sum_zvk, status_zvk } = req.body;
+
+    if (!id_ft) return res.status(400).json({ success: false, error: "id_ft is required" });
+
+    const toPayNum =
+      (sum_zvk === "" || sum_zvk === undefined || sum_zvk === null) ? 0 : Number(sum_zvk);
+
+    const r = await pool.query(
+      `
+      INSERT INTO zvk (id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag)
+      VALUES (
+        'ZFT' || nextval('zvk_id_seq')::text,
+        $1,
+        NOW(),
+        COALESCE($2,''),
+        $3,
+        'Нет'
+      )
+      RETURNING id_zvk, zvk_date
+      `,
+      [String(id_ft).trim(), zvk_name ? String(zvk_name).trim() : "", toPayNum]
+    );
+
+    // статус (если передали)
+    if (status_zvk) {
+      await pool.query(
+        `
+        INSERT INTO zvk_status (id_zvk, status_time)
+        VALUES ($1, NOW())
+        ON CONFLICT (id_zvk)
+        DO UPDATE SET status_time = NOW()
+        `,
+        [r.rows[0].id_zvk]
+      );
+    }
+
+    res.json({ success: true, id_zvk: r.rows[0].id_zvk, zvk_date: r.rows[0].zvk_date });
+  } catch (e) {
+    console.error("SAVE ZVK ERROR:", e);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// =====================================================
+// UPDATE ZFT: К оплате (сумма) + Заявка
 // =====================================================
 app.post("/update-zft", async (req, res) => {
   try {
     const { id_zvk, to_pay, request_flag, zvk_name } = req.body;
     if (!id_zvk) return res.status(400).json({ success: false, error: "id_zvk is required" });
 
+    const toPayNum =
+      (to_pay === "" || to_pay === undefined || to_pay === null) ? null : Number(to_pay);
+
     const r = await pool.query(
       `
       UPDATE zvk
       SET
-        to_pay = CASE WHEN $2::numeric IS NULL THEN to_pay ELSE $2::numeric END,
+        to_pay = COALESCE($2, to_pay),
         request_flag = COALESCE($3, request_flag),
         zvk_name = COALESCE($4, zvk_name)
       WHERE id_zvk = $1
@@ -97,7 +218,7 @@ app.post("/update-zft", async (req, res) => {
       `,
       [
         String(id_zvk).trim(),
-        (to_pay === "" || to_pay === undefined || to_pay === null) ? null : Number(to_pay),
+        toPayNum,
         request_flag ? String(request_flag).trim() : null,
         zvk_name ? String(zvk_name).trim() : null,
       ]
@@ -111,25 +232,27 @@ app.post("/update-zft", async (req, res) => {
 });
 
 // =====================================================
-// Инициатор: src_d / src_o + stat_date
+// Инициатор: Источник Див / Источник Объект (+status_time авто)
 // =====================================================
 app.post("/upsert-zvk-src", async (req, res) => {
   const client = await pool.connect();
   try {
-    const { login, id_zvk, src_d, src_o } = req.body;
-    if (!login || !id_zvk) return res.status(400).json({ success: false, error: "login, id_zvk required" });
+    const { id_zvk, src_d, src_o } = req.body;
+    if (!id_zvk) return res.status(400).json({ success: false, error: "id_zvk required" });
 
     await client.query("BEGIN");
 
     const r = await client.query(
-      `INSERT INTO zvk_status (id_zvk, stat_date, src_d, src_o)
-       VALUES ($1, (NOW() AT TIME ZONE 'Asia/Almaty'), $2, $3)
-       ON CONFLICT (id_zvk)
-       DO UPDATE SET
-         stat_date = (NOW() AT TIME ZONE 'Asia/Almaty'),
-         src_d = EXCLUDED.src_d,
-         src_o = EXCLUDED.src_o
-       RETURNING *`,
+      `
+      INSERT INTO zvk_status (id_zvk, status_time, src_d, src_o)
+      VALUES ($1, NOW(), $2, $3)
+      ON CONFLICT (id_zvk)
+      DO UPDATE SET
+        status_time = NOW(),
+        src_d = EXCLUDED.src_d,
+        src_o = EXCLUDED.src_o
+      RETURNING *
+      `,
       [
         String(id_zvk).trim(),
         (src_d ?? "").toString().trim(),
@@ -149,25 +272,21 @@ app.post("/upsert-zvk-src", async (req, res) => {
 });
 
 // =====================================================
-// Админ: Реестр + Оплачено (+ pay_time авто)
-// =====================================================
-// =====================================================
-// Админ: Реестр + Оплачено (+ pay_time авто)
-// (Проверка ТОЛЬКО по is_admin, без b_erkin)
+// Админ: Реестр + Оплачено (pay_time авто если Да)
+// is_admin приходит из вебаппа (роль Админ)
 // =====================================================
 app.post("/upsert-zvk-admin", async (req, res) => {
   const client = await pool.connect();
   try {
     const { is_admin, id_zvk, registry_flag, is_paid } = req.body;
 
-    if (!id_zvk) {
-      return res.status(400).json({ success: false, error: "id_zvk required" });
-    }
+    if (!id_zvk) return res.status(400).json({ success: false, error: "id_zvk required" });
 
-    // ✅ ТОЛЬКО админ (флаг из веб-аппа)
-    if (!is_admin) {
-      return res.status(403).json({ success: false, error: "only admin allowed" });
-    }
+    // принимаем: true / "true" / 1 / "1"
+    const adminOk =
+      is_admin === true || is_admin === 1 || is_admin === "1" || String(is_admin).toLowerCase() === "true";
+
+    if (!adminOk) return res.status(403).json({ success: false, error: "only admin allowed" });
 
     await client.query("BEGIN");
 
@@ -178,14 +297,14 @@ app.post("/upsert-zvk-admin", async (req, res) => {
         $1,
         $2,
         $3,
-        CASE WHEN $3 = 'Да' THEN (NOW() AT TIME ZONE 'Asia/Almaty') ELSE NULL END
+        CASE WHEN $3 = 'Да' THEN NOW() ELSE NULL END
       )
       ON CONFLICT (id_zvk)
       DO UPDATE SET
         registry_flag = COALESCE(EXCLUDED.registry_flag, zvk_admin.registry_flag),
         is_paid = COALESCE(EXCLUDED.is_paid, zvk_admin.is_paid),
         pay_time = CASE
-          WHEN EXCLUDED.is_paid = 'Да' AND zvk_admin.pay_time IS NULL THEN (NOW() AT TIME ZONE 'Asia/Almaty')
+          WHEN EXCLUDED.is_paid = 'Да' AND zvk_admin.pay_time IS NULL THEN NOW()
           WHEN EXCLUDED.is_paid <> 'Да' THEN NULL
           ELSE zvk_admin.pay_time
         END
@@ -209,9 +328,9 @@ app.post("/upsert-zvk-admin", async (req, res) => {
   }
 });
 
-
 // =====================================================
-// JOIN: FT + ZFT + остаток + статус + согласование + админ
+// JOIN: FT + ZVK + balance + status + agree + admin
+// (БЕЗ zs.stat_date !!!)
 // =====================================================
 app.get("/ft-zvk-join", async (req, res) => {
   try {
@@ -225,11 +344,11 @@ app.get("/ft-zvk-join", async (req, res) => {
 
         z.id_zvk, z.zvk_date, z.zvk_name, z.to_pay, z.request_flag,
 
-       
+        zs.status_time,
         zs.src_d,
         zs.src_o,
 
-        za.agree_date,
+        za.agree_time,
         za.agree_name,
 
         adm.registry_flag,
