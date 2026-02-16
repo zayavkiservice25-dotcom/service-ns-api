@@ -346,6 +346,84 @@ app.get("/ft-zvk-join", async (req, res) => {
     res.status(500).json({ success: false, error: e.message });
   }
 });
+// =====================================================
+// SAVE FT (создать FT + авто баланс + авто ZFT1 через триггер или отдельно)
+// =====================================================
+app.post("/save-ft", async (req, res) => {
+  try {
+    const {
+      input_date,
+      input_name,
+      division,
+      object,
+      contractor,
+      invoice_no,
+      invoice_date,
+      invoice_pdf,
+      sum_ft
+    } = req.body;
+
+    if (!input_name) return res.status(400).json({ success:false, error:"input_name is required" });
+    if (!division || !object) return res.status(400).json({ success:false, error:"division/object required" });
+    if (!contractor) return res.status(400).json({ success:false, error:"contractor required" });
+    if (!invoice_no) return res.status(400).json({ success:false, error:"invoice_no required" });
+    if (!invoice_date) return res.status(400).json({ success:false, error:"invoice_date required" });
+
+    const sumNum = (sum_ft === "" || sum_ft === null || sum_ft === undefined) ? 0 : Number(sum_ft);
+    if (Number.isNaN(sumNum)) return res.status(400).json({ success:false, error:"sum_ft must be number" });
+
+    // новый ID FT
+    const idRow = await pool.query(`SELECT 'FT' || nextval('ft_id_seq')::text AS id_ft`);
+    const id_ft = idRow.rows[0].id_ft;
+
+    // сохранить FT
+    const r = await pool.query(
+      `
+      INSERT INTO ft
+        (id_ft, input_date, input_name, division, "object", contractor, invoice_no, invoice_date, invoice_pdf, sum_ft)
+      VALUES
+        ($1, $2, $3, $4, $5, $6, $7, to_date($8,'DD.MM.YYYY'), $9, $10)
+      RETURNING id_ft
+      `,
+      [
+        id_ft,
+        input_date ? new Date(input_date) : new Date(),
+        String(input_name).trim(),
+        String(division).trim(),
+        String(object).trim(),
+        String(contractor).trim(),
+        String(invoice_no).trim(),
+        String(invoice_date).trim(),  // приходит "dd.mm.yyyy"
+        invoice_pdf ? String(invoice_pdf).trim() : "",
+        sumNum
+      ]
+    );
+
+    // balance_ft (если используешь)
+    await pool.query(
+      `
+      INSERT INTO ft_balance (id_ft, balance_ft)
+      VALUES ($1, $2)
+      ON CONFLICT (id_ft) DO UPDATE SET balance_ft = EXCLUDED.balance_ft
+      `,
+      [id_ft, sumNum]
+    );
+
+    // ✅ если у тебя НЕТ триггера на авто ZFT1 — создадим ZFT1 тут
+    await pool.query(
+      `
+      INSERT INTO zvk (id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag)
+      VALUES ('ZFT' || nextval('zvk_id_seq')::text, $1, NOW(), 'СИСТЕМА', $2, 'Нет')
+      `,
+      [id_ft, sumNum]
+    );
+
+    res.json({ success:true, id_ft: r.rows[0].id_ft });
+  } catch (e) {
+    console.error("SAVE-FT ERROR:", e);
+    res.status(500).json({ success:false, error:e.message });
+  }
+});
 
 // ===============================
 // Start
