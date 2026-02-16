@@ -337,31 +337,59 @@ app.get("/ft-zvk-join", async (req, res) => {
     const limit = Math.min(Number(req.query.limit || 500), 500);
 
     const q = `
+      WITH last_status AS (
+        SELECT DISTINCT ON (s.id_zvk)
+          s.id_zvk,
+          s.src_d,
+          s.src_o,
+          s.created_at AS status_time
+        FROM zvk_status s
+        ORDER BY s.id_zvk, s.created_at DESC
+      ),
+      last_agree AS (
+        SELECT DISTINCT ON (a.id_zvk)
+          a.id_zvk,
+          a.agree_name,
+          a.created_at AS agree_time
+        FROM zvk_agree a
+        ORDER BY a.id_zvk, a.created_at DESC
+      )
       SELECT
-        f.id_ft, f.input_date, f.input_name, f.division, f."object",
-        f.contractor, f.invoice_no, f.invoice_date, f.invoice_pdf, f.sum_ft,
-        b.balance_ft,
+        f.id_ft,
+        f.input_date,
+        f.input_name,
+        f.division,
+        f."object" as object,
+        f.contractor,
+        f.invoice_no,
+        f.invoice_date,
+        f.invoice_pdf,
+        f.sum_ft,
 
-        z.id_zvk, z.zvk_date, z.zvk_name, z.to_pay, z.request_flag,
+        z.id_zvk,
+        z.zvk_date,
+        z.zvk_name,
+        z.to_pay,
+        z.request_flag,
 
-        zs.stat_date,
-        zs.src_d,
-        zs.src_o,
+        ls.status_time,
+        ls.src_d,
+        ls.src_o,
 
-        za.agree_date,
-        za.agree_name,
+        la.agree_time,
+        la.agree_name,
 
-        adm.registry_flag,
-        adm.pay_time,
-        adm.is_paid
+        p.created_at AS pay_time,
+        p.is_paid,
+
+        b.balance_ft
 
       FROM ft f
-      LEFT JOIN zvk z ON trim(z.id_ft) = trim(f.id_ft)
+      LEFT JOIN zvk z ON z.id_ft = f.id_ft
+      LEFT JOIN last_status ls ON ls.id_zvk = z.id_zvk
+      LEFT JOIN last_agree  la ON la.id_zvk = z.id_zvk
+      LEFT JOIN zvk_pay p ON p.id_zvk = z.id_zvk
       LEFT JOIN ft_balance b ON b.id_ft = f.id_ft
-      LEFT JOIN zvk_status zs ON zs.id_zvk = z.id_zvk
-      LEFT JOIN zvk_agree  za ON za.id_zvk = z.id_zvk
-      LEFT JOIN zvk_admin adm ON adm.id_zvk = z.id_zvk
-
       ORDER BY
         COALESCE(NULLIF(regexp_replace(f.id_ft,'\\D','','g'),''),'0')::int DESC,
         COALESCE(z.zvk_date, NOW()) DESC
