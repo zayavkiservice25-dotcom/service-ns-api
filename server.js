@@ -151,15 +151,23 @@ app.post("/upsert-zvk-src", async (req, res) => {
 // =====================================================
 // Админ: Реестр + Оплачено (+ pay_time авто)
 // =====================================================
+// =====================================================
+// Админ: Реестр + Оплачено (+ pay_time авто)
+// (Проверка ТОЛЬКО по is_admin, без b_erkin)
+// =====================================================
 app.post("/upsert-zvk-admin", async (req, res) => {
   const client = await pool.connect();
   try {
-    const { login, id_zvk, registry_flag, is_paid } = req.body;
-    if (!login || !id_zvk) return res.status(400).json({ success: false, error: "login, id_zvk required" });
+    const { is_admin, id_zvk, registry_flag, is_paid } = req.body;
 
-    const loginNorm = String(login).trim().toLowerCase();
-    const isAdmin = (loginNorm === "b_erkin"); // или расширь как хочешь
-    if (!isAdmin) return res.status(403).json({ success: false, error: "only admin allowed" });
+    if (!id_zvk) {
+      return res.status(400).json({ success: false, error: "id_zvk required" });
+    }
+
+    // ✅ ТОЛЬКО админ (флаг из веб-аппа)
+    if (!is_admin) {
+      return res.status(403).json({ success: false, error: "only admin allowed" });
+    }
 
     await client.query("BEGIN");
 
@@ -200,6 +208,7 @@ app.post("/upsert-zvk-admin", async (req, res) => {
     client.release();
   }
 });
+
 
 // =====================================================
 // JOIN: FT + ZFT + остаток + статус + согласование + админ
