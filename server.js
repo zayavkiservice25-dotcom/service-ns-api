@@ -337,62 +337,11 @@ app.get("/ft-zvk-join", async (req, res) => {
     const limit = Math.min(Number(req.query.limit || 500), 500);
 
     const q = `
-      WITH last_status AS (
-        SELECT DISTINCT ON (s.id_zvk)
-          s.id_zvk,
-          s.src_d,
-          s.src_o,
-          s.created_at AS status_time
-        FROM zvk_status s
-        ORDER BY s.id_zvk, s.created_at DESC
-      ),
-      last_agree AS (
-        SELECT DISTINCT ON (a.id_zvk)
-          a.id_zvk,
-          a.agree_name,
-          a.created_at AS agree_time
-        FROM zvk_agree a
-        ORDER BY a.id_zvk, a.created_at DESC
-      )
-      SELECT
-        f.id_ft,
-        f.input_date,
-        f.input_name,
-        f.division,
-        f."object" as object,
-        f.contractor,
-        f.invoice_no,
-        f.invoice_date,
-        f.invoice_pdf,
-        f.sum_ft,
-
-        z.id_zvk,
-        z.zvk_date,
-        z.zvk_name,
-        z.to_pay,
-        z.request_flag,
-
-        ls.status_time,
-        ls.src_d,
-        ls.src_o,
-
-        la.agree_time,
-        la.agree_name,
-
-        p.created_at AS pay_time,
-        p.is_paid,
-
-        b.balance_ft
-
-      FROM ft f
-      LEFT JOIN zvk z ON z.id_ft = f.id_ft
-      LEFT JOIN last_status ls ON ls.id_zvk = z.id_zvk
-      LEFT JOIN last_agree  la ON la.id_zvk = z.id_zvk
-      LEFT JOIN zvk_pay p ON p.id_zvk = z.id_zvk
-      LEFT JOIN ft_balance b ON b.id_ft = f.id_ft
+      SELECT v.*, b.balance_ft
+      FROM ft_zvk_full v
+      LEFT JOIN ft_balance b ON b.id_ft = v.id_ft
       ORDER BY
-        COALESCE(NULLIF(regexp_replace(f.id_ft,'\\D','','g'),''),'0')::int DESC,
-        COALESCE(z.zvk_date, NOW()) DESC
+        COALESCE(NULLIF(regexp_replace(v.id_ft,'\\D','','g'),''),'0')::int DESC
       LIMIT $1
     `;
 
@@ -403,6 +352,7 @@ app.get("/ft-zvk-join", async (req, res) => {
     res.status(500).json({ success: false, error: e.message });
   }
 });
+
 
 // ===============================
 // Start
