@@ -397,6 +397,12 @@ app.post("/zvk-pay-row", async (req, res) => {
   try {
     const { is_admin, zvk_row_id, registry_flag, is_paid } = req.body;
 
+    console.log("=== ZVK-PAY-ROW CALLED ===");
+    console.log("is_admin:", is_admin);
+    console.log("zvk_row_id:", zvk_row_id);
+    console.log("registry_flag:", registry_flag);
+    console.log("is_paid:", is_paid);
+
     const adminOk =
       is_admin === true || is_admin === 1 || is_admin === "1" ||
       String(is_admin).toLowerCase() === "true";
@@ -451,6 +457,8 @@ app.post("/zvk-pay-row", async (req, res) => {
       ]
     );
 
+    console.log("ZVK-PAY-ROW result:", r.rows[0]);
+
     await client.query("COMMIT");
     res.json({ success:true, row: r.rows[0] });
 
@@ -462,7 +470,6 @@ app.post("/zvk-pay-row", async (req, res) => {
     client.release();
   }
 });
-
 // =====================================================
 // JOIN: читаем из VIEW ft_zvk_history_v2
 // =====================================================
