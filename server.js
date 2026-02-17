@@ -376,6 +376,9 @@ app.get("/ft-zvk-join", async (req, res) => {
 // =====================================================
 // SAVE FT (создать FT + авто баланс + авто ZFT1)
 // =====================================================
+// =====================================================
+// SAVE FT (создать FT + авто баланс + авто ZFT1)
+// =====================================================
 app.post("/save-ft", async (req, res) => {
   try {
     const {
@@ -403,24 +406,35 @@ app.post("/save-ft", async (req, res) => {
     const idRow = await pool.query(`SELECT 'FT' || nextval('ft_id_seq')::text AS id_ft`);
     const id_ft = idRow.rows[0].id_ft;
 
+    // ✅ ИСПРАВЛЕНО: Правильная обработка дат
+    let inputDateFormatted = input_date;
+    // Если пришла ISO строка, преобразуем в Date
+    if (input_date && typeof input_date === 'string') {
+      inputDateFormatted = new Date(input_date);
+    }
+
+    let invoiceDateFormatted = invoice_date;
+    // invoice_date приходит как YYYY-MM-DD из input type="date"
+    // PostgreSQL принимает этот формат напрямую
+
     // сохранить FT
     const r = await pool.query(
       `
       INSERT INTO ft
         (id_ft, input_date, input_name, division, "object", contractor, invoice_no, invoice_date, invoice_pdf, sum_ft)
       VALUES
-        ($1, $2, $3, $4, $5, $6, $7, to_date($8,'DD.MM.YYYY'), $9, $10)
+        ($1, $2, $3, $4, $5, $6, $7, $8::date, $9, $10)
       RETURNING id_ft
       `,
       [
         id_ft,
-        input_date ? new Date(input_date) : new Date(),
+        inputDateFormatted,              // ✅ Date объект или ISO строка
         String(input_name).trim(),
         String(division).trim(),
         String(object).trim(),
         String(contractor).trim(),
         String(invoice_no).trim(),
-        String(invoice_date).trim(),
+        invoiceDateFormatted,             // ✅ YYYY-MM-DD строка
         invoice_pdf ? String(invoice_pdf).trim() : "",
         sumNum
       ]
@@ -441,7 +455,6 @@ app.post("/save-ft", async (req, res) => {
     res.status(500).json({ success:false, error:e.message });
   }
 });
-
 // ===============================
 // Start
 // ===============================
