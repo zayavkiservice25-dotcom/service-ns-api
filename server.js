@@ -571,6 +571,62 @@ app.post("/save-ft", async (req, res) => {
   }
 });
 
+// =====================================================
+// Оплата / Реестр — ДЛЯ ОДНОЙ СТРОКИ (как источники)
+// таблица: zvk_pay (zvk_row_id UNIQUE)
+// =====================================================
+app.post("/zvk-pay-row", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { is_admin, zvk_row_id, registry_flag, is_paid } = req.body;
+
+    const adminOk =
+      is_admin === true || is_admin === 1 || is_admin === "1" ||
+      String(is_admin).toLowerCase() === "true";
+    if (!adminOk) return res.status(403).json({ success:false, error:"only admin allowed" });
+
+    if (!zvk_row_id) return res.status(400).json({ success:false, error:"zvk_row_id required" });
+
+    await client.query("BEGIN");
+
+    // если оплатили "Да" -> ставим pay_time NOW(), иначе NULL
+    const r = await client.query(
+      `
+      INSERT INTO zvk_pay (zvk_row_id, is_paid, pay_time, registry_flag)
+      VALUES (
+        $1,
+        $2,
+        CASE WHEN $2 = 'Да' THEN NOW() ELSE NULL END,
+        $3
+      )
+      ON CONFLICT (zvk_row_id)
+      DO UPDATE SET
+        is_paid = EXCLUDED.is_paid,
+        registry_flag = EXCLUDED.registry_flag,
+        pay_time = CASE
+          WHEN EXCLUDED.is_paid = 'Да' THEN COALESCE(zvk_pay.pay_time, NOW())
+          ELSE NULL
+        END
+      RETURNING *
+      `,
+      [
+        Number(zvk_row_id),
+        is_paid ? String(is_paid).trim() : null,
+        registry_flag ? String(registry_flag).trim() : null,
+      ]
+    );
+
+    await client.query("COMMIT");
+    res.json({ success:true, row: r.rows[0] });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    res.status(500).json({ success:false, error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+
 // ===============================
 // Start
 // ===============================
