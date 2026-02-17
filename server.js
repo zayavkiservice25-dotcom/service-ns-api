@@ -336,7 +336,7 @@ app.get("/ft-zvk-join", async (req, res) => {
       // Админ видит всё
       query = `
         SELECT v.*
-        FROM ft_zvk_full_v2 v
+        FROM ft_zvk_history_v1 v
         ORDER BY
           COALESCE(NULLIF(substring(v.id_ft from '\\d+'), ''), '0')::int DESC,
           v.zvk_date DESC NULLS LAST
@@ -346,7 +346,7 @@ app.get("/ft-zvk-join", async (req, res) => {
       // Обычный пользователь видит только свои записи
       query = `
         SELECT v.*
-        FROM ft_zvk_full_v2 v
+        FROM ft_zvk_history_v1 v
         WHERE v.input_name = $2
         ORDER BY
           COALESCE(NULLIF(substring(v.id_ft from '\\d+'), ''), '0')::int DESC,
