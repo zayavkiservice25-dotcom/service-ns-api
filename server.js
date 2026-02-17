@@ -1,17 +1,15 @@
 // server.js (FULL) — Service-NS API 🚀
-// Логика:
+// Логика (как ты хочешь):
 // 1) FT хранится в ft
-// 2) ZVK (zvk) хранит "историю строк" внутри одного цикла id_zvk (ZFT1 повторяется)
+// 2) ZVK (zvk) хранит историю строк внутри одного цикла id_zvk (ZFT1 повторяется)
 // 3) Пока zvk_admin.is_paid != 'Да' -> новые сохранения пишутся с тем же id_zvk
 // 4) Когда zvk_admin.is_paid = 'Да' -> следующий save создаёт новый цикл id_zvk = ZFT2
 //
-// ВАЖНО ПРО БАЗУ:
-// - Чтобы разрешить повторение id_zvk (ZFT1 много строк), В БД должен быть скрытый PK "id" (bigserial)
-//   и id_zvk НЕ должен быть PRIMARY KEY.
-//   Сделай миграцию один раз:
-//     ALTER TABLE zvk DROP CONSTRAINT IF EXISTS zvk_pkey;
-//     ALTER TABLE zvk ADD COLUMN IF NOT EXISTS id bigserial;
-//     ALTER TABLE zvk ADD CONSTRAINT zvk_pkey PRIMARY KEY (id);
+// ВАЖНО ПРО ИСТОЧНИК:
+// - Источник хранится НЕ на весь ZFT, а на КОНКРЕТНУЮ СТРОКУ истории.
+// - Поэтому таблица zvk_status теперь по zvk_row_id (это zvk.id), а не по id_zvk.
+//
+// Этот server.js сам делает миграции безопасно (IF NOT EXISTS, DROP CONSTRAINT IF EXISTS).
 
 require("dotenv").config();
 
@@ -29,13 +27,15 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// ===============================
-// Init DB (создаём если нет)
-// ===============================
+// =====================================================
+// INIT DB + МИГРАЦИИ
+// =====================================================
 async function initDb() {
+  // sequences
   await pool.query(`CREATE SEQUENCE IF NOT EXISTS ft_id_seq START 1;`);
   await pool.query(`CREATE SEQUENCE IF NOT EXISTS zvk_id_seq START 1;`);
 
+  // FT
   await pool.query(`
     CREATE TABLE IF NOT EXISTS ft (
       id_ft text PRIMARY KEY,
@@ -51,7 +51,7 @@ async function initDb() {
     );
   `);
 
-  // ZVK/ZFT (история)
+  // ZVK история (сначала создаём, если нет)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS zvk (
       id_zvk text,
@@ -63,14 +63,41 @@ async function initDb() {
     );
   `);
 
-  // Статус/источники (1 строка на id_zvk)
+  // ✅ гарантируем технический PK id в zvk
+  // 1) добавляем колонку id если нет
+  await pool.query(`ALTER TABLE zvk ADD COLUMN IF NOT EXISTS id bigserial;`);
+  // 2) делаем PK на id (если вдруг раньше был PK на другом)
+  await pool.query(`ALTER TABLE zvk DROP CONSTRAINT IF EXISTS zvk_pkey;`);
+  await pool.query(`ALTER TABLE zvk ADD CONSTRAINT zvk_pkey PRIMARY KEY (id);`);
+
+  // ✅ zvk_status — источник/статус по строке истории (zvk_row_id = zvk.id)
+  // Если у тебя раньше был старый zvk_status с id_zvk — оставим как есть (если существует),
+  // но приведём к новой схеме:
+  // - добавим колонку zvk_row_id
+  // - сделаем PK по zvk_row_id
   await pool.query(`
     CREATE TABLE IF NOT EXISTS zvk_status (
-      id_zvk text PRIMARY KEY,
+      zvk_row_id bigint,
       status_time timestamptz,
       src_d text,
       src_o text
     );
+  `);
+
+  // добавим колонку, если не было
+  await pool.query(`ALTER TABLE zvk_status ADD COLUMN IF NOT EXISTS zvk_row_id bigint;`);
+
+  // уберём старый PK (если был на id_zvk)
+  await pool.query(`ALTER TABLE zvk_status DROP CONSTRAINT IF EXISTS zvk_status_pkey;`);
+
+  // сделаем новый PK по zvk_row_id (и уникальность)
+  // (если есть NULL-ы — это нормально, но PK требует NOT NULL на уровне данных;
+  //  поэтому мы не ставим NOT NULL принудительно — просто PK попытается.
+  //  Чтобы не падало, ставим UNIQUE вместо PK, а PK оставим если уже чисто.)
+  // Надёжно: создаём UNIQUE индекс
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS zvk_status_row_uq
+    ON zvk_status (zvk_row_id);
   `);
 
   // Согласование (1 строка на id_zvk)
@@ -92,18 +119,67 @@ async function initDb() {
     );
   `);
 
-  // Индексы для скорости
+  // индексы
   await pool.query(`CREATE INDEX IF NOT EXISTS zvk_idx_ft_date ON zvk (id_ft, zvk_date DESC);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS zvk_idx_zvk_date ON zvk (id_zvk, zvk_date DESC);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS zvk_idx_id ON zvk (id);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS zvk_status_row_idx ON zvk_status (zvk_row_id);`);
 
-  console.log("DB init OK");
+  // ✅ VIEW (история + источник по row_id)
+  await pool.query(`
+    CREATE OR REPLACE VIEW ft_zvk_history_v2 AS
+    SELECT
+      f.id_ft,
+      f.input_date,
+      f.input_name,
+      f.division,
+      f."object" AS object,
+      f.contractor,
+      f.invoice_no,
+      f.invoice_date,
+      f.invoice_pdf,
+      f.sum_ft,
+
+      z.id_zvk,
+      z.zvk_date,
+      z.zvk_name,
+      z.to_pay,
+      z.request_flag,
+
+      z.id AS zvk_row_id, -- ⭐ нужно UI
+
+      s.status_time,
+      s.src_d,
+      s.src_o,
+
+      a.agree_time,
+
+      ad.registry_flag,
+      ad.pay_time,
+      ad.is_paid
+
+    FROM ft f
+    LEFT JOIN zvk z ON z.id_ft = f.id_ft
+    LEFT JOIN LATERAL (
+      SELECT s.*
+      FROM zvk_status s
+      WHERE s.zvk_row_id = z.id
+      ORDER BY s.status_time DESC NULLS LAST
+      LIMIT 1
+    ) s ON TRUE
+    LEFT JOIN zvk_agree a ON a.id_zvk = z.id_zvk
+    LEFT JOIN zvk_admin ad ON ad.id_zvk = z.id_zvk;
+  `);
+
+  console.log("DB init OK ✅ (tables + migrations + view ft_zvk_history_v2)");
 }
-initDb().catch(console.error);
 
-// ===============================
+initDb().catch((e) => console.error("DB init error:", e));
+
+// =====================================================
 // Health
-// ===============================
-app.get("/", (req, res) => res.send("Service-NS API работает 🚀 v-ftzvk-history-final-2"));
+// =====================================================
+app.get("/", (req, res) => res.send("Service-NS API работает 🚀 v-history-rowid-1"));
 
 app.get("/db-ping", async (req, res) => {
   try {
@@ -155,6 +231,7 @@ app.get("/ft", async (req, res) => {
 // SAVE (история) — /zvk-save
 // Пока is_paid != 'Да' -> пишем в тот же id_zvk
 // После is_paid = 'Да' -> создаём новый id_zvk (ZFT2...)
+// ✅ Возвращает zvk_row_id (это zvk.id вставленной строки)
 // =====================================================
 app.post("/zvk-save", async (req, res) => {
   try {
@@ -215,12 +292,17 @@ app.post("/zvk-save", async (req, res) => {
       `
       INSERT INTO zvk (id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag)
       VALUES ($1, $2, NOW(), $3, $4, $5)
-      RETURNING id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag
+      RETURNING id, id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag
       `,
       [id_zvk, ft, name, toPayNum, flag]
     );
 
-    res.json({ success: true, row: r.rows[0], id_zvk });
+    res.json({
+      success: true,
+      row: r.rows[0],
+      id_zvk,
+      zvk_row_id: r.rows[0].id,
+    });
   } catch (e) {
     console.error("ZVK-SAVE ERROR:", e);
     res.status(500).json({ success: false, error: e.message });
@@ -228,42 +310,84 @@ app.post("/zvk-save", async (req, res) => {
 });
 
 // =====================================================
-// Инициатор: Источник Див / Источник Объект
+// ✅ Новый правильный источник по строке истории
+// POST /zvk-status-row  { zvk_row_id, src_d, src_o }
 // =====================================================
-app.post("/upsert-zvk-src", async (req, res) => {
-  const client = await pool.connect();
+app.post("/zvk-status-row", async (req, res) => {
   try {
-    const { id_zvk, src_d, src_o } = req.body;
-    if (!id_zvk) return res.status(400).json({ success: false, error: "id_zvk required" });
+    const { zvk_row_id, src_d, src_o } = req.body;
+    if (!zvk_row_id)
+      return res.status(400).json({ success: false, error: "zvk_row_id required" });
 
-    await client.query("BEGIN");
+    const rid = Number(zvk_row_id);
+    if (Number.isNaN(rid))
+      return res.status(400).json({ success: false, error: "zvk_row_id must be number" });
 
-    const r = await client.query(
+    const r = await pool.query(
       `
-      INSERT INTO zvk_status (id_zvk, status_time, src_d, src_o)
+      INSERT INTO zvk_status (zvk_row_id, status_time, src_d, src_o)
       VALUES ($1, NOW(), $2, $3)
-      ON CONFLICT (id_zvk)
+      ON CONFLICT (zvk_row_id)
       DO UPDATE SET
         status_time = NOW(),
         src_d = EXCLUDED.src_d,
         src_o = EXCLUDED.src_o
       RETURNING *
       `,
-      [
-        String(id_zvk).trim(),
-        (src_d ?? "").toString().trim(),
-        (src_o ?? "").toString().trim(),
-      ]
+      [rid, String(src_d || ""), String(src_o || "")]
     );
 
-    await client.query("COMMIT");
     res.json({ success: true, row: r.rows[0] });
   } catch (e) {
-    await client.query("ROLLBACK");
+    console.error("ZVK-STATUS-ROW ERROR:", e);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// =====================================================
+// (LEGACY) Старый источник по id_zvk — оставляем чтобы не ломать старые клиенты
+// Он берёт ПОСЛЕДНЮЮ строку истории в этом ZFT и сохраняет источник туда.
+// POST /upsert-zvk-src  { id_zvk, src_d, src_o }
+// =====================================================
+app.post("/upsert-zvk-src", async (req, res) => {
+  try {
+    const { id_zvk, src_d, src_o } = req.body;
+    if (!id_zvk) return res.status(400).json({ success: false, error: "id_zvk required" });
+
+    const zid = String(id_zvk).trim();
+
+    const lastRow = await pool.query(
+      `
+      SELECT id
+      FROM zvk
+      WHERE id_zvk = $1
+      ORDER BY zvk_date DESC NULLS LAST, id DESC
+      LIMIT 1
+      `,
+      [zid]
+    );
+
+    const rid = lastRow.rows[0]?.id;
+    if (!rid) return res.status(404).json({ success: false, error: "zvk row not found for id_zvk" });
+
+    const r = await pool.query(
+      `
+      INSERT INTO zvk_status (zvk_row_id, status_time, src_d, src_o)
+      VALUES ($1, NOW(), $2, $3)
+      ON CONFLICT (zvk_row_id)
+      DO UPDATE SET
+        status_time = NOW(),
+        src_d = EXCLUDED.src_d,
+        src_o = EXCLUDED.src_o
+      RETURNING *
+      `,
+      [Number(rid), String(src_d || ""), String(src_o || "")]
+    );
+
+    res.json({ success: true, row: r.rows[0], zvk_row_id: rid });
+  } catch (e) {
     console.error("UPSERT-ZVK-SRC ERROR:", e);
     res.status(500).json({ success: false, error: e.message });
-  } finally {
-    client.release();
   }
 });
 
@@ -321,7 +445,7 @@ app.post("/upsert-zvk-admin", async (req, res) => {
 });
 
 // =====================================================
-// JOIN: читаем из VIEW ft_zvk_full_v2
+// JOIN: читаем из VIEW ft_zvk_history_v2 (важно!)
 // =====================================================
 app.get("/ft-zvk-join", async (req, res) => {
   try {
@@ -329,55 +453,49 @@ app.get("/ft-zvk-join", async (req, res) => {
     const login = String(req.query.login || "").trim();
     const isAdmin = String(req.query.is_admin || "0") === "1";
 
-    let query = '';
+    let query = "";
     let params = [limit];
 
     if (isAdmin) {
-      // Админ видит всё
       query = `
         SELECT v.*
-        FROM ft_zvk_history_v1 v
+        FROM ft_zvk_history_v2 v
         ORDER BY
           COALESCE(NULLIF(substring(v.id_ft from '\\d+'), ''), '0')::int DESC,
-          v.zvk_date DESC NULLS LAST
+          v.zvk_date DESC NULLS LAST,
+          v.zvk_row_id DESC
         LIMIT $1
       `;
     } else {
-      // Обычный пользователь видит только свои записи
       query = `
         SELECT v.*
-        FROM ft_zvk_history_v1 v
+        FROM ft_zvk_history_v2 v
         WHERE v.input_name = $2
         ORDER BY
           COALESCE(NULLIF(substring(v.id_ft from '\\d+'), ''), '0')::int DESC,
-          v.zvk_date DESC NULLS LAST
+          v.zvk_date DESC NULLS LAST,
+          v.zvk_row_id DESC
         LIMIT $1
       `;
       params.push(login);
     }
 
     const r = await pool.query(query, params);
-    
-    res.json({ 
-      success: true, 
+
+    res.json({
+      success: true,
       rows: r.rows,
       count: r.rows.length,
-      isAdmin: isAdmin 
+      isAdmin: isAdmin,
     });
   } catch (e) {
     console.error("FT-ZVK-JOIN ERROR:", e);
-    res.status(500).json({ 
-      success: false, 
-      error: e.message 
-    });
+    res.status(500).json({ success: false, error: e.message });
   }
 });
 
 // =====================================================
-// SAVE FT (создать FT + авто баланс + авто ZFT1)
-// =====================================================
-// =====================================================
-// SAVE FT (создать FT + авто баланс + авто ZFT1)
+// SAVE FT (создать FT + авто ZFT1)
 // =====================================================
 app.post("/save-ft", async (req, res) => {
   try {
@@ -406,16 +524,10 @@ app.post("/save-ft", async (req, res) => {
     const idRow = await pool.query(`SELECT 'FT' || nextval('ft_id_seq')::text AS id_ft`);
     const id_ft = idRow.rows[0].id_ft;
 
-    // ✅ ИСПРАВЛЕНО: Правильная обработка дат
     let inputDateFormatted = input_date;
-    // Если пришла ISO строка, преобразуем в Date
-    if (input_date && typeof input_date === 'string') {
+    if (input_date && typeof input_date === "string") {
       inputDateFormatted = new Date(input_date);
     }
-
-    let invoiceDateFormatted = invoice_date;
-    // invoice_date приходит как YYYY-MM-DD из input type="date"
-    // PostgreSQL принимает этот формат напрямую
 
     // сохранить FT
     const r = await pool.query(
@@ -428,51 +540,33 @@ app.post("/save-ft", async (req, res) => {
       `,
       [
         id_ft,
-        inputDateFormatted,              // ✅ Date объект или ISO строка
+        inputDateFormatted,
         String(input_name).trim(),
         String(division).trim(),
         String(object).trim(),
         String(contractor).trim(),
         String(invoice_no).trim(),
-        invoiceDateFormatted,             // ✅ YYYY-MM-DD строка
+        invoice_date, // YYYY-MM-DD
         invoice_pdf ? String(invoice_pdf).trim() : "",
         sumNum
       ]
     );
 
-    // создаем ZFT1
+    // создаем ZFT1 и первую строку "СИСТЕМА"
+    const zftRow = await pool.query(`SELECT 'ZFT' || nextval('zvk_id_seq')::text AS id_zvk`);
+    const id_zvk = zftRow.rows[0].id_zvk;
+
     await pool.query(
       `
       INSERT INTO zvk (id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag)
-      VALUES ('ZFT' || nextval('zvk_id_seq')::text, $1, NOW(), 'СИСТЕМА', $2, 'Нет')
+      VALUES ($1, $2, NOW(), 'СИСТЕМА', $3, 'Нет')
       `,
-      [id_ft, sumNum]
+      [id_zvk, id_ft, sumNum]
     );
 
-    res.json({ success:true, id_ft: r.rows[0].id_ft });
+    res.json({ success:true, id_ft: r.rows[0].id_ft, id_zvk });
   } catch (e) {
     console.error("SAVE-FT ERROR:", e);
-    res.status(500).json({ success:false, error:e.message });
-  }
-});
-
-app.post("/zvk-status-row", async (req, res) => {
-  try {
-    const { zvk_row_id, src_d, src_o } = req.body;
-    if (!zvk_row_id)
-      return res.status(400).json({ success:false, error:"zvk_row_id required" });
-
-    const r = await pool.query(
-      `
-      INSERT INTO zvk_status (zvk_row_id, status_time, src_d, src_o)
-      VALUES ($1, NOW(), $2, $3)
-      RETURNING *
-      `,
-      [Number(zvk_row_id), String(src_d||""), String(src_o||"")]
-    );
-
-    res.json({ success:true, row: r.rows[0] });
-  } catch(e){
     res.status(500).json({ success:false, error:e.message });
   }
 });
