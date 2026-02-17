@@ -583,41 +583,60 @@ app.post("/zvk-pay-row", async (req, res) => {
     const adminOk =
       is_admin === true || is_admin === 1 || is_admin === "1" ||
       String(is_admin).toLowerCase() === "true";
-    if (!adminOk) return res.status(403).json({ success:false, error:"only admin allowed" });
 
-    if (!zvk_row_id) return res.status(400).json({ success:false, error:"zvk_row_id required" });
+    if (!adminOk)
+      return res.status(403).json({ success:false, error:"only admin allowed" });
+
+    if (!zvk_row_id)
+      return res.status(400).json({ success:false, error:"zvk_row_id required" });
 
     await client.query("BEGIN");
 
-    // если оплатили "Да" -> ставим pay_time NOW(), иначе NULL
     const r = await client.query(
       `
-      INSERT INTO zvk_pay (zvk_row_id, is_paid, pay_time, registry_flag)
+      INSERT INTO zvk_pay (zvk_row_id, registry_flag, is_paid, pay_time, agree_time)
       VALUES (
         $1,
         $2,
-        CASE WHEN $2 = 'Да' THEN NOW() ELSE NULL END,
-        $3
+        $3,
+        CASE WHEN $3 = 'Да' THEN NOW() ELSE NULL END,
+        CASE WHEN $2 IN ('Да','Обнуление') THEN NOW() ELSE NULL END
       )
       ON CONFLICT (zvk_row_id)
       DO UPDATE SET
-        is_paid = EXCLUDED.is_paid,
+
         registry_flag = EXCLUDED.registry_flag,
+
+        agree_time = CASE
+          WHEN EXCLUDED.registry_flag IN ('Да','Обнуление')
+            THEN COALESCE(zvk_pay.agree_time, NOW())   -- ставим один раз
+          WHEN EXCLUDED.registry_flag = 'Нет'
+            THEN NULL                                  -- очистка
+          ELSE zvk_pay.agree_time
+        END,
+
+        is_paid = EXCLUDED.is_paid,
+
         pay_time = CASE
-          WHEN EXCLUDED.is_paid = 'Да' THEN COALESCE(zvk_pay.pay_time, NOW())
-          ELSE NULL
+          WHEN EXCLUDED.is_paid = 'Да'
+            THEN COALESCE(zvk_pay.pay_time, NOW())
+          WHEN EXCLUDED.is_paid <> 'Да'
+            THEN NULL
+          ELSE zvk_pay.pay_time
         END
-      RETURNING *
+
+      RETURNING *;
       `,
       [
         Number(zvk_row_id),
-        is_paid ? String(is_paid).trim() : null,
         registry_flag ? String(registry_flag).trim() : null,
+        is_paid ? String(is_paid).trim() : null,
       ]
     );
 
     await client.query("COMMIT");
     res.json({ success:true, row: r.rows[0] });
+
   } catch (e) {
     await client.query("ROLLBACK");
     res.status(500).json({ success:false, error: e.message });
