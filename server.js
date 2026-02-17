@@ -455,6 +455,28 @@ app.post("/save-ft", async (req, res) => {
     res.status(500).json({ success:false, error:e.message });
   }
 });
+
+app.post("/zvk-status-row", async (req, res) => {
+  try {
+    const { zvk_row_id, src_d, src_o } = req.body;
+    if (!zvk_row_id)
+      return res.status(400).json({ success:false, error:"zvk_row_id required" });
+
+    const r = await pool.query(
+      `
+      INSERT INTO zvk_status (zvk_row_id, status_time, src_d, src_o)
+      VALUES ($1, NOW(), $2, $3)
+      RETURNING *
+      `,
+      [Number(zvk_row_id), String(src_d||""), String(src_o||"")]
+    );
+
+    res.json({ success:true, row: r.rows[0] });
+  } catch(e){
+    res.status(500).json({ success:false, error:e.message });
+  }
+});
+
 // ===============================
 // Start
 // ===============================
