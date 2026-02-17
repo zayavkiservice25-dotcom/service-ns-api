@@ -52,8 +52,6 @@ async function initDb() {
   `);
 
   // ZVK/ZFT (история)
-  // ⚠️ НЕ создаём тут PRIMARY KEY на id_zvk.
-  // Если таблица уже существует со старым PK — миграцию делай вручную (см. комментарий вверху).
   await pool.query(`
     CREATE TABLE IF NOT EXISTS zvk (
       id_zvk text,
@@ -323,31 +321,60 @@ app.post("/upsert-zvk-admin", async (req, res) => {
 });
 
 // =====================================================
-// JOIN: читаем из VIEW ft_zvk_full
-// Важно: сортировка безопасная через substring(... '\d+')
+// JOIN: читаем из VIEW ft_zvk_full_v2
 // =====================================================
 app.get("/ft-zvk-join", async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit || 500), 500);
+    const login = String(req.query.login || "").trim();
+    const isAdmin = String(req.query.is_admin || "0") === "1";
 
-    const q = `
-      SELECT v.*
-      FROM ft_zvk_full v
-      ORDER BY
-        COALESCE(NULLIF(substring(v.id_ft from '\\d+'), ''), '0')::int DESC,
-        v.zvk_date DESC NULLS LAST
-      LIMIT $1
-    `;
+    let query = '';
+    let params = [limit];
 
-    const r = await pool.query(q, [limit]);
-    res.json({ success: true, rows: r.rows });
+    if (isAdmin) {
+      // Админ видит всё
+      query = `
+        SELECT v.*
+        FROM ft_zvk_full_v2 v
+        ORDER BY
+          COALESCE(NULLIF(substring(v.id_ft from '\\d+'), ''), '0')::int DESC,
+          v.zvk_date DESC NULLS LAST
+        LIMIT $1
+      `;
+    } else {
+      // Обычный пользователь видит только свои записи
+      query = `
+        SELECT v.*
+        FROM ft_zvk_full_v2 v
+        WHERE v.input_name = $2
+        ORDER BY
+          COALESCE(NULLIF(substring(v.id_ft from '\\d+'), ''), '0')::int DESC,
+          v.zvk_date DESC NULLS LAST
+        LIMIT $1
+      `;
+      params.push(login);
+    }
+
+    const r = await pool.query(query, params);
+    
+    res.json({ 
+      success: true, 
+      rows: r.rows,
+      count: r.rows.length,
+      isAdmin: isAdmin 
+    });
   } catch (e) {
     console.error("FT-ZVK-JOIN ERROR:", e);
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ 
+      success: false, 
+      error: e.message 
+    });
   }
 });
+
 // =====================================================
-// SAVE FT (создать FT + авто баланс + авто ZFT1 через триггер или отдельно)
+// SAVE FT (создать FT + авто баланс + авто ZFT1)
 // =====================================================
 app.post("/save-ft", async (req, res) => {
   try {
@@ -393,15 +420,13 @@ app.post("/save-ft", async (req, res) => {
         String(object).trim(),
         String(contractor).trim(),
         String(invoice_no).trim(),
-        String(invoice_date).trim(),  // приходит "dd.mm.yyyy"
+        String(invoice_date).trim(),
         invoice_pdf ? String(invoice_pdf).trim() : "",
         sumNum
       ]
     );
 
-
-
-    // ✅ если у тебя НЕТ триггера на авто ZFT1 — создадим ZFT1 тут
+    // создаем ZFT1
     await pool.query(
       `
       INSERT INTO zvk (id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag)
