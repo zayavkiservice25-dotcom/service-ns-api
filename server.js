@@ -107,7 +107,7 @@ async function initDb() {
 
   // ✅ VIEW: история + источник + оплата ПО СТРОКЕ (НЕ ТРОГАЕМ — это история)
   await pool.query(`
-    CREATE OR REPLACE VIEW ft_zvk_history_v2 AS
+    CREATE OR REPLACE VIEW ft_zvk_current_v1 AS
     SELECT
       f.id_ft,
       f.input_date,
@@ -490,7 +490,7 @@ app.post("/zvk-pay-row", async (req, res) => {
   }
 });
 // =====================================================
-// JOIN: читаем из VIEW ft_zvk_history_v2
+// JOIN: читаем из VIEW ft_zvk_current_v1
 // =====================================================
 app.get("/ft-zvk-join", async (req, res) => {
   try {
