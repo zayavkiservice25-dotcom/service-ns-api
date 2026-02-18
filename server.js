@@ -105,7 +105,7 @@ async function initDb() {
   await pool.query(`CREATE INDEX IF NOT EXISTS zvk_status_row_idx ON zvk_status (zvk_row_id);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS zvk_pay_row_idx ON zvk_pay (zvk_row_id);`);
 
-  // ✅ VIEW: история + источник + оплата ПО СТРОКЕ
+  // ✅ VIEW: история + источник + оплата ПО СТРОКЕ (НЕ ТРОГАЕМ — это история)
   await pool.query(`
     CREATE OR REPLACE VIEW ft_zvk_history_v2 AS
     SELECT
@@ -151,7 +151,26 @@ async function initDb() {
     LEFT JOIN zvk_pay p ON p.zvk_row_id = z.id;
   `);
 
-  console.log("DB init OK ✅ (tables + migrations + view ft_zvk_history_v2)");
+  // ✅ VIEW: ТЕКУЩЕЕ СОСТОЯНИЕ (последняя строка по каждому ZFT)
+  // ✅ + скрываем стартовую "СИСТЕМА/Нет"
+  await pool.query(`
+    CREATE OR REPLACE VIEW ft_zvk_current_v1 AS
+    WITH ranked AS (
+      SELECT
+        v.*,
+        ROW_NUMBER() OVER (
+          PARTITION BY v.id_ft, v.id_zvk
+          ORDER BY v.zvk_date DESC NULLS LAST, v.zvk_row_id DESC
+        ) AS rn
+      FROM ft_zvk_current_v1 v
+    )
+    SELECT *
+    FROM ranked
+    WHERE rn = 1
+      AND NOT (zvk_name = 'СИСТЕМА' AND COALESCE(request_flag,'') = 'Нет');
+  `);
+
+  console.log("DB init OK ✅ (tables + migrations + views history_v2 + current_v1)");
 }
 
 initDb().catch((e) => console.error("DB init error:", e));
@@ -485,7 +504,7 @@ app.get("/ft-zvk-join", async (req, res) => {
     if (isAdmin) {
       query = `
         SELECT v.*
-        FROM ft_zvk_history_v2 v
+        FROM ft_zvk_current_v1 v
         ORDER BY
           COALESCE(NULLIF(substring(v.id_ft from '\\d+'), ''), '0')::int DESC,
           v.zvk_date DESC NULLS LAST,
@@ -495,7 +514,7 @@ app.get("/ft-zvk-join", async (req, res) => {
     } else {
       query = `
         SELECT v.*
-        FROM ft_zvk_history_v2 v
+        FROM ft_zvk_current_v1 v
         WHERE v.input_name = $2
         ORDER BY
           COALESCE(NULLIF(substring(v.id_ft from '\\d+'), ''), '0')::int DESC,
