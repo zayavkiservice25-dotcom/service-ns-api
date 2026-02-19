@@ -1,9 +1,9 @@
-// server.js (FULL) — Service-NS API 🚀 (FIXED)
-// ✅ Источник + оплата теперь ХРАНЯТСЯ ПО СТРОКЕ ИСТОРИИ (zvk_row_id = zvk.id)
-// ✅ VIEW читает zvk_status + zvk_pay по zvk_row_id
-// ✅ Логика циклов ZFT (id_zvk): пока pay по ПОСЛЕДНЕЙ строке != 'Да' → пишем в тот же id_zvk
-// ✅ Когда pay по ПОСЛЕДНЕЙ строке = 'Да' → следующий save создаст новый ZFT (ZFT2, ZFT3...)
-// ✅ Авто-миграции: IF NOT EXISTS, DROP CONSTRAINT IF EXISTS
+// server.js — Service-NS API 🚀 (FULL, FIXED)
+// ✅ Источник + оплата ХРАНЯТСЯ ПО СТРОКЕ ИСТОРИИ (zvk_row_id = zvk.id)
+// ✅ VIEW history + VIEW current (без рекурсии)
+// ✅ Логика циклов ZFT (id_zvk): пока ПОСЛЕДНЯЯ строка НЕ оплачена -> пишем в тот же id_zvk
+// ✅ Когда ПОСЛЕДНЯЯ строка оплачена -> следующий save создаст новый ZFT
+// ✅ Автосоздание следующего ZFT (СИСТЕМА) при оплате: Реестр=Да/Обнуление + Оплачено=Да
 
 require("dotenv").config();
 
@@ -45,7 +45,7 @@ async function initDb() {
     );
   `);
 
-  // ZVK история (строки)
+  // ZVK (история строк)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS zvk (
       id_zvk text,
@@ -57,12 +57,12 @@ async function initDb() {
     );
   `);
 
-  // ✅ гарантируем технический PK id в zvk
+  // ✅ технический PK id
   await pool.query(`ALTER TABLE zvk ADD COLUMN IF NOT EXISTS id bigserial;`);
   await pool.query(`ALTER TABLE zvk DROP CONSTRAINT IF EXISTS zvk_pkey;`);
   await pool.query(`ALTER TABLE zvk ADD CONSTRAINT zvk_pkey PRIMARY KEY (id);`);
 
-  // ✅ Источник/статус ПО СТРОКЕ (zvk_row_id = zvk.id)
+  // ✅ Источник по строке истории (zvk_row_id UNIQUE)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS zvk_status (
       zvk_row_id bigint,
@@ -72,13 +72,12 @@ async function initDb() {
     );
   `);
 
-  // уникальность по строке
   await pool.query(`
     CREATE UNIQUE INDEX IF NOT EXISTS zvk_status_row_uq
     ON zvk_status (zvk_row_id);
   `);
 
-  // ✅ Оплата ПО СТРОКЕ (zvk_row_id UNIQUE / PK)
+  // ✅ Оплата по строке истории (zvk_row_id PK)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS zvk_pay (
       zvk_row_id bigint PRIMARY KEY,
@@ -89,7 +88,7 @@ async function initDb() {
     );
   `);
 
-  // (опционально) согласование по id_zvk (если нужно отдельно)
+  // (опционально) согласование по id_zvk
   await pool.query(`
     CREATE TABLE IF NOT EXISTS zvk_agree (
       id_zvk text PRIMARY KEY,
@@ -105,9 +104,9 @@ async function initDb() {
   await pool.query(`CREATE INDEX IF NOT EXISTS zvk_status_row_idx ON zvk_status (zvk_row_id);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS zvk_pay_row_idx ON zvk_pay (zvk_row_id);`);
 
-  // ✅ VIEW: история + источник + оплата ПО СТРОКЕ (НЕ ТРОГАЕМ — это история)
+  // ✅ VIEW: ИСТОРИЯ
   await pool.query(`
-    CREATE OR REPLACE VIEW ft_zvk_current_v1 AS
+    CREATE OR REPLACE VIEW ft_zvk_history_v1 AS
     SELECT
       f.id_ft,
       f.input_date,
@@ -151,8 +150,8 @@ async function initDb() {
     LEFT JOIN zvk_pay p ON p.zvk_row_id = z.id;
   `);
 
-  // ✅ VIEW: ТЕКУЩЕЕ СОСТОЯНИЕ (последняя строка по каждому ZFT)
-  // ✅ + скрываем стартовую "СИСТЕМА/Нет"
+  // ✅ VIEW: ТЕКУЩЕЕ (последняя строка по каждому ZFT)
+  // ✅ и скрываем стартовую "СИСТЕМА/Нет"
   await pool.query(`
     CREATE OR REPLACE VIEW ft_zvk_current_v1 AS
     WITH ranked AS (
@@ -162,7 +161,7 @@ async function initDb() {
           PARTITION BY v.id_ft, v.id_zvk
           ORDER BY v.zvk_date DESC NULLS LAST, v.zvk_row_id DESC
         ) AS rn
-      FROM ft_zvk_current_v1 v
+      FROM ft_zvk_history_v1 v
     )
     SELECT *
     FROM ranked
@@ -170,7 +169,7 @@ async function initDb() {
       AND NOT (zvk_name = 'СИСТЕМА' AND COALESCE(request_flag,'') = 'Нет');
   `);
 
-  console.log("DB init OK ✅ (tables + migrations + views history_v2 + current_v1)");
+  console.log("DB init OK ✅ (tables + migrations + views history_v1 + current_v1)");
 }
 
 initDb().catch((e) => console.error("DB init error:", e));
@@ -178,7 +177,7 @@ initDb().catch((e) => console.error("DB init error:", e));
 // =====================================================
 // Health
 // =====================================================
-app.get("/", (req, res) => res.send("Service-NS API работает 🚀 v-history-rowid-pay-1"));
+app.get("/", (req, res) => res.send("Service-NS API работает 🚀 v-fixed-full-1"));
 
 app.get("/db-ping", async (req, res) => {
   try {
@@ -287,7 +286,7 @@ app.post("/zvk-save", async (req, res) => {
       }
     }
 
-    // 3) если цикла нет — создаём новый id_zvk и первую строку "СИСТЕМА/Нет/sum_ft"
+    // 3) если цикла нет — создаём новый id_zvk и стартовую строку "СИСТЕМА/Нет/sum_ft"
     if (!id_zvk) {
       const created = await pool.query(`SELECT 'ZFT' || nextval('zvk_id_seq')::text AS id_zvk`);
       id_zvk = created.rows[0].id_zvk;
@@ -362,65 +361,14 @@ app.post("/zvk-status-row", async (req, res) => {
 });
 
 // =====================================================
-// LEGACY: источник по id_zvk (берёт последнюю строку цикла)
-// POST /upsert-zvk-src  { id_zvk, src_d, src_o }
-// =====================================================
-app.post("/upsert-zvk-src", async (req, res) => {
-  try {
-    const { id_zvk, src_d, src_o } = req.body;
-    if (!id_zvk) return res.status(400).json({ success: false, error: "id_zvk required" });
-
-    const zid = String(id_zvk).trim();
-
-    const lastRow = await pool.query(
-      `
-      SELECT id
-      FROM zvk
-      WHERE id_zvk = $1
-      ORDER BY zvk_date DESC NULLS LAST, id DESC
-      LIMIT 1
-      `,
-      [zid]
-    );
-
-    const rid = lastRow.rows[0]?.id;
-    if (!rid) return res.status(404).json({ success: false, error: "zvk row not found for id_zvk" });
-
-    const r = await pool.query(
-      `
-      INSERT INTO zvk_status (zvk_row_id, status_time, src_d, src_o)
-      VALUES ($1, NOW(), $2, $3)
-      ON CONFLICT (zvk_row_id)
-      DO UPDATE SET
-        status_time = NOW(),
-        src_d = EXCLUDED.src_d,
-        src_o = EXCLUDED.src_o
-      RETURNING *
-      `,
-      [Number(rid), String(src_d || ""), String(src_o || "")]
-    );
-
-    res.json({ success: true, row: r.rows[0], zvk_row_id: rid });
-  } catch (e) {
-    console.error("UPSERT-ZVK-SRC ERROR:", e);
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// =====================================================
 // ✅ Оплата/Реестр — ПО СТРОКЕ истории (zvk_row_id)
 // POST /zvk-pay-row  { is_admin, zvk_row_id, registry_flag, is_paid }
+// ✅ + авто-создание следующего ZFT (СИСТЕМА)
 // =====================================================
 app.post("/zvk-pay-row", async (req, res) => {
   const client = await pool.connect();
   try {
     const { is_admin, zvk_row_id, registry_flag, is_paid } = req.body;
-
-    console.log("=== ZVK-PAY-ROW CALLED ===");
-    console.log("is_admin:", is_admin);
-    console.log("zvk_row_id:", zvk_row_id);
-    console.log("registry_flag:", registry_flag);
-    console.log("is_paid:", is_paid);
 
     const adminOk =
       is_admin === true || is_admin === 1 || is_admin === "1" ||
@@ -446,7 +394,6 @@ app.post("/zvk-pay-row", async (req, res) => {
       )
       ON CONFLICT (zvk_row_id)
       DO UPDATE SET
-
         registry_flag = EXCLUDED.registry_flag,
 
         agree_time = CASE
@@ -466,7 +413,6 @@ app.post("/zvk-pay-row", async (req, res) => {
             THEN NULL
           ELSE zvk_pay.pay_time
         END
-
       RETURNING *;
       `,
       [
@@ -476,7 +422,92 @@ app.post("/zvk-pay-row", async (req, res) => {
       ]
     );
 
-    console.log("ZVK-PAY-ROW result:", r.rows[0]);
+    // ===============================
+    // ✅ АВТО-СОЗДАНИЕ СЛЕДУЮЩЕГО ZFT (СИСТЕМА)
+    // Когда: Реестр=Да/Обнуление и Оплачено=Да
+    // ===============================
+    const reg = (registry_flag ? String(registry_flag).trim() : "");
+    const paid = (is_paid ? String(is_paid).trim() : "");
+
+    if (paid === "Да" && (reg === "Да" || reg === "Обнуление")) {
+
+      // строка zvk, которую оплатили
+      const zr = await client.query(
+        `SELECT id, id_ft, id_zvk, to_pay
+         FROM zvk
+         WHERE id = $1
+         LIMIT 1`,
+        [Number(zvk_row_id)]
+      );
+
+      const zrow = zr.rows[0];
+
+      if (zrow) {
+        const ft = String(zrow.id_ft);
+        const paidToPay = Number(zrow.to_pay || 0);
+
+        const fr = await client.query(`SELECT sum_ft FROM ft WHERE id_ft=$1`, [ft]);
+        const sumFt = Number(fr.rows[0]?.sum_ft || 0);
+
+        // остаток
+        let remaining = 0;
+        if (reg === "Обнуление") {
+          remaining = 0; // обнуление
+        } else {
+          remaining = Math.max(sumFt - paidToPay, 0);
+        }
+
+        // создаем новый ZFT только если остаток > 0
+        if (remaining > 0) {
+
+          // защита от дубля
+          const already = await client.query(
+            `
+            SELECT 1
+            FROM zvk z
+            WHERE z.id_ft = $1
+              AND z.zvk_name = 'СИСТЕМА'
+              AND COALESCE(z.request_flag,'') = 'Нет'
+              AND z.to_pay = $2
+              AND z.id_zvk <> $3
+            ORDER BY z.id DESC
+            LIMIT 1
+            `,
+            [ft, remaining, String(zrow.id_zvk)]
+          );
+
+          if (already.rowCount === 0) {
+            const created = await client.query(
+              `SELECT 'ZFT' || nextval('zvk_id_seq')::text AS id_zvk`
+            );
+            const newIdZvk = created.rows[0].id_zvk;
+
+            const ins = await client.query(
+              `
+              INSERT INTO zvk (id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag)
+              VALUES ($1, $2, NOW(), 'СИСТЕМА', $3, 'Нет')
+              RETURNING id
+              `,
+              [newIdZvk, ft, remaining]
+            );
+
+            const newRowId = ins.rows[0]?.id;
+
+            // чтобы в UI не было пусто по оплате
+            if (newRowId) {
+              await client.query(
+                `
+                INSERT INTO zvk_pay (zvk_row_id, registry_flag, is_paid, pay_time, agree_time)
+                VALUES ($1, NULL, 'Нет', NULL, NULL)
+                ON CONFLICT (zvk_row_id) DO NOTHING
+                `,
+                [Number(newRowId)]
+              );
+            }
+          }
+        }
+      }
+    }
 
     await client.query("COMMIT");
     res.json({ success:true, row: r.rows[0] });
@@ -489,6 +520,7 @@ app.post("/zvk-pay-row", async (req, res) => {
     client.release();
   }
 });
+
 // =====================================================
 // JOIN: читаем из VIEW ft_zvk_current_v1
 // =====================================================
@@ -540,7 +572,7 @@ app.get("/ft-zvk-join", async (req, res) => {
 });
 
 // =====================================================
-// SAVE FT (создать FT + авто ZFT1 + строка СИСТЕМА)
+// SAVE FT (создать FT + авто ZFT + строка СИСТЕМА)
 // =====================================================
 app.post("/save-ft", async (req, res) => {
   try {
