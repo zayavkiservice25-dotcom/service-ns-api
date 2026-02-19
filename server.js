@@ -561,7 +561,7 @@ app.get("/ft-zvk-join", async (req, res) => {
       query = `
         SELECT v.*
         FROM ft_zvk_current_v1 v
-        WHERE v.input_name = $2
+       WHERE lower(trim(v.input_name)) = lower(trim($2))
         ORDER BY
           COALESCE(NULLIF(substring(v.id_ft from '\\d+'), ''), '0')::int DESC,
           v.zvk_date DESC NULLS LAST,
