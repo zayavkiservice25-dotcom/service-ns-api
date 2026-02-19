@@ -446,16 +446,30 @@ app.post("/zvk-pay-row", async (req, res) => {
         const ft = String(zrow.id_ft);
         const paidToPay = Number(zrow.to_pay || 0);
 
-        const fr = await client.query(`SELECT sum_ft FROM ft WHERE id_ft=$1`, [ft]);
-        const sumFt = Number(fr.rows[0]?.sum_ft || 0);
+        // ✅ берём баланс из последней строки "СИСТЕМА" текущего цикла (id_zvk)
+const baseRow = await client.query(
+  `
+  SELECT z.to_pay
+  FROM zvk z
+  WHERE z.id_ft = $1
+    AND z.id_zvk = $2
+    AND z.zvk_name = 'СИСТЕМА'
+  ORDER BY z.id DESC
+  LIMIT 1
+  `,
+  [ft, String(zrow.id_zvk)]
+);
 
-        // остаток
-        let remaining = 0;
-        if (reg === "Обнуление") {
-          remaining = 0; // обнуление
-        } else {
-          remaining = Math.max(sumFt - paidToPay, 0);
-        }
+const baseBalance = Number(baseRow.rows[0]?.to_pay || 0);
+
+// остаток считаем от baseBalance, а не от sum_ft
+let remaining = 0;
+if (reg === "Обнуление") {
+  remaining = 0;
+} else {
+  remaining = Math.max(baseBalance - paidToPay, 0);
+}
+
 
         // создаем новый ZFT только если остаток > 0
         if (remaining > 0) {
