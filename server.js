@@ -1,9 +1,11 @@
-// server.js — Service-NS API 🚀 (FULL, FIXED)
+// server.js — Service-NS API 🚀 (FULL, FIXED v2)
 // ✅ Источник + оплата ХРАНЯТСЯ ПО СТРОКЕ ИСТОРИИ (zvk_row_id = zvk.id)
 // ✅ VIEW history + VIEW current (без рекурсии)
 // ✅ Логика циклов ZFT (id_zvk): пока ПОСЛЕДНЯЯ строка НЕ оплачена -> пишем в тот же id_zvk
 // ✅ Когда ПОСЛЕДНЯЯ строка оплачена -> следующий save создаст новый ZFT
 // ✅ Автосоздание следующего ZFT (СИСТЕМА) при оплате: Реестр=Да/Обнуление + Оплачено=Да
+// ✅ FIX: авто-строка "СИСТЕМА" создаётся с is_paid = NULL (пусто), а НЕ "Нет"
+// ✅ FIX: agree_time/pay_time ставим аккуратно (не ломаем прежние значения)
 
 require("dotenv").config();
 
@@ -177,7 +179,7 @@ initDb().catch((e) => console.error("DB init error:", e));
 // =====================================================
 // Health
 // =====================================================
-app.get("/", (req, res) => res.send("Service-NS API работает 🚀 v-fixed-full-1"));
+app.get("/", (req, res) => res.send("Service-NS API работает 🚀 v-fixed-full-2"));
 
 app.get("/db-ping", async (req, res) => {
   try {
@@ -364,6 +366,7 @@ app.post("/zvk-status-row", async (req, res) => {
 // ✅ Оплата/Реестр — ПО СТРОКЕ истории (zvk_row_id)
 // POST /zvk-pay-row  { is_admin, zvk_row_id, registry_flag, is_paid }
 // ✅ + авто-создание следующего ZFT (СИСТЕМА)
+// ✅ FIX: авто-строка СИСТЕМА создаётся с is_paid=NULL (пусто), а НЕ "Нет"
 // =====================================================
 app.post("/zvk-pay-row", async (req, res) => {
   const client = await pool.connect();
@@ -422,16 +425,15 @@ app.post("/zvk-pay-row", async (req, res) => {
       ]
     );
 
+    const reg = (registry_flag ? String(registry_flag).trim() : "");
+    const paid = (is_paid ? String(is_paid).trim() : "");
+
     // ===============================
     // ✅ АВТО-СОЗДАНИЕ СЛЕДУЮЩЕГО ZFT (СИСТЕМА)
     // Когда: Реестр=Да/Обнуление и Оплачено=Да
     // ===============================
-    const reg = (registry_flag ? String(registry_flag).trim() : "");
-    const paid = (is_paid ? String(is_paid).trim() : "");
-
     if (paid === "Да" && (reg === "Да" || reg === "Обнуление")) {
 
-      // строка zvk, которую оплатили
       const zr = await client.query(
         `SELECT id, id_ft, id_zvk, to_pay
          FROM zvk
@@ -447,29 +449,24 @@ app.post("/zvk-pay-row", async (req, res) => {
         const paidToPay = Number(zrow.to_pay || 0);
 
         // ✅ берём баланс из последней строки "СИСТЕМА" текущего цикла (id_zvk)
-const baseRow = await client.query(
-  `
-  SELECT z.to_pay
-  FROM zvk z
-  WHERE z.id_ft = $1
-    AND z.id_zvk = $2
-    AND z.zvk_name = 'СИСТЕМА'
-  ORDER BY z.id DESC
-  LIMIT 1
-  `,
-  [ft, String(zrow.id_zvk)]
-);
+        const baseRow = await client.query(
+          `
+          SELECT z.to_pay
+          FROM zvk z
+          WHERE z.id_ft = $1
+            AND z.id_zvk = $2
+            AND z.zvk_name = 'СИСТЕМА'
+          ORDER BY z.id DESC
+          LIMIT 1
+          `,
+          [ft, String(zrow.id_zvk)]
+        );
 
-const baseBalance = Number(baseRow.rows[0]?.to_pay || 0);
+        const baseBalance = Number(baseRow.rows[0]?.to_pay || 0);
 
-// остаток считаем от baseBalance, а не от sum_ft
-let remaining = 0;
-if (reg === "Обнуление") {
-  remaining = 0;
-} else {
-  remaining = Math.max(baseBalance - paidToPay, 0);
-}
-
+        let remaining = 0;
+        if (reg === "Обнуление") remaining = 0;
+        else remaining = Math.max(baseBalance - paidToPay, 0);
 
         // создаем новый ZFT только если остаток > 0
         if (remaining > 0) {
@@ -507,12 +504,12 @@ if (reg === "Обнуление") {
 
             const newRowId = ins.rows[0]?.id;
 
-            // чтобы в UI не было пусто по оплате
+            // ✅ FIX: не ставим is_paid='Нет' для СИСТЕМА (пусть будет ПУСТО)
             if (newRowId) {
               await client.query(
                 `
                 INSERT INTO zvk_pay (zvk_row_id, registry_flag, is_paid, pay_time, agree_time)
-                VALUES ($1, NULL, 'Нет', NULL, NULL)
+                VALUES ($1, NULL, NULL, NULL, NULL)
                 ON CONFLICT (zvk_row_id) DO NOTHING
                 `,
                 [Number(newRowId)]
@@ -561,7 +558,7 @@ app.get("/ft-zvk-join", async (req, res) => {
       query = `
         SELECT v.*
         FROM ft_zvk_current_v1 v
-       WHERE lower(trim(v.input_name)) = lower(trim($2))
+        WHERE lower(trim(v.input_name)) = lower(trim($2))
         ORDER BY
           COALESCE(NULLIF(substring(v.id_ft from '\\d+'), ''), '0')::int DESC,
           v.zvk_date DESC NULLS LAST,
