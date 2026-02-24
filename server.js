@@ -669,9 +669,8 @@ app.post("/io-save", async (req, res) => {
     let insPrihod = 0, insPerevod = 0;
 
     for (const r of rows) {
-      const dt = r.date ? new Date(r.date) : null;
       const sum = toNum(r.sum);
-      if (!dt || sum === null) continue;
+      if (sum === null) continue;
 
       const obj    = r.object || null;
       const divIn  = r.div_in || null;
@@ -679,19 +678,19 @@ app.post("/io-save", async (req, res) => {
       const divOut = r.div_out || null;
       const ddsOut = r.dds_out || null;
 
-      // prihod6
+      // prihod6 (doc_time сам = NOW())
       await client.query(
-        `INSERT INTO public.prihod6 (doc_time, amount_in, object_name, division_in, dds_in)
-         VALUES ($1,$2,$3,$4,$5)`,
-        [dt, sum, obj, divIn, ddsIn]
+        `INSERT INTO public.prihod6 (amount_in, object_name, division_in, dds_in)
+         VALUES ($1,$2,$3,$4)`,
+        [sum, obj, divIn, ddsIn]
       );
       insPrihod++;
 
-      // perevod7
+      // perevod7 (doc_time сам = NOW())
       await client.query(
-        `INSERT INTO public.perevod7 (doc_time, amount_out, object_name, division_out, dds_out)
-         VALUES ($1,$2,$3,$4,$5)`,
-        [dt, sum, obj, divOut, ddsOut]
+        `INSERT INTO public.perevod7 (amount_out, object_name, division_out, dds_out)
+         VALUES ($1,$2,$3,$4)`,
+        [sum, obj, divOut, ddsOut]
       );
       insPerevod++;
     }
