@@ -1,22 +1,18 @@
-// server.js — Service-NS API 🚀 (FULL, FIXED v2)
-// ✅ Источник + оплата ХРАНЯТСЯ ПО СТРОКЕ ИСТОРИИ (zvk_row_id = zvk.id)
-// ✅ VIEW history + VIEW current (без рекурсии)
-// ✅ Логика циклов ZFT (id_zvk): пока ПОСЛЕДНЯЯ строка НЕ оплачена -> пишем в тот же id_zvk
-// ✅ Когда ПОСЛЕДНЯЯ строка оплачена -> следующий save создаст новый ZFT
-// ✅ Автосоздание следующего ZFT (СИСТЕМА) при оплате: Реестр=Да/Обнуление + Оплачено=Да
-// ✅ FIX: авто-строка "СИСТЕМА" создаётся с is_paid = NULL (пусто), а НЕ "Нет"
-// ✅ FIX: agree_time/pay_time ставим аккуратно (не ломаем прежние значения)
-
 require("dotenv").config();
 
 const express = require("express");
 const cors = require("cors");
+const path = require("path");      // ✅ ДОБАВЬ
 const { Pool } = require("pg");
 
 const app = express();
+
 app.use(cors());
 app.use(express.json());
 app.options(/.*/, cors());
+
+// 🔥 СТАТИКА (гарантированный путь)
+app.use("/public", express.static(process.cwd() + "/public"));
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
