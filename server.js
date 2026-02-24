@@ -652,6 +652,61 @@ app.post("/save-ft", async (req, res) => {
   }
 });
 
+app.post("/io-save", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+    if (!rows.length) return res.status(400).json({ success:false, error:"rows required" });
+
+    const toNum = (v) => {
+      if (v === null || v === undefined || v === "") return null;
+      const n = Number(String(v).replace(/\s/g,"").replace(",", "."));
+      return Number.isFinite(n) ? n : null;
+    };
+
+    await client.query("BEGIN");
+
+    let insPrihod = 0, insPerevod = 0;
+
+    for (const r of rows) {
+      const dt = r.date ? new Date(r.date) : null;
+      const sum = toNum(r.sum);
+      if (!dt || sum === null) continue;
+
+      const obj    = r.object || null;
+      const divIn  = r.div_in || null;
+      const ddsIn  = r.dds_in || null;
+      const divOut = r.div_out || null;
+      const ddsOut = r.dds_out || null;
+
+      // prihod6
+      await client.query(
+        `INSERT INTO public.prihod6 (doc_time, amount_in, object_name, division_in, dds_in)
+         VALUES ($1,$2,$3,$4,$5)`,
+        [dt, sum, obj, divIn, ddsIn]
+      );
+      insPrihod++;
+
+      // perevod7
+      await client.query(
+        `INSERT INTO public.perevod7 (doc_time, amount_out, object_name, division_out, dds_out)
+         VALUES ($1,$2,$3,$4,$5)`,
+        [dt, sum, obj, divOut, ddsOut]
+      );
+      insPerevod++;
+    }
+
+    await client.query("COMMIT");
+    res.json({ success:true, inserted:{ prihod6: insPrihod, perevod7: insPerevod } });
+
+  } catch (e) {
+    await client.query("ROLLBACK");
+    res.status(500).json({ success:false, error:e.message });
+  } finally {
+    client.release();
+  }
+});
+
 // ===============================
 // Start
 // ===============================
