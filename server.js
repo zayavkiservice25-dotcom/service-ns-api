@@ -169,8 +169,17 @@ async function initDb() {
     WHERE rn = 1
       AND NOT (zvk_name = 'СИСТЕМА' AND COALESCE(request_flag,'') = 'Нет');
   `);
+// ✅ Таблица для данных от 1С
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS data_from_1c (
+    id SERIAL PRIMARY KEY,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    raw_data JSONB NOT NULL
+  );
+`);
 
-  console.log("DB init OK ✅ (tables + migrations + views history_v1 + current_v1)");
+
+  console.log("DB init OK ✅ (tables + migrations + views history_v1 + current_v1 + data_from_1c)");
 }
 
 initDb().catch((e) => console.error("DB init error:", e));
@@ -733,8 +742,96 @@ app.get("/division-svod", async (req, res) => {
   }
 });
 
-// ===============================
+// =====================================================
+// ✅ НОВЫЕ ЭНДПОИНТЫ ДЛЯ 1С
+// =====================================================
+
+// Эндпоинт для приема любых JSON данных от 1С
+app.post('/from-1c', async (req, res) => {
+    try {
+        // Получаем данные от 1С (любой JSON)
+        const dataFrom1C = req.body;
+        
+        console.log('📦 Получены данные от 1С:', JSON.stringify(dataFrom1C).substring(0, 200) + '...');
+        
+        // Сохраняем в базу данных как есть
+        const result = await pool.query(
+            'INSERT INTO data_from_1c (raw_data) VALUES ($1) RETURNING id',
+            [dataFrom1C]
+        );
+        
+        // Отправляем ответ 1С, что всё хорошо
+        res.json({ 
+            success: true, 
+            message: 'Данные сохранены',
+            id: result.rows[0].id 
+        });
+        
+    } catch (error) {
+        console.error('❌ Ошибка в /from-1c:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: error.message 
+        });
+    }
+});
+
+// Эндпоинт для просмотра последних записей от 1С
+app.get('/last-data', async (req, res) => {
+    try {
+        const limit = Math.min(Number(req.query.limit || 10), 100);
+        
+        const result = await pool.query(
+            'SELECT id, created_at, raw_data FROM data_from_1c ORDER BY id DESC LIMIT $1',
+            [limit]
+        );
+        
+        res.json({
+            success: true,
+            count: result.rows.length,
+            rows: result.rows
+        });
+    } catch (error) {
+        console.error('❌ Ошибка в /last-data:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: error.message 
+        });
+    }
+});
+
+// Эндпоинт для получения конкретной записи по ID
+app.get('/data/:id', async (req, res) => {
+    try {
+        const id = parseInt(req.params.id);
+        
+        const result = await pool.query(
+            'SELECT id, created_at, raw_data FROM data_from_1c WHERE id = $1',
+            [id]
+        );
+        
+        if (result.rows.length === 0) {
+            return res.status(404).json({ 
+                success: false, 
+                error: 'Запись не найдена' 
+            });
+        }
+        
+        res.json({
+            success: true,
+            row: result.rows[0]
+        });
+    } catch (error) {
+        console.error('❌ Ошибка в /data/:id:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: error.message 
+        });
+    }
+});
+
+// =====================================================
 // Start
-// ===============================
+// =====================================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Server started on port " + PORT));
