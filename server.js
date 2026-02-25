@@ -2,13 +2,16 @@ require("dotenv").config();
 
 const express = require("express");
 const cors = require("cors");
-const path = require("path");      // ✅ ДОБАВЬ
+const path = require("path");
 const { Pool } = require("pg");
 
 const app = express();
 
 app.use(cors());
 app.use(express.json());
+
+app.get("/ping", (req,res)=>res.json({ok:true, ts: Date.now()}));  // ✅ правильно
+
 app.options(/.*/, cors());
 
 // 🔥 СТАТИКА (гарантированный путь)
