@@ -706,6 +706,30 @@ app.post("/io-save", async (req, res) => {
   }
 });
 
+app.get("/division-svod", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const r = await client.query(`
+      SELECT
+        division_dds,
+        amount_in,
+        amount_out,
+        to_pay_paid,
+        balance,
+        to_pay_registry,
+        balance_after_registry
+      FROM public.division_svod_web_v1
+      ORDER BY division_dds
+    `);
+    res.json({ ok: true, rows: r.rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  } finally {
+    client.release();
+  }
+});
+
 // ===============================
 // Start
 // ===============================
