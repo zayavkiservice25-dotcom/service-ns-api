@@ -114,7 +114,7 @@ await pool.query(`ALTER TABLE public.ft ADD COLUMN IF NOT EXISTS contract_date d
 
   // ✅ VIEW: ИСТОРИЯ
   await pool.query(`
-    CREATE OR REPLACE VIEW ft_zvk_history_v1 AS
+    CREATE OR REPLACE VIEW ft_zvk_history_v2 AS
    SELECT
   f.id_ft,
   f.input_date,
@@ -167,7 +167,7 @@ await pool.query(`ALTER TABLE public.ft ADD COLUMN IF NOT EXISTS contract_date d
   // ✅ VIEW: ТЕКУЩЕЕ (последняя строка по каждому ZFT)
   // ✅ и скрываем стартовую "СИСТЕМА/Нет"
   await pool.query(`
-    CREATE OR REPLACE VIEW ft_zvk_current_v1 AS
+    CREATE OR REPLACE VIEW ft_zvk_current_v2 AS
     WITH ranked AS (
       SELECT
         v.*,
@@ -175,7 +175,7 @@ await pool.query(`ALTER TABLE public.ft ADD COLUMN IF NOT EXISTS contract_date d
           PARTITION BY v.id_ft, v.id_zvk
           ORDER BY v.zvk_date DESC NULLS LAST, v.zvk_row_id DESC
         ) AS rn
-      FROM ft_zvk_history_v1 v
+      FROM ft_zvk_history_v2 v
     )
     SELECT *
     FROM ranked
@@ -554,7 +554,7 @@ app.post("/zvk-pay-row", async (req, res) => {
 });
 
 // =====================================================
-// JOIN: читаем из VIEW ft_zvk_current_v1
+// JOIN: читаем из VIEW ft_zvk_current_v2
 // =====================================================
 app.get("/ft-zvk-join", async (req, res) => {
   try {
@@ -568,7 +568,7 @@ app.get("/ft-zvk-join", async (req, res) => {
     if (isAdmin) {
       query = `
         SELECT v.*
-        FROM ft_zvk_current_v1 v
+        FROM ft_zvk_current_v2 v
         ORDER BY
           COALESCE(NULLIF(substring(v.id_ft from '\\d+'), ''), '0')::int DESC,
           v.zvk_date DESC NULLS LAST,
@@ -578,7 +578,7 @@ app.get("/ft-zvk-join", async (req, res) => {
     } else {
       query = `
         SELECT v.*
-        FROM ft_zvk_current_v1 v
+        FROM ft_zvk_current_v2 v
         WHERE lower(trim(v.input_name)) = lower(trim($2))
         ORDER BY
           COALESCE(NULLIF(substring(v.id_ft from '\\d+'), ''), '0')::int DESC,
