@@ -27,7 +27,7 @@ const pool = new Pool({
 // =====================================================
 // INIT DB + МИГРАЦИИ
 // =====================================================
-async function ф {
+async function initDb()  {
   // sequences
   await pool.query(`CREATE SEQUENCE IF NOT EXISTS ft_id_seq START 1;`);
   await pool.query(`CREATE SEQUENCE IF NOT EXISTS zvk_id_seq START 1;`);
