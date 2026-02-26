@@ -19,16 +19,19 @@ app.use("/public", express.static(process.cwd() + "/public"));
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+  ssl: process.env.DATABASE_URL?.includes('render.com') 
+    ? { rejectUnauthorized: false }  // SSL только для Render
+    : false                          // без SSL для локальной БД
 });
 
 // =====================================================
 // INIT DB + МИГРАЦИИ
 // =====================================================
-async function initDb() {
+async function ф {
   // sequences
   await pool.query(`CREATE SEQUENCE IF NOT EXISTS ft_id_seq START 1;`);
   await pool.query(`CREATE SEQUENCE IF NOT EXISTS zvk_id_seq START 1;`);
+
 
   // FT
   await pool.query(`
@@ -45,6 +48,10 @@ async function initDb() {
       sum_ft numeric
     );
   `);
+await pool.query(`ALTER TABLE public.ft ADD COLUMN IF NOT EXISTS pay_purpose text;`);
+await pool.query(`ALTER TABLE public.ft ADD COLUMN IF NOT EXISTS dds_article text;`);
+await pool.query(`ALTER TABLE public.ft ADD COLUMN IF NOT EXISTS contract_no text;`);
+await pool.query(`ALTER TABLE public.ft ADD COLUMN IF NOT EXISTS contract_date date;`);
 
   // ZVK (история строк)
   await pool.query(`
@@ -108,17 +115,23 @@ async function initDb() {
   // ✅ VIEW: ИСТОРИЯ
   await pool.query(`
     CREATE OR REPLACE VIEW ft_zvk_history_v1 AS
-    SELECT
-      f.id_ft,
-      f.input_date,
-      f.input_name,
-      f.division,
-      f."object" AS object,
-      f.contractor,
-      f.invoice_no,
-      f.invoice_date,
-      f.invoice_pdf,
-      f.sum_ft,
+   SELECT
+  f.id_ft,
+  f.input_date,
+  f.input_name,
+  f.division,
+  f."object" AS object,
+  f.contractor,
+
+  f.pay_purpose,
+  f.dds_article,
+  f.contract_no,
+  f.contract_date,
+
+  f.invoice_no,
+  f.invoice_date,
+  f.invoice_pdf,
+  f.sum_ft,
 
       z.id_zvk,
       z.zvk_date,
@@ -596,16 +609,22 @@ app.get("/ft-zvk-join", async (req, res) => {
 app.post("/save-ft", async (req, res) => {
   try {
     const {
-      input_date,
-      input_name,
-      division,
-      object,
-      contractor,
-      invoice_no,
-      invoice_date,
-      invoice_pdf,
-      sum_ft
-    } = req.body;
+  input_date,
+  input_name,
+  division,
+  object,
+  contractor,
+
+  pay_purpose,
+  dds_article,
+  contract_no,
+  contract_date,
+
+  invoice_no,
+  invoice_date,
+  invoice_pdf,
+  sum_ft
+} = req.body;
 
     if (!input_name) return res.status(400).json({ success:false, error:"input_name is required" });
     if (!division || !object) return res.status(400).json({ success:false, error:"division/object required" });
@@ -624,27 +643,37 @@ app.post("/save-ft", async (req, res) => {
       inputDateFormatted = new Date(input_date);
     }
 
-    const r = await pool.query(
-      `
-      INSERT INTO ft
-        (id_ft, input_date, input_name, division, "object", contractor, invoice_no, invoice_date, invoice_pdf, sum_ft)
-      VALUES
-        ($1, $2, $3, $4, $5, $6, $7, $8::date, $9, $10)
-      RETURNING id_ft
-      `,
-      [
-        id_ft,
-        inputDateFormatted,
-        String(input_name).trim(),
-        String(division).trim(),
-        String(object).trim(),
-        String(contractor).trim(),
-        String(invoice_no).trim(),
-        invoice_date,
-        invoice_pdf ? String(invoice_pdf).trim() : "",
-        sumNum
-      ]
-    );
+  const r = await pool.query(
+  `
+  INSERT INTO public.ft
+    (id_ft, input_date, input_name, division, "object", contractor,
+     pay_purpose, dds_article, contract_no, contract_date,
+     invoice_no, invoice_date, invoice_pdf, sum_ft)
+  VALUES
+    ($1, $2, $3, $4, $5, $6,
+     $7, $8, $9, $10,
+     $11, $12, $13, $14)
+  RETURNING id_ft
+  `,
+  [
+    id_ft,
+    inputDateFormatted,
+    String(input_name).trim(),
+    String(division).trim(),
+    String(object).trim(),
+    String(contractor).trim(),
+
+    pay_purpose ? String(pay_purpose).trim() : null,
+    dds_article ? String(dds_article).trim() : null,
+    contract_no ? String(contract_no).trim() : null,
+    contract_date ? contract_date : null,  // YYYY-MM-DD или null
+
+    String(invoice_no).trim(),
+    invoice_date ? invoice_date : null,    // YYYY-MM-DD или null
+    invoice_pdf ? String(invoice_pdf).trim() : null,
+    sumNum
+  ]
+);
 
     const zftRow = await pool.query(`SELECT 'ZFT' || nextval('zvk_id_seq')::text AS id_zvk`);
     const id_zvk = zftRow.rows[0].id_zvk;
