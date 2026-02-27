@@ -776,33 +776,41 @@ app.get("/division-svod", async (req, res) => {
 // =====================================================
 
 // Эндпоинт для приема любых JSON данных от 1С
-app.post('/from-1c', async (req, res) => {
-    try {
-        // Получаем данные от 1С (любой JSON)
-        const dataFrom1C = req.body;
-        
-        console.log('📦 Получены данные от 1С:', JSON.stringify(dataFrom1C).substring(0, 200) + '...');
-        
-        // Сохраняем в базу данных как есть
-        const result = await pool.query(
-            'INSERT INTO data_from_1c (raw_data) VALUES ($1) RETURNING id',
-            [dataFrom1C]
-        );
-        
-        // Отправляем ответ 1С, что всё хорошо
-        res.json({ 
-            success: true, 
-            message: 'Данные сохранены',
-            id: result.rows[0].id 
-        });
-        
-    } catch (error) {
-        console.error('❌ Ошибка в /from-1c:', error);
-        res.status(500).json({ 
-            success: false, 
-            error: error.message 
-        });
+app.post("/from-1c", async (req, res) => {
+  try {
+    console.log("=== /from-1c HIT ===");
+    console.log("Content-Type:", req.headers["content-type"]);
+    console.log("Content-Length:", req.headers["content-length"]);
+
+    // что реально пришло
+    console.log("Body typeof:", typeof req.body);
+    console.log("Body:", req.body);
+
+    const empty =
+      !req.body ||
+      (typeof req.body === "object" && Object.keys(req.body).length === 0);
+
+    // если тело пустое — НЕ сохраняем, сразу говорим 1С что пусто
+    if (empty) {
+      console.log("⚠️ EMPTY BODY from 1C");
+      return res.status(400).json({ success: false, error: "EMPTY_JSON_BODY" });
     }
+
+    // сохраняем как есть
+    const result = await pool.query(
+      "INSERT INTO data_from_1c (raw_data) VALUES ($1) RETURNING id",
+      [req.body]
+    );
+
+    res.json({
+      success: true,
+      message: "Данные сохранены",
+      id: result.rows[0].id,
+    });
+  } catch (error) {
+    console.error("❌ Ошибка в /from-1c:", error);
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
 // Эндпоинт для просмотра последних записей от 1С
