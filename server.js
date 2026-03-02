@@ -901,7 +901,7 @@ app.get('/data/:id', async (req, res) => {
 app.get("/registry", async (req, res) => {
   try {
     const login = String(req.query.login || "").trim();
-    if (!login) 
+    if (!login)
       return res.status(400).json({ success:false, error:"login required" });
 
     const q = `
@@ -923,7 +923,7 @@ app.get("/registry", async (req, res) => {
       LEFT JOIN zvk_pay p ON p.zvk_row_id = z.id
       LEFT JOIN zvk_status s ON s.zvk_row_id = z.id
       WHERE z.request_flag = 'Да'
-        AND (p.registry_flag IS NULL OR p.registry_flag = '')
+        AND (p.registry_flag IS NULL OR TRIM(p.registry_flag) = '')
         AND LOWER(TRIM(f.input_name)) = LOWER(TRIM($1))
       ORDER BY z.id_zvk DESC, z.id DESC;
     `;
