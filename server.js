@@ -899,10 +899,13 @@ app.get('/data/:id', async (req, res) => {
 });
 
 app.get("/registry", async (req, res) => {
+  console.log("GET /registry login =", req.query.login);
+
   try {
     const login = String(req.query.login || "").trim();
-    if (!login)
-      return res.status(400).json({ success:false, error:"login required" });
+    if (!login) {
+      return res.status(400).json({ success: false, error: "login required" });
+    }
 
     const q = `
       SELECT
@@ -927,27 +930,45 @@ app.get("/registry", async (req, res) => {
     `;
 
     const { rows } = await pool.query(q, [login]);
-    const total = rows.reduce((s,r)=> s + Number(r.to_pay || 0), 0);
+    const total = rows.reduce((s, r) => s + Number(r.to_pay || 0), 0);
 
-    res.json({ success:true, total, rows });
+    return res.json({ success: true, total, rows });
 
   } catch (e) {
     console.error("registry error", e);
-    res.status(500).json({ success:false, error:"SERVER_ERROR" });
+    return res.status(500).json({
+      success: false,
+      error: "SERVER_ERROR",
+      message: String(e?.message || e),
+      stack: String(e?.stack || ""),
+    });
   }
 });
+
+
 app.get("/registry-test", async (req, res) => {
-  const { rows } = await pool.query(`
-    SELECT f.input_name, COUNT(*) cnt
-    FROM ft f
-    JOIN zvk z ON z.id_ft=f.id_ft
-    LEFT JOIN zvk_pay_status_v1 p ON p.id_zvk=z.id_zvk
-    WHERE COALESCE(p.registry_flag,'')='Да'
-    GROUP BY f.input_name
-    ORDER BY cnt DESC
-    LIMIT 50
-  `);
-  res.json(rows);
+  try {
+    const { rows } = await pool.query(`
+      SELECT f.input_name, COUNT(*) cnt
+      FROM ft f
+      JOIN zvk z ON z.id_ft = f.id_ft
+      LEFT JOIN zvk_pay_status_v1 p ON p.id_zvk = z.id_zvk
+      WHERE COALESCE(p.registry_flag,'')='Да'
+      GROUP BY f.input_name
+      ORDER BY cnt DESC
+      LIMIT 50
+    `);
+
+    return res.json({ success: true, rows });
+
+  } catch (e) {
+    console.error("registry-test error", e);
+    return res.status(500).json({
+      success: false,
+      error: "SERVER_ERROR",
+      message: String(e?.message || e),
+    });
+  }
 });
 // =====================================================
 // Start
