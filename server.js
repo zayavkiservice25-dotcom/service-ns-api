@@ -8,7 +8,15 @@ const { Pool } = require("pg");
 const app = express();
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "20mb" }));
+app.use(express.urlencoded({ extended: true, limit: "20mb" }));
+app.use((err, req, res, next) => {
+  if (err) {
+    console.error("❌ JSON parse error:", err.message);
+    return res.status(400).json({ success:false, error:"BAD_JSON", message: err.message });
+  }
+  next();
+});
 
 app.get("/ping", (req,res)=>res.json({ok:true, ts: Date.now()}));  // ✅ правильно
 
@@ -32,7 +40,6 @@ async function initDb()  {
   await pool.query(`CREATE SEQUENCE IF NOT EXISTS ft_id_seq START 1;`);
   await pool.query(`CREATE SEQUENCE IF NOT EXISTS zvk_id_seq START 1;`);
 
-
   // FT
   await pool.query(`
     CREATE TABLE IF NOT EXISTS ft (
@@ -48,10 +55,19 @@ async function initDb()  {
       sum_ft numeric
     );
   `);
-await pool.query(`ALTER TABLE public.ft ADD COLUMN IF NOT EXISTS pay_purpose text;`);
-await pool.query(`ALTER TABLE public.ft ADD COLUMN IF NOT EXISTS dds_article text;`);
-await pool.query(`ALTER TABLE public.ft ADD COLUMN IF NOT EXISTS contract_no text;`);
-await pool.query(`ALTER TABLE public.ft ADD COLUMN IF NOT EXISTS contract_date date;`);
+
+  await pool.query(`ALTER TABLE public.ft ADD COLUMN IF NOT EXISTS pay_purpose text;`);
+  await pool.query(`ALTER TABLE public.ft ADD COLUMN IF NOT EXISTS dds_article text;`);
+  await pool.query(`ALTER TABLE public.ft ADD COLUMN IF NOT EXISTS contract_no text;`);
+  await pool.query(`ALTER TABLE public.ft ADD COLUMN IF NOT EXISTS contract_date date;`);
+
+  // ✅ СИНХРОНИЗИРУЕМ ft_id_seq (чтобы после FT334 пошло FT335)
+  await pool.query(`
+    SELECT setval(
+      'public.ft_id_seq',
+      COALESCE((SELECT MAX((regexp_replace(id_ft, '\\D','','g'))::bigint) FROM public.ft), 0)
+    );
+  `);
 
   // ZVK (история строк)
   await pool.query(`
@@ -65,10 +81,26 @@ await pool.query(`ALTER TABLE public.ft ADD COLUMN IF NOT EXISTS contract_date d
     );
   `);
 
-  // ✅ технический PK id
-  await pool.query(`ALTER TABLE zvk ADD COLUMN IF NOT EXISTS id bigserial;`);
-  await pool.query(`ALTER TABLE zvk DROP CONSTRAINT IF EXISTS zvk_pkey;`);
-  await pool.query(`ALTER TABLE zvk ADD CONSTRAINT zvk_pkey PRIMARY KEY (id);`);
+  // ✅ технический PK id (bigserial)
+  await pool.query(`ALTER TABLE public.zvk ADD COLUMN IF NOT EXISTS id bigserial;`);
+  await pool.query(`ALTER TABLE public.zvk DROP CONSTRAINT IF EXISTS zvk_pkey;`);
+  await pool.query(`ALTER TABLE public.zvk ADD CONSTRAINT zvk_pkey PRIMARY KEY (id);`);
+
+  // ✅ СИНХРОНИЗИРУЕМ sequence bigserial для zvk.id (исправляет duplicate zvk_pkey)
+  await pool.query(`
+    SELECT setval(
+      pg_get_serial_sequence('public.zvk','id'),
+      COALESCE((SELECT MAX(id) FROM public.zvk), 0)
+    );
+  `);
+
+  // ✅ СИНХРОНИЗИРУЕМ zvk_id_seq (чтобы ZFT продолжался дальше)
+  await pool.query(`
+    SELECT setval(
+      'public.zvk_id_seq',
+      COALESCE((SELECT MAX((regexp_replace(id_zvk, '\\D','','g'))::bigint) FROM public.zvk), 0)
+    );
+  `);
 
   // ✅ Источник по строке истории (zvk_row_id UNIQUE)
   await pool.query(`
@@ -115,23 +147,23 @@ await pool.query(`ALTER TABLE public.ft ADD COLUMN IF NOT EXISTS contract_date d
   // ✅ VIEW: ИСТОРИЯ
   await pool.query(`
     CREATE OR REPLACE VIEW ft_zvk_history_v2 AS
-   SELECT
-  f.id_ft,
-  f.input_date,
-  f.input_name,
-  f.division,
-  f."object" AS object,
-  f.contractor,
+    SELECT
+      f.id_ft,
+      f.input_date,
+      f.input_name,
+      f.division,
+      f."object" AS object,
+      f.contractor,
 
-  f.pay_purpose,
-  f.dds_article,
-  f.contract_no,
-  f.contract_date,
+      f.pay_purpose,
+      f.dds_article,
+      f.contract_no,
+      f.contract_date,
 
-  f.invoice_no,
-  f.invoice_date,
-  f.invoice_pdf,
-  f.sum_ft,
+      f.invoice_no,
+      f.invoice_date,
+      f.invoice_pdf,
+      f.sum_ft,
 
       z.id_zvk,
       z.zvk_date,
@@ -164,8 +196,7 @@ await pool.query(`ALTER TABLE public.ft ADD COLUMN IF NOT EXISTS contract_date d
     LEFT JOIN zvk_pay p ON p.zvk_row_id = z.id;
   `);
 
-  // ✅ VIEW: ТЕКУЩЕЕ (последняя строка по каждому ZFT)
-  // ✅ и скрываем стартовую "СИСТЕМА/Нет"
+  // ✅ VIEW: ТЕКУЩЕЕ
   await pool.query(`
     CREATE OR REPLACE VIEW ft_zvk_current_v2 AS
     WITH ranked AS (
@@ -182,17 +213,17 @@ await pool.query(`ALTER TABLE public.ft ADD COLUMN IF NOT EXISTS contract_date d
     WHERE rn = 1
       AND NOT (zvk_name = 'СИСТЕМА' AND COALESCE(request_flag,'') = 'Нет');
   `);
-// ✅ Таблица для данных от 1С
-await pool.query(`
-  CREATE TABLE IF NOT EXISTS data_from_1c (
-    id SERIAL PRIMARY KEY,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    raw_data JSONB NOT NULL
-  );
-`);
 
+  // ✅ Таблица для данных от 1С
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS data_from_1c (
+      id SERIAL PRIMARY KEY,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      raw_data JSONB NOT NULL
+    );
+  `);
 
-  console.log("DB init OK ✅ (tables + migrations + views history_v1 + current_v1 + data_from_1c)");
+  console.log("DB init OK ✅");
 }
 
 initDb().catch((e) => console.error("DB init error:", e));
