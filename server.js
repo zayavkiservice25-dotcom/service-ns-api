@@ -905,34 +905,56 @@ app.get("/registry", async (req, res) => {
 
     const q = `
       SELECT
-        f."object"            AS object,
-        z.id_zvk              AS reg_no,
-        f.contractor          AS contractor,
-        f.pay_purpose         AS pay_purpose,
-        f.dds_article         AS dds_article,
-        f.contract_no         AS contract_no,
-        f.invoice_no          AS invoice_no,
-        f.invoice_date        AS invoice_date,
-        f.invoice_pdf         AS invoice_pdf,
-        COALESCE(z.src_d,'')  AS src_d,
-        COALESCE(z.src_o,'')  AS src_o,
-        COALESCE(z.to_pay,0)  AS to_pay
+        f."object"           AS object,
+        z.id_zvk             AS reg_no,
+        f.contractor         AS contractor,
+        f.pay_purpose        AS pay_purpose,
+        f.dds_article        AS dds_article,
+        f.contract_no        AS contract_no,
+        f.invoice_no         AS invoice_no,
+        f.invoice_date       AS invoice_date,
+        f.invoice_pdf        AS invoice_pdf,
+        COALESCE(s.src_d,'') AS src_d,
+        COALESCE(s.src_o,'') AS src_o,
+        COALESCE(z.to_pay,0) AS to_pay
       FROM ft f
       JOIN zvk z ON z.id_ft = f.id_ft
-      WHERE COALESCE(z.registry_flag,'') = 'Да'
+      LEFT JOIN zvk_pay p ON p.zvk_row_id = z.id
+      LEFT JOIN zvk_status s ON s.zvk_row_id = z.id
+      WHERE COALESCE(p.registry_flag,'') = 'Да'
         AND LOWER(TRIM(f.input_name)) = LOWER(TRIM($1))
-      ORDER BY z.id_zvk DESC;
+      ORDER BY z.id_zvk DESC, z.id DESC;
     `;
 
     const { rows } = await pool.query(q, [login]);
-    const total = rows.reduce((s,r)=> s + Number(r.to_pay || 0), 0);
-    res.json({ success:true, total, rows });
+    const total = rows.reduce((sum, r) => sum + Number(r.to_pay || 0), 0);
 
+    res.json({ success:true, total, rows });
   } catch (e) {
     console.error("registry error", e);
     res.status(500).json({ success:false, error:"SERVER_ERROR", message:String(e?.message||e) });
   }
-});// =====================================================
+});
+app.get("/registry-test", async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT f.input_name, COUNT(*) cnt
+      FROM ft f
+      JOIN zvk z ON z.id_ft = f.id_ft
+      LEFT JOIN zvk_pay p ON p.zvk_row_id = z.id
+      WHERE COALESCE(p.registry_flag,'') = 'Да'
+      GROUP BY f.input_name
+      ORDER BY cnt DESC
+      LIMIT 50
+    `);
+    res.json({ success:true, rows });
+  } catch (e) {
+    res.status(500).json({ success:false, error:e.message });
+  }
+});
+
+
+// =====================================================
 // Start
 // =====================================================
 const PORT = process.env.PORT || 3000;
