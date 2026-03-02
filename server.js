@@ -898,6 +898,54 @@ app.get('/data/:id', async (req, res) => {
     }
 });
 
+
+app.get("/registry", async (req, res) => {
+  try {
+    const reg_date = String(req.query.reg_date || "").trim(); // "2026-03-02"
+    const account  = String(req.query.account || "").trim();  // optional
+
+    if (!reg_date) {
+      return res.status(400).json({ success:false, error:"reg_date required" });
+    }
+
+    const q = `
+      SELECT
+        f."object"               AS object,
+        z.id_zvk                 AS reg_no,
+        f.contractor             AS contractor,
+        f.pay_purpose            AS pay_purpose,
+        f.dds_article            AS dds_article,
+        f.contract_no            AS contract_no,
+        f.invoice_no             AS invoice_no,
+        f.invoice_date           AS invoice_date,
+        f.invoice_pdf            AS invoice_pdf,
+        COALESCE(z.src_d,'')     AS src_d,
+        COALESCE(z.src_o,'')     AS src_o,
+        COALESCE(z.to_pay,0)::numeric AS to_pay
+      FROM ft f
+      JOIN zvk z ON z.id_ft = f.id_ft
+      LEFT JOIN zvk_pay_status_v1 p ON p.id_zvk = z.id_zvk
+      WHERE COALESCE(p.registry_flag,'') = 'Да'
+        AND COALESCE(p.agree_time, p.status_time, z.zvk_date)::date = $1::date
+      ORDER BY f."object", z.id_zvk;
+    `;
+
+    const { rows } = await pool.query(q, [reg_date]);
+
+    const total = rows.reduce((s,r)=> s + (parseFloat(r.to_pay) || 0), 0);
+
+    return res.json({
+      success:true,
+      header:{ reg_date, account: account || null },
+      total,
+      rows
+    });
+  } catch (e) {
+    console.error("registry error", e);
+    res.status(500).json({ success:false, error:"SERVER_ERROR", message:e.message });
+  }
+});
+
 // =====================================================
 // Start
 // =====================================================
