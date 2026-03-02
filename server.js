@@ -901,7 +901,8 @@ app.get('/data/:id', async (req, res) => {
 app.get("/registry", async (req, res) => {
   try {
     const login = String(req.query.login || "").trim();
-    if (!login) return res.status(400).json({ success:false, error:"login required" });
+    if (!login) 
+      return res.status(400).json({ success:false, error:"login required" });
 
     const q = `
       SELECT
@@ -921,7 +922,8 @@ app.get("/registry", async (req, res) => {
       JOIN zvk z ON z.id_ft = f.id_ft
       LEFT JOIN zvk_pay p ON p.zvk_row_id = z.id
       LEFT JOIN zvk_status s ON s.zvk_row_id = z.id
-      WHERE COALESCE(p.registry_flag,'') = 'Да'
+      WHERE z.request_flag = 'Да'
+        AND (p.registry_flag IS NULL OR p.registry_flag = '')
         AND LOWER(TRIM(f.input_name)) = LOWER(TRIM($1))
       ORDER BY z.id_zvk DESC, z.id DESC;
     `;
@@ -930,26 +932,14 @@ app.get("/registry", async (req, res) => {
     const total = rows.reduce((sum, r) => sum + Number(r.to_pay || 0), 0);
 
     res.json({ success:true, total, rows });
+
   } catch (e) {
     console.error("registry error", e);
-    res.status(500).json({ success:false, error:"SERVER_ERROR", message:String(e?.message||e) });
-  }
-});
-app.get("/registry-test", async (req, res) => {
-  try {
-    const { rows } = await pool.query(`
-      SELECT f.input_name, COUNT(*) cnt
-      FROM ft f
-      JOIN zvk z ON z.id_ft = f.id_ft
-      LEFT JOIN zvk_pay p ON p.zvk_row_id = z.id
-      WHERE COALESCE(p.registry_flag,'') = 'Да'
-      GROUP BY f.input_name
-      ORDER BY cnt DESC
-      LIMIT 50
-    `);
-    res.json({ success:true, rows });
-  } catch (e) {
-    res.status(500).json({ success:false, error:e.message });
+    res.status(500).json({
+      success:false,
+      error:"SERVER_ERROR",
+      message:String(e?.message||e)
+    });
   }
 });
 
