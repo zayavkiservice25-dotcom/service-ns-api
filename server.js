@@ -913,8 +913,8 @@ app.get("/registry", async (req, res) => {
     ORDER BY z.id_ft, z.id DESC
   )
   SELECT
-    z.id_zvk             AS reg_no,
     f."object"           AS object,
+    z.id_zvk             AS reg_no,
     f.contractor         AS contractor,
     f.pay_purpose        AS pay_purpose,
     f.dds_article        AS dds_article,
@@ -928,18 +928,16 @@ app.get("/registry", async (req, res) => {
   FROM ft f
   JOIN last_zvk z ON z.id_ft = f.id_ft
 
-  -- ✅ берём ПОСЛЕДНИЙ статус (если статусов несколько)
   LEFT JOIN LATERAL (
     SELECT s1.*
     FROM zvk_status s1
     WHERE s1.zvk_row_id = z.id
-    ORDER BY s1.id DESC
+    ORDER BY s1.status_time DESC NULLS LAST
     LIMIT 1
   ) s ON true
 
   WHERE LOWER(TRIM(f.input_name)) = LOWER(TRIM($1))
 
-    -- ❌ не показывать если registry_flag = 'Да' (даже если есть другие строки pay)
     AND NOT EXISTS (
       SELECT 1
       FROM zvk_pay p2
@@ -947,7 +945,6 @@ app.get("/registry", async (req, res) => {
         AND TRIM(COALESCE(p2.registry_flag,'')) = 'Да'
     )
 
-    -- ❌ не показывать "Обнуление" (to_pay = 0)
     AND COALESCE(z.to_pay,0) <> 0
 
   ORDER BY z.id_zvk DESC, z.id DESC;
