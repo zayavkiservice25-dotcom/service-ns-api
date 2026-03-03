@@ -898,7 +898,14 @@ app.get('/data/:id', async (req, res) => {
     }
 });
 
-const q = `
+app.get("/registry", async (req, res) => {
+  try {
+    const login = String(req.query.login || "").trim();
+    if (!login) {
+      return res.status(400).json({ success:false, error:"login required" });
+    }
+
+    const q = `
 WITH last_zvk AS (
   SELECT DISTINCT ON (z.id_ft)
     z.*
