@@ -317,6 +317,26 @@ async function canEditFtByLogin(poolOrClient, id_ft, login){
   );
   return r.rowCount > 0;
 }
+async function canEditRowByLogin(poolOrClient, zvk_row_id, login) {
+  const rid = Number(zvk_row_id);
+  const lg  = normLogin(login);
+
+  if (!rid || Number.isNaN(rid) || !lg) return false;
+
+  const r = await poolOrClient.query(
+    `
+    SELECT 1
+    FROM zvk z
+    JOIN ft f ON f.id_ft = z.id_ft
+    WHERE z.id = $1
+      AND lower(trim(f.input_name)) = $2
+    LIMIT 1
+    `,
+    [rid, lg]
+  );
+
+  return r.rowCount > 0;
+}
 
 app.post("/zvk-save", async (req, res) => {
   try {
