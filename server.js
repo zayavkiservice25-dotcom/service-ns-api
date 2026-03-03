@@ -913,8 +913,8 @@ app.get("/registry", async (req, res) => {
     ORDER BY z.id_ft, z.id DESC
   )
   SELECT
-    f."object"           AS object,
     z.id_zvk             AS reg_no,
+    f."object"           AS object,
     f.contractor         AS contractor,
     f.pay_purpose        AS pay_purpose,
     f.dds_article        AS dds_article,
