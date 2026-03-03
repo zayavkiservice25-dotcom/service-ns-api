@@ -250,6 +250,7 @@ app.get("/ft", async (req, res) => {
     const limit = Math.min(Number(req.query.limit || 500), 500);
     const login = String(req.query.login || "").trim();
     const isAdmin = String(req.query.is_admin || "0") === "1";
+    const isAll   = String(req.query.is_all   || "0") === "1"; // ✅ НОВОЕ
     if (!login) return res.status(400).json({ success: false, error: "login is required" });
 
     const qAdmin = `
@@ -267,7 +268,7 @@ app.get("/ft", async (req, res) => {
       LIMIT $1
     `;
 
-    const r = isAdmin
+     const r = (isAdmin || isAll)
       ? await pool.query(qAdmin, [limit])
       : await pool.query(qUser, [limit, login]);
 
@@ -592,33 +593,34 @@ app.get("/ft-zvk-join", async (req, res) => {
     const limit = Math.min(Number(req.query.limit || 500), 500);
     const login = String(req.query.login || "").trim();
     const isAdmin = String(req.query.is_admin || "0") === "1";
+    const isAll   = String(req.query.is_all   || "0") === "1"; // ✅ НОВОЕ
 
     let query = "";
     let params = [limit];
 
-    if (isAdmin) {
-      query = `
-        SELECT v.*
-        FROM ft_zvk_current_v2 v
-        ORDER BY
-          COALESCE(NULLIF(substring(v.id_ft from '\\d+'), ''), '0')::int DESC,
-          v.zvk_date DESC NULLS LAST,
-          v.zvk_row_id DESC
-        LIMIT $1
-      `;
-    } else {
-      query = `
-        SELECT v.*
-        FROM ft_zvk_current_v2 v
-        WHERE lower(trim(v.input_name)) = lower(trim($2))
-        ORDER BY
-          COALESCE(NULLIF(substring(v.id_ft from '\\d+'), ''), '0')::int DESC,
-          v.zvk_date DESC NULLS LAST,
-          v.zvk_row_id DESC
-        LIMIT $1
-      `;
-      params.push(login);
-    }
+     if (isAdmin || isAll) {
+  query = `
+    SELECT v.*
+    FROM ft_zvk_current_v2 v
+    ORDER BY
+      COALESCE(NULLIF(substring(v.id_ft from '\\d+'), ''), '0')::int DESC,
+      v.zvk_date DESC NULLS LAST,
+      v.zvk_row_id DESC
+    LIMIT $1
+  `;
+} else {
+  query = `
+    SELECT v.*
+    FROM ft_zvk_current_v2 v
+    WHERE lower(trim(v.input_name)) = lower(trim($2))
+    ORDER BY
+      COALESCE(NULLIF(substring(v.id_ft from '\\d+'), ''), '0')::int DESC,
+      v.zvk_date DESC NULLS LAST,
+      v.zvk_row_id DESC
+    LIMIT $1
+  `;
+  params.push(login);
+}
 
     const r = await pool.query(query, params);
 
