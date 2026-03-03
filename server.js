@@ -898,13 +898,7 @@ app.get('/data/:id', async (req, res) => {
     }
 });
 
-app.get("/registry", async (req, res) => {
-  try {
-    const login = String(req.query.login || "").trim();
-    if (!login)
-      return res.status(400).json({ success:false, error:"login required" });
-
-   const q = `
+const q = `
 WITH last_zvk AS (
   SELECT DISTINCT ON (z.id_ft)
     z.*
@@ -928,16 +922,17 @@ SELECT
 FROM ft f
 JOIN last_zvk z ON z.id_ft = f.id_ft
 
--- 👉 Берём ПОСЛЕДНИЙ zvk_pay
+-- ✅ последняя строка zvk_pay (чтобы registry_flag был один “последний”)
 LEFT JOIN LATERAL (
-  SELECT p1.*
+  SELECT p1.registry_flag
   FROM zvk_pay p1
   WHERE p1.zvk_row_id = z.id
-  ORDER BY p1.id DESC
+  ORDER BY p1.pay_time DESC NULLS LAST,
+           p1.agree_time DESC NULLS LAST
   LIMIT 1
 ) p ON true
 
--- 👉 Берём последний статус
+-- ✅ последний статус (если нужно)
 LEFT JOIN LATERAL (
   SELECT s1.*
   FROM zvk_status s1
@@ -948,15 +943,16 @@ LEFT JOIN LATERAL (
 
 WHERE LOWER(TRIM(f.input_name)) = LOWER(TRIM($1))
 
-  -- ❌ НЕ брать если Реестр = Да
-  AND COALESCE(TRIM(p.registry_flag),'') <> 'Да'
+  -- ✅ request_flag уже = 'Да' (в last_zvk)
 
-  -- ❌ НЕ брать если Обнуление
+  -- ✅ показывать только если registry_flag пусто
+  AND NULLIF(TRIM(COALESCE(p.registry_flag,'')), '') IS NULL
+
+  -- ❌ обнуление не показывать
   AND COALESCE(z.to_pay,0) <> 0
 
 ORDER BY z.id_zvk DESC, z.id DESC;
 `;
-
     const { rows } = await pool.query(q, [login]);
     const total = rows.reduce((sum, r) => sum + Number(r.to_pay || 0), 0);
 
