@@ -285,19 +285,67 @@ app.get("/ft", async (req, res) => {
 // ✅ Если ПОСЛЕДНЯЯ строка оплачена -> создаём новый id_zvk
 // ✅ Возвращает zvk_row_id (это zvk.id)
 // =====================================================
+// =====================================================
+// SAVE (история) — /zvk-save
+// ✅ Права:
+//    - Админ / is_all (R_Kasymkhan) → может создавать/менять всем
+//    - Инициатор / Оператор → может создавать/менять ТОЛЬКО свои FT (ft.input_name == login)
+// ✅ Пока ПОСЛЕДНЯЯ строка цикла НЕ оплачена -> пишем в тот же id_zvk
+// ✅ Если ПОСЛЕДНЯЯ строка оплачена -> создаём новый id_zvk
+// ✅ Возвращает zvk_row_id (это zvk.id)
+// =====================================================
+
+// helpers (если их ещё нет выше по файлу)
+function isTruthy(v){
+  return v === true || v === 1 || v === "1" || String(v).toLowerCase() === "true";
+}
+function normLogin(v){
+  return String(v || "").trim().toLowerCase();
+}
+async function canEditFtByLogin(poolOrClient, id_ft, login){
+  const ft = String(id_ft || "").trim();
+  const lg = normLogin(login);
+  if (!ft || !lg) return false;
+
+  const r = await poolOrClient.query(
+    `SELECT 1
+     FROM ft
+     WHERE id_ft = $1
+       AND lower(trim(input_name)) = $2
+     LIMIT 1`,
+    [ft, lg]
+  );
+  return r.rowCount > 0;
+}
+
 app.post("/zvk-save", async (req, res) => {
   try {
-    const { id_ft, user_name, to_pay, request_flag } = req.body;
-    if (!id_ft) return res.status(400).json({ success: false, error: "id_ft is required" });
+    // ✅ ДОБАВИЛИ login/is_admin/is_all (передавай с фронта)
+    const { id_ft, user_name, to_pay, request_flag, login, is_admin, is_all } = req.body;
+
+    if (!id_ft) return res.status(400).json({ success:false, error:"id_ft is required" });
+
+    // ✅ кто делает действие (для оператора/инициатора)
+    const actor = String(login || user_name || "").trim();
+    if (!actor) return res.status(400).json({ success:false, error:"login required" });
+
+    // ✅ админ или супер-права
+    const adminOk = isTruthy(is_admin) || String(is_all || "0") === "1";
+
+    // ✅ НЕ админ -> только свои FT
+    if (!adminOk) {
+      const ok = await canEditFtByLogin(pool, id_ft, actor);
+      if (!ok) return res.status(403).json({ success:false, error:"NO_RIGHTS_THIS_FT" });
+    }
 
     const ft = String(id_ft).trim();
-    const name = (user_name || "СИСТЕМА").toString().trim();
+    const name = (user_name || actor || "СИСТЕМА").toString().trim();
     const flag = (request_flag || "Нет").toString().trim();
 
     const toPayNum =
       (to_pay === "" || to_pay === undefined || to_pay === null) ? 0 : Number(to_pay);
     if (Number.isNaN(toPayNum)) {
-      return res.status(400).json({ success: false, error: "to_pay must be number" });
+      return res.status(400).json({ success:false, error:"to_pay must be number" });
     }
 
     // 1) последний цикл ZFT по FT
@@ -374,9 +422,10 @@ app.post("/zvk-save", async (req, res) => {
       id_zvk,
       zvk_row_id: r.rows[0].id,
     });
+
   } catch (e) {
     console.error("ZVK-SAVE ERROR:", e);
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success:false, error:e.message });
   }
 });
 
@@ -386,14 +435,27 @@ app.post("/zvk-save", async (req, res) => {
 // =====================================================
 app.post("/zvk-status-row", async (req, res) => {
   try {
-    const { zvk_row_id, src_d, src_o } = req.body;
+    const { zvk_row_id, src_d, src_o, login, is_admin, can_edit_all, is_all } = req.body;
+
     if (!zvk_row_id)
-      return res.status(400).json({ success: false, error: "zvk_row_id required" });
+      return res.status(400).json({ success:false, error:"zvk_row_id required" });
 
     const rid = Number(zvk_row_id);
     if (Number.isNaN(rid))
-      return res.status(400).json({ success: false, error: "zvk_row_id must be number" });
+      return res.status(400).json({ success:false, error:"zvk_row_id must be number" });
 
+    const actor = String(login || "").trim();
+    if (!actor) return res.status(400).json({ success:false, error:"login required" });
+
+    const adminOk = isTruthy(is_admin) || isTruthy(can_edit_all) || String(is_all || "0") === "1";
+
+    // ✅ НЕ админ -> можно менять ТОЛЬКО свои строки (по FT.input_name)
+    if (!adminOk) {
+      const ok = await canEditRowByLogin(pool, rid, actor);
+      if (!ok) return res.status(403).json({ success:false, error:"NO_RIGHTS_THIS_ROW" });
+    }
+
+    // --- дальше твой upsert ---
     const r = await pool.query(
       `
       INSERT INTO zvk_status (zvk_row_id, status_time, src_d, src_o)
@@ -408,13 +470,13 @@ app.post("/zvk-status-row", async (req, res) => {
       [rid, String(src_d || ""), String(src_o || "")]
     );
 
-    res.json({ success: true, row: r.rows[0] });
+    res.json({ success:true, row: r.rows[0] });
+
   } catch (e) {
     console.error("ZVK-STATUS-ROW ERROR:", e);
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success:false, error:e.message });
   }
 });
-
 // =====================================================
 // ✅ Оплата/Реестр — ПО СТРОКЕ истории (zvk_row_id)
 // POST /zvk-pay-row  { is_admin, zvk_row_id, registry_flag, is_paid }
@@ -588,54 +650,67 @@ app.post("/zvk-pay-row", async (req, res) => {
 // =====================================================
 // JOIN: читаем из VIEW ft_zvk_current_v2
 // =====================================================
+
+
 app.get("/ft-zvk-join", async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit || 500), 500);
     const login = String(req.query.login || "").trim();
-    const isAdmin = String(req.query.is_admin || "0") === "1";
-    const isAll   = String(req.query.is_all   || "0") === "1"; // ✅ НОВОЕ
+
+    const isAdmin    = String(req.query.is_admin || "0") === "1";
+    const isAll      = String(req.query.is_all || "0") === "1";          // R_Kasymkhan
+    const isOperator = String(req.query.is_operator || "0") === "1";     // ✅ Оператор
+
+    if (!login) return res.status(400).json({ success:false, error:"login is required" });
 
     let query = "";
     let params = [limit];
 
-     if (isAdmin || isAll) {
-  query = `
-    SELECT v.*
-    FROM ft_zvk_current_v2 v
-    ORDER BY
-      COALESCE(NULLIF(substring(v.id_ft from '\\d+'), ''), '0')::int DESC,
-      v.zvk_date DESC NULLS LAST,
-      v.zvk_row_id DESC
-    LIMIT $1
-  `;
-} else {
-  query = `
-    SELECT v.*
-    FROM ft_zvk_current_v2 v
-    WHERE lower(trim(v.input_name)) = lower(trim($2))
-    ORDER BY
-      COALESCE(NULLIF(substring(v.id_ft from '\\d+'), ''), '0')::int DESC,
-      v.zvk_date DESC NULLS LAST,
-      v.zvk_row_id DESC
-    LIMIT $1
-  `;
-  params.push(login);
-}
+    if (isAdmin || isAll || isOperator) {
+      // ✅ админ/супер/оператор видят всё
+      query = `
+        SELECT v.*
+        FROM ft_zvk_current_v2 v
+        ORDER BY
+          COALESCE(NULLIF(substring(v.id_ft from '\\d+'), ''), '0')::int DESC,
+          v.zvk_date DESC NULLS LAST,
+          v.zvk_row_id DESC
+        LIMIT $1
+      `;
+    } else {
+      // ✅ инициатор видит только своё
+      query = `
+        SELECT v.*
+        FROM ft_zvk_current_v2 v
+        WHERE lower(trim(v.input_name)) = lower(trim($2))
+        ORDER BY
+          COALESCE(NULLIF(substring(v.id_ft from '\\d+'), ''), '0')::int DESC,
+          v.zvk_date DESC NULLS LAST,
+          v.zvk_row_id DESC
+        LIMIT $1
+      `;
+      params.push(login);
+    }
 
     const r = await pool.query(query, params);
 
-    res.json({
-      success: true,
-      rows: r.rows,
-      count: r.rows.length,
-      isAdmin: isAdmin,
-    });
+    // ✅ can_edit: админ/супер — true; иначе только свои FT
+    const loginNorm = normLogin(login);
+
+    const rows = r.rows.map(x => ({
+      ...x,
+      can_edit: (isAdmin || isAll)
+        ? true
+        : (normLogin(x.input_name) === loginNorm)
+    }));
+
+    res.json({ success:true, rows, count: rows.length, isAdmin, isOperator });
+
   } catch (e) {
     console.error("FT-ZVK-JOIN ERROR:", e);
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success:false, error:e.message });
   }
 });
-
 // =====================================================
 // SAVE FT (создать FT + авто ZFT + строка СИСТЕМА)
 // =====================================================
