@@ -904,29 +904,54 @@ app.get("/registry", async (req, res) => {
     if (!login)
       return res.status(400).json({ success:false, error:"login required" });
 
-    const q = `
-      SELECT
-        f."object"           AS object,
-        z.id_zvk             AS reg_no,
-        f.contractor         AS contractor,
-        f.pay_purpose        AS pay_purpose,
-        f.dds_article        AS dds_article,
-        f.contract_no        AS contract_no,
-        f.invoice_no         AS invoice_no,
-        f.invoice_date       AS invoice_date,
-        f.invoice_pdf        AS invoice_pdf,
-        COALESCE(s.src_d,'') AS src_d,
-        COALESCE(s.src_o,'') AS src_o,
-        COALESCE(z.to_pay,0) AS to_pay
-      FROM ft f
-      JOIN zvk z ON z.id_ft = f.id_ft
-      LEFT JOIN zvk_pay p ON p.zvk_row_id = z.id
-      LEFT JOIN zvk_status s ON s.zvk_row_id = z.id
-      WHERE z.request_flag = 'Да'
-        AND (p.registry_flag IS NULL OR TRIM(p.registry_flag) = '')
-        AND LOWER(TRIM(f.input_name)) = LOWER(TRIM($1))
-      ORDER BY z.id_zvk DESC, z.id DESC;
-    `;
+   const q = `
+  WITH last_zvk AS (
+    SELECT DISTINCT ON (z.id_ft)
+      z.*
+    FROM zvk z
+    WHERE z.request_flag = 'Да'
+    ORDER BY z.id_ft, z.id DESC
+  )
+  SELECT
+    f."object"           AS object,
+    z.id_zvk             AS reg_no,
+    f.contractor         AS contractor,
+    f.pay_purpose        AS pay_purpose,
+    f.dds_article        AS dds_article,
+    f.contract_no        AS contract_no,
+    f.invoice_no         AS invoice_no,
+    f.invoice_date       AS invoice_date,
+    f.invoice_pdf        AS invoice_pdf,
+    COALESCE(s.src_d,'') AS src_d,
+    COALESCE(s.src_o,'') AS src_o,
+    COALESCE(z.to_pay,0) AS to_pay
+  FROM ft f
+  JOIN last_zvk z ON z.id_ft = f.id_ft
+
+  -- ✅ берём ПОСЛЕДНИЙ статус (если статусов несколько)
+  LEFT JOIN LATERAL (
+    SELECT s1.*
+    FROM zvk_status s1
+    WHERE s1.zvk_row_id = z.id
+    ORDER BY s1.id DESC
+    LIMIT 1
+  ) s ON true
+
+  WHERE LOWER(TRIM(f.input_name)) = LOWER(TRIM($1))
+
+    -- ❌ не показывать если registry_flag = 'Да' (даже если есть другие строки pay)
+    AND NOT EXISTS (
+      SELECT 1
+      FROM zvk_pay p2
+      WHERE p2.zvk_row_id = z.id
+        AND TRIM(COALESCE(p2.registry_flag,'')) = 'Да'
+    )
+
+    -- ❌ не показывать "Обнуление" (to_pay = 0)
+    AND COALESCE(z.to_pay,0) <> 0
+
+  ORDER BY z.id_zvk DESC, z.id DESC;
+`;
 
     const { rows } = await pool.query(q, [login]);
     const total = rows.reduce((sum, r) => sum + Number(r.to_pay || 0), 0);
