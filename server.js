@@ -1002,60 +1002,29 @@ app.get("/registry", async (req, res) => {
       return res.status(400).json({ success:false, error:"login required" });
     }
 
-    const q = `
-WITH last_zvk AS (
-  SELECT DISTINCT ON (z.id_ft)
-    z.*
-  FROM zvk z
-  WHERE z.request_flag = 'Да'
-  ORDER BY z.id_ft, z.id DESC
-)
+const q = `
 SELECT
-  f."object"           AS object,
-  z.id_zvk             AS reg_no,
-  f.contractor         AS contractor,
-  f.pay_purpose        AS pay_purpose,
-  f.dds_article        AS dds_article,
-  f.contract_no        AS contract_no,
-  f.invoice_no         AS invoice_no,
-  f.invoice_date       AS invoice_date,
-  f.invoice_pdf        AS invoice_pdf,
-  COALESCE(s.src_d,'') AS src_d,
-  COALESCE(s.src_o,'') AS src_o,
-  COALESCE(z.to_pay,0) AS to_pay
-FROM ft f
-JOIN last_zvk z ON z.id_ft = f.id_ft
-
--- ✅ последняя строка zvk_pay (чтобы registry_flag был один “последний”)
-LEFT JOIN LATERAL (
-  SELECT p1.registry_flag
-  FROM zvk_pay p1
-  WHERE p1.zvk_row_id = z.id
-  ORDER BY p1.pay_time DESC NULLS LAST,
-           p1.agree_time DESC NULLS LAST
-  LIMIT 1
-) p ON true
-
--- ✅ последний статус (если нужно)
-LEFT JOIN LATERAL (
-  SELECT s1.*
-  FROM zvk_status s1
-  WHERE s1.zvk_row_id = z.id
-  ORDER BY s1.status_time DESC NULLS LAST
-  LIMIT 1
-) s ON true
-
-WHERE LOWER(TRIM(f.input_name)) = LOWER(TRIM($1))
-
-  -- ✅ request_flag уже = 'Да' (в last_zvk)
-
-  -- ✅ показывать только если registry_flag пусто
-  AND NULLIF(TRIM(COALESCE(p.registry_flag,'')), '') IS NULL
-
-  -- ❌ обнуление не показывать
-  AND COALESCE(z.to_pay,0) <> 0
-
-ORDER BY z.id_zvk DESC, z.id DESC;
+  v.object              AS object,
+  v.id_zvk              AS reg_no,
+  v.contractor          AS contractor,
+  v.pay_purpose         AS pay_purpose,
+  v.dds_article         AS dds_article,
+  v.contract_no         AS contract_no,
+  v.invoice_no          AS invoice_no,
+  v.invoice_date        AS invoice_date,
+  v.invoice_pdf         AS invoice_pdf,
+  COALESCE(v.src_d,'')  AS src_d,
+  COALESCE(v.src_o,'')  AS src_o,
+  COALESCE(v.to_pay,0)  AS to_pay
+FROM ft_zvk_current_v2 v
+WHERE lower(trim(v.input_name)) = lower(trim($1))
+  AND v.request_flag = 'Да'
+  AND NULLIF(trim(COALESCE(v.registry_flag,'')), '') IS NULL   -- ✅ Реестр пусто (__EMPTY__)
+  AND COALESCE(v.to_pay,0) <> 0
+ORDER BY
+  COALESCE(NULLIF(substring(v.id_ft from '\\d+'), ''), '0')::int DESC,
+  v.zvk_date DESC NULLS LAST,
+  v.zvk_row_id DESC;
 `;
     const { rows } = await pool.query(q, [login]);
     const total = rows.reduce((sum, r) => sum + Number(r.to_pay || 0), 0);
