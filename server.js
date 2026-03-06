@@ -1041,7 +1041,35 @@ ORDER BY
   }
 });
 
+app.get("/svod-object", async (req, res) => {
+  try {
 
+    const result = await pool.query(`
+      SELECT
+        object_name,
+        amount_in,
+        to_pay,
+        balance,
+        registry,
+        balance_registry
+      FROM public.svod_object_v1
+      ORDER BY object_name
+    `);
+
+    res.json({
+      ok: true,
+      rows: result.rows
+    });
+
+  } catch (err) {
+    console.error("❌ /svod-object error:", err);
+
+    res.status(500).json({
+      ok: false,
+      error: err.message
+    });
+  }
+});
 // =====================================================
 // Start
 // =====================================================
