@@ -340,19 +340,29 @@ async function canEditRowByLogin(poolOrClient, zvk_row_id, login) {
 
 app.post("/zvk-save", async (req, res) => {
   try {
-    // ✅ ДОБАВИЛИ login/is_admin/is_all (передавай с фронта)
-    const { id_ft, user_name, to_pay, request_flag, login, is_admin, is_all } = req.body;
+    const {
+      id_ft,
+      user_name,
+      to_pay,
+      request_flag,
+      login,
+      is_admin,
+      is_all,
+      can_edit_all   // ✅ ДОБАВИЛИ
+    } = req.body;
 
     if (!id_ft) return res.status(400).json({ success:false, error:"id_ft is required" });
 
-    // ✅ кто делает действие (для оператора/инициатора)
     const actor = String(login || user_name || "").trim();
     if (!actor) return res.status(400).json({ success:false, error:"login required" });
 
-    // ✅ админ или супер-права
-    const adminOk = isTruthy(is_admin) || String(is_all || "0") === "1";
+    // ✅ админ / супервайзер
+    const adminOk =
+      isTruthy(is_admin) ||
+      isTruthy(is_all) ||
+      isTruthy(can_edit_all);
 
-    // ✅ НЕ админ -> только свои FT
+    // ✅ НЕ админ/супер -> только свои FT
     if (!adminOk) {
       const ok = await canEditFtByLogin(pool, id_ft, actor);
       if (!ok) return res.status(403).json({ success:false, error:"NO_RIGHTS_THIS_FT" });
@@ -364,11 +374,11 @@ app.post("/zvk-save", async (req, res) => {
 
     const toPayNum =
       (to_pay === "" || to_pay === undefined || to_pay === null) ? 0 : Number(to_pay);
+
     if (Number.isNaN(toPayNum)) {
       return res.status(400).json({ success:false, error:"to_pay must be number" });
     }
 
-    // 1) последний цикл ZFT по FT
     const lastCycle = await pool.query(
       `
       SELECT z.id_zvk
@@ -385,7 +395,6 @@ app.post("/zvk-save", async (req, res) => {
 
     let id_zvk = lastCycle.rows[0]?.id_zvk || null;
 
-    // 2) если есть цикл — проверяем оплату ПОСЛЕДНЕЙ строки этого цикла
     if (id_zvk) {
       const lastRow = await pool.query(
         `
@@ -405,11 +414,10 @@ app.post("/zvk-save", async (req, res) => {
           `SELECT is_paid FROM zvk_pay WHERE zvk_row_id=$1`,
           [Number(lastRowId)]
         );
-        if (paid.rows[0]?.is_paid === "Да") id_zvk = null; // цикл закрыт
+        if (paid.rows[0]?.is_paid === "Да") id_zvk = null;
       }
     }
 
-    // 3) если цикла нет — создаём новый id_zvk и стартовую строку "СИСТЕМА/Нет/sum_ft"
     if (!id_zvk) {
       const created = await pool.query(`SELECT 'ZFT' || nextval('zvk_id_seq')::text AS id_zvk`);
       id_zvk = created.rows[0].id_zvk;
@@ -426,7 +434,6 @@ app.post("/zvk-save", async (req, res) => {
       );
     }
 
-    // 4) добавляем новую строку истории (тот же id_zvk)
     const r = await pool.query(
       `
       INSERT INTO zvk (id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag)
