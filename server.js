@@ -1182,6 +1182,37 @@ app.post("/create-registry", async (req, res) => {
   }
 });
 
+app.get("/registry-list", async (req,res)=>{
+
+  try{
+
+    const r = await pool.query(`
+      SELECT
+        registry_no,
+        registry_date,
+        created_by,
+        items_count,
+        total_amount,
+        workflow_stage
+      FROM registry_head
+      ORDER BY id DESC
+    `);
+
+    res.json({
+      success:true,
+      rows:r.rows
+    });
+
+  }catch(e){
+
+    res.status(500).json({
+      success:false,
+      error:e.message
+    });
+
+  }
+
+});
 // =====================================================
 // Start
 // =====================================================
