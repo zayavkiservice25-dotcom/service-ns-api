@@ -1183,11 +1183,10 @@ app.post("/create-registry", async (req, res) => {
 });
 
 app.get("/registry-list", async (req,res)=>{
-
   try{
-
     const r = await pool.query(`
       SELECT
+        id,
         registry_no,
         registry_date,
         created_by,
@@ -1204,14 +1203,11 @@ app.get("/registry-list", async (req,res)=>{
     });
 
   }catch(e){
-
     res.status(500).json({
       success:false,
       error:e.message
     });
-
   }
-
 });
 
 app.get("/registry-card", async (req, res) => {
