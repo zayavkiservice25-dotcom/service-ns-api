@@ -1086,55 +1086,102 @@ app.post("/create-registry", async (req, res) => {
   const client = await pool.connect();
 
   try {
+
     const { row_ids, login } = req.body;
 
     if (!Array.isArray(row_ids) || row_ids.length === 0) {
       return res.status(400).json({
-        success: false,
-        error: "row_ids required"
+        success:false,
+        error:"row_ids required"
       });
     }
 
     await client.query("BEGIN");
 
-    const registryRow = await client.query(`
-      SELECT 'REG' || nextval('zvk_id_seq')::text AS registry_id
-    `);
+    // 1️⃣ создаем шапку реестра
+    const head = await client.query(`
+      INSERT INTO registry_head (created_by)
+      VALUES ($1)
+      RETURNING id, registry_no
+    `,[login || null]);
 
-    const registry_id = registryRow.rows[0].registry_id;
+    const registry_id = head.rows[0].id;
+    const registry_no = head.rows[0].registry_no;
 
-    // 1. шапка реестра
+    // 2️⃣ вставляем строки реестра
+    const items = await client.query(`
+      INSERT INTO registry_items
+      (
+        registry_id,
+        zvk_row_id,
+        id_ft,
+        id_zvk,
+        object,
+        contractor,
+        pay_purpose,
+        dds_article,
+        contract_no,
+        invoice_no,
+        invoice_date,
+        src_d,
+        src_o,
+        to_pay
+      )
+      SELECT
+        $1,
+        v.zvk_row_id,
+        v.id_ft,
+        v.id_zvk,
+        v.object,
+        v.contractor,
+        v.pay_purpose,
+        v.dds_article,
+        v.contract_no,
+        v.invoice_no,
+        v.invoice_date,
+        v.src_d,
+        v.src_o,
+        v.to_pay
+      FROM ft_zvk_current_v2 v
+      WHERE v.zvk_row_id = ANY($2::bigint[])
+      RETURNING to_pay
+    `,[registry_id,row_ids]);
+
+    // 3️⃣ считаем сумму и количество
+    const total = items.rows.reduce((s,r)=>s+Number(r.to_pay||0),0);
+    const count = items.rows.length;
+
     await client.query(`
-      INSERT INTO payment_registry (registry_id, created_by, status)
-      VALUES ($1, $2, 'Создан')
-    `, [registry_id, String(login || "").trim() || null]);
-
-    // 2. строки реестра
-    for (const rowId of row_ids) {
-      await client.query(`
-        INSERT INTO payment_registry_items (registry_id, zvk_row_id)
-        VALUES ($1, $2)
-      `, [registry_id, Number(rowId)]);
-    }
+      UPDATE registry_head
+      SET total_amount=$1,
+          items_count=$2
+      WHERE id=$3
+    `,[total,count,registry_id]);
 
     await client.query("COMMIT");
 
     res.json({
-      success: true,
-      registry_id
+      success:true,
+      registry_id,
+      registry_no
     });
 
-  } catch (e) {
+  } catch(e) {
+
     await client.query("ROLLBACK");
-    console.error("CREATE REGISTRY ERROR:", e);
+
+    console.error("CREATE REGISTRY ERROR:",e);
+
     res.status(500).json({
-      success: false,
-      error: e.message
+      success:false,
+      error:e.message
     });
+
   } finally {
     client.release();
   }
 });
+
 // =====================================================
 // Start
 // =====================================================
