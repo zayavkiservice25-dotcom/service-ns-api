@@ -1213,6 +1213,80 @@ app.get("/registry-list", async (req,res)=>{
   }
 
 });
+
+app.get("/registry-card", async (req, res) => {
+  try {
+    const id = Number(req.query.id);
+
+    if (!id) {
+      return res.status(400).json({
+        success: false,
+        error: "id required"
+      });
+    }
+
+    const headRes = await pool.query(`
+      SELECT
+        id,
+        registry_no,
+        registry_date,
+        created_by,
+        division,
+        total_amount,
+        items_count,
+        workflow_stage,
+        agree_status,
+        execution_status,
+        archive_flag,
+        pdf_url,
+        created_at
+      FROM registry_head
+      WHERE id = $1
+      LIMIT 1
+    `, [id]);
+
+    if (!headRes.rows.length) {
+      return res.status(404).json({
+        success: false,
+        error: "registry not found"
+      });
+    }
+
+    const itemsRes = await pool.query(`
+      SELECT
+        registry_id,
+        zvk_row_id,
+        id_ft,
+        id_zvk,
+        object,
+        contractor,
+        pay_purpose,
+        dds_article,
+        contract_no,
+        invoice_no,
+        invoice_date,
+        src_d,
+        src_o,
+        to_pay
+      FROM registry_items
+      WHERE registry_id = $1
+      ORDER BY id
+    `, [id]);
+
+    res.json({
+      success: true,
+      head: headRes.rows[0],
+      items: itemsRes.rows
+    });
+
+  } catch (e) {
+    console.error("REGISTRY CARD ERROR:", e);
+    res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
 // =====================================================
 // Start
 // =====================================================
