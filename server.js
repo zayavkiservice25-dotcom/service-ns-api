@@ -1077,6 +1077,49 @@ app.get("/svod-object", async (req, res) => {
     });
   }
 });
+
+// =====================================================
+// CREATE REGISTRY
+// =====================================================
+
+app.post("/create-registry", async (req, res) => {
+  try {
+
+    const { row_ids, login } = req.body;
+
+    if (!Array.isArray(row_ids) || row_ids.length === 0) {
+      return res.status(400).json({
+        success:false,
+        error:"row_ids required"
+      });
+    }
+
+    const registryRow = await pool.query(`
+      SELECT 'REG' || nextval('zvk_id_seq')::text AS registry_id
+    `);
+
+    const registry_id = registryRow.rows[0].registry_id;
+
+    // обновляем строки → ставим registry_flag='Да'
+    await pool.query(`
+      UPDATE zvk_pay
+      SET registry_flag = 'Да'
+      WHERE zvk_row_id = ANY($1::bigint[])
+    `,[row_ids]);
+
+    res.json({
+      success:true,
+      registry_id
+    });
+
+  } catch (e) {
+    console.error("CREATE REGISTRY ERROR:", e);
+    res.status(500).json({
+      success:false,
+      error:e.message
+    });
+  }
+});
 // =====================================================
 // Start
 // =====================================================
