@@ -1083,41 +1083,56 @@ app.get("/svod-object", async (req, res) => {
 // =====================================================
 
 app.post("/create-registry", async (req, res) => {
-  try {
+  const client = await pool.connect();
 
+  try {
     const { row_ids, login } = req.body;
 
     if (!Array.isArray(row_ids) || row_ids.length === 0) {
       return res.status(400).json({
-        success:false,
-        error:"row_ids required"
+        success: false,
+        error: "row_ids required"
       });
     }
 
-    const registryRow = await pool.query(`
+    await client.query("BEGIN");
+
+    const registryRow = await client.query(`
       SELECT 'REG' || nextval('zvk_id_seq')::text AS registry_id
     `);
 
     const registry_id = registryRow.rows[0].registry_id;
 
-    // обновляем строки → ставим registry_flag='Да'
-    await pool.query(`
-      UPDATE zvk_pay
-      SET registry_flag = 'Да'
-      WHERE zvk_row_id = ANY($1::bigint[])
-    `,[row_ids]);
+    // 1. шапка реестра
+    await client.query(`
+      INSERT INTO payment_registry (registry_id, created_by, status)
+      VALUES ($1, $2, 'Создан')
+    `, [registry_id, String(login || "").trim() || null]);
+
+    // 2. строки реестра
+    for (const rowId of row_ids) {
+      await client.query(`
+        INSERT INTO payment_registry_items (registry_id, zvk_row_id)
+        VALUES ($1, $2)
+      `, [registry_id, Number(rowId)]);
+    }
+
+    await client.query("COMMIT");
 
     res.json({
-      success:true,
+      success: true,
       registry_id
     });
 
   } catch (e) {
+    await client.query("ROLLBACK");
     console.error("CREATE REGISTRY ERROR:", e);
     res.status(500).json({
-      success:false,
-      error:e.message
+      success: false,
+      error: e.message
     });
+  } finally {
+    client.release();
   }
 });
 // =====================================================
