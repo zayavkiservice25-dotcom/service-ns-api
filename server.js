@@ -1340,8 +1340,10 @@ app.get("/registry-list", async (req,res)=>{
         created_by,
         items_count,
         total_amount,
-        workflow_stage
+        workflow_stage,
+        archive_flag
       FROM registry_head
+      WHERE COALESCE(archive_flag,'Нет') <> 'Да'
       ORDER BY id DESC
     `);
 
@@ -1801,6 +1803,138 @@ app.post("/registry-move-stage", async (req, res) => {
     client.release();
   }
 });
+
+app.post("/registry-send-to-archive", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const { registry_id, login, name } = req.body;
+
+    if (!registry_id) {
+      return res.status(400).json({ success:false, error:"registry_id required" });
+    }
+
+    const actor = String(login || "").trim().toLowerCase();
+
+    // кто может отправлять в архив
+    const allowed = ["k_erkin", "k_erkin2"];
+    if (!allowed.includes(actor)) {
+      return res.status(403).json({ success:false, error:"NO_RIGHTS_TO_ARCHIVE" });
+    }
+
+    await client.query("BEGIN");
+
+    const regRes = await client.query(`
+      SELECT id, workflow_stage, archive_flag
+      FROM public.registry_head
+      WHERE id = $1
+      LIMIT 1
+    `, [Number(registry_id)]);
+
+    if (!regRes.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success:false, error:"registry not found" });
+    }
+
+    const reg = regRes.rows[0];
+
+    if (String(reg.archive_flag || "").trim() === "Да") {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ success:false, error:"ALREADY_ARCHIVED" });
+    }
+
+    if (String(reg.workflow_stage || "").trim() !== "Контроль и архивирование") {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ success:false, error:"NOT_READY_FOR_ARCHIVE" });
+    }
+
+    // 1. помечаем сам реестр архивным
+    await client.query(`
+      UPDATE public.registry_head
+      SET
+        archive_flag = 'Да',
+        execution_status = 'Исполнено'
+      WHERE id = $1
+    `, [Number(registry_id)]);
+
+    // 2. по всем строкам реестра ставим is_paid = Да
+    await client.query(`
+      INSERT INTO public.zvk_pay (zvk_row_id, registry_flag, is_paid, agree_time, pay_time)
+      SELECT
+        ri.zvk_row_id,
+        'Да',
+        'Да',
+        NOW(),
+        NOW()
+      FROM public.registry_items ri
+      WHERE ri.registry_id = $1
+        AND ri.zvk_row_id IS NOT NULL
+      ON CONFLICT (zvk_row_id)
+      DO UPDATE SET
+        registry_flag = 'Да',
+        is_paid = 'Да',
+        agree_time = COALESCE(zvk_pay.agree_time, NOW()),
+        pay_time = COALESCE(zvk_pay.pay_time, NOW())
+    `, [Number(registry_id)]);
+
+    // лог
+    await client.query(`
+      INSERT INTO public.registry_approve_log
+        (registry_id, stage_name, approver_login, approver_name, action_type, comment_text)
+      VALUES ($1, $2, $3, $4, 'archive', $5)
+    `, [
+      Number(registry_id),
+      'Контроль и архивирование',
+      String(login || ""),
+      String(name || ""),
+      'Отправлено в архив'
+    ]);
+
+    await client.query("COMMIT");
+
+    res.json({ success:true, archived:true });
+
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("REGISTRY-SEND-TO-ARCHIVE ERROR:", e);
+    res.status(500).json({ success:false, error:e.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/registry-archive-list", async (req,res)=>{
+  try{
+    const r = await pool.query(`
+      SELECT
+        id,
+        registry_no,
+        registry_date,
+        created_by,
+        items_count,
+        total_amount,
+        workflow_stage,
+        archive_flag,
+        execution_status
+      FROM public.registry_head
+      WHERE COALESCE(archive_flag,'Нет') = 'Да'
+      ORDER BY id DESC
+    `);
+
+    res.json({
+      success:true,
+      rows:r.rows
+    });
+
+  }catch(e){
+    res.status(500).json({
+      success:false,
+      error:e.message
+    });
+  }
+});
+
+
 // =====================================================
 // Start
 // =====================================================
