@@ -1573,22 +1573,22 @@ app.post("/registry-approve", async (req, res) => {
       let approveParams = [];
       let nextStage = "";
 
-      if (stage === "Главный бухгалтер") {
-        approveSql = `
-          UPDATE public.registry_head
-          SET
-            acc_buh_status = 'Согласовано',
-            acc_buh_time = NOW(),
-            acc_buh_comment = $2,
-            workflow_stage = 'Зам. директора по финансам',
-            agree_status = 'На согласовании'
-          WHERE id = $1
-        `;
-        approveParams = [Number(registry_id), String(comment || "")];
-        nextStage = "Зам. директора по финансам";
-      }
+  if (stage === "Главный бухгалтер") {
+  approveSql = `
+    UPDATE public.registry_head
+    SET
+      acc_buh_status = 'Согласовано',
+      acc_buh_time = NOW(),
+      acc_buh_comment = $2,
+      workflow_stage = 'Заместитель директора по финансам',
+      agree_status = 'На согласовании'
+    WHERE id = $1
+  `;
+  approveParams = [Number(registry_id), String(comment || "")];
+  nextStage = "Заместитель директора по финансам";
+}
 
-      else if (stage === "Зам. директора по финансам") {
+      else if (stage === "Заместитель директора по финансам") {
         approveSql = `
           UPDATE public.registry_head
           SET
