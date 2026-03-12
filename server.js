@@ -1695,6 +1695,112 @@ app.post("/registry-approve", async (req, res) => {
   }
 });
 
+app.post("/registry-move-stage", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const { registry_id, from_stage, to_stage, login, name } = req.body;
+
+    if (!registry_id) {
+      return res.status(400).json({ success:false, error:"registry_id required" });
+    }
+
+    if (!from_stage || !to_stage) {
+      return res.status(400).json({ success:false, error:"from_stage and to_stage required" });
+    }
+
+    const actor = String(login || "").trim().toLowerCase();
+    const fromS = String(from_stage || "").trim();
+    const toS   = String(to_stage || "").trim();
+
+    await client.query("BEGIN");
+
+    const regRes = await client.query(
+      `SELECT * FROM public.registry_head WHERE id = $1 LIMIT 1`,
+      [Number(registry_id)]
+    );
+
+    if (!regRes.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success:false, error:"registry not found" });
+    }
+
+    // Ермек может двигать в любой столбец
+    if (actor === "k_ermek") {
+      await client.query(
+        `
+        UPDATE public.registry_head
+        SET workflow_stage = $2
+        WHERE id = $1
+        `,
+        [Number(registry_id), toS]
+      );
+
+      await client.query(
+        `
+        INSERT INTO public.registry_approve_log
+          (registry_id, stage_name, approver_login, approver_name, action_type, comment_text)
+        VALUES ($1, $2, $3, $4, 'move', $5)
+        `,
+        [
+          Number(registry_id),
+          `${fromS} -> ${toS}`,
+          String(login || ""),
+          String(name || ""),
+          "Перемещение через канбан"
+        ]
+      );
+
+      await client.query("COMMIT");
+      return res.json({ success:true, moved_to: toS });
+    }
+
+    const allowed =
+      (actor === "s_zhasulan" && fromS === "Главный бухгалтер" && toS === "Заместитель директора по финансам") ||
+      (actor === "o_dinara"   && fromS === "Заместитель директора по финансам" && toS === "Заместитель директора") ||
+      (actor === "k_marat"    && fromS === "Заместитель директора" && toS === "Управляющий директор") ||
+      (actor === "k_arailym"  && fromS === "Исполнение платежей" && toS === "Контроль и архивирование");
+
+    if (!allowed) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ success:false, error:"NO_RIGHTS_TO_MOVE_STAGE" });
+    }
+
+    await client.query(
+      `
+      UPDATE public.registry_head
+      SET workflow_stage = $2
+      WHERE id = $1
+      `,
+      [Number(registry_id), toS]
+    );
+
+    await client.query(
+      `
+      INSERT INTO public.registry_approve_log
+        (registry_id, stage_name, approver_login, approver_name, action_type, comment_text)
+      VALUES ($1, $2, $3, $4, 'move', $5)
+      `,
+      [
+        Number(registry_id),
+        `${fromS} -> ${toS}`,
+        String(login || ""),
+        String(name || ""),
+        "Перемещение через канбан"
+      ]
+    );
+
+    await client.query("COMMIT");
+    return res.json({ success:true, moved_to: toS });
+
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("REGISTRY-MOVE-STAGE ERROR:", e);
+    res.status(500).json({ success:false, error:e.message });
+  } finally {
+    client.release();
+  }
+});
 // =====================================================
 // Start
 // =====================================================
