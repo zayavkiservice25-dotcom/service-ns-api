@@ -1436,6 +1436,241 @@ FROM registry_items
     });
   }
 });
+
+app.post("/registry-approve", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const {
+      registry_id,
+      stage,
+      action,
+      login,
+      name,
+      comment
+    } = req.body;
+
+    if (!registry_id) {
+      return res.status(400).json({ success:false, error:"registry_id required" });
+    }
+
+    if (!stage) {
+      return res.status(400).json({ success:false, error:"stage required" });
+    }
+
+    if (!action) {
+      return res.status(400).json({ success:false, error:"action required" });
+    }
+
+    await client.query("BEGIN");
+
+    const regRes = await client.query(
+      `SELECT * FROM public.registry_head WHERE id = $1 LIMIT 1`,
+      [Number(registry_id)]
+    );
+
+    if (!regRes.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success:false, error:"registry not found" });
+    }
+
+    const reg = regRes.rows[0];
+
+    // ----------------------------
+    // REJECT
+    // ----------------------------
+    if (action === "reject") {
+      let rejectSql = "";
+      let rejectParams = [];
+
+      if (stage === "Главный бухгалтер") {
+        rejectSql = `
+          UPDATE public.registry_head
+          SET
+            acc_buh_status = 'Отклонено',
+            acc_buh_time = NOW(),
+            acc_buh_comment = $2,
+            workflow_stage = 'Инициация',
+            agree_status = 'Отклонено'
+          WHERE id = $1
+        `;
+        rejectParams = [Number(registry_id), String(comment || "")];
+      }
+
+      else if (stage === "Зам. директора по финансам") {
+        rejectSql = `
+          UPDATE public.registry_head
+          SET
+            acc_fin_status = 'Отклонено',
+            acc_fin_time = NOW(),
+            acc_fin_comment = $2,
+            workflow_stage = 'Инициация',
+            agree_status = 'Отклонено'
+          WHERE id = $1
+        `;
+        rejectParams = [Number(registry_id), String(comment || "")];
+      }
+
+      else if (stage === "Заместитель директора") {
+        rejectSql = `
+          UPDATE public.registry_head
+          SET
+            acc_zam_status = 'Отклонено',
+            acc_zam_time = NOW(),
+            acc_zam_comment = $2,
+            workflow_stage = 'Инициация',
+            agree_status = 'Отклонено'
+          WHERE id = $1
+        `;
+        rejectParams = [Number(registry_id), String(comment || "")];
+      }
+
+      else if (stage === "Управляющий директор") {
+        rejectSql = `
+          UPDATE public.registry_head
+          SET
+            acc_ud_status = 'Отклонено',
+            acc_ud_time = NOW(),
+            acc_ud_comment = $2,
+            workflow_stage = 'Инициация',
+            agree_status = 'Отклонено'
+          WHERE id = $1
+        `;
+        rejectParams = [Number(registry_id), String(comment || "")];
+      }
+
+      else {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ success:false, error:"unknown stage" });
+      }
+
+      await client.query(rejectSql, rejectParams);
+
+      await client.query(
+        `
+        INSERT INTO public.registry_approve_log
+          (registry_id, stage_name, approver_login, approver_name, action_type, comment_text)
+        VALUES ($1, $2, $3, $4, 'reject', $5)
+        `,
+        [
+          Number(registry_id),
+          String(stage),
+          String(login || ""),
+          String(name || ""),
+          String(comment || "")
+        ]
+      );
+
+      await client.query("COMMIT");
+      return res.json({ success:true, moved_to:"Инициация", action:"reject" });
+    }
+
+    // ----------------------------
+    // APPROVE
+    // ----------------------------
+    if (action === "approve") {
+      let approveSql = "";
+      let approveParams = [];
+      let nextStage = "";
+
+      if (stage === "Главный бухгалтер") {
+        approveSql = `
+          UPDATE public.registry_head
+          SET
+            acc_buh_status = 'Согласовано',
+            acc_buh_time = NOW(),
+            acc_buh_comment = $2,
+            workflow_stage = 'Зам. директора по финансам',
+            agree_status = 'На согласовании'
+          WHERE id = $1
+        `;
+        approveParams = [Number(registry_id), String(comment || "")];
+        nextStage = "Зам. директора по финансам";
+      }
+
+      else if (stage === "Зам. директора по финансам") {
+        approveSql = `
+          UPDATE public.registry_head
+          SET
+            acc_fin_status = 'Согласовано',
+            acc_fin_time = NOW(),
+            acc_fin_comment = $2,
+            workflow_stage = 'Заместитель директора',
+            agree_status = 'На согласовании'
+          WHERE id = $1
+        `;
+        approveParams = [Number(registry_id), String(comment || "")];
+        nextStage = "Заместитель директора";
+      }
+
+      else if (stage === "Заместитель директора") {
+        approveSql = `
+          UPDATE public.registry_head
+          SET
+            acc_zam_status = 'Согласовано',
+            acc_zam_time = NOW(),
+            acc_zam_comment = $2,
+            workflow_stage = 'Управляющий директор',
+            agree_status = 'На согласовании'
+          WHERE id = $1
+        `;
+        approveParams = [Number(registry_id), String(comment || "")];
+        nextStage = "Управляющий директор";
+      }
+
+      else if (stage === "Управляющий директор") {
+        approveSql = `
+          UPDATE public.registry_head
+          SET
+            acc_ud_status = 'Согласовано',
+            acc_ud_time = NOW(),
+            acc_ud_comment = $2,
+            workflow_stage = 'Исполнение платежей',
+            agree_status = 'Согласовано'
+          WHERE id = $1
+        `;
+        approveParams = [Number(registry_id), String(comment || "")];
+        nextStage = "Исполнение платежей";
+      }
+
+      else {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ success:false, error:"unknown stage" });
+      }
+
+      await client.query(approveSql, approveParams);
+
+      await client.query(
+        `
+        INSERT INTO public.registry_approve_log
+          (registry_id, stage_name, approver_login, approver_name, action_type, comment_text)
+        VALUES ($1, $2, $3, $4, 'approve', $5)
+        `,
+        [
+          Number(registry_id),
+          String(stage),
+          String(login || ""),
+          String(name || ""),
+          String(comment || "")
+        ]
+      );
+
+      await client.query("COMMIT");
+      return res.json({ success:true, moved_to:nextStage, action:"approve" });
+    }
+
+    await client.query("ROLLBACK");
+    return res.status(400).json({ success:false, error:"unknown action" });
+
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("REGISTRY-APPROVE ERROR:", e);
+    res.status(500).json({ success:false, error:e.message });
+  } finally {
+    client.release();
+  }
+});
+
 // =====================================================
 // Start
 // =====================================================
