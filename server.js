@@ -222,7 +222,115 @@ async function initDb()  {
       raw_data JSONB NOT NULL
     );
   `);
+  // =========================
+  // REGISTRY HEAD
+  // =========================
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.registry_head (
+      id bigserial PRIMARY KEY,
+      registry_no bigint,
+      registry_date date DEFAULT CURRENT_DATE,
+      created_by text,
+      division text,
+      total_amount numeric(18,2) DEFAULT 0,
+      items_count integer DEFAULT 0,
+      workflow_stage text DEFAULT 'Инициация',
+      agree_status text,
+      execution_status text,
+      archive_flag text DEFAULT 'Нет',
+      pdf_url text,
+      created_at timestamptz DEFAULT now()
+    );
+  `);
 
+  await pool.query(`
+    CREATE SEQUENCE IF NOT EXISTS public.registry_no_seq START 1;
+  `);
+
+  await pool.query(`
+    SELECT setval(
+      'public.registry_no_seq',
+      COALESCE((SELECT MAX(registry_no) FROM public.registry_head), 0)
+    );
+  `);
+
+  await pool.query(`
+    ALTER TABLE public.registry_head
+    ALTER COLUMN registry_no SET DEFAULT nextval('public.registry_no_seq');
+  `);
+
+  // =========================
+  // REGISTRY ITEMS
+  // =========================
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.registry_items (
+      id bigserial PRIMARY KEY,
+      registry_id bigint NOT NULL,
+      zvk_row_id bigint,
+      id_ft text,
+      id_zvk text,
+      object text,
+      contractor text,
+      pay_purpose text,
+      dds_article text,
+      contract_no text,
+      invoice_no text,
+      invoice_date date,
+      invoice_pdf text,
+      src_d text,
+      src_o text,
+      to_pay numeric(18,2) DEFAULT 0
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS registry_items_registry_id_idx
+    ON public.registry_items (registry_id);
+  `);
+
+  // =========================
+  // REGISTRY APPROVE LOG
+  // =========================
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.registry_approve_log (
+      id bigserial PRIMARY KEY,
+      registry_id bigint NOT NULL,
+      stage_name text NOT NULL,
+      approver_login text,
+      approver_name text,
+      action_type text NOT NULL,
+      comment_text text,
+      created_at timestamptz DEFAULT now()
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS registry_approve_log_registry_id_idx
+    ON public.registry_approve_log (registry_id);
+  `);
+
+  // =========================
+  // APPROVAL COLUMNS
+  // =========================
+  await pool.query(`ALTER TABLE public.registry_head ADD COLUMN IF NOT EXISTS acc_buh_name text;`);
+  await pool.query(`ALTER TABLE public.registry_head ADD COLUMN IF NOT EXISTS acc_buh_status text;`);
+  await pool.query(`ALTER TABLE public.registry_head ADD COLUMN IF NOT EXISTS acc_buh_time timestamptz;`);
+  await pool.query(`ALTER TABLE public.registry_head ADD COLUMN IF NOT EXISTS acc_buh_comment text;`);
+
+  await pool.query(`ALTER TABLE public.registry_head ADD COLUMN IF NOT EXISTS acc_fin_name text;`);
+  await pool.query(`ALTER TABLE public.registry_head ADD COLUMN IF NOT EXISTS acc_fin_status text;`);
+  await pool.query(`ALTER TABLE public.registry_head ADD COLUMN IF NOT EXISTS acc_fin_time timestamptz;`);
+  await pool.query(`ALTER TABLE public.registry_head ADD COLUMN IF NOT EXISTS acc_fin_comment text;`);
+
+  await pool.query(`ALTER TABLE public.registry_head ADD COLUMN IF NOT EXISTS acc_zam_name text;`);
+  await pool.query(`ALTER TABLE public.registry_head ADD COLUMN IF NOT EXISTS acc_zam_status text;`);
+  await pool.query(`ALTER TABLE public.registry_head ADD COLUMN IF NOT EXISTS acc_zam_time timestamptz;`);
+  await pool.query(`ALTER TABLE public.registry_head ADD COLUMN IF NOT EXISTS acc_zam_comment text;`);
+
+  await pool.query(`ALTER TABLE public.registry_head ADD COLUMN IF NOT EXISTS acc_ud_name text;`);
+  await pool.query(`ALTER TABLE public.registry_head ADD COLUMN IF NOT EXISTS acc_ud_status text;`);
+  await pool.query(`ALTER TABLE public.registry_head ADD COLUMN IF NOT EXISTS acc_ud_time timestamptz;`);
+  await pool.query(`ALTER TABLE public.registry_head ADD COLUMN IF NOT EXISTS acc_ud_comment text;`);
   console.log("DB init OK ✅");
 }
 
