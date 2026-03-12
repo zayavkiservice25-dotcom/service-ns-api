@@ -1160,6 +1160,27 @@ FROM ft_zvk_current_v2 v
       WHERE id=$3
     `,[total,count,registry_id]);
 
+    await client.query(`
+  UPDATE public.registry_head
+  SET
+    workflow_stage = 'Главный бухгалтер',
+    agree_status = 'На согласовании',
+
+    acc_buh_name = 'Жасулан Сулейменов',
+    acc_buh_status = 'Ожидает',
+
+    acc_fin_name = 'Динара Омарбекова',
+    acc_fin_status = 'Ожидает',
+
+    acc_zam_name = 'Марат Койлыбаев',
+    acc_zam_status = 'Ожидает',
+
+    acc_ud_name = 'Ермек Касенов',
+    acc_ud_status = 'Ожидает'
+  WHERE id = $1
+`, [registry_id]);
+    
+
     await client.query("COMMIT");
 
     res.json({
@@ -1223,25 +1244,46 @@ app.get("/registry-card", async (req, res) => {
       });
     }
 
-    const headRes = await pool.query(`
-      SELECT
-        id,
-        registry_no,
-        registry_date,
-        created_by,
-        division,
-        total_amount,
-        items_count,
-        workflow_stage,
-        agree_status,
-        execution_status,
-        archive_flag,
-        pdf_url,
-        created_at
-      FROM registry_head
-      WHERE id = $1
-      LIMIT 1
-    `, [id]);
+ const headRes = await pool.query(`
+  SELECT
+    id,
+    registry_no,
+    registry_date,
+    created_by,
+    division,
+    total_amount,
+    items_count,
+    workflow_stage,
+    agree_status,
+    execution_status,
+    archive_flag,
+    pdf_url,
+    created_at,
+
+    acc_buh_name,
+    acc_buh_status,
+    acc_buh_time,
+    acc_buh_comment,
+
+    acc_fin_name,
+    acc_fin_status,
+    acc_fin_time,
+    acc_fin_comment,
+
+    acc_zam_name,
+    acc_zam_status,
+    acc_zam_time,
+    acc_zam_comment,
+
+    acc_ud_name,
+    acc_ud_status,
+    acc_ud_time,
+    acc_ud_comment
+
+  FROM registry_head
+  WHERE id = $1
+  LIMIT 1
+`, [id]);
 
     if (!headRes.rows.length) {
       return res.status(404).json({
