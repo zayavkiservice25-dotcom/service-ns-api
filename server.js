@@ -533,13 +533,13 @@ app.post("/zvk-save", async (req, res) => {
       const sumFtRow = await pool.query(`SELECT sum_ft FROM ft WHERE id_ft=$1`, [ft]);
       const sumFt = Number(sumFtRow.rows[0]?.sum_ft || 0);
 
-      await pool.query(
-        `
-        INSERT INTO zvk (id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag)
-        VALUES ($1, $2, NOW(), 'СИСТЕМА', $3, 'Нет')
-        `,
-        [id_zvk, ft, sumFt]
-      );
+     await pool.query(
+  `
+  INSERT INTO zvk (id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag)
+  VALUES ($1, $2, NOW(), 'СИСТЕМА', 0, 'Нет')
+  `,
+  [id_zvk, ft]
+);
     }
 
     const r = await pool.query(
@@ -699,25 +699,42 @@ app.post("/zvk-pay-row", async (req, res) => {
         const paidToPay = Number(zrow.to_pay || 0);
 
         // ✅ берём баланс из последней строки "СИСТЕМА" текущего цикла (id_zvk)
-        const baseRow = await client.query(
-          `
-          SELECT z.to_pay
-          FROM zvk z
-          WHERE z.id_ft = $1
-            AND z.id_zvk = $2
-            AND z.zvk_name = 'СИСТЕМА'
-          ORDER BY z.id DESC
-          LIMIT 1
-          `,
-          [ft, String(zrow.id_zvk)]
-        );
+       
+const ftRow = await client.query(
+  `
+  SELECT COALESCE(sum_ft, 0) AS sum_ft
+  FROM ft
+  WHERE id_ft = $1
+  LIMIT 1
+  `,
+  [ft]
+);
 
-        const baseBalance = Number(baseRow.rows[0]?.to_pay || 0);
+const ftSum = Number(ftRow.rows[0]?.sum_ft || 0);
 
-        let remaining = 0;
-        if (reg === "Обнуление") remaining = 0;
-        else remaining = Math.max(baseBalance - paidToPay, 0);
+// сколько уже ушло в реестр по этому циклу ДО текущей строки
+const paidBeforeRow = await client.query(
+  `
+  SELECT COALESCE(SUM(COALESCE(z.to_pay,0)),0) AS paid_sum
+  FROM zvk z
+  JOIN zvk_pay p ON p.zvk_row_id = z.id
+  WHERE z.id_ft = $1
+    AND z.id_zvk = $2
+    AND p.registry_flag = 'Да'
+    AND z.id <> $3
+    AND lower(trim(coalesce(z.zvk_name,''))) <> 'система'
+  `,
+  [ft, String(zrow.id_zvk), Number(zvk_row_id)]
+);
 
+const alreadyPaid = Number(paidBeforeRow.rows[0]?.paid_sum || 0);
+
+let remaining = 0;
+if (reg === "Обнуление") {
+  remaining = 0;
+} else {
+  remaining = Math.max(ftSum - alreadyPaid - paidToPay, 0);
+}
         // создаем новый ZFT только если остаток > 0
         if (remaining > 0) {
 
@@ -743,14 +760,14 @@ app.post("/zvk-pay-row", async (req, res) => {
             );
             const newIdZvk = created.rows[0].id_zvk;
 
-            const ins = await client.query(
-              `
-              INSERT INTO zvk (id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag)
-              VALUES ($1, $2, NOW(), 'СИСТЕМА', $3, 'Нет')
-              RETURNING id
-              `,
-              [newIdZvk, ft, remaining]
-            );
+           const ins = await client.query(
+  `
+  INSERT INTO zvk (id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag)
+  VALUES ($1, $2, NOW(), 'СИСТЕМА', 0, 'Нет')
+  RETURNING id
+  `,
+  [newIdZvk, ft]
+);
 
             const newRowId = ins.rows[0]?.id;
 
@@ -922,12 +939,12 @@ app.post("/save-ft", async (req, res) => {
     const id_zvk = zftRow.rows[0].id_zvk;
 
     await pool.query(
-      `
-      INSERT INTO zvk (id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag)
-      VALUES ($1, $2, NOW(), 'СИСТЕМА', $3, 'Нет')
-      `,
-      [id_zvk, id_ft, sumNum]
-    );
+  `
+  INSERT INTO zvk (id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag)
+  VALUES ($1, $2, NOW(), 'СИСТЕМА', 0, 'Нет')
+  `,
+  [id_zvk, id_ft]
+);
 
     res.json({ success:true, id_ft: r.rows[0].id_ft, id_zvk });
   } catch (e) {
