@@ -1475,15 +1475,16 @@ app.post("/registry-approve", async (req, res) => {
     }
 
     const reg = regRes.rows[0];
-
+    const stageName = String(stage || "").trim();
+    const actionName = String(action || "").trim();
     // ----------------------------
     // REJECT
     // ----------------------------
-    if (action === "reject") {
+    if (actionName === "reject") {
       let rejectSql = "";
       let rejectParams = [];
 
-      if (stage === "Главный бухгалтер") {
+      if (stageName === "Главный бухгалтер") {
         rejectSql = `
           UPDATE public.registry_head
           SET
@@ -1497,7 +1498,10 @@ app.post("/registry-approve", async (req, res) => {
         rejectParams = [Number(registry_id), String(comment || "")];
       }
 
-      else if (stage === "Зам. директора по финансам") {
+      else if (
+  stageName === "Заместитель директора по финансам" ||
+  stageName === "Зам. директора по финансам"
+) {
         rejectSql = `
           UPDATE public.registry_head
           SET
@@ -1511,7 +1515,7 @@ app.post("/registry-approve", async (req, res) => {
         rejectParams = [Number(registry_id), String(comment || "")];
       }
 
-      else if (stage === "Заместитель директора") {
+      else if (stageName === "Заместитель директора") {
         rejectSql = `
           UPDATE public.registry_head
           SET
@@ -1525,7 +1529,7 @@ app.post("/registry-approve", async (req, res) => {
         rejectParams = [Number(registry_id), String(comment || "")];
       }
 
-      else if (stage === "Управляющий директор") {
+      else if (stageName === "Управляющий директор") {
         rejectSql = `
           UPDATE public.registry_head
           SET
@@ -1573,7 +1577,7 @@ app.post("/registry-approve", async (req, res) => {
       let approveParams = [];
       let nextStage = "";
 
-  if (stage === "Главный бухгалтер") {
+  if (stageName === "Главный бухгалтер") {
   approveSql = `
     UPDATE public.registry_head
     SET
@@ -1588,7 +1592,10 @@ app.post("/registry-approve", async (req, res) => {
   nextStage = "Заместитель директора по финансам";
 }
 
-      else if (stage === "Заместитель директора по финансам") {
+      else if (
+  stageName === "Заместитель директора по финансам" ||
+  stageName === "Зам. директора по финансам"
+) {
         approveSql = `
           UPDATE public.registry_head
           SET
@@ -1603,7 +1610,7 @@ app.post("/registry-approve", async (req, res) => {
         nextStage = "Заместитель директора";
       }
 
-      else if (stage === "Заместитель директора") {
+      else if (stageName === "Заместитель директора") {
         approveSql = `
           UPDATE public.registry_head
           SET
@@ -1618,7 +1625,7 @@ app.post("/registry-approve", async (req, res) => {
         nextStage = "Управляющий директор";
       }
 
-      else if (stage === "Управляющий директор") {
+      else if (stageName === "Управляющий директор") {
         approveSql = `
           UPDATE public.registry_head
           SET
