@@ -1306,13 +1306,25 @@ FROM ft_zvk_current_v2 v
 `, [registry_id]);
     
 
-    await client.query("COMMIT");
+await client.query("COMMIT");
 
-    res.json({
-      success:true,
-      registry_id,
-      registry_no
-    });
+// Telegram уведомление
+try {
+  await sendRegistryTelegramNotification({
+    registryId: registry_id,
+    registryNo: registry_no,
+    stage: "Главный бухгалтер",
+    totalAmount: total
+  });
+} catch (tgErr) {
+  console.error("telegram registry notify error:", tgErr);
+}
+
+res.json({
+  success:true,
+  registry_id,
+  registry_no
+});
 
   } catch(e) {
 
@@ -2139,8 +2151,46 @@ app.get("/telegram/test-login", async (req, res) => {
     res.status(500).json({ success: false, error: e.message });
   }
 });
+function getStageApproverLogin(stage) {
+  const s = String(stage || "").trim();
 
+  if (s === "Главный бухгалтер") return "S_Zhasulan";
+  if (s === "Заместитель директора по финансам") return "o_dinara";
+  if (s === "Заместитель директора") return "k_marat";
+  if (s === "Управляющий директор") return "k_ermek";
 
+  return null;
+}
+async function sendRegistryTelegramNotification({ registryId, registryNo, stage, totalAmount }) {
+  const approverLogin = getStageApproverLogin(stage);
+  if (!approverLogin) return { skipped: true, reason: "no approver login" };
+
+  const chatId = await getTelegramChatId(approverLogin);
+  if (!chatId) return { skipped: true, reason: "chat_id not found" };
+
+  const cardUrl =
+    `https://script.google.com/macros/s/AKfycbySY2CFP3WJ9M_MW5HiDZvSScGCTn2SCOLW68SS1Gt5q-CsHGk9lve06PkeKnuZwZ-j/exec?page=registryCard&id=${encodeURIComponent(registryId)}&login=${encodeURIComponent(approverLogin)}`;
+
+  const text =
+    `🔔 Новый реестр на согласование\n\n` +
+    `№: ${registryNo}\n` +
+    `Этап: ${stage}\n` +
+    `Сумма: ${Number(totalAmount || 0).toLocaleString("ru-RU", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+  return sendTelegramMessage(
+    String(chatId),
+    text,
+    [
+      [
+        { text: "Открыть карточку", url: cardUrl }
+      ],
+      [
+        { text: "Согласовать", callback_data: `approve_registry:${registryId}` },
+        { text: "Отклонить", callback_data: `reject_registry:${registryId}` }
+      ]
+    ]
+  );
+}
 // =====================================================
 // Start
 // =====================================================
