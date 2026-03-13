@@ -1939,7 +1939,7 @@ app.get("/registry-archive-list", async (req,res)=>{
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
 async function sendTelegramMessage(chatId, text, buttons=null){
-  const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
+  const url = `https://api.telegram.org/bot${8637180228:AAHl_qTlPPErV2pSsflXd0yUOPAM8J0rR2U}/sendMessage`;
 
   const payload = {
     chat_id: chatId,
