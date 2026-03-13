@@ -1508,6 +1508,7 @@ app.post("/registry-approve", async (req, res) => {
     const reg = regRes.rows[0];
     const stageName = String(stage || "").trim();
     const actionName = String(action || "").trim();
+
     // ----------------------------
     // REJECT
     // ----------------------------
@@ -1530,9 +1531,9 @@ app.post("/registry-approve", async (req, res) => {
       }
 
       else if (
-  stageName === "Заместитель директора по финансам" ||
-  stageName === "Зам. директора по финансам"
-) {
+        stageName === "Заместитель директора по финансам" ||
+        stageName === "Зам. директора по финансам"
+      ) {
         rejectSql = `
           UPDATE public.registry_head
           SET
@@ -1603,30 +1604,30 @@ app.post("/registry-approve", async (req, res) => {
     // ----------------------------
     // APPROVE
     // ----------------------------
-    if (action === "approve") {
+    if (actionName === "approve") {
       let approveSql = "";
       let approveParams = [];
       let nextStage = "";
 
-  if (stageName === "Главный бухгалтер") {
-  approveSql = `
-    UPDATE public.registry_head
-    SET
-      acc_buh_status = 'Согласовано',
-      acc_buh_time = NOW(),
-      acc_buh_comment = $2,
-      workflow_stage = 'Заместитель директора по финансам',
-      agree_status = 'На согласовании'
-    WHERE id = $1
-  `;
-  approveParams = [Number(registry_id), String(comment || "")];
-  nextStage = "Заместитель директора по финансам";
-}
+      if (stageName === "Главный бухгалтер") {
+        approveSql = `
+          UPDATE public.registry_head
+          SET
+            acc_buh_status = 'Согласовано',
+            acc_buh_time = NOW(),
+            acc_buh_comment = $2,
+            workflow_stage = 'Заместитель директора по финансам',
+            agree_status = 'На согласовании'
+          WHERE id = $1
+        `;
+        approveParams = [Number(registry_id), String(comment || "")];
+        nextStage = "Заместитель директора по финансам";
+      }
 
       else if (
-  stageName === "Заместитель директора по финансам" ||
-  stageName === "Зам. директора по финансам"
-) {
+        stageName === "Заместитель директора по финансам" ||
+        stageName === "Зам. директора по финансам"
+      ) {
         approveSql = `
           UPDATE public.registry_head
           SET
@@ -1694,6 +1695,21 @@ app.post("/registry-approve", async (req, res) => {
       );
 
       await client.query("COMMIT");
+
+      // 🔔 Telegram уведомление следующему этапу
+      if (nextStage && nextStage !== "Исполнение платежей") {
+        try {
+          await sendRegistryTelegramNotification({
+            registryId: registry_id,
+            registryNo: reg.registry_no,
+            stage: nextStage,
+            totalAmount: reg.total_amount
+          });
+        } catch (tgErr) {
+          console.error("telegram next stage notify error:", tgErr);
+        }
+      }
+
       return res.json({ success:true, moved_to:nextStage, action:"approve" });
     }
 
@@ -2016,24 +2032,96 @@ app.post("/telegram/webhook", async (req, res) => {
       console.log("TELEGRAM CALLBACK:", { chatId, data });
 
       if (data.startsWith("approve_registry:")) {
-        const registryId = data.split(":")[1];
+  const registryId = data.split(":")[1];
 
-        await answerTelegramCallback(cq.id, "Согласование получено");
-        await sendTelegramMessage(
-          chatId,
-          `Реестр <b>№${registryId}</b> отмечен как согласование-запрос.`
-        );
-      }
+ const login = await getLoginByChatId(chatId);
+  if (!login) {
+    await answerTelegramCallback(cq.id, "Логин не найден");
+    return res.json({ ok: true });
+  }
 
-      if (data.startsWith("reject_registry:")) {
-        const registryId = data.split(":")[1];
+  const reg = await getRegistryStage(registryId);
+  if (!reg) {
+    await answerTelegramCallback(cq.id, "Реестр не найден");
+    return res.json({ ok: true });
+  }
 
-        await answerTelegramCallback(cq.id, "Отклонение получено");
-        await sendTelegramMessage(
-          chatId,
-          `Реестр <b>№${registryId}</b> отмечен как отклонение-запрос.`
-        );
-      }
+  const approveResp = await fetch(`${process.env.APP_BASE_URL || "https://service-ns-api.onrender.com"}/registry-approve`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      registry_id: Number(registryId),
+      stage: reg.workflow_stage,
+      action: "approve",
+      login: login,
+      name: login,
+      comment: "Согласовано через Telegram"
+    })
+  });
+
+  const approveData = await approveResp.json();
+
+  if (!approveData.success) {
+    await answerTelegramCallback(cq.id, "Ошибка согласования");
+    await sendTelegramMessage(
+      chatId,
+      `Ошибка согласования реестра <b>№${reg.registry_no || registryId}</b>\n${approveData.error || ""}`
+    );
+    return res.json({ ok: true });
+  }
+
+  await answerTelegramCallback(cq.id, "Согласовано");
+  await sendTelegramMessage(
+    chatId,
+    `✅ Реестр <b>№${reg.registry_no || registryId}</b> согласован.\nСледующий этап: <b>${approveData.moved_to || "-"}</b>`
+  );
+}
+
+     if (data.startsWith("reject_registry:")) {
+  const registryId = data.split(":")[1];
+
+ const login = await getLoginByChatId(chatId);
+  if (!login) {
+    await answerTelegramCallback(cq.id, "Логин не найден");
+    return res.json({ ok: true });
+  }
+
+  const reg = await getRegistryStage(registryId);
+  if (!reg) {
+    await answerTelegramCallback(cq.id, "Реестр не найден");
+    return res.json({ ok: true });
+  }
+
+  const rejectResp = await fetch(`${process.env.APP_BASE_URL || "https://service-ns-api.onrender.com"}/registry-approve`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      registry_id: Number(registryId),
+      stage: reg.workflow_stage,
+      action: "reject",
+      login: login,
+      name: login,
+      comment: "Отклонено через Telegram"
+    })
+  });
+
+  const rejectData = await rejectResp.json();
+
+  if (!rejectData.success) {
+    await answerTelegramCallback(cq.id, "Ошибка отклонения");
+    await sendTelegramMessage(
+      chatId,
+      `Ошибка отклонения реестра <b>№${reg.registry_no || registryId}</b>\n${rejectData.error || ""}`
+    );
+    return res.json({ ok: true });
+  }
+
+  await answerTelegramCallback(cq.id, "Отклонено");
+  await sendTelegramMessage(
+    chatId,
+    `❌ Реестр <b>№${reg.registry_no || registryId}</b> отклонен.`
+  );
+}
     }
 
     res.json({ ok: true });
@@ -2081,6 +2169,23 @@ async function getTelegramChatId(login) {
   const resp = await fetch(`${GAS_URL}?page=telegramChat&login=${encodeURIComponent(login)}`);
   const data = await resp.json();
   return data.chat_id || null;
+}
+async function getLoginByChatId(chatId) {
+  const resp = await fetch(`${GAS_URL}?page=telegramLoginByChatId&chat_id=${encodeURIComponent(chatId)}`);
+const data = await resp.json();
+return data.login || null;
+}
+
+async function getRegistryStage(registryId) {
+  const r = await pool.query(
+    `SELECT workflow_stage, registry_no
+     FROM public.registry_head
+     WHERE id = $1
+     LIMIT 1`,
+    [Number(registryId)]
+  );
+
+  return r.rows[0] || null;
 }
 
 
