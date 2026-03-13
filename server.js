@@ -1817,7 +1817,7 @@ app.post("/registry-send-to-archive", async (req, res) => {
     const actor = String(login || "").trim().toLowerCase();
 
     // кто может отправлять в архив
-    const allowed = ["k_erkin", "k_erkin2"];
+    const allowed = ["b_erkin", "b_erkin2"];
     if (!allowed.includes(actor)) {
       return res.status(403).json({ success:false, error:"NO_RIGHTS_TO_ARCHIVE" });
     }
