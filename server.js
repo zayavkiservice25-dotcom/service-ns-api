@@ -1934,7 +1934,63 @@ app.get("/registry-archive-list", async (req,res)=>{
   }
 });
 
+// ================= TELEGRAM =================
 
+const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+
+async function sendTelegramMessage(chatId, text, buttons=null){
+  const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
+
+  const payload = {
+    chat_id: chatId,
+    text: text,
+    parse_mode: "HTML"
+  };
+
+  if(buttons){
+    payload.reply_markup = {
+      inline_keyboard: buttons
+    };
+  }
+
+  const resp = await fetch(url,{
+    method:"POST",
+    headers:{ "Content-Type":"application/json"},
+    body: JSON.stringify(payload)
+  });
+
+  return resp.json();
+}
+
+
+// webhook от Telegram
+app.post("/telegram/webhook", async (req,res)=>{
+  try{
+
+    const update = req.body;
+
+    // кнопка нажата
+    if(update.callback_query){
+
+      const data = update.callback_query.data;
+      const chatId = update.callback_query.message.chat.id;
+
+      if(data.startsWith("approve_registry:")){
+        const registryId = data.split(":")[1];
+
+        console.log("Approve registry from telegram:", registryId);
+
+      }
+
+    }
+
+    res.json({ok:true});
+
+  }catch(e){
+    console.error(e);
+    res.json({ok:true});
+  }
+});
 // =====================================================
 // Start
 // =====================================================
