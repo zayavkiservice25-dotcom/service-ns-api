@@ -2062,6 +2062,49 @@ app.post("/telegram/test-send", async (req, res) => {
     res.status(500).json({ success: false, error: e.message });
   }
 });
+
+const GAS_URL = "https://script.google.com/macros/s/AKfycbySY2CFP3WJ9M_MW5HiDZvSScGCTn2SCOLW68SS1Gt5q-CsHGk9lve06PkeKnuZwZ-j/exec";
+
+async function getTelegramChatId(login) {
+  const resp = await fetch(`${GAS_URL}?page=telegramChat&login=${encodeURIComponent(login)}`);
+  const data = await resp.json();
+  return data.chat_id || null;
+}
+
+
+app.post("/telegram/test-login", async (req, res) => {
+  try {
+    const { login, text } = req.body || {};
+
+    if (!login) {
+      return res.status(400).json({ success: false, error: "login required" });
+    }
+
+    const chatId = await getTelegramChatId(login);
+
+    if (!chatId) {
+      return res.status(404).json({ success: false, error: "chat_id not found" });
+    }
+
+    const result = await sendTelegramMessage(
+      String(chatId),
+      text || `Тест Telegram уведомления\nЛогин: ${login}`,
+      [
+        [
+          {
+            text: "Открыть реестр",
+            url: "https://script.google.com/macros/s/AKfycbySY2CFP3WJ9M_MW5HiDZvSScGCTn2SCOLW68SS1Gt5q-CsHGk9lve06PkeKnuZwZ-j/exec?page=registry"
+          }
+        ]
+      ]
+    );
+
+    res.json({ success: true, chat_id: chatId, result });
+  } catch (e) {
+    console.error("telegram test-login error:", e);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
 // =====================================================
 // Start
 // =====================================================
