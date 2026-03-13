@@ -1934,61 +1934,132 @@ app.get("/registry-archive-list", async (req,res)=>{
   }
 });
 
-// ================= TELEGRAM =================
-
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
-async function sendTelegramMessage(chatId, text, buttons=null){
-  const url = `https://api.telegram.org/bot${8637180228:AAHl_qTlPPErV2pSsflXd0yUOPAM8J0rR2U}/sendMessage`;
+async function telegramRequest(method, payload = {}) {
+  const resp = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/${method}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
 
+  const data = await resp.json();
+  if (!resp.ok || !data.ok) {
+    throw new Error(data.description || `Telegram API error: ${resp.status}`);
+  }
+  return data;
+}
+
+async function sendTelegramMessage(chatId, text, buttons = null) {
   const payload = {
     chat_id: chatId,
-    text: text,
+    text,
     parse_mode: "HTML"
   };
 
-  if(buttons){
+  if (buttons) {
     payload.reply_markup = {
       inline_keyboard: buttons
     };
   }
 
-  const resp = await fetch(url,{
-    method:"POST",
-    headers:{ "Content-Type":"application/json"},
-    body: JSON.stringify(payload)
-  });
-
-  return resp.json();
+  return telegramRequest("sendMessage", payload);
 }
 
+async function answerTelegramCallback(callbackQueryId, text = "") {
+  return telegramRequest("answerCallbackQuery", {
+    callback_query_id: callbackQueryId,
+    text
+  });
+}
 
-// webhook от Telegram
-app.post("/telegram/webhook", async (req,res)=>{
-  try{
+app.post("/telegram/webhook", async (req, res) => {
+  try {
+    const update = req.body || {};
+    console.log("TELEGRAM UPDATE:", JSON.stringify(update));
 
-    const update = req.body;
+    if (update.message) {
+      const chatId = String(update.message.chat.id);
+      const text = String(update.message.text || "");
 
-    // кнопка нажата
-    if(update.callback_query){
-
-      const data = update.callback_query.data;
-      const chatId = update.callback_query.message.chat.id;
-
-      if(data.startsWith("approve_registry:")){
-        const registryId = data.split(":")[1];
-
-        console.log("Approve registry from telegram:", registryId);
-
-      }
-
+      await sendTelegramMessage(
+        chatId,
+        `Привет. Ваш chat_id: <b>${chatId}</b>\nТекст: ${text || "-"}`,
+        [
+          [
+            {
+              text: "Открыть систему",
+              url: "https://script.google.com/macros/s/AKfycbxxkzig_MDxAFf8i18evid5g2-CAJeeNSj5RtIWAOTvgcseklO3Btp83V6rgoUakvcgBQ/exec"
+            }
+          ]
+        ]
+      );
     }
 
-    res.json({ok:true});
+    if (update.callback_query) {
+      const cq = update.callback_query;
+      const data = String(cq.data || "");
+      const chatId = String(cq.message?.chat?.id || "");
 
-  }catch(e){
-    console.error(e);
-    res.json({ok:true});
+      console.log("TELEGRAM CALLBACK:", { chatId, data });
+
+      if (data.startsWith("approve_registry:")) {
+        const registryId = data.split(":")[1];
+
+        await answerTelegramCallback(cq.id, "Согласование получено");
+        await sendTelegramMessage(
+          chatId,
+          `Реестр <b>№${registryId}</b> отмечен как согласование-запрос.`
+        );
+      }
+
+      if (data.startsWith("reject_registry:")) {
+        const registryId = data.split(":")[1];
+
+        await answerTelegramCallback(cq.id, "Отклонение получено");
+        await sendTelegramMessage(
+          chatId,
+          `Реестр <b>№${registryId}</b> отмечен как отклонение-запрос.`
+        );
+      }
+    }
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("telegram webhook error:", e);
+    res.json({ ok: true });
+  }
+});
+
+app.post("/telegram/test-send", async (req, res) => {
+  try {
+    const { chat_id, text } = req.body || {};
+
+    if (!chat_id) {
+      return res.status(400).json({ success: false, error: "chat_id required" });
+    }
+
+    const result = await sendTelegramMessage(
+      String(chat_id),
+      text || "Тестовое сообщение от Service NS",
+      [
+        [
+          {
+            text: "Открыть карточку",
+            url: "https://script.google.com/macros/s/AKfycbxxkzig_MDxAFf8i18evid5g2-CAJeeNSj5RtIWAOTvgcseklO3Btp83V6rgoUakvcgBQ/exec?page=registry"
+          }
+        ],
+        [
+          { text: "Согласовать", callback_data: "approve_registry:123" },
+          { text: "Отклонить", callback_data: "reject_registry:123" }
+        ]
+      ]
+    );
+
+    res.json({ success: true, result });
+  } catch (e) {
+    console.error("telegram test send error:", e);
+    res.status(500).json({ success: false, error: e.message });
   }
 });
 // =====================================================
