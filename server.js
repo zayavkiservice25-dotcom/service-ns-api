@@ -2260,9 +2260,9 @@ function getStageApproverLogin(stage) {
   const s = String(stage || "").trim();
 
   if (s === "Главный бухгалтер") return "S_Zhasulan";
-  if (s === "Заместитель директора по финансам") return "o_dinara";
-  if (s === "Заместитель директора") return "k_marat";
-  if (s === "Управляющий директор") return "k_ermek";
+  if (s === "Заместитель директора по финансам") return "O_Dinara";
+  if (s === "Заместитель директора") return "K_Marat";
+  if (s === "Управляющий директор") return "K_Ermek";
 
   return null;
 }
