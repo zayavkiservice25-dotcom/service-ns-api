@@ -1696,7 +1696,7 @@ app.post("/registry-approve", async (req, res) => {
 
       await client.query("COMMIT");
 
-      // 🔔 Telegram уведомление следующему этапу
+      // уведомляем следующий этап
       if (nextStage && nextStage !== "Исполнение платежей") {
         try {
           await sendRegistryTelegramNotification({
@@ -1755,7 +1755,7 @@ app.post("/registry-move-stage", async (req, res) => {
       return res.status(404).json({ success:false, error:"registry not found" });
     }
 
-    // Ермек может двигать в любой столбец
+    // Ермек может двигать всё
     if (actor === "k_ermek") {
       await client.query(
         `
@@ -1844,7 +1844,6 @@ app.post("/registry-send-to-archive", async (req, res) => {
 
     const actor = String(login || "").trim().toLowerCase();
 
-    // кто может отправлять в архив
     const allowed = ["b_erkin", "b_erkin2"];
     if (!allowed.includes(actor)) {
       return res.status(403).json({ success:false, error:"NO_RIGHTS_TO_ARCHIVE" });
@@ -1876,7 +1875,6 @@ app.post("/registry-send-to-archive", async (req, res) => {
       return res.status(400).json({ success:false, error:"NOT_READY_FOR_ARCHIVE" });
     }
 
-    // 1. помечаем сам реестр архивным
     await client.query(`
       UPDATE public.registry_head
       SET
@@ -1885,7 +1883,6 @@ app.post("/registry-send-to-archive", async (req, res) => {
       WHERE id = $1
     `, [Number(registry_id)]);
 
-    // 2. по всем строкам реестра ставим is_paid = Да
     await client.query(`
       INSERT INTO public.zvk_pay (zvk_row_id, registry_flag, is_paid, agree_time, pay_time)
       SELECT
@@ -1905,7 +1902,6 @@ app.post("/registry-send-to-archive", async (req, res) => {
         pay_time = COALESCE(zvk_pay.pay_time, NOW())
     `, [Number(registry_id)]);
 
-    // лог
     await client.query(`
       INSERT INTO public.registry_approve_log
         (registry_id, stage_name, approver_login, approver_name, action_type, comment_text)
@@ -2001,6 +1997,32 @@ async function answerTelegramCallback(callbackQueryId, text = "") {
   });
 }
 
+const GAS_URL = "https://script.google.com/macros/s/AKfycbySY2CFP3WJ9M_MW5HiDZvSScGCTn2SCOLW68SS1Gt5q-CsHGk9lve06PkeKnuZwZ-j/exec";
+
+async function getTelegramChatId(login) {
+  const resp = await fetch(`${GAS_URL}?page=telegramChat&login=${encodeURIComponent(login)}`);
+  const data = await resp.json();
+  return data.chat_id || null;
+}
+
+async function getLoginByChatId(chatId) {
+  const resp = await fetch(`${GAS_URL}?page=telegramLoginByChatId&chat_id=${encodeURIComponent(chatId)}`);
+  const data = await resp.json();
+  return data.login || null;
+}
+
+async function getRegistryStage(registryId) {
+  const r = await pool.query(
+    `SELECT workflow_stage, registry_no, total_amount
+     FROM public.registry_head
+     WHERE id = $1
+     LIMIT 1`,
+    [Number(registryId)]
+  );
+
+  return r.rows[0] || null;
+}
+
 app.post("/telegram/webhook", async (req, res) => {
   try {
     const update = req.body || {};
@@ -2032,96 +2054,102 @@ app.post("/telegram/webhook", async (req, res) => {
       console.log("TELEGRAM CALLBACK:", { chatId, data });
 
       if (data.startsWith("approve_registry:")) {
-  const registryId = data.split(":")[1];
+        const registryId = data.split(":")[1];
 
- const login = await getLoginByChatId(chatId);
-  if (!login) {
-    await answerTelegramCallback(cq.id, "Логин не найден");
-    return res.json({ ok: true });
-  }
+        const login = await getLoginByChatId(chatId);
+        if (!login) {
+          await answerTelegramCallback(cq.id, "Логин не найден");
+          return res.json({ ok: true });
+        }
 
-  const reg = await getRegistryStage(registryId);
-  if (!reg) {
-    await answerTelegramCallback(cq.id, "Реестр не найден");
-    return res.json({ ok: true });
-  }
+        const reg = await getRegistryStage(registryId);
+        if (!reg) {
+          await answerTelegramCallback(cq.id, "Реестр не найден");
+          return res.json({ ok: true });
+        }
 
-  const approveResp = await fetch(`${process.env.APP_BASE_URL || "https://service-ns-api.onrender.com"}/registry-approve`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      registry_id: Number(registryId),
-      stage: reg.workflow_stage,
-      action: "approve",
-      login: login,
-      name: login,
-      comment: "Согласовано через Telegram"
-    })
-  });
+        const approveResp = await fetch(`${process.env.APP_BASE_URL || "https://service-ns-api.onrender.com"}/registry-approve`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            registry_id: Number(registryId),
+            stage: reg.workflow_stage,
+            action: "approve",
+            login: login,
+            name: login,
+            comment: "Согласовано через Telegram"
+          })
+        });
 
-  const approveData = await approveResp.json();
+        const approveData = await approveResp.json();
 
-  if (!approveData.success) {
-    await answerTelegramCallback(cq.id, "Ошибка согласования");
-    await sendTelegramMessage(
-      chatId,
-      `Ошибка согласования реестра <b>№${reg.registry_no || registryId}</b>\n${approveData.error || ""}`
-    );
-    return res.json({ ok: true });
-  }
+        if (!approveData.success) {
+          await answerTelegramCallback(cq.id, "Ошибка согласования");
+          await sendTelegramMessage(
+            chatId,
+            `Ошибка согласования реестра <b>№${reg.registry_no || registryId}</b>\n${approveData.error || ""}`
+          );
+          return res.json({ ok: true });
+        }
 
-  await answerTelegramCallback(cq.id, "Согласовано");
-  await sendTelegramMessage(
-    chatId,
-    `✅ Реестр <b>№${reg.registry_no || registryId}</b> согласован.\nСледующий этап: <b>${approveData.moved_to || "-"}</b>`
-  );
-}
+        await answerTelegramCallback(cq.id, "Согласовано");
+        await sendTelegramMessage(
+          chatId,
+          `✅ Реестр <b>№${reg.registry_no || registryId}</b> согласован.\nСледующий этап: <b>${approveData.moved_to || "-"}</b>`
+        );
 
-     if (data.startsWith("reject_registry:")) {
-  const registryId = data.split(":")[1];
+        return res.json({ ok: true });
+      }
 
- const login = await getLoginByChatId(chatId);
-  if (!login) {
-    await answerTelegramCallback(cq.id, "Логин не найден");
-    return res.json({ ok: true });
-  }
+      if (data.startsWith("reject_registry:")) {
+        const registryId = data.split(":")[1];
 
-  const reg = await getRegistryStage(registryId);
-  if (!reg) {
-    await answerTelegramCallback(cq.id, "Реестр не найден");
-    return res.json({ ok: true });
-  }
+        const login = await getLoginByChatId(chatId);
+        if (!login) {
+          await answerTelegramCallback(cq.id, "Логин не найден");
+          return res.json({ ok: true });
+        }
 
-  const rejectResp = await fetch(`${process.env.APP_BASE_URL || "https://service-ns-api.onrender.com"}/registry-approve`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      registry_id: Number(registryId),
-      stage: reg.workflow_stage,
-      action: "reject",
-      login: login,
-      name: login,
-      comment: "Отклонено через Telegram"
-    })
-  });
+        const reg = await getRegistryStage(registryId);
+        if (!reg) {
+          await answerTelegramCallback(cq.id, "Реестр не найден");
+          return res.json({ ok: true });
+        }
 
-  const rejectData = await rejectResp.json();
+        const rejectResp = await fetch(`${process.env.APP_BASE_URL || "https://service-ns-api.onrender.com"}/registry-approve`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            registry_id: Number(registryId),
+            stage: reg.workflow_stage,
+            action: "reject",
+            login: login,
+            name: login,
+            comment: "Отклонено через Telegram"
+          })
+        });
 
-  if (!rejectData.success) {
-    await answerTelegramCallback(cq.id, "Ошибка отклонения");
-    await sendTelegramMessage(
-      chatId,
-      `Ошибка отклонения реестра <b>№${reg.registry_no || registryId}</b>\n${rejectData.error || ""}`
-    );
-    return res.json({ ok: true });
-  }
+        const rejectData = await rejectResp.json();
 
-  await answerTelegramCallback(cq.id, "Отклонено");
-  await sendTelegramMessage(
-    chatId,
-    `❌ Реестр <b>№${reg.registry_no || registryId}</b> отклонен.`
-  );
-}
+        if (!rejectData.success) {
+          await answerTelegramCallback(cq.id, "Ошибка отклонения");
+          await sendTelegramMessage(
+            chatId,
+            `Ошибка отклонения реестра <b>№${reg.registry_no || registryId}</b>\n${rejectData.error || ""}`
+          );
+          return res.json({ ok: true });
+        }
+
+        await answerTelegramCallback(cq.id, "Отклонено");
+        await sendTelegramMessage(
+          chatId,
+          `❌ Реестр <b>№${reg.registry_no || registryId}</b> отклонен.`
+        );
+
+        return res.json({ ok: true });
+      }
+
+      return res.json({ ok: true });
     }
 
     res.json({ ok: true });
@@ -2163,32 +2191,6 @@ app.post("/telegram/test-send", async (req, res) => {
   }
 });
 
-const GAS_URL = "https://script.google.com/macros/s/AKfycbySY2CFP3WJ9M_MW5HiDZvSScGCTn2SCOLW68SS1Gt5q-CsHGk9lve06PkeKnuZwZ-j/exec";
-
-async function getTelegramChatId(login) {
-  const resp = await fetch(`${GAS_URL}?page=telegramChat&login=${encodeURIComponent(login)}`);
-  const data = await resp.json();
-  return data.chat_id || null;
-}
-async function getLoginByChatId(chatId) {
-  const resp = await fetch(`${GAS_URL}?page=telegramLoginByChatId&chat_id=${encodeURIComponent(chatId)}`);
-const data = await resp.json();
-return data.login || null;
-}
-
-async function getRegistryStage(registryId) {
-  const r = await pool.query(
-    `SELECT workflow_stage, registry_no
-     FROM public.registry_head
-     WHERE id = $1
-     LIMIT 1`,
-    [Number(registryId)]
-  );
-
-  return r.rows[0] || null;
-}
-
-
 app.post("/telegram/test-login", async (req, res) => {
   try {
     const { login, text } = req.body || {};
@@ -2222,6 +2224,7 @@ app.post("/telegram/test-login", async (req, res) => {
     res.status(500).json({ success: false, error: e.message });
   }
 });
+
 app.get("/telegram/test-login", async (req, res) => {
   try {
     const login = String(req.query.login || "").trim();
@@ -2256,22 +2259,31 @@ app.get("/telegram/test-login", async (req, res) => {
     res.status(500).json({ success: false, error: e.message });
   }
 });
+
 function getStageApproverLogin(stage) {
   const s = String(stage || "").trim();
 
   if (s === "Главный бухгалтер") return "S_Zhasulan";
   if (s === "Заместитель директора по финансам") return "O_Dinara";
+  if (s === "Зам. директора по финансам") return "O_Dinara";
   if (s === "Заместитель директора") return "K_Marat";
   if (s === "Управляющий директор") return "K_Ermek";
 
   return null;
 }
+
 async function sendRegistryTelegramNotification({ registryId, registryNo, stage, totalAmount }) {
   const approverLogin = getStageApproverLogin(stage);
-  if (!approverLogin) return { skipped: true, reason: "no approver login" };
+  if (!approverLogin) {
+    console.log("telegram notify skipped: no approver login for stage", stage);
+    return { skipped: true, reason: "no approver login" };
+  }
 
   const chatId = await getTelegramChatId(approverLogin);
-  if (!chatId) return { skipped: true, reason: "chat_id not found" };
+  if (!chatId) {
+    console.log("telegram notify skipped: chat_id not found for login", approverLogin);
+    return { skipped: true, reason: "chat_id not found" };
+  }
 
   const cardUrl =
     `https://script.google.com/macros/s/AKfycbySY2CFP3WJ9M_MW5HiDZvSScGCTn2SCOLW68SS1Gt5q-CsHGk9lve06PkeKnuZwZ-j/exec?page=registryCard&id=${encodeURIComponent(registryId)}&login=${encodeURIComponent(approverLogin)}`;
@@ -2280,7 +2292,10 @@ async function sendRegistryTelegramNotification({ registryId, registryNo, stage,
     `🔔 Новый реестр на согласование\n\n` +
     `№: ${registryNo}\n` +
     `Этап: ${stage}\n` +
-    `Сумма: ${Number(totalAmount || 0).toLocaleString("ru-RU", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    `Сумма: ${Number(totalAmount || 0).toLocaleString("ru-RU", {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2
+    })}`;
 
   return sendTelegramMessage(
     String(chatId),
@@ -2296,6 +2311,7 @@ async function sendRegistryTelegramNotification({ registryId, registryNo, stage,
     ]
   );
 }
+
 // =====================================================
 // Start
 // =====================================================
