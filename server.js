@@ -4,7 +4,8 @@ const express = require("express");
 const cors = require("cors");
 const path = require("path");
 const { Pool } = require("pg");
-
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const APP_BASE_URL = process.env.APP_BASE_URL;
 const app = express();
 
 app.use(cors());
@@ -1958,15 +1959,56 @@ app.get("/registry-archive-list", async (req,res)=>{
   }
 });
 
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+async function tgRequest(method, payload) {
+  const resp = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {})
+  });
 
-await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({
-    chat_id: chatId,
-    text: "Привет"
-  })
+  const data = await resp.json();
+  if (!data.ok) {
+    throw new Error(data.description || "Telegram API error");
+  }
+  return data.result;
+}
+
+async function sendTelegramMessage(chatId, text, replyMarkup) {
+  return tgRequest("sendMessage", {
+    chat_id: String(chatId),
+    text,
+    parse_mode: "HTML",
+    reply_markup: replyMarkup || undefined
+  });
+}
+
+app.post("/telegram-webhook", async (req, res) => {
+  try {
+    const update = req.body || {};
+
+    if (update.message) {
+      const msg = update.message;
+      const chatId = String(msg.chat?.id || "");
+      const text = String(msg.text || "").trim();
+
+      if (text === "/start") {
+        await sendTelegramMessage(
+          chatId,
+          "Бот подключен ✅\nНапишите ваш логин системы."
+        );
+      } else if (text) {
+        await sendTelegramMessage(
+          chatId,
+          `Ваш chat_id: <b>${chatId}</b>\nЛогин: <b>${text}</b>`
+        );
+      }
+    }
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("TELEGRAM WEBHOOK ERROR:", e);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 // =====================================================
