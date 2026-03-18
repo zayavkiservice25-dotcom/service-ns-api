@@ -2011,6 +2011,47 @@ app.post("/telegram-webhook", async (req, res) => {
   }
 });
 
+async function sendRegistryTelegramNotification({ registryId, registryNo, stage, totalAmount }) {
+  try {
+    let chatId = "";
+
+    if (stage === "Главный бухгалтер") {
+      chatId = "460955357";
+    } else if (stage === "Заместитель директора по финансам") {
+      chatId = "СЮДА_CHAT_ID_ДИНАРЫ";
+    } else if (stage === "Заместитель директора") {
+      chatId = "СЮДА_CHAT_ID_МАРАТА";
+    } else if (stage === "Управляющий директор") {
+      chatId = "СЮДА_CHAT_ID_ЕРМЕКА";
+    } else if (stage === "Исполнение платежей") {
+      chatId = "СЮДА_CHAT_ID_АРАЙЛЫМ";
+    } else if (stage === "Контроль и архивирование") {
+      chatId = "412596988";
+    }
+
+    if (!chatId) {
+      console.log("нет chat_id для этапа", stage);
+      return;
+    }
+
+    const text =
+      `📌 <b>Новый реестр</b>\n\n` +
+      `№ <b>${registryNo}</b>\n` +
+      `ID: <b>${registryId}</b>\n` +
+      `Этап: <b>${stage}</b>\n` +
+      `Сумма: <b>${Number(totalAmount || 0).toLocaleString("ru-RU", {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2
+      })}</b>`;
+
+    await sendTelegramMessage(chatId, text);
+
+    console.log("telegram sent:", { registryId, registryNo, stage, chatId });
+  } catch (e) {
+    console.error("telegram send error:", e);
+  }
+}
+
 // =====================================================
 // Start
 // =====================================================
