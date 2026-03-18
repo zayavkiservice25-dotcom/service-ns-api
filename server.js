@@ -1312,11 +1312,12 @@ await client.query("COMMIT");
 // Telegram уведомление
 try {
   await sendRegistryTelegramNotification({
-    registryId: registry_id,
-    registryNo: registry_no,
-    stage: "Главный бухгалтер",
-    totalAmount: total
-  });
+  registryId: registry_id,
+  registryNo: reg.registry_no,
+  stage: nextStage,
+  totalAmount: reg.total_amount,
+  createdBy: reg.created_by || ""
+});
 } catch (tgErr) {
   console.error("telegram registry notify error:", tgErr);
 }
@@ -1700,12 +1701,13 @@ app.post("/registry-approve", async (req, res) => {
       // уведомляем следующий этап
       if (nextStage && nextStage !== "Исполнение платежей") {
         try {
-          await sendRegistryTelegramNotification({
-            registryId: registry_id,
-            registryNo: reg.registry_no,
-            stage: nextStage,
-            totalAmount: reg.total_amount
-          });
+         await sendRegistryTelegramNotification({
+  registryId: registry_id,
+  registryNo: registry_no,
+  stage: "Главный бухгалтер",
+  totalAmount: total,
+  createdBy: login || ""
+});
         } catch (tgErr) {
           console.error("telegram next stage notify error:", tgErr);
         }
@@ -2004,6 +2006,46 @@ app.post("/telegram-webhook", async (req, res) => {
       }
     }
 
+    if (update.callback_query) {
+      const cb = update.callback_query;
+      const callbackId = cb.id;
+      const chatId = String(cb.message?.chat?.id || "");
+      const data = String(cb.data || "");
+
+      const [action, registryId, stage] = data.split("|");
+
+      const resp = await fetch(`${APP_BASE_URL}/registry-approve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          registry_id: Number(registryId),
+          stage: stage,
+          action: action,
+          login: "telegram_user",
+          name: "Telegram",
+          comment: action === "reject" ? "Отклонено из Telegram" : "Согласовано из Telegram"
+        })
+      });
+
+      const result = await resp.json();
+
+      await tgRequest("answerCallbackQuery", {
+        callback_query_id: callbackId,
+        text: result?.success
+          ? (action === "approve" ? "Согласовано" : "Отклонено")
+          : (result?.error || "Ошибка")
+      });
+
+      if (result?.success) {
+        await sendTelegramMessage(
+          chatId,
+          action === "approve"
+            ? `✅ Реестр №${registryId} согласован`
+            : `❌ Реестр №${registryId} отклонён`
+        );
+      }
+    }
+
     return res.json({ ok: true });
   } catch (e) {
     console.error("TELEGRAM WEBHOOK ERROR:", e);
@@ -2011,7 +2053,7 @@ app.post("/telegram-webhook", async (req, res) => {
   }
 });
 
-async function sendRegistryTelegramNotification({ registryId, registryNo, stage, totalAmount }) {
+async function sendRegistryTelegramNotification({ registryId, registryNo, stage, totalAmount, createdBy }) {
   try {
     let chatId = "";
 
@@ -2036,22 +2078,33 @@ async function sendRegistryTelegramNotification({ registryId, registryNo, stage,
 
     const text =
       `📌 <b>Новый реестр</b>\n\n` +
-      `№ <b>${registryNo}</b>\n` +
-      `ID: <b>${registryId}</b>\n` +
+      `Реестр №: <b>${registryNo}</b>\n` +
+      `Инициатор: <b>${createdBy || "-"}</b>\n` +
       `Этап: <b>${stage}</b>\n` +
       `Сумма: <b>${Number(totalAmount || 0).toLocaleString("ru-RU", {
         minimumFractionDigits: 2,
         maximumFractionDigits: 2
       })}</b>`;
 
-    await sendTelegramMessage(chatId, text);
+    const replyMarkup = {
+      inline_keyboard: [
+        [
+          { text: "✅ Согласовать", callback_data: `approve|${registryId}|${stage}` },
+          { text: "❌ Отклонить", callback_data: `reject|${registryId}|${stage}` }
+        ],
+        [
+          { text: "📄 Открыть реестр", url: `${APP_BASE_URL}/registry-card?id=${registryId}` }
+        ]
+      ]
+    };
+
+    await sendTelegramMessage(chatId, text, replyMarkup);
 
     console.log("telegram sent:", { registryId, registryNo, stage, chatId });
   } catch (e) {
     console.error("telegram send error:", e);
   }
 }
-
 // =====================================================
 // Start
 // =====================================================
