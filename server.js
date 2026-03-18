@@ -1313,10 +1313,10 @@ await client.query("COMMIT");
 try {
   await sendRegistryTelegramNotification({
   registryId: registry_id,
-  registryNo: reg.registry_no,
-  stage: nextStage,
-  totalAmount: reg.total_amount,
-  createdBy: reg.created_by || ""
+  registryNo: registry_no,
+  stage: "Главный бухгалтер",
+  totalAmount: total,
+  createdBy: login || ""
 });
 } catch (tgErr) {
   console.error("telegram registry notify error:", tgErr);
@@ -1703,10 +1703,10 @@ app.post("/registry-approve", async (req, res) => {
         try {
          await sendRegistryTelegramNotification({
   registryId: registry_id,
-  registryNo: registry_no,
-  stage: "Главный бухгалтер",
-  totalAmount: total,
-  createdBy: login || ""
+  registryNo: reg.registry_no,
+  stage: nextStage,
+  totalAmount: reg.total_amount,
+  createdBy: reg.created_by || ""
 });
         } catch (tgErr) {
           console.error("telegram next stage notify error:", tgErr);
@@ -1983,7 +1983,28 @@ async function sendTelegramMessage(chatId, text, replyMarkup) {
     reply_markup: replyMarkup || undefined
   });
 }
+function getApproverByStage(stage) {
+  const s = String(stage || "").trim();
 
+  if (s === "Главный бухгалтер") {
+    return { login: "S_Zhasulan", name: "Жасулан Сулейменов" };
+  }
+  
+  if (s === "Заместитель директора") {
+    return { login: "K_Marat", name: "Марат Койлыбаев" };
+  }
+  if (s === "Управляющий директор") {
+    return { login: "K_Ermek", name: "Ермек Касенов" };
+  }
+  if (s === "Исполнение платежей") {
+    return { login: "K_Arailym", name: "Арайлым" };
+  }
+  if (s === "Контроль и архивирование") {
+    return { login: "B_Erkin", name: "B_Erkin" };
+  }
+
+  return { login: "telegram_user", name: "Telegram" };
+}
 app.post("/telegram-webhook", async (req, res) => {
   try {
     const update = req.body || {};
@@ -2014,18 +2035,20 @@ app.post("/telegram-webhook", async (req, res) => {
 
       const [action, registryId, stage] = data.split("|");
 
-      const resp = await fetch(`${APP_BASE_URL}/registry-approve`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          registry_id: Number(registryId),
-          stage: stage,
-          action: action,
-          login: "telegram_user",
-          name: "Telegram",
-          comment: action === "reject" ? "Отклонено из Telegram" : "Согласовано из Telegram"
-        })
-      });
+   const approver = getApproverByStage(stage);
+
+const resp = await fetch(`${APP_BASE_URL}/registry-approve`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({
+    registry_id: Number(registryId),
+    stage: stage,
+    action: action,
+    login: approver.login,
+    name: approver.name,
+    comment: action === "reject" ? "Отклонено из Telegram" : "Согласовано из Telegram"
+  })
+});
 
       const result = await resp.json();
 
@@ -2059,8 +2082,6 @@ async function sendRegistryTelegramNotification({ registryId, registryNo, stage,
 
     if (stage === "Главный бухгалтер") {
       chatId = "460955357";
-    } else if (stage === "Заместитель директора по финансам") {
-      chatId = "СЮДА_CHAT_ID_ДИНАРЫ";
     } else if (stage === "Заместитель директора") {
       chatId = "СЮДА_CHAT_ID_МАРАТА";
     } else if (stage === "Управляющий директор") {
@@ -2093,7 +2114,7 @@ async function sendRegistryTelegramNotification({ registryId, registryNo, stage,
           { text: "❌ Отклонить", callback_data: `reject|${registryId}|${stage}` }
         ],
         [
-          { text: "📄 Открыть реестр", url: `${APP_BASE_URL}/registry-card?id=${registryId}` }
+          { text: "📄 Открыть реестр", url: `https://script.google.com/macros/s/AKfycbySY2CFP3WJ9M_MW5HiDZvSScGCTn2SCOLW68SS1Gt5q-CsHGk9lve06PkeKnuZwZ-j/exec?page=registryCard&id=${registryId}` }
         ]
       ]
     };
