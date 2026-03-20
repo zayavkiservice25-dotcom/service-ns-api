@@ -807,20 +807,19 @@ if (reg === "Обнуление") {
 
 app.get("/ft-zvk-join", async (req, res) => {
   try {
-    const limit = Math.min(Number(req.query.limit || 500), 500);
     const login = String(req.query.login || "").trim();
 
     const isAdmin    = String(req.query.is_admin || "0") === "1";
-    const isAll      = String(req.query.is_all || "0") === "1";          // R_Kasymkhan
-    const isOperator = String(req.query.is_operator || "0") === "1";     // ✅ Оператор
+    const isAll      = String(req.query.is_all || "0") === "1";
+    const isOperator = String(req.query.is_operator || "0") === "1";
 
     if (!login) return res.status(400).json({ success:false, error:"login is required" });
 
     let query = "";
-    let params = [limit];
+    let params = [];
 
     if (isAdmin || isAll || isOperator) {
-      // ✅ админ/супер/оператор видят всё
+      // ✅ B_Erkin / Админ / Оператор / Супервайзер видят всё БЕЗ LIMIT
       query = `
         SELECT v.*
         FROM ft_zvk_current_v2 v
@@ -828,26 +827,23 @@ app.get("/ft-zvk-join", async (req, res) => {
           COALESCE(NULLIF(substring(v.id_ft from '\\d+'), ''), '0')::int DESC,
           v.zvk_date DESC NULLS LAST,
           v.zvk_row_id DESC
-        LIMIT $1
       `;
     } else {
-      // ✅ инициатор видит только своё
+      // ✅ остальным тоже убираем лимит, но оставляем только свои строки
       query = `
         SELECT v.*
         FROM ft_zvk_current_v2 v
-        WHERE lower(trim(v.input_name)) = lower(trim($2))
+        WHERE lower(trim(v.input_name)) = lower(trim($1))
         ORDER BY
           COALESCE(NULLIF(substring(v.id_ft from '\\d+'), ''), '0')::int DESC,
           v.zvk_date DESC NULLS LAST,
           v.zvk_row_id DESC
-        LIMIT $1
       `;
-      params.push(login);
+      params = [login];
     }
 
     const r = await pool.query(query, params);
 
-    // ✅ can_edit: админ/супер — true; иначе только свои FT
     const loginNorm = normLogin(login);
 
     const rows = r.rows.map(x => ({
@@ -857,7 +853,13 @@ app.get("/ft-zvk-join", async (req, res) => {
         : (normLogin(x.input_name) === loginNorm)
     }));
 
-    res.json({ success:true, rows, count: rows.length, isAdmin, isOperator });
+    res.json({
+      success: true,
+      rows,
+      count: rows.length,
+      isAdmin,
+      isOperator
+    });
 
   } catch (e) {
     console.error("FT-ZVK-JOIN ERROR:", e);
