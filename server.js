@@ -1792,19 +1792,19 @@ app.post("/registry-approve", async (req, res) => {
       await client.query("COMMIT");
 
       // уведомляем следующий этап
-      if (nextStage && nextStage !== "Исполнение платежей") {
-        try {
-         await sendRegistryTelegramNotification({
-  registryId: registry_id,
-  registryNo: reg.registry_no,
-  stage: nextStage,
-  totalAmount: reg.total_amount,
-  createdBy: reg.created_by || ""
-});
-        } catch (tgErr) {
-          console.error("telegram next stage notify error:", tgErr);
-        }
-      }
+   if (nextStage) {
+  try {
+    await sendRegistryTelegramNotification({
+      registryId: registry_id,
+      registryNo: reg.registry_no,
+      stage: nextStage,
+      totalAmount: reg.total_amount,
+      createdBy: reg.created_by || ""
+    });
+  } catch (tgErr) {
+    console.error("telegram next stage notify error:", tgErr);
+  }
+}
 
       return res.json({ success:true, moved_to:nextStage, action:"approve" });
     }
@@ -1881,11 +1881,13 @@ app.post("/registry-move-stage", async (req, res) => {
       return res.json({ success:true, moved_to: toS });
     }
 
-    const allowed =
-      (actor === "s_zhasulan" && fromS === "Главный бухгалтер" && toS === "Заместитель директора по финансам") ||
-      (actor === "o_dinara"   && fromS === "Заместитель директора по финансам" && toS === "Заместитель директора") ||
-      (actor === "k_marat"    && fromS === "Заместитель директора" && toS === "Управляющий директор") ||
-      (actor === "k_arailym"  && fromS === "Исполнение платежей" && toS === "Контроль и архивирование");
+const allowed =
+  (actor === "s_zhasulan" && fromS === "Главный бухгалтер" && toS === "Заместитель директора по финансам") ||
+  (actor === "o_dinara"   && fromS === "Заместитель директора по финансам" && toS === "Заместитель директора") ||
+  (actor === "k_marat"    && fromS === "Заместитель директора" && toS === "Управляющий директор") ||
+  ((actor === "k_arailym" || actor === "zh_elena") &&
+    fromS === "Исполнение платежей" &&
+    toS === "Контроль и архивирование");
 
     if (!allowed) {
       await client.query("ROLLBACK");
@@ -2126,9 +2128,24 @@ app.post("/telegram-webhook", async (req, res) => {
       const chatId = String(cb.message?.chat?.id || "");
       const data = String(cb.data || "");
 
-      const [action, registryId, stage] = data.split("|");
+    const [action, registryId, stage] = data.split("|");
 
-   const approver = getApproverByStage(stage);
+let approver = getApproverByStage(stage);
+
+if (String(stage || "").trim() === "Исполнение платежей") {
+  const client = await pool.connect();
+  try {
+    const executor = await getExecutorByRegistry(Number(registryId), client);
+
+    if (executor === "Zh_Elena") {
+      approver = { login: "Zh_Elena", name: "Елена" };
+    } else {
+      approver = { login: "K_Arailym", name: "Арайлым" };
+    }
+  } finally {
+    client.release();
+  }
+}
 
 const resp = await fetch(`${APP_BASE_URL}/registry-approve`, {
   method: "POST",
@@ -2169,20 +2186,122 @@ const resp = await fetch(`${APP_BASE_URL}/registry-approve`, {
   }
 });
 
+async function getExecutorByRegistry(registryId, client) {
+  const r = await client.query(`
+    SELECT DISTINCT TRIM(COALESCE(src_d,'')) AS src_d
+    FROM registry_items
+    WHERE registry_id = $1
+  `, [registryId]);
+
+  const divisions = r.rows.map(x => x.src_d);
+
+  const elenaDivs = [
+    "СК Жилой дом",
+    "Sapa asphalt",
+    "Smart Estate"
+  ];
+
+  const hasElena = divisions.some(d => elenaDivs.includes(d));
+
+  return hasElena ? "Zh_Elena" : "K_Arailym";
+}
+
+// =========================
+// WATCHERS ПО ДИВИЗИОНАМ
+// =========================
+const DIVISION_WATCHERS = {
+  "Дорога": [
+    "K_Ermek","S_Zhasulan","K_Marat","K_Arailym","B_Erkin","K_Talimzhan","T_Azat"
+  ],
+  "Механизация": [
+    "K_Ermek","S_Zhasulan","K_Marat","K_Arailym","B_Erkin","K_Talimzhan","T_Azat"
+  ],
+  "Мост": [
+    "K_Ermek","S_Zhasulan","K_Marat","K_Arailym","B_Erkin","K_Talimzhan","T_Azat"
+  ],
+  "Офис": [
+    "K_Ermek","S_Zhasulan","K_Marat","K_Arailym","B_Erkin","K_Talimzhan","T_Azat"
+  ],
+  "Сети": [
+    "K_Ermek","S_Zhasulan","K_Marat","K_Arailym","B_Erkin","K_Talimzhan","T_Azat"
+  ],
+  "СК Жилой дом": [
+    "K_Ermek","S_Zhasulan","K_Marat","Zh_Elena","B_Erkin","K_Talimzhan","T_Azat","K_Arailym"
+  ],
+  "Sapa asphalt": [
+    "K_Ermek","S_Zhasulan","K_Marat","B_Erkin","K_Talimzhan","T_Azat","K_Arailym"
+  ],
+  "Smart Estate": [
+    "K_Ermek","S_Zhasulan","K_Marat","Zh_Elena","B_Erkin","K_Talimzhan","T_Azat","K_Arailym"
+  ]
+};
+
+async function getWatchersByRegistry(registryId, client) {
+  const r = await client.query(`
+    SELECT DISTINCT TRIM(COALESCE(src_d,'')) AS src_d
+    FROM registry_items
+    WHERE registry_id = $1
+  `, [registryId]);
+
+  const divisions = r.rows.map(x => x.src_d);
+  const watchers = new Set();
+
+  for (const d of divisions) {
+    const list = DIVISION_WATCHERS[d] || [];
+    list.forEach(w => watchers.add(w));
+  }
+
+  const executor = await getExecutorByRegistry(registryId, client);
+
+  const excluded = new Set([
+    "S_Zhasulan", // главный бухгалтер
+    "K_Marat",    // заместитель директора
+    "K_Ermek",    // утверждающий
+    executor      // исполнитель
+  ]);
+
+  return Array.from(watchers).filter(w => !excluded.has(w));
+}
+
+
 async function sendRegistryTelegramNotification({ registryId, registryNo, stage, totalAmount, createdBy }) {
   try {
     let chatId = "";
 
+    const USER_CHAT_MAP = {
+      "K_Ermek": "493945914",
+      "S_Zhasulan": "460955357",
+      "K_Marat": "412596988",
+      "K_Arailym": "CHAT_ID_АРАЙЛЫМ",
+      "Zh_Elena": "CHAT_ID_ЕЛЕНЫ",
+      "B_Erkin": "",
+      "K_Talimzhan": "CHAT_ID_ТАЛИМЖАНА",
+      "T_Azat": "CHAT_ID_АЗАТА"
+    };
+
     if (stage === "Главный бухгалтер") {
       chatId = "460955357";
     } else if (stage === "Заместитель директора") {
-      chatId = "СЮДА_CHAT_ID_МАРАТА";
-    } else if (stage === "Управляющий директор") {
-      chatId = "СЮДА_CHAT_ID_ЕРМЕКА";
-    } else if (stage === "Исполнение платежей") {
-      chatId = "СЮДА_CHAT_ID_АРАЙЛЫМ";
-    } else if (stage === "Контроль и архивирование") {
       chatId = "412596988";
+    } else if (stage === "Управляющий директор") {
+      chatId = "493945914";
+    } else if (stage === "Исполнение платежей") {
+      const client = await pool.connect();
+      let executor = "K_Arailym";
+
+      try {
+        executor = await getExecutorByRegistry(registryId, client);
+      } finally {
+        client.release();
+      }
+
+      if (executor === "Zh_Elena") {
+        chatId = "CHAT_ID_ЕЛЕНЫ";
+      } else {
+        chatId = "CHAT_ID_АРАЙЛЫМ";
+      }
+    } else if (stage === "Контроль и архивирование") {
+      chatId = "";
     }
 
     if (!chatId) {
@@ -2214,7 +2333,33 @@ async function sendRegistryTelegramNotification({ registryId, registryNo, stage,
 
     await sendTelegramMessage(chatId, text, replyMarkup);
 
-    console.log("telegram sent:", { registryId, registryNo, stage, chatId });
+    const client = await pool.connect();
+    let watchers = [];
+
+    try {
+      watchers = await getWatchersByRegistry(registryId, client);
+    } finally {
+      client.release();
+    }
+
+    for (const w of watchers) {
+      const cid = USER_CHAT_MAP[w];
+      if (!cid) continue;
+
+      await sendTelegramMessage(
+        cid,
+        `👀 <b>Наблюдатель</b>\n\n${text}`
+      );
+    }
+
+    console.log("telegram sent:", {
+      registryId,
+      registryNo,
+      stage,
+      chatId,
+      watchers
+    });
+
   } catch (e) {
     console.error("telegram send error:", e);
   }
