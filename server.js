@@ -1285,13 +1285,11 @@ app.post("/create-registry", async (req, res) => {
   try {
 
     const { row_ids, login } = req.body;
+const isEmpty = !Array.isArray(row_ids) || row_ids.length === 0;
 
-    if (!Array.isArray(row_ids) || row_ids.length === 0) {
-      return res.status(400).json({
-        success:false,
-        error:"row_ids required"
-      });
-    }
+
+if (isEmpty)
+
 
     await client.query("BEGIN");
 
