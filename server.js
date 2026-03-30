@@ -2326,13 +2326,10 @@ async function sendRegistryTelegramNotification({ registryId, registryNo, stage,
 
     if (stage === "Главный бухгалтер") {
       chatId = "460955357";
-
     } else if (stage === "Заместитель директора") {
       chatId = "412596988";
-
     } else if (stage === "Управляющий директор") {
       chatId = "493945914";
-
     } else if (stage === "Исполнение платежей") {
       const client = await pool.connect();
       let executor = "K_Arailym";
@@ -2348,14 +2345,8 @@ async function sendRegistryTelegramNotification({ registryId, registryNo, stage,
       } else {
         chatId = "CHAT_ID_АРАЙЛЫМ";
       }
-
     } else if (stage === "Контроль и архивирование") {
       chatId = "";
-    }
-
-    if (!chatId) {
-      console.log("нет chat_id для этапа", stage);
-      return;
     }
 
     const text =
@@ -2368,51 +2359,54 @@ async function sendRegistryTelegramNotification({ registryId, registryNo, stage,
         maximumFractionDigits: 2
       })}</b>`;
 
-    const replyMarkup =
-      stage === "Контроль и архивирование"
-        ? undefined
-        : {
-            inline_keyboard: [
-              [
-                { text: "✅ Согласовать", callback_data: `approve|${registryId}|${stage}` },
-                { text: "❌ Отклонить", callback_data: `reject|${registryId}|${stage}` }
-              ],
-              [
-                {
-                  text: "📄 Открыть реестр",
-                  url: `https://script.google.com/macros/s/AKfycbySY2CFP3WJ9M_MW5HiDZvSScGCTn2SCOLW68SS1Gt5q-CsHGk9lve06PkeKnuZwZ-j/exec?page=registryCard&id=${registryId}`
-                }
-              ]
-            ]
-          };
+    const replyMarkup = {
+      inline_keyboard: [
+        [
+          { text: "✅ Согласовать", callback_data: `approve|${registryId}|${stage}` },
+          { text: "❌ Отклонить", callback_data: `reject|${registryId}|${stage}` }
+        ],
+        [
+          { text: "📄 Открыть реестр", url: `https://script.google.com/macros/s/AKfycbySY2CFP3WJ9M_MW5HiDZvSScGCTn2SCOLW68SS1Gt5q-CsHGk9lve06PkeKnuZwZ-j/exec?page=registryCard&id=${registryId}` }
+        ]
+      ]
+    };
 
-    await sendTelegramMessage(chatId, text, replyMarkup);
-
-    const client = await pool.connect();
-    let watchers = [];
-
-    try {
-      watchers = await getWatchersByRegistry(registryId, client);
-    } finally {
-      client.release();
+    // 1. Отправка основному согласующему / исполнителю этапа
+    if (chatId) {
+      await sendTelegramMessage(chatId, text, replyMarkup);
+    } else {
+      console.log("нет chat_id для этапа", stage);
     }
 
-    for (const w of watchers) {
-      const cid = USER_CHAT_MAP[w];
-      if (!cid) continue;
+    // 2. Наблюдателям отправляем ТОЛЬКО при создании реестра
+    if (stage === "Главный бухгалтер") {
+      const client = await pool.connect();
+      let watchers = [];
 
-      await sendTelegramMessage(
-        cid,
-        `👀 <b>Наблюдатель</b>\n\n${text}`
-      );
+      try {
+        watchers = await getWatchersByRegistry(registryId, client);
+      } finally {
+        client.release();
+      }
+
+      for (const w of watchers) {
+        const cid = USER_CHAT_MAP[w];
+        if (!cid) continue;
+
+        await sendTelegramMessage(
+          cid,
+          `👀 <b>Наблюдатель</b>\n\n${text}`
+        );
+      }
+
+      console.log("watchers notified:", { registryId, watchers });
     }
 
     console.log("telegram sent:", {
       registryId,
       registryNo,
       stage,
-      chatId,
-      watchers
+      chatId
     });
 
   } catch (e) {
