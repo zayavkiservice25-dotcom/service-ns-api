@@ -1415,47 +1415,131 @@ app.post("/create-registry", async (req, res) => {
   }
 });
 
+const APPROVER_LOGINS = [
+  "s_zhasulan",
+  "k_marat",
+  "k_ermek",
+  "k_arailym",
+  "zh_elena",
+  "b_erkin",
+  "b_erkin2"
+];
+
+const DIVISION_WATCHERS = {
+  "Дорога": ["k_talimzhan", "t_azat"],
+  "Механизация": ["k_talimzhan", "t_azat"],
+  "Мост": ["k_talimzhan", "t_azat"],
+  "Офис": ["k_talimzhan", "t_azat"],
+  "Сети": ["k_talimzhan", "t_azat"],
+  "СК Жилой дом": ["k_talimzhan", "t_azat"],
+  "Sapa asphalt": ["k_talimzhan", "t_azat"],
+  "Smart Estate": ["k_talimzhan", "t_azat"]
+};
+
+function getWatcherDivisions(login) {
+  const lg = String(login || "").trim().toLowerCase();
+  const result = [];
+
+  for (const [division, watchers] of Object.entries(DIVISION_WATCHERS)) {
+    if ((watchers || []).map(x => String(x).toLowerCase()).includes(lg)) {
+      result.push(division);
+    }
+  }
+
+  return result;
+}
+
 app.get("/registry-list", async (req, res) => {
   try {
-    const r = await pool.query(`
-      SELECT
-        h.id,
-        h.registry_no,
-        h.registry_date,
-        h.created_by,
-        h.items_count,
-        h.total_amount,
-        h.workflow_stage,
-        h.archive_flag,
+    const login = String(req.query.login || "").trim().toLowerCase();
+    if (!login) {
+      return res.status(400).json({ success:false, error:"login required" });
+    }
 
-        COALESCE(
-          STRING_AGG(DISTINCT NULLIF(TRIM(i.src_d), ''), ', ')
-            FILTER (WHERE NULLIF(TRIM(i.src_d), '') IS NOT NULL),
-          ''
-        ) AS src_d
+    // 1. Согласующие видят всё
+    if (APPROVER_LOGINS.includes(login)) {
+      const r = await pool.query(`
+        SELECT
+          h.id,
+          h.registry_no,
+          h.registry_date,
+          h.created_by,
+          h.items_count,
+          h.total_amount,
+          h.workflow_stage,
+          h.archive_flag,
+          COALESCE(
+            STRING_AGG(DISTINCT NULLIF(TRIM(i.src_d), ''), ', ')
+              FILTER (WHERE NULLIF(TRIM(i.src_d), '') IS NOT NULL),
+            ''
+          ) AS src_d
+        FROM public.registry_head h
+        LEFT JOIN public.registry_items i
+          ON i.registry_id = h.id
+        WHERE COALESCE(h.archive_flag, 'Нет') <> 'Да'
+        GROUP BY
+          h.id,
+          h.registry_no,
+          h.registry_date,
+          h.created_by,
+          h.items_count,
+          h.total_amount,
+          h.workflow_stage,
+          h.archive_flag
+        ORDER BY h.id DESC
+      `);
 
-      FROM public.registry_head h
-      LEFT JOIN public.registry_items i
-        ON i.registry_id = h.id
+      return res.json({ success:true, rows:r.rows });
+    }
 
-      WHERE COALESCE(h.archive_flag, 'Нет') <> 'Да'
+    // 2. Наблюдатели видят только свои дивизионы
+    const watcherDivisions = getWatcherDivisions(login);
 
-      GROUP BY
-        h.id,
-        h.registry_no,
-        h.registry_date,
-        h.created_by,
-        h.items_count,
-        h.total_amount,
-        h.workflow_stage,
-        h.archive_flag
+    if (watcherDivisions.length > 0) {
+      const r = await pool.query(`
+        SELECT
+          h.id,
+          h.registry_no,
+          h.registry_date,
+          h.created_by,
+          h.items_count,
+          h.total_amount,
+          h.workflow_stage,
+          h.archive_flag,
+          COALESCE(
+            STRING_AGG(DISTINCT NULLIF(TRIM(i.src_d), ''), ', ')
+              FILTER (WHERE NULLIF(TRIM(i.src_d), '') IS NOT NULL),
+            ''
+          ) AS src_d
+        FROM public.registry_head h
+        LEFT JOIN public.registry_items i
+          ON i.registry_id = h.id
+        WHERE COALESCE(h.archive_flag, 'Нет') <> 'Да'
+          AND EXISTS (
+            SELECT 1
+            FROM public.registry_items i2
+            WHERE i2.registry_id = h.id
+              AND TRIM(COALESCE(i2.src_d,'')) = ANY($1::text[])
+          )
+        GROUP BY
+          h.id,
+          h.registry_no,
+          h.registry_date,
+          h.created_by,
+          h.items_count,
+          h.total_amount,
+          h.workflow_stage,
+          h.archive_flag
+        ORDER BY h.id DESC
+      `, [watcherDivisions]);
 
-      ORDER BY h.id DESC
-    `);
+      return res.json({ success:true, rows:r.rows });
+    }
 
-    res.json({
-      success: true,
-      rows: r.rows
+    // 3. Остальным доступа нет
+    return res.status(403).json({
+      success:false,
+      error:"NO_ACCESS_TO_REGISTRY"
     });
 
   } catch (e) {
@@ -2255,30 +2339,14 @@ async function getExecutorByRegistry(registryId, client) {
 // WATCHERS ПО ДИВИЗИОНАМ
 // =========================
 const DIVISION_WATCHERS = {
-  "Дорога": [
-    "K_Ermek","S_Zhasulan","K_Marat","K_Arailym","B_Erkin","K_Talimzhan","T_Azat"
-  ],
-  "Механизация": [
-    "K_Ermek","S_Zhasulan","K_Marat","K_Arailym","B_Erkin","K_Talimzhan","T_Azat"
-  ],
-  "Мост": [
-    "K_Ermek","S_Zhasulan","K_Marat","K_Arailym","B_Erkin","K_Talimzhan","T_Azat"
-  ],
-  "Офис": [
-    "K_Ermek","S_Zhasulan","K_Marat","K_Arailym","B_Erkin","K_Talimzhan","T_Azat"
-  ],
-  "Сети": [
-    "K_Ermek","S_Zhasulan","K_Marat","K_Arailym","B_Erkin","K_Talimzhan","T_Azat"
-  ],
-  "СК Жилой дом": [
-    "K_Ermek","S_Zhasulan","K_Marat","Zh_Elena","B_Erkin","K_Talimzhan","T_Azat","K_Arailym"
-  ],
-  "Sapa asphalt": [
-    "K_Ermek","S_Zhasulan","K_Marat","B_Erkin","K_Talimzhan","T_Azat","K_Arailym"
-  ],
-  "Smart Estate": [
-    "K_Ermek","S_Zhasulan","K_Marat","Zh_Elena","B_Erkin","K_Talimzhan","T_Azat","K_Arailym"
-  ]
+  "Дорога": ["k_talimzhan", "t_azat"],
+  "Механизация": ["k_talimzhan", "t_azat"],
+  "Мост": ["k_talimzhan", "t_azat"],
+  "Офис": ["k_talimzhan", "t_azat"],
+  "Сети": ["k_talimzhan", "t_azat"],
+  "СК Жилой дом": ["k_talimzhan", "t_azat"],
+  "Sapa asphalt": ["k_talimzhan", "t_azat"],
+  "Smart Estate": ["k_talimzhan", "t_azat"]
 };
 
 async function getWatchersByRegistry(registryId, client) {
