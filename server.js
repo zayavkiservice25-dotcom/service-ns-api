@@ -309,7 +309,24 @@ async function initDb()  {
     CREATE INDEX IF NOT EXISTS registry_approve_log_registry_id_idx
     ON public.registry_approve_log (registry_id);
   `);
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS public.io_history (
+    id bigserial PRIMARY KEY,
+    created_at timestamptz DEFAULT now(),
+    input_date_text text,
+    sum_value numeric(18,2),
+    object_name text,
+    div_in text,
+    dds_in text,
+    div_out text,
+    dds_out text
+  );
+`);
 
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS io_history_created_at_idx
+  ON public.io_history (created_at DESC);
+`);
   // =========================
   // APPROVAL COLUMNS
   // =========================
@@ -960,7 +977,9 @@ app.post("/io-save", async (req, res) => {
   const client = await pool.connect();
   try {
     const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
-    if (!rows.length) return res.status(400).json({ success:false, error:"rows required" });
+    if (!rows.length) {
+      return res.status(400).json({ success:false, error:"rows required" });
+    }
 
     const toNum = (v) => {
       if (v === null || v === undefined || v === "") return null;
@@ -970,19 +989,21 @@ app.post("/io-save", async (req, res) => {
 
     await client.query("BEGIN");
 
-    let insPrihod = 0, insPerevod = 0;
+    let insPrihod = 0;
+    let insPerevod = 0;
+    let insHistory = 0;
 
     for (const r of rows) {
       const sum = toNum(r.sum);
       if (sum === null) continue;
 
+      const inputDate = r.input_date || null;
       const obj    = r.object || null;
       const divIn  = r.div_in || null;
       const ddsIn  = r.dds_in || null;
       const divOut = r.div_out || null;
       const ddsOut = r.dds_out || null;
 
-      // prihod6 (doc_time сам = NOW())
       await client.query(
         `INSERT INTO public.prihod6 (amount_in, object_name, division_in, dds_in)
          VALUES ($1,$2,$3,$4)`,
@@ -990,20 +1011,68 @@ app.post("/io-save", async (req, res) => {
       );
       insPrihod++;
 
-      // perevod7 (doc_time сам = NOW())
       await client.query(
         `INSERT INTO public.perevod7 (amount_out, object_name, division_out, dds_out)
          VALUES ($1,$2,$3,$4)`,
         [sum, obj, divOut, ddsOut]
       );
       insPerevod++;
+
+      await client.query(
+        `INSERT INTO public.io_history
+          (input_date_text, sum_value, object_name, div_in, dds_in, div_out, dds_out)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        [inputDate, sum, obj, divIn, ddsIn, divOut, ddsOut]
+      );
+      insHistory++;
     }
 
     await client.query("COMMIT");
-    res.json({ success:true, inserted:{ prihod6: insPrihod, perevod7: insPerevod } });
+
+    res.json({
+      success:true,
+      inserted:{
+        prihod6: insPrihod,
+        perevod7: insPerevod,
+        io_history: insHistory
+      }
+    });
 
   } catch (e) {
     await client.query("ROLLBACK");
+    console.error("IO-SAVE ERROR:", e);
+    res.status(500).json({ success:false, error:e.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/io-history", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const limit = Math.min(Number(req.query.limit || 200), 500);
+
+    const r = await client.query(`
+      SELECT
+        id,
+        input_date_text,
+        sum_value,
+        object_name,
+        div_in,
+        dds_in,
+        div_out,
+        dds_out
+      FROM public.io_history
+      ORDER BY id DESC
+      LIMIT $1
+    `, [limit]);
+
+    res.json({
+      success: true,
+      rows: r.rows
+    });
+  } catch (e) {
+    console.error("IO-HISTORY ERROR:", e);
     res.status(500).json({ success:false, error:e.message });
   } finally {
     client.release();
