@@ -1370,9 +1370,6 @@ app.post("/create-registry", async (req, res) => {
         acc_buh_name = 'Жасулан Сулейменов',
         acc_buh_status = 'Ожидает',
 
-        acc_fin_name = 'Динара Омарбекова',
-        acc_fin_status = 'Ожидает',
-
         acc_zam_name = 'Марат Койлыбаев',
         acc_zam_status = 'Ожидает',
 
@@ -2335,19 +2332,7 @@ async function getExecutorByRegistry(registryId, client) {
   return hasElena ? "Zh_Elena" : "K_Arailym";
 }
 
-// =========================
-// WATCHERS ПО ДИВИЗИОНАМ
-// =========================
-const DIVISION_WATCHERS = {
-  "Дорога": ["k_talimzhan", "t_azat"],
-  "Механизация": ["k_talimzhan", "t_azat"],
-  "Мост": ["k_talimzhan", "t_azat"],
-  "Офис": ["k_talimzhan", "t_azat"],
-  "Сети": ["k_talimzhan", "t_azat"],
-  "СК Жилой дом": ["k_talimzhan", "t_azat"],
-  "Sapa asphalt": ["k_talimzhan", "t_azat"],
-  "Smart Estate": ["k_talimzhan", "t_azat"]
-};
+
 
 async function getWatchersByRegistry(registryId, client) {
   const r = await client.query(`
