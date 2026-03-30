@@ -1625,23 +1625,6 @@ app.post("/registry-approve", async (req, res) => {
         rejectParams = [Number(registry_id), String(comment || "")];
       }
 
-      else if (
-        stageName === "Заместитель директора по финансам" ||
-        stageName === "Зам. директора по финансам"
-      ) {
-        rejectSql = `
-          UPDATE public.registry_head
-          SET
-            acc_fin_status = 'Отклонено',
-            acc_fin_time = NOW(),
-            acc_fin_comment = $2,
-            workflow_stage = 'Инициация',
-            agree_status = 'Отклонено'
-          WHERE id = $1
-        `;
-        rejectParams = [Number(registry_id), String(comment || "")];
-      }
-
       else if (stageName === "Заместитель директора") {
         rejectSql = `
           UPDATE public.registry_head
@@ -1668,6 +1651,40 @@ app.post("/registry-approve", async (req, res) => {
           WHERE id = $1
         `;
         rejectParams = [Number(registry_id), String(comment || "")];
+      }
+
+      else if (stageName === "Исполнение платежей") {
+        const executor = await getExecutorByRegistry(Number(registry_id), client);
+
+        rejectSql = `
+          UPDATE public.registry_head
+          SET
+            execution_status = 'Отклонено',
+            workflow_stage = 'Инициация',
+            agree_status = 'Отклонено'
+          WHERE id = $1
+        `;
+        rejectParams = [Number(registry_id)];
+
+        await client.query(
+          `
+          INSERT INTO public.registry_approve_log
+            (registry_id, stage_name, approver_login, approver_name, action_type, comment_text)
+          VALUES ($1, $2, $3, $4, 'reject', $5)
+          `,
+          [
+            Number(registry_id),
+            String(stage),
+            executor,
+            executor === "Zh_Elena" ? "Елена" : "Арайлым",
+            String(comment || "")
+          ]
+        );
+
+        await client.query(rejectSql, rejectParams);
+        await client.query("COMMIT");
+
+        return res.json({ success:true, moved_to:"Инициация", action:"reject" });
       }
 
       else {
@@ -1711,24 +1728,6 @@ app.post("/registry-approve", async (req, res) => {
             acc_buh_status = 'Согласовано',
             acc_buh_time = NOW(),
             acc_buh_comment = $2,
-            workflow_stage = 'Заместитель директора по финансам',
-            agree_status = 'На согласовании'
-          WHERE id = $1
-        `;
-        approveParams = [Number(registry_id), String(comment || "")];
-        nextStage = "Заместитель директора по финансам";
-      }
-
-      else if (
-        stageName === "Заместитель директора по финансам" ||
-        stageName === "Зам. директора по финансам"
-      ) {
-        approveSql = `
-          UPDATE public.registry_head
-          SET
-            acc_fin_status = 'Согласовано',
-            acc_fin_time = NOW(),
-            acc_fin_comment = $2,
             workflow_stage = 'Заместитель директора',
             agree_status = 'На согласовании'
           WHERE id = $1
@@ -1767,6 +1766,19 @@ app.post("/registry-approve", async (req, res) => {
         nextStage = "Исполнение платежей";
       }
 
+      else if (stageName === "Исполнение платежей") {
+        approveSql = `
+          UPDATE public.registry_head
+          SET
+            execution_status = 'На исполнении',
+            workflow_stage = 'Контроль и архивирование',
+            agree_status = 'Согласовано'
+          WHERE id = $1
+        `;
+        approveParams = [Number(registry_id)];
+        nextStage = "Контроль и архивирование";
+      }
+
       else {
         await client.query("ROLLBACK");
         return res.status(400).json({ success:false, error:"unknown stage" });
@@ -1791,20 +1803,19 @@ app.post("/registry-approve", async (req, res) => {
 
       await client.query("COMMIT");
 
-      // уведомляем следующий этап
-   if (nextStage) {
-  try {
-    await sendRegistryTelegramNotification({
-      registryId: registry_id,
-      registryNo: reg.registry_no,
-      stage: nextStage,
-      totalAmount: reg.total_amount,
-      createdBy: reg.created_by || ""
-    });
-  } catch (tgErr) {
-    console.error("telegram next stage notify error:", tgErr);
-  }
-}
+      if (nextStage) {
+        try {
+          await sendRegistryTelegramNotification({
+            registryId: registry_id,
+            registryNo: reg.registry_no,
+            stage: nextStage,
+            totalAmount: reg.total_amount,
+            createdBy: reg.created_by || ""
+          });
+        } catch (tgErr) {
+          console.error("telegram next stage notify error:", tgErr);
+        }
+      }
 
       return res.json({ success:true, moved_to:nextStage, action:"approve" });
     }
@@ -1820,6 +1831,7 @@ app.post("/registry-approve", async (req, res) => {
     client.release();
   }
 });
+
 
 app.post("/registry-move-stage", async (req, res) => {
   const client = await pool.connect();
@@ -1877,30 +1889,29 @@ app.post("/registry-move-stage", async (req, res) => {
         ]
       );
 
-await client.query("COMMIT");
+      await client.query("COMMIT");
 
-try {
-  await sendRegistryTelegramNotification({
-    registryId: Number(registry_id),
-    registryNo: regRes.rows[0].registry_no,
-    stage: toS,
-    totalAmount: regRes.rows[0].total_amount,
-    createdBy: regRes.rows[0].created_by || ""
-  });
-} catch (tgErr) {
-  console.error("telegram move-stage notify error:", tgErr);
-}
+      try {
+        await sendRegistryTelegramNotification({
+          registryId: Number(registry_id),
+          registryNo: regRes.rows[0].registry_no,
+          stage: toS,
+          totalAmount: regRes.rows[0].total_amount,
+          createdBy: regRes.rows[0].created_by || ""
+        });
+      } catch (tgErr) {
+        console.error("telegram move-stage notify error:", tgErr);
+      }
 
-return res.json({ success:true, moved_to: toS });
+      return res.json({ success:true, moved_to: toS });
     }
 
-const allowed =
-  (actor === "s_zhasulan" && fromS === "Главный бухгалтер" && toS === "Заместитель директора по финансам") ||
-  (actor === "o_dinara"   && fromS === "Заместитель директора по финансам" && toS === "Заместитель директора") ||
-  (actor === "k_marat"    && fromS === "Заместитель директора" && toS === "Управляющий директор") ||
-  ((actor === "k_arailym" || actor === "zh_elena") &&
-    fromS === "Исполнение платежей" &&
-    toS === "Контроль и архивирование");
+    const allowed =
+      (actor === "s_zhasulan" && fromS === "Главный бухгалтер" && toS === "Заместитель директора") ||
+      (actor === "k_marat"    && fromS === "Заместитель директора" && toS === "Управляющий директор") ||
+      ((actor === "k_arailym" || actor === "zh_elena") &&
+        fromS === "Исполнение платежей" &&
+        toS === "Контроль и архивирование");
 
     if (!allowed) {
       await client.query("ROLLBACK");
@@ -1931,21 +1942,21 @@ const allowed =
       ]
     );
 
-await client.query("COMMIT");
+    await client.query("COMMIT");
 
-try {
-  await sendRegistryTelegramNotification({
-    registryId: Number(registry_id),
-    registryNo: regRes.rows[0].registry_no,
-    stage: toS,
-    totalAmount: regRes.rows[0].total_amount,
-    createdBy: regRes.rows[0].created_by || ""
-  });
-} catch (tgErr) {
-  console.error("telegram move-stage notify error:", tgErr);
-}
+    try {
+      await sendRegistryTelegramNotification({
+        registryId: Number(registry_id),
+        registryNo: regRes.rows[0].registry_no,
+        stage: toS,
+        totalAmount: regRes.rows[0].total_amount,
+        createdBy: regRes.rows[0].created_by || ""
+      });
+    } catch (tgErr) {
+      console.error("telegram move-stage notify error:", tgErr);
+    }
 
-return res.json({ success:true, moved_to: toS });
+    return res.json({ success:true, moved_to: toS });
 
   } catch (e) {
     await client.query("ROLLBACK");
@@ -1955,6 +1966,7 @@ return res.json({ success:true, moved_to: toS });
     client.release();
   }
 });
+
 
 app.post("/registry-send-to-archive", async (req, res) => {
   const client = await pool.connect();
@@ -2104,28 +2116,35 @@ async function sendTelegramMessage(chatId, text, replyMarkup) {
     reply_markup: replyMarkup || undefined
   });
 }
+
+
 function getApproverByStage(stage) {
   const s = String(stage || "").trim();
 
   if (s === "Главный бухгалтер") {
     return { login: "S_Zhasulan", name: "Жасулан Сулейменов" };
   }
-  
+
   if (s === "Заместитель директора") {
     return { login: "K_Marat", name: "Марат Койлыбаев" };
   }
+
   if (s === "Управляющий директор") {
     return { login: "K_Ermek", name: "Ермек Касенов" };
   }
+
   if (s === "Исполнение платежей") {
     return { login: "K_Arailym", name: "Арайлым" };
   }
+
   if (s === "Контроль и архивирование") {
     return { login: "B_Erkin", name: "B_Erkin" };
   }
 
   return { login: "telegram_user", name: "Telegram" };
 }
+
+
 app.post("/telegram-webhook", async (req, res) => {
   try {
     const update = req.body || {};
@@ -2305,17 +2324,16 @@ async function sendRegistryTelegramNotification({ registryId, registryNo, stage,
       "T_Azat": "CHAT_ID_АЗАТА"
     };
 
-if (stage === "Главный бухгалтер") {
-  chatId = "460955357";
-} else if (
-  stage === "Заместитель директора по финансам" ||
-  stage === "Зам. директора по финансам" ||
-  stage === "Заместитель директора"
-) {
-  chatId = "412596988";
-} else if (stage === "Управляющий директор") {
-  chatId = "493945914";
-} else if (stage === "Исполнение платежей") {
+    if (stage === "Главный бухгалтер") {
+      chatId = "460955357";
+
+    } else if (stage === "Заместитель директора") {
+      chatId = "412596988";
+
+    } else if (stage === "Управляющий директор") {
+      chatId = "493945914";
+
+    } else if (stage === "Исполнение платежей") {
       const client = await pool.connect();
       let executor = "K_Arailym";
 
@@ -2330,6 +2348,7 @@ if (stage === "Главный бухгалтер") {
       } else {
         chatId = "CHAT_ID_АРАЙЛЫМ";
       }
+
     } else if (stage === "Контроль и архивирование") {
       chatId = "";
     }
@@ -2349,17 +2368,23 @@ if (stage === "Главный бухгалтер") {
         maximumFractionDigits: 2
       })}</b>`;
 
-    const replyMarkup = {
-      inline_keyboard: [
-        [
-          { text: "✅ Согласовать", callback_data: `approve|${registryId}|${stage}` },
-          { text: "❌ Отклонить", callback_data: `reject|${registryId}|${stage}` }
-        ],
-        [
-          { text: "📄 Открыть реестр", url: `https://script.google.com/macros/s/AKfycbySY2CFP3WJ9M_MW5HiDZvSScGCTn2SCOLW68SS1Gt5q-CsHGk9lve06PkeKnuZwZ-j/exec?page=registryCard&id=${registryId}` }
-        ]
-      ]
-    };
+    const replyMarkup =
+      stage === "Контроль и архивирование"
+        ? undefined
+        : {
+            inline_keyboard: [
+              [
+                { text: "✅ Согласовать", callback_data: `approve|${registryId}|${stage}` },
+                { text: "❌ Отклонить", callback_data: `reject|${registryId}|${stage}` }
+              ],
+              [
+                {
+                  text: "📄 Открыть реестр",
+                  url: `https://script.google.com/macros/s/AKfycbySY2CFP3WJ9M_MW5HiDZvSScGCTn2SCOLW68SS1Gt5q-CsHGk9lve06PkeKnuZwZ-j/exec?page=registryCard&id=${registryId}`
+                }
+              ]
+            ]
+          };
 
     await sendTelegramMessage(chatId, text, replyMarkup);
 
@@ -2394,6 +2419,8 @@ if (stage === "Главный бухгалтер") {
     console.error("telegram send error:", e);
   }
 }
+
+
 // =====================================================
 // Start
 // =====================================================
