@@ -1415,32 +1415,54 @@ app.post("/create-registry", async (req, res) => {
   }
 });
 
-app.get("/registry-list", async (req,res)=>{
-  try{
+app.get("/registry-list", async (req, res) => {
+  try {
     const r = await pool.query(`
       SELECT
-        id,
-        registry_no,
-        registry_date,
-        created_by,
-        items_count,
-        total_amount,
-        workflow_stage,
-        archive_flag
-      FROM registry_head
-      WHERE COALESCE(archive_flag,'Нет') <> 'Да'
-      ORDER BY id DESC
+        h.id,
+        h.registry_no,
+        h.registry_date,
+        h.created_by,
+        h.items_count,
+        h.total_amount,
+        h.workflow_stage,
+        h.archive_flag,
+
+        COALESCE(
+          STRING_AGG(DISTINCT NULLIF(TRIM(i.src_d), ''), ', ')
+            FILTER (WHERE NULLIF(TRIM(i.src_d), '') IS NOT NULL),
+          ''
+        ) AS src_d
+
+      FROM public.registry_head h
+      LEFT JOIN public.registry_items i
+        ON i.registry_id = h.id
+
+      WHERE COALESCE(h.archive_flag, 'Нет') <> 'Да'
+
+      GROUP BY
+        h.id,
+        h.registry_no,
+        h.registry_date,
+        h.created_by,
+        h.items_count,
+        h.total_amount,
+        h.workflow_stage,
+        h.archive_flag
+
+      ORDER BY h.id DESC
     `);
 
     res.json({
-      success:true,
-      rows:r.rows
+      success: true,
+      rows: r.rows
     });
 
-  }catch(e){
+  } catch (e) {
+    console.error("REGISTRY-LIST ERROR:", e);
     res.status(500).json({
-      success:false,
-      error:e.message
+      success: false,
+      error: e.message
     });
   }
 });
