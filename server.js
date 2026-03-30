@@ -1877,8 +1877,21 @@ app.post("/registry-move-stage", async (req, res) => {
         ]
       );
 
-      await client.query("COMMIT");
-      return res.json({ success:true, moved_to: toS });
+await client.query("COMMIT");
+
+try {
+  await sendRegistryTelegramNotification({
+    registryId: Number(registry_id),
+    registryNo: regRes.rows[0].registry_no,
+    stage: toS,
+    totalAmount: regRes.rows[0].total_amount,
+    createdBy: regRes.rows[0].created_by || ""
+  });
+} catch (tgErr) {
+  console.error("telegram move-stage notify error:", tgErr);
+}
+
+return res.json({ success:true, moved_to: toS });
     }
 
 const allowed =
@@ -1918,8 +1931,21 @@ const allowed =
       ]
     );
 
-    await client.query("COMMIT");
-    return res.json({ success:true, moved_to: toS });
+await client.query("COMMIT");
+
+try {
+  await sendRegistryTelegramNotification({
+    registryId: Number(registry_id),
+    registryNo: regRes.rows[0].registry_no,
+    stage: toS,
+    totalAmount: regRes.rows[0].total_amount,
+    createdBy: regRes.rows[0].created_by || ""
+  });
+} catch (tgErr) {
+  console.error("telegram move-stage notify error:", tgErr);
+}
+
+return res.json({ success:true, moved_to: toS });
 
   } catch (e) {
     await client.query("ROLLBACK");
@@ -2279,13 +2305,17 @@ async function sendRegistryTelegramNotification({ registryId, registryNo, stage,
       "T_Azat": "CHAT_ID_АЗАТА"
     };
 
-    if (stage === "Главный бухгалтер") {
-      chatId = "460955357";
-    } else if (stage === "Заместитель директора") {
-      chatId = "412596988";
-    } else if (stage === "Управляющий директор") {
-      chatId = "493945914";
-    } else if (stage === "Исполнение платежей") {
+if (stage === "Главный бухгалтер") {
+  chatId = "460955357";
+} else if (
+  stage === "Заместитель директора по финансам" ||
+  stage === "Зам. директора по финансам" ||
+  stage === "Заместитель директора"
+) {
+  chatId = "412596988";
+} else if (stage === "Управляющий директор") {
+  chatId = "493945914";
+} else if (stage === "Исполнение платежей") {
       const client = await pool.connect();
       let executor = "K_Arailym";
 
