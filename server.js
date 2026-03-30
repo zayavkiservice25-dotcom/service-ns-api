@@ -1283,13 +1283,14 @@ app.post("/create-registry", async (req, res) => {
   const client = await pool.connect();
 
   try {
+    const { row_ids, login, mode } = req.body;
 
-    const { row_ids, login } = req.body;
-const isEmpty = !Array.isArray(row_ids) || row_ids.length === 0;
+    const ids = Array.isArray(row_ids)
+      ? row_ids.map(x => Number(x)).filter(Boolean)
+      : [];
 
-
-if (isEmpty)
-
+    const isEmptyRegistry = ids.length === 0;
+    const registryMode = String(mode || "").trim() || (isEmptyRegistry ? "transfer" : "payment");
 
     await client.query("BEGIN");
 
@@ -1298,116 +1299,117 @@ if (isEmpty)
       INSERT INTO registry_head (created_by)
       VALUES ($1)
       RETURNING id, registry_no
-    `,[login || null]);
+    `, [login || null]);
 
     const registry_id = head.rows[0].id;
     const registry_no = head.rows[0].registry_no;
 
-    // 2️⃣ вставляем строки реестра
-    const items = await client.query(`
-     INSERT INTO registry_items
-(
-  registry_id,
-  zvk_row_id,
-  id_ft,
-  id_zvk,
-  object,
-  contractor,
-  pay_purpose,
-  dds_article,
-  contract_no,
-  invoice_no,
-  invoice_date,
-  invoice_pdf,
-  src_d,
-  src_o,
-  to_pay
-)
-     SELECT
-  $1,
-  v.zvk_row_id,
-  v.id_ft,
-  v.id_zvk,
-  v.object,
-  v.contractor,
-  v.pay_purpose,
-  v.dds_article,
-  v.contract_no,
-  v.invoice_no,
-  v.invoice_date,
-  v.invoice_pdf,
-  v.src_d,
-  v.src_o,
-  v.to_pay
-FROM ft_zvk_current_v2 v
-      WHERE v.zvk_row_id = ANY($2::bigint[])
-      RETURNING to_pay
-    `,[registry_id,row_ids]);
+    let total = 0;
+    let count = 0;
 
-    // 3️⃣ считаем сумму и количество
-    const total = items.rows.reduce((s,r)=>s+Number(r.to_pay||0),0);
-    const count = items.rows.length;
+    // 2️⃣ если строки выбраны — вставляем их
+    if (!isEmptyRegistry) {
+      const items = await client.query(`
+        INSERT INTO registry_items
+        (
+          registry_id,
+          zvk_row_id,
+          id_ft,
+          id_zvk,
+          object,
+          contractor,
+          pay_purpose,
+          dds_article,
+          contract_no,
+          invoice_no,
+          invoice_date,
+          invoice_pdf,
+          src_d,
+          src_o,
+          to_pay
+        )
+        SELECT
+          $1,
+          v.zvk_row_id,
+          v.id_ft,
+          v.id_zvk,
+          v.object,
+          v.contractor,
+          v.pay_purpose,
+          v.dds_article,
+          v.contract_no,
+          v.invoice_no,
+          v.invoice_date,
+          v.invoice_pdf,
+          v.src_d,
+          v.src_o,
+          v.to_pay
+        FROM ft_zvk_current_v2 v
+        WHERE v.zvk_row_id = ANY($2::bigint[])
+        RETURNING to_pay
+      `, [registry_id, ids]);
 
+      total = items.rows.reduce((s, r) => s + Number(r.to_pay || 0), 0);
+      count = items.rows.length;
+    }
+
+    // 3️⃣ обновляем шапку
     await client.query(`
       UPDATE registry_head
-      SET total_amount=$1,
-          items_count=$2
-      WHERE id=$3
-    `,[total,count,registry_id]);
+      SET total_amount = $1,
+          items_count = $2
+      WHERE id = $3
+    `, [total, count, registry_id]);
 
     await client.query(`
-  UPDATE public.registry_head
-  SET
-    workflow_stage = 'Главный бухгалтер',
-    agree_status = 'На согласовании',
+      UPDATE public.registry_head
+      SET
+        workflow_stage = 'Главный бухгалтер',
+        agree_status = 'На согласовании',
 
-    acc_buh_name = 'Жасулан Сулейменов',
-    acc_buh_status = 'Ожидает',
+        acc_buh_name = 'Жасулан Сулейменов',
+        acc_buh_status = 'Ожидает',
 
-    acc_fin_name = 'Динара Омарбекова',
-    acc_fin_status = 'Ожидает',
+        acc_fin_name = 'Динара Омарбекова',
+        acc_fin_status = 'Ожидает',
 
-    acc_zam_name = 'Марат Койлыбаев',
-    acc_zam_status = 'Ожидает',
+        acc_zam_name = 'Марат Койлыбаев',
+        acc_zam_status = 'Ожидает',
 
-    acc_ud_name = 'Ермек Касенов',
-    acc_ud_status = 'Ожидает'
-  WHERE id = $1
-`, [registry_id]);
-    
+        acc_ud_name = 'Ермек Касенов',
+        acc_ud_status = 'Ожидает'
+      WHERE id = $1
+    `, [registry_id]);
 
-await client.query("COMMIT");
+    await client.query("COMMIT");
 
-// Telegram уведомление
-try {
-  await sendRegistryTelegramNotification({
-  registryId: registry_id,
-  registryNo: registry_no,
-  stage: "Главный бухгалтер",
-  totalAmount: total,
-  createdBy: login || ""
-});
-} catch (tgErr) {
-  console.error("telegram registry notify error:", tgErr);
-}
+    try {
+      await sendRegistryTelegramNotification({
+        registryId: registry_id,
+        registryNo: registry_no,
+        stage: "Главный бухгалтер",
+        totalAmount: total,
+        createdBy: login || ""
+      });
+    } catch (tgErr) {
+      console.error("telegram registry notify error:", tgErr);
+    }
 
-res.json({
-  success:true,
-  registry_id,
-  registry_no
-});
-
-  } catch(e) {
-
-    await client.query("ROLLBACK");
-
-    console.error("CREATE REGISTRY ERROR:",e);
-
-    res.status(500).json({
-      success:false,
-      error:e.message
+    res.json({
+      success: true,
+      registry_id,
+      registry_no,
+      mode: registryMode,
+      is_empty_registry: isEmptyRegistry
     });
 
+  } catch(e) {
+    await client.query("ROLLBACK");
+    console.error("CREATE REGISTRY ERROR:", e);
+    res.status(500).json({
+      success: false,
+      error: e.message
+    });
   } finally {
     client.release();
   }
