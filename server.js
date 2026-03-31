@@ -284,6 +284,11 @@ async function initDb()  {
     );
   `);
 
+await pool.query(`
+  ALTER TABLE public.registry_items
+  ADD COLUMN IF NOT EXISTS input_name text;
+`);
+
   await pool.query(`
     CREATE INDEX IF NOT EXISTS registry_items_registry_id_idx
     ON public.registry_items (registry_id);
@@ -1310,43 +1315,45 @@ app.post("/create-registry", async (req, res) => {
     // 2️⃣ если строки выбраны — вставляем их
     if (!isEmptyRegistry) {
       const items = await client.query(`
-        INSERT INTO registry_items
-        (
-          registry_id,
-          zvk_row_id,
-          id_ft,
-          id_zvk,
-          object,
-          contractor,
-          pay_purpose,
-          dds_article,
-          contract_no,
-          invoice_no,
-          invoice_date,
-          invoice_pdf,
-          src_d,
-          src_o,
-          to_pay
-        )
-        SELECT
-          $1,
-          v.zvk_row_id,
-          v.id_ft,
-          v.id_zvk,
-          v.object,
-          v.contractor,
-          v.pay_purpose,
-          v.dds_article,
-          v.contract_no,
-          v.invoice_no,
-          v.invoice_date,
-          v.invoice_pdf,
-          v.src_d,
-          v.src_o,
-          v.to_pay
-        FROM ft_zvk_current_v2 v
-        WHERE v.zvk_row_id = ANY($2::bigint[])
-        RETURNING to_pay
+INSERT INTO registry_items
+(
+  registry_id,
+  zvk_row_id,
+  id_ft,
+  id_zvk,
+  object,
+  input_name,
+  contractor,
+  pay_purpose,
+  dds_article,
+  contract_no,
+  invoice_no,
+  invoice_date,
+  invoice_pdf,
+  src_d,
+  src_o,
+  to_pay
+)
+SELECT
+  $1,
+  v.zvk_row_id,
+  v.id_ft,
+  v.id_zvk,
+  v.object,
+  v.input_name,
+  v.contractor,
+  v.pay_purpose,
+  v.dds_article,
+  v.contract_no,
+  v.invoice_no,
+  v.invoice_date,
+  v.invoice_pdf,
+  v.src_d,
+  v.src_o,
+  v.to_pay
+FROM ft_zvk_current_v2 v
+WHERE v.zvk_row_id = ANY($2::bigint[])
+RETURNING to_pay         
       `, [registry_id, ids]);
 
       total = items.rows.reduce((s, r) => s + Number(r.to_pay || 0), 0);
@@ -1607,27 +1614,28 @@ app.get("/registry-card", async (req, res) => {
       });
     }
 
-    const itemsRes = await pool.query(`
-      SELECT
-  registry_id,
-  zvk_row_id,
-  id_ft,
-  id_zvk,
-  object,
-  contractor,
-  pay_purpose,
-  dds_article,
-  contract_no,
-  invoice_no,
-  invoice_date,
-  invoice_pdf,
-  src_d,
-  src_o,
-  to_pay
-FROM registry_items
-      WHERE registry_id = $1
-      ORDER BY id
-    `, [id]);
+const itemsRes = await pool.query(`
+  SELECT
+    registry_id,
+    zvk_row_id,
+    id_ft,
+    id_zvk,
+    object,
+    input_name,
+    contractor,
+    pay_purpose,
+    dds_article,
+    contract_no,
+    invoice_no,
+    invoice_date,
+    invoice_pdf,
+    src_d,
+    src_o,
+    to_pay
+  FROM registry_items
+  WHERE registry_id = $1
+  ORDER BY id
+`, [id]);
 
     res.json({
       success: true,
