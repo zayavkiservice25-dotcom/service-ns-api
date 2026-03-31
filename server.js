@@ -2455,6 +2455,7 @@ async function getRegistryChatMap(registryId, client) {
 
   return r.rows[0]?.chat_map || {};
 }
+
 async function sendRegistryTelegramNotification({
   registryId,
   registryNo,
@@ -2464,9 +2465,9 @@ async function sendRegistryTelegramNotification({
   chatMap = {}
 }) {
   try {
-    // если chatMap не передали, читаем из registry_head
     let finalChatMap = chatMap || {};
 
+    // если chatMap не передали — читаем из БД
     if (!finalChatMap || Object.keys(finalChatMap).length === 0) {
       const client = await pool.connect();
       try {
@@ -2496,17 +2497,30 @@ async function sendRegistryTelegramNotification({
       approverLogin = "b_erkin";
     }
 
-    const approverChatId = finalChatMap[String(approverLogin || "").toLowerCase()] || "";
+    const approverLoginNorm = String(approverLogin || "").trim().toLowerCase();
+    const approverChatId = finalChatMap[approverLoginNorm] || "";
 
-    const text =
-      `📌 <b>Новый реестр</b>\n\n` +
+    const openUrl =
+      `https://script.google.com/macros/s/AKfycbySY2CFP3WJ9M_MW5HiDZvSScGCTn2SCOLW68SS1Gt5q-CsHGk9lve06PkeKnuZwZ-j/exec?page=registryCard&id=${registryId}`;
+
+    const amountText = Number(totalAmount || 0).toLocaleString("ru-RU", {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2
+    });
+
+    const approverText =
+      `📌 <b>Реестр на согласовании</b>\n\n` +
       `Реестр №: <b>${registryNo}</b>\n` +
       `Инициатор: <b>${createdBy || "-"}</b>\n` +
       `Этап: <b>${stage}</b>\n` +
-      `Сумма: <b>${Number(totalAmount || 0).toLocaleString("ru-RU", {
-        minimumFractionDigits: 2,
-        maximumFractionDigits: 2
-      })}</b>`;
+      `Сумма: <b>${amountText}</b>`;
+
+    const infoText =
+      `📣 <b>Обновление по реестру</b>\n\n` +
+      `Реестр №: <b>${registryNo}</b>\n` +
+      `Инициатор: <b>${createdBy || "-"}</b>\n` +
+      `Текущий этап: <b>${stage}</b>\n` +
+      `Сумма: <b>${amountText}</b>`;
 
     const replyMarkup = {
       inline_keyboard: [
@@ -2515,81 +2529,96 @@ async function sendRegistryTelegramNotification({
           { text: "❌ Отклонить", callback_data: `reject|${registryId}|${stage}` }
         ],
         [
-          {
-            text: "📄 Открыть реестр",
-            url: `https://script.google.com/macros/s/AKfycbySY2CFP3WJ9M_MW5HiDZvSScGCTn2SCOLW68SS1Gt5q-CsHGk9lve06PkeKnuZwZ-j/exec?page=registryCard&id=${registryId}`
-          }
+          { text: "📄 Открыть реестр", url: openUrl }
         ]
       ]
     };
 
+    const viewOnlyMarkup = {
+      inline_keyboard: [
+        [
+          { text: "📄 Открыть реестр", url: openUrl }
+        ]
+      ]
+    };
+
+    // -------------------------------------------------
     // 1. Основной согласующий / исполнитель
+    // -------------------------------------------------
     if (approverChatId) {
-      await sendTelegramMessage(approverChatId, text, replyMarkup);
+      await sendTelegramMessage(approverChatId, approverText, replyMarkup);
     } else {
-      console.log("❌ chat_id не найден в листе/БД для:", approverLogin, "stage:", stage);
+      console.log("❌ chat_id не найден для согласующего:", approverLoginNorm, "stage:", stage);
     }
 
-    // 2. Наблюдатели — только при создании
-    if (stage === "Главный бухгалтер") {
-      const client = await pool.connect();
-      let watchers = [];
+    // -------------------------------------------------
+    // 2. Наблюдатели — НА КАЖДОМ ЭТАПЕ
+    // -------------------------------------------------
+    const client1 = await pool.connect();
+    let watchers = [];
 
-      try {
-        watchers = await getWatchersByRegistry(registryId, client);
-      } finally {
-        client.release();
-      }
-
-      for (const w of watchers) {
-        const cid = finalChatMap[String(w || "").toLowerCase()];
-        if (!cid) continue;
-
-        await sendTelegramMessage(
-          cid,
-          `👀 <b>Наблюдатель</b>\n\n${text}`
-        );
-      }
-
-      console.log("watchers notified:", { registryId, watchers });
+    try {
+      watchers = await getWatchersByRegistry(registryId, client1);
+    } finally {
+      client1.release();
     }
 
-    // 3. Сотрудники по input_name — только при создании
-    if (stage === "Главный бухгалтер") {
-      const client = await pool.connect();
-      let employees = [];
+    for (const w of watchers) {
+      const watcherLogin = String(w || "").trim().toLowerCase();
+      const cid = finalChatMap[watcherLogin];
+      if (!cid) continue;
 
-      try {
-        employees = await getEmployeesByRegistry(registryId, client);
-      } finally {
-        client.release();
-      }
+      // чтобы согласующему не дублировать второе сообщение
+      if (watcherLogin === approverLoginNorm) continue;
 
-      for (const empLogin of employees) {
-        const cid = finalChatMap[String(empLogin || "").toLowerCase()];
-        if (!cid) continue;
-
-        await sendTelegramMessage(
-          cid,
-          `📥 <b>Создан новый реестр</b>\n\n` +
-          `Реестр №: <b>${registryNo}</b>\n` +
-          `Ваш логин найден в реестре: <b>${empLogin}</b>\n` +
-          `Инициатор: <b>${createdBy || "-"}</b>\n` +
-          `Этап: <b>${stage}</b>\n` +
-          `Сумма: <b>${Number(totalAmount || 0).toLocaleString("ru-RU", {
-            minimumFractionDigits: 2,
-            maximumFractionDigits: 2
-          })}</b>`
-        );
-      }
-
-      console.log("employees notified:", { registryId, employees });
+      await sendTelegramMessage(
+        cid,
+        `👀 <b>Наблюдатель</b>\n\n${infoText}`,
+        viewOnlyMarkup
+      );
     }
+
+    console.log("watchers notified:", { registryId, stage, watchers });
+
+    // -------------------------------------------------
+    // 3. Сотрудники по input_name — НА КАЖДОМ ЭТАПЕ
+    // -------------------------------------------------
+    const client2 = await pool.connect();
+    let employees = [];
+
+    try {
+      employees = await getEmployeesByRegistry(registryId, client2);
+    } finally {
+      client2.release();
+    }
+
+    for (const empLoginRaw of employees) {
+      const empLogin = String(empLoginRaw || "").trim().toLowerCase();
+      const cid = finalChatMap[empLogin];
+      if (!cid) continue;
+
+      // чтобы согласующему не дублировать второе сообщение
+      if (empLogin === approverLoginNorm) continue;
+
+      await sendTelegramMessage(
+        cid,
+        `📥 <b>Ваши заявки есть в реестре</b>\n\n` +
+        `Реестр №: <b>${registryNo}</b>\n` +
+        `Ваш логин: <b>${empLogin}</b>\n` +
+        `Инициатор: <b>${createdBy || "-"}</b>\n` +
+        `Текущий этап: <b>${stage}</b>\n` +
+        `Сумма: <b>${amountText}</b>`,
+        viewOnlyMarkup
+      );
+    }
+
+    console.log("employees notified:", { registryId, stage, employees });
 
   } catch (e) {
     console.error("telegram send error:", e);
   }
 }
+
 
 
 
