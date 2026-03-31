@@ -244,6 +244,11 @@ async function initDb()  {
     );
   `);
 
+await pool.query(`
+  ALTER TABLE public.registry_head
+  ADD COLUMN IF NOT EXISTS chat_map jsonb;
+`);
+
   await pool.query(`
     CREATE SEQUENCE IF NOT EXISTS public.registry_no_seq START 1;
   `);
@@ -1283,12 +1288,11 @@ app.get("/svod-object", async (req, res) => {
 // =====================================================
 // CREATE REGISTRY
 // =====================================================
-
 app.post("/create-registry", async (req, res) => {
   const client = await pool.connect();
 
   try {
-    const { row_ids, login, mode } = req.body;
+    const { row_ids, login, mode, chat_map } = req.body;
 
     const ids = Array.isArray(row_ids)
       ? row_ids.map(x => Number(x)).filter(Boolean)
@@ -1299,12 +1303,15 @@ app.post("/create-registry", async (req, res) => {
 
     await client.query("BEGIN");
 
-    // 1️⃣ создаем шапку реестра
+    // 1️⃣ создаем шапку реестра + сохраняем chat_map
     const head = await client.query(`
-      INSERT INTO registry_head (created_by)
-      VALUES ($1)
+      INSERT INTO registry_head (created_by, chat_map)
+      VALUES ($1, $2::jsonb)
       RETURNING id, registry_no
-    `, [login || null]);
+    `, [
+      login || null,
+      JSON.stringify(chat_map || {})
+    ]);
 
     const registry_id = head.rows[0].id;
     const registry_no = head.rows[0].registry_no;
@@ -1315,45 +1322,45 @@ app.post("/create-registry", async (req, res) => {
     // 2️⃣ если строки выбраны — вставляем их
     if (!isEmptyRegistry) {
       const items = await client.query(`
-INSERT INTO registry_items
-(
-  registry_id,
-  zvk_row_id,
-  id_ft,
-  id_zvk,
-  object,
-  input_name,
-  contractor,
-  pay_purpose,
-  dds_article,
-  contract_no,
-  invoice_no,
-  invoice_date,
-  invoice_pdf,
-  src_d,
-  src_o,
-  to_pay
-)
-SELECT
-  $1,
-  v.zvk_row_id,
-  v.id_ft,
-  v.id_zvk,
-  v.object,
-  v.input_name,
-  v.contractor,
-  v.pay_purpose,
-  v.dds_article,
-  v.contract_no,
-  v.invoice_no,
-  v.invoice_date,
-  v.invoice_pdf,
-  v.src_d,
-  v.src_o,
-  v.to_pay
-FROM ft_zvk_current_v2 v
-WHERE v.zvk_row_id = ANY($2::bigint[])
-RETURNING to_pay         
+        INSERT INTO registry_items
+        (
+          registry_id,
+          zvk_row_id,
+          id_ft,
+          id_zvk,
+          object,
+          input_name,
+          contractor,
+          pay_purpose,
+          dds_article,
+          contract_no,
+          invoice_no,
+          invoice_date,
+          invoice_pdf,
+          src_d,
+          src_o,
+          to_pay
+        )
+        SELECT
+          $1,
+          v.zvk_row_id,
+          v.id_ft,
+          v.id_zvk,
+          v.object,
+          v.input_name,
+          v.contractor,
+          v.pay_purpose,
+          v.dds_article,
+          v.contract_no,
+          v.invoice_no,
+          v.invoice_date,
+          v.invoice_pdf,
+          v.src_d,
+          v.src_o,
+          v.to_pay
+        FROM ft_zvk_current_v2 v
+        WHERE v.zvk_row_id = ANY($2::bigint[])
+        RETURNING to_pay
       `, [registry_id, ids]);
 
       total = items.rows.reduce((s, r) => s + Number(r.to_pay || 0), 0);
@@ -1393,7 +1400,8 @@ RETURNING to_pay
         registryNo: registry_no,
         stage: "Главный бухгалтер",
         totalAmount: total,
-        createdBy: login || ""
+        createdBy: login || "",
+        chatMap: chat_map || {}
       });
     } catch (tgErr) {
       console.error("telegram registry notify error:", tgErr);
@@ -1419,6 +1427,7 @@ RETURNING to_pay
   }
 });
 
+
 const APPROVER_LOGINS = [
   "s_zhasulan",
   "k_marat",
@@ -1440,6 +1449,19 @@ const DIVISION_WATCHERS = {
   "Smart Estate": ["k_talimzhan", "t_azat"]
 };
 
+
+async function getEmployeesByRegistry(registryId, client) {
+  const r = await client.query(`
+    SELECT DISTINCT lower(trim(COALESCE(input_name,''))) AS input_name
+    FROM public.registry_items
+    WHERE registry_id = $1
+      AND NULLIF(trim(COALESCE(input_name,'')), '') IS NOT NULL
+  `, [registryId]);
+
+  return r.rows
+    .map(x => String(x.input_name || "").trim().toLowerCase())
+    .filter(Boolean);
+}
 function getWatcherDivisions(login) {
   const lg = String(login || "").trim().toLowerCase();
   const result = [];
@@ -1539,8 +1561,56 @@ app.get("/registry-list", async (req, res) => {
 
       return res.json({ success:true, rows:r.rows });
     }
+    // 3. Сотрудники видят только те реестры, где встречается их input_name
+    const employeeCheck = await pool.query(`
+      SELECT 1
+      FROM public.registry_items
+      WHERE lower(trim(COALESCE(input_name,''))) = lower(trim($1))
+      LIMIT 1
+    `, [login]);
 
-    // 3. Остальным доступа нет
+    if (employeeCheck.rowCount > 0) {
+      const r = await pool.query(`
+        SELECT
+          h.id,
+          h.registry_no,
+          h.registry_date,
+          h.created_by,
+          h.items_count,
+          h.total_amount,
+          h.workflow_stage,
+          h.archive_flag,
+          COALESCE(
+            STRING_AGG(DISTINCT NULLIF(TRIM(i.src_d), ''), ', ')
+              FILTER (WHERE NULLIF(TRIM(i.src_d), '') IS NOT NULL),
+            ''
+          ) AS src_d
+        FROM public.registry_head h
+        LEFT JOIN public.registry_items i
+          ON i.registry_id = h.id
+        WHERE COALESCE(h.archive_flag, 'Нет') <> 'Да'
+          AND EXISTS (
+            SELECT 1
+            FROM public.registry_items i2
+            WHERE i2.registry_id = h.id
+              AND lower(trim(COALESCE(i2.input_name,''))) = lower(trim($1))
+          )
+        GROUP BY
+          h.id,
+          h.registry_no,
+          h.registry_date,
+          h.created_by,
+          h.items_count,
+          h.total_amount,
+          h.workflow_stage,
+          h.archive_flag
+        ORDER BY h.id DESC
+      `, [login]);
+
+      return res.json({ success:true, rows:r.rows });
+    }
+
+    // 4. Остальным доступа нет
     return res.status(403).json({
       success:false,
       error:"NO_ACCESS_TO_REGISTRY"
@@ -1566,7 +1636,7 @@ app.get("/registry-card", async (req, res) => {
       });
     }
 
- const headRes = await pool.query(`
+const headRes = await pool.query(`
   SELECT
     id,
     registry_no,
@@ -1581,6 +1651,7 @@ app.get("/registry-card", async (req, res) => {
     archive_flag,
     pdf_url,
     created_at,
+    chat_map,
 
     acc_buh_name,
     acc_buh_status,
@@ -1892,19 +1963,22 @@ app.post("/registry-approve", async (req, res) => {
 
       await client.query("COMMIT");
 
-      if (nextStage) {
-        try {
-          await sendRegistryTelegramNotification({
-            registryId: registry_id,
-            registryNo: reg.registry_no,
-            stage: nextStage,
-            totalAmount: reg.total_amount,
-            createdBy: reg.created_by || ""
-          });
-        } catch (tgErr) {
-          console.error("telegram next stage notify error:", tgErr);
-        }
-      }
+ if (nextStage) {
+  try {
+    const savedChatMap = reg.chat_map || {};
+
+    await sendRegistryTelegramNotification({
+      registryId: registry_id,
+      registryNo: reg.registry_no,
+      stage: nextStage,
+      totalAmount: reg.total_amount,
+      createdBy: reg.created_by || "",
+      chatMap: savedChatMap
+    });
+  } catch (tgErr) {
+    console.error("telegram next stage notify error:", tgErr);
+  }
+}
 
       return res.json({ success:true, moved_to:nextStage, action:"approve" });
     }
@@ -1981,13 +2055,14 @@ app.post("/registry-move-stage", async (req, res) => {
       await client.query("COMMIT");
 
       try {
-        await sendRegistryTelegramNotification({
-          registryId: Number(registry_id),
-          registryNo: regRes.rows[0].registry_no,
-          stage: toS,
-          totalAmount: regRes.rows[0].total_amount,
-          createdBy: regRes.rows[0].created_by || ""
-        });
+await sendRegistryTelegramNotification({
+  registryId: Number(registry_id),
+  registryNo: regRes.rows[0].registry_no,
+  stage: toS,
+  totalAmount: regRes.rows[0].total_amount,
+  createdBy: regRes.rows[0].created_by || "",
+  chatMap: regRes.rows[0].chat_map || {}
+});
       } catch (tgErr) {
         console.error("telegram move-stage notify error:", tgErr);
       }
@@ -2033,17 +2108,18 @@ app.post("/registry-move-stage", async (req, res) => {
 
     await client.query("COMMIT");
 
-    try {
-      await sendRegistryTelegramNotification({
-        registryId: Number(registry_id),
-        registryNo: regRes.rows[0].registry_no,
-        stage: toS,
-        totalAmount: regRes.rows[0].total_amount,
-        createdBy: regRes.rows[0].created_by || ""
-      });
-    } catch (tgErr) {
-      console.error("telegram move-stage notify error:", tgErr);
-    }
+try {
+  await sendRegistryTelegramNotification({
+    registryId: Number(registry_id),
+    registryNo: regRes.rows[0].registry_no,
+    stage: toS,
+    totalAmount: regRes.rows[0].total_amount,
+    createdBy: regRes.rows[0].created_by || "",
+    chatMap: regRes.rows[0].chat_map || {}
+  });
+} catch (tgErr) {
+  console.error("telegram move-stage notify error:", tgErr);
+}
 
     return res.json({ success:true, moved_to: toS });
 
@@ -2369,46 +2445,58 @@ async function getWatchersByRegistry(registryId, client) {
   return Array.from(watchers).filter(w => !excluded.has(w));
 }
 
+async function getRegistryChatMap(registryId, client) {
+  const r = await client.query(`
+    SELECT chat_map
+    FROM public.registry_head
+    WHERE id = $1
+    LIMIT 1
+  `, [Number(registryId)]);
 
-async function sendRegistryTelegramNotification({ registryId, registryNo, stage, totalAmount, createdBy }) {
+  return r.rows[0]?.chat_map || {};
+}
+async function sendRegistryTelegramNotification({
+  registryId,
+  registryNo,
+  stage,
+  totalAmount,
+  createdBy,
+  chatMap = {}
+}) {
   try {
-    let chatId = "";
+    // если chatMap не передали, читаем из registry_head
+    let finalChatMap = chatMap || {};
 
-    const USER_CHAT_MAP = {
-      "K_Ermek": "493945914",
-      "S_Zhasulan": "460955357",
-      "K_Marat": "412596988",
-      "K_Arailym": "CHAT_ID_АРАЙЛЫМ",
-      "Zh_Elena": "CHAT_ID_ЕЛЕНЫ",
-      "B_Erkin": "",
-      "K_Talimzhan": "CHAT_ID_ТАЛИМЖАНА",
-      "T_Azat": "CHAT_ID_АЗАТА"
-    };
-
-    if (stage === "Главный бухгалтер") {
-      chatId = "460955357";
-    } else if (stage === "Заместитель директора") {
-      chatId = "412596988";
-    } else if (stage === "Управляющий директор") {
-      chatId = "493945914";
-    } else if (stage === "Исполнение платежей") {
+    if (!finalChatMap || Object.keys(finalChatMap).length === 0) {
       const client = await pool.connect();
-      let executor = "K_Arailym";
-
       try {
-        executor = await getExecutorByRegistry(registryId, client);
+        finalChatMap = await getRegistryChatMap(registryId, client);
       } finally {
         client.release();
       }
+    }
 
-      if (executor === "Zh_Elena") {
-        chatId = "CHAT_ID_ЕЛЕНЫ";
-      } else {
-        chatId = "CHAT_ID_АРАЙЛЫМ";
+    let approverLogin = "";
+
+    if (stage === "Главный бухгалтер") {
+      approverLogin = "s_zhasulan";
+    } else if (stage === "Заместитель директора") {
+      approverLogin = "k_marat";
+    } else if (stage === "Управляющий директор") {
+      approverLogin = "k_ermek";
+    } else if (stage === "Исполнение платежей") {
+      const client = await pool.connect();
+      try {
+        const executor = await getExecutorByRegistry(registryId, client);
+        approverLogin = String(executor || "").trim().toLowerCase();
+      } finally {
+        client.release();
       }
     } else if (stage === "Контроль и архивирование") {
-      chatId = "";
+      approverLogin = "b_erkin";
     }
+
+    const approverChatId = finalChatMap[String(approverLogin || "").toLowerCase()] || "";
 
     const text =
       `📌 <b>Новый реестр</b>\n\n` +
@@ -2427,19 +2515,22 @@ async function sendRegistryTelegramNotification({ registryId, registryNo, stage,
           { text: "❌ Отклонить", callback_data: `reject|${registryId}|${stage}` }
         ],
         [
-          { text: "📄 Открыть реестр", url: `https://script.google.com/macros/s/AKfycbySY2CFP3WJ9M_MW5HiDZvSScGCTn2SCOLW68SS1Gt5q-CsHGk9lve06PkeKnuZwZ-j/exec?page=registryCard&id=${registryId}` }
+          {
+            text: "📄 Открыть реестр",
+            url: `https://script.google.com/macros/s/AKfycbySY2CFP3WJ9M_MW5HiDZvSScGCTn2SCOLW68SS1Gt5q-CsHGk9lve06PkeKnuZwZ-j/exec?page=registryCard&id=${registryId}`
+          }
         ]
       ]
     };
 
-    // 1. Отправка основному согласующему / исполнителю этапа
-    if (chatId) {
-      await sendTelegramMessage(chatId, text, replyMarkup);
+    // 1. Основной согласующий / исполнитель
+    if (approverChatId) {
+      await sendTelegramMessage(approverChatId, text, replyMarkup);
     } else {
-      console.log("нет chat_id для этапа", stage);
+      console.log("❌ chat_id не найден в листе/БД для:", approverLogin, "stage:", stage);
     }
 
-    // 2. Наблюдателям отправляем ТОЛЬКО при создании реестра
+    // 2. Наблюдатели — только при создании
     if (stage === "Главный бухгалтер") {
       const client = await pool.connect();
       let watchers = [];
@@ -2451,7 +2542,7 @@ async function sendRegistryTelegramNotification({ registryId, registryNo, stage,
       }
 
       for (const w of watchers) {
-        const cid = USER_CHAT_MAP[w];
+        const cid = finalChatMap[String(w || "").toLowerCase()];
         if (!cid) continue;
 
         await sendTelegramMessage(
@@ -2463,17 +2554,43 @@ async function sendRegistryTelegramNotification({ registryId, registryNo, stage,
       console.log("watchers notified:", { registryId, watchers });
     }
 
-    console.log("telegram sent:", {
-      registryId,
-      registryNo,
-      stage,
-      chatId
-    });
+    // 3. Сотрудники по input_name — только при создании
+    if (stage === "Главный бухгалтер") {
+      const client = await pool.connect();
+      let employees = [];
+
+      try {
+        employees = await getEmployeesByRegistry(registryId, client);
+      } finally {
+        client.release();
+      }
+
+      for (const empLogin of employees) {
+        const cid = finalChatMap[String(empLogin || "").toLowerCase()];
+        if (!cid) continue;
+
+        await sendTelegramMessage(
+          cid,
+          `📥 <b>Создан новый реестр</b>\n\n` +
+          `Реестр №: <b>${registryNo}</b>\n` +
+          `Ваш логин найден в реестре: <b>${empLogin}</b>\n` +
+          `Инициатор: <b>${createdBy || "-"}</b>\n` +
+          `Этап: <b>${stage}</b>\n` +
+          `Сумма: <b>${Number(totalAmount || 0).toLocaleString("ru-RU", {
+            minimumFractionDigits: 2,
+            maximumFractionDigits: 2
+          })}</b>`
+        );
+      }
+
+      console.log("employees notified:", { registryId, employees });
+    }
 
   } catch (e) {
     console.error("telegram send error:", e);
   }
 }
+
 
 
 // =====================================================
