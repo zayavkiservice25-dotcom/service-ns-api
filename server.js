@@ -761,6 +761,7 @@ async function rebuildFtTail(client, zvk_row_id) {
 
 app.post("/zvk-pay-row", async (req, res) => {
   const client = await pool.connect();
+
   try {
     const { is_admin, zvk_row_id, registry_flag, is_paid } = req.body;
 
@@ -821,15 +822,10 @@ app.post("/zvk-pay-row", async (req, res) => {
         END
       RETURNING *;
       `,
-      [
-        Number(zvk_row_id),
-        reg,
-        paid
-      ]
+      [Number(zvk_row_id), reg, paid]
     );
 
-    // Всегда пересобираем хвост FT после любого изменения реестра/оплаты
-    // 1. определяем FT
+    // определяем FT
     const ftRowRes = await client.query(
       `
       SELECT id_ft
@@ -843,10 +839,16 @@ app.post("/zvk-pay-row", async (req, res) => {
     const id_ft = String(ftRowRes.rows[0]?.id_ft || "").trim();
 
     let rebuild = null;
+    let deletedTail = null;
     let reset = null;
 
     if (id_ft) {
-      // 2. есть ли еще обычные строки с Реестр = Да
+      // если текущее значение стало пустым -> сначала удалить последний авто-хвост
+      if (reg === null || reg === "") {
+        deletedTail = await deleteLastAutoTailByFt(client, Number(zvk_row_id));
+      }
+
+      // проверяем, остались ли еще обычные строки с Реестр=Да
       const anyRegistryYes = await client.query(
         `
         SELECT 1
@@ -860,32 +862,91 @@ app.post("/zvk-pay-row", async (req, res) => {
         [id_ft]
       );
 
-      // 3. если больше нет ни одной строки с Реестр=Да -> вернуть начальную форму
+      // если не осталось ни одной строки с Реестр=Да -> вернуть FT в начальную форму
       if (anyRegistryYes.rowCount === 0) {
         reset = await resetFtToInitialState(client, id_ft);
-      } else {
-        // 4. если есть активные строки -> пересобрать хвост
+      } 
+      // если строки с Реестр=Да еще есть -> пересобрать только один хвост
+      else if (reg === "Да" || reg === "Обнуление") {
         rebuild = await rebuildFtTail(client, Number(zvk_row_id));
       }
     }
 
     await client.query("COMMIT");
 
-    res.json({
+    return res.json({
       success: true,
       row: r.rows[0],
       rebuild,
+      deletedTail,
       reset
     });
 
   } catch (e) {
     await client.query("ROLLBACK");
     console.error("ZVK-PAY-ROW ERROR:", e);
-    res.status(500).json({ success:false, error:e.message });
+    return res.status(500).json({ success:false, error:e.message });
   } finally {
     client.release();
   }
 });
+
+async function deleteLastAutoTailByFt(client, zvk_row_id) {
+  const zr = await client.query(
+    `
+    SELECT id_ft, id_zvk
+    FROM zvk
+    WHERE id = $1
+    LIMIT 1
+    `,
+    [Number(zvk_row_id)]
+  );
+
+  const row = zr.rows[0];
+  if (!row) return { success:false, reason:"ROW_NOT_FOUND" };
+
+  const ft = String(row.id_ft || "").trim();
+  const currentIdZvk = String(row.id_zvk || "").trim();
+
+  if (!ft) return { success:false, reason:"FT_NOT_FOUND" };
+
+  // ищем самый последний авто-хвост СИСТЕМА/Нет, но не текущий цикл
+  const tailRes = await client.query(
+    `
+    SELECT z.id, z.id_zvk
+    FROM zvk z
+    LEFT JOIN zvk_pay p ON p.zvk_row_id = z.id
+    WHERE z.id_ft = $1
+      AND z.id_zvk <> $2
+      AND lower(trim(COALESCE(z.zvk_name,''))) = 'система'
+      AND COALESCE(z.request_flag,'') = 'Нет'
+      AND COALESCE(p.registry_flag,'') = ''
+      AND COALESCE(p.is_paid,'') = ''
+    ORDER BY
+      COALESCE(NULLIF(substring(z.id_zvk from '\\d+'), ''), '0')::int DESC,
+      z.id DESC
+    LIMIT 1
+    `,
+    [ft, currentIdZvk]
+  );
+
+  if (!tailRes.rowCount) {
+    return { success:true, deleted:false, reason:"NO_TAIL_FOUND" };
+  }
+
+  const tailId = Number(tailRes.rows[0].id);
+
+  await client.query(`DELETE FROM zvk_pay WHERE zvk_row_id = $1`, [tailId]);
+  await client.query(`DELETE FROM zvk_status WHERE zvk_row_id = $1`, [tailId]);
+  await client.query(`DELETE FROM zvk WHERE id = $1`, [tailId]);
+
+  return {
+    success:true,
+    deleted:true,
+    deleted_row_id: tailId,
+    deleted_id_zvk: tailRes.rows[0].id_zvk
+  };
+}
 
 async function resetFtToInitialState(client, id_ft) {
   // 1. найти самый первый ZFT/системную строку
