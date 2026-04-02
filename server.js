@@ -663,6 +663,29 @@ async function rebuildFtTail(client, zvk_row_id) {
     return { success:false, reason:"FT_NOT_FOUND" };
   }
 
+const hasReset = await client.query(
+  `
+  SELECT 1
+  FROM zvk z
+  JOIN zvk_pay p ON p.zvk_row_id = z.id
+  WHERE z.id_ft = $1
+    AND p.registry_flag = 'Обнуление'
+    AND lower(trim(COALESCE(z.zvk_name,''))) <> 'система'
+  LIMIT 1
+  `,
+  [ft]
+);
+
+if (hasReset.rowCount > 0) {
+  return {
+    success: true,
+    ft,
+    remaining: 0,
+    created: false,
+    reason: "HAS_OBNULENIE"
+  };
+}
+
   // 1. сумма FT
   const ftRes = await client.query(
     `
@@ -856,10 +879,10 @@ app.post("/zvk-pay-row", async (req, res) => {
         deletedTail = await deleteLastAutoTailByFt(client, Number(zvk_row_id));
       }
 
-      // если Реестр = Да или Обнуление -> пересобрать хвост
-      if (reg === "Да" || reg === "Обнуление") {
-        rebuild = await rebuildFtTail(client, Number(zvk_row_id));
-      }
+     // если Реестр = Да -> пересобрать хвост
+if (reg === "Да") {
+  rebuild = await rebuildFtTail(client, Number(zvk_row_id));
+}
     }
 
     await client.query("COMMIT");
