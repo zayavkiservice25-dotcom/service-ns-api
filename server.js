@@ -647,10 +647,10 @@ app.post("/zvk-status-row", async (req, res) => {
 // ✅ FIX: авто-строка СИСТЕМА создаётся с is_paid=NULL (пусто), а НЕ "Нет"
 // =====================================================
 
-async function ensureNextSystemZft(client, zvk_row_id, currentRegistryFlag) {
+async function rebuildFtTail(client, zvk_row_id) {
   const zr = await client.query(
     `
-    SELECT id, id_ft, id_zvk, to_pay
+    SELECT id_ft
     FROM zvk
     WHERE id = $1
     LIMIT 1
@@ -658,18 +658,13 @@ async function ensureNextSystemZft(client, zvk_row_id, currentRegistryFlag) {
     [Number(zvk_row_id)]
   );
 
-  const zrow = zr.rows[0];
-  if (!zrow) return { created: false, reason: "ROW_NOT_FOUND" };
-
-  const ft = String(zrow.id_ft || "").trim();
-  const currentIdZvk = String(zrow.id_zvk || "").trim();
-  const currentToPay = Number(zrow.to_pay || 0);
-
-  if (!ft || !currentIdZvk) {
-    return { created: false, reason: "NO_FT_OR_ZFT" };
+  const ft = String(zr.rows[0]?.id_ft || "").trim();
+  if (!ft) {
+    return { success:false, reason:"FT_NOT_FOUND" };
   }
 
-  const ftRow = await client.query(
+  // 1. сумма FT
+  const ftRes = await client.query(
     `
     SELECT COALESCE(sum_ft, 0) AS sum_ft
     FROM ft
@@ -679,149 +674,89 @@ async function ensureNextSystemZft(client, zvk_row_id, currentRegistryFlag) {
     [ft]
   );
 
-  const ftSum = Number(ftRow.rows[0]?.sum_ft || 0);
+  const ftSum = Number(ftRes.rows[0]?.sum_ft || 0);
 
-  const paidBeforeRow = await client.query(
+  // 2. сколько уже ушло в реестр по обычным строкам
+  const usedRes = await client.query(
     `
-    SELECT COALESCE(SUM(COALESCE(z.to_pay,0)),0) AS paid_sum
+    SELECT COALESCE(SUM(COALESCE(z.to_pay,0)),0) AS used_sum
     FROM zvk z
     JOIN zvk_pay p ON p.zvk_row_id = z.id
     WHERE z.id_ft = $1
-      AND z.id_zvk = $2
       AND p.registry_flag = 'Да'
-      AND z.id <> $3
-      AND lower(trim(coalesce(z.zvk_name,''))) <> 'система'
+      AND lower(trim(COALESCE(z.zvk_name,''))) <> 'система'
     `,
-    [ft, currentIdZvk, Number(zvk_row_id)]
+    [ft]
   );
 
-  const alreadyPaid = Number(paidBeforeRow.rows[0]?.paid_sum || 0);
+  const usedSum = Number(usedRes.rows[0]?.used_sum || 0);
+  const remaining = Math.max(ftSum - usedSum, 0);
 
-  let remaining = 0;
-  if (String(currentRegistryFlag || "").trim() === "Обнуление") {
-    remaining = 0;
-  } else {
-    remaining = Math.max(ftSum - alreadyPaid - currentToPay, 0);
-  }
-
-  if (remaining <= 0) {
-    return { created: false, reason: "NO_REMAINING" };
-  }
-
-  // ищем уже открытый системный ZFT по этому FT
-  const existing = await client.query(
+  // 3. удалить ВСЕ открытые системные хвосты по этому FT
+  const tails = await client.query(
     `
-    SELECT z.id, z.id_zvk
+    SELECT z.id
     FROM zvk z
     LEFT JOIN zvk_pay p ON p.zvk_row_id = z.id
     WHERE z.id_ft = $1
-      AND z.id_zvk <> $2
-      AND z.zvk_name = 'СИСТЕМА'
+      AND lower(trim(COALESCE(z.zvk_name,''))) = 'система'
       AND COALESCE(z.request_flag,'') = 'Нет'
       AND COALESCE(p.registry_flag,'') <> 'Да'
       AND COALESCE(p.is_paid,'') <> 'Да'
-    ORDER BY z.id DESC
-    LIMIT 1
     `,
-    [ft, currentIdZvk]
+    [ft]
   );
 
-  if (existing.rowCount > 0) {
-    return {
-      created: false,
-      reason: "ALREADY_EXISTS",
-      id_zvk: existing.rows[0].id_zvk
-    };
+  for (const row of tails.rows) {
+    const rid = Number(row.id);
+    await client.query(`DELETE FROM zvk_pay WHERE zvk_row_id = $1`, [rid]);
+    await client.query(`DELETE FROM zvk_status WHERE zvk_row_id = $1`, [rid]);
+    await client.query(`DELETE FROM zvk WHERE id = $1`, [rid]);
   }
 
-  const created = await client.query(
-    `SELECT 'ZFT' || nextval('zvk_id_seq')::text AS id_zvk`
-  );
-  const newIdZvk = created.rows[0].id_zvk;
+  // 4. если остаток есть -> создать только ОДИН хвост
+  if (remaining > 0) {
+    const created = await client.query(
+      `SELECT 'ZFT' || nextval('zvk_id_seq')::text AS id_zvk`
+    );
+    const newIdZvk = created.rows[0].id_zvk;
 
-  const ins = await client.query(
-    `
-    INSERT INTO zvk (id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag)
-    VALUES ($1, $2, NOW(), 'СИСТЕМА', 0, 'Нет')
-    RETURNING id, id_zvk
-    `,
-    [newIdZvk, ft]
-  );
+    const ins = await client.query(
+      `
+      INSERT INTO zvk (id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag)
+      VALUES ($1, $2, NOW(), 'СИСТЕМА', 0, 'Нет')
+      RETURNING id, id_zvk
+      `,
+      [newIdZvk, ft]
+    );
 
-  const newRowId = ins.rows[0]?.id;
+    const newRowId = Number(ins.rows[0].id);
 
-  if (newRowId) {
     await client.query(
       `
       INSERT INTO zvk_pay (zvk_row_id, registry_flag, is_paid, pay_time, agree_time)
       VALUES ($1, NULL, NULL, NULL, NULL)
       ON CONFLICT (zvk_row_id) DO NOTHING
       `,
-      [Number(newRowId)]
+      [newRowId]
     );
+
+    return {
+      success:true,
+      ft,
+      remaining,
+      created:true,
+      id_zvk:newIdZvk,
+      zvk_row_id:newRowId
+    };
   }
 
   return {
-    created: true,
-    id_zvk: newIdZvk,
-    zvk_row_id: newRowId,
-    remaining
+    success:true,
+    ft,
+    remaining:0,
+    created:false
   };
-}
-
-async function rollbackNextSystemZft(client, zvk_row_id) {
-  const zr = await client.query(
-    `
-    SELECT id, id_ft, id_zvk
-    FROM zvk
-    WHERE id = $1
-    LIMIT 1
-    `,
-    [Number(zvk_row_id)]
-  );
-
-  const zrow = zr.rows[0];
-  if (!zrow) return { success:false, reason:"ROW_NOT_FOUND" };
-
-  const ft = String(zrow.id_ft || "").trim();
-  const currentIdZvk = String(zrow.id_zvk || "").trim();
-
-  if (!ft || !currentIdZvk) {
-    return { success:false, reason:"NO_FT_OR_ZFT" };
-  }
-
-  // ищем следующий открытый авто-системный хвост
-  const nextRes = await client.query(
-    `
-    SELECT z.id, z.id_zvk
-    FROM zvk z
-    LEFT JOIN zvk_pay p ON p.zvk_row_id = z.id
-    WHERE z.id_ft = $1
-      AND z.id_zvk <> $2
-      AND z.zvk_name = 'СИСТЕМА'
-      AND COALESCE(z.request_flag,'') = 'Нет'
-      AND COALESCE(p.registry_flag,'') = ''
-      AND COALESCE(p.is_paid,'') = ''
-    ORDER BY
-      COALESCE(NULLIF(substring(z.id_zvk from '\\d+'), ''), '0')::int DESC,
-      z.id DESC
-    LIMIT 1
-    `,
-    [ft, currentIdZvk]
-  );
-
-  if (!nextRes.rowCount) {
-    return { success:true, deleted:false, reason:"NO_AUTO_TAIL" };
-  }
-
-  const nextRowId = Number(nextRes.rows[0].id);
-  const nextIdZvk = String(nextRes.rows[0].id_zvk || "");
-
-  await client.query(`DELETE FROM zvk_pay WHERE zvk_row_id = $1`, [nextRowId]);
-  await client.query(`DELETE FROM zvk_status WHERE zvk_row_id = $1`, [nextRowId]);
-  await client.query(`DELETE FROM zvk WHERE id = $1`, [nextRowId]);
-
-  return { success:true, deleted:true, id_zvk: nextIdZvk, zvk_row_id: nextRowId };
 }
 
 app.post("/zvk-pay-row", async (req, res) => {
@@ -843,6 +778,16 @@ app.post("/zvk-pay-row", async (req, res) => {
 
     await client.query("BEGIN");
 
+    const reg =
+      registry_flag === undefined || registry_flag === null
+        ? null
+        : String(registry_flag).trim();
+
+    const paid =
+      is_paid === undefined || is_paid === null
+        ? null
+        : String(is_paid).trim();
+
     const r = await client.query(
       `
       INSERT INTO zvk_pay (zvk_row_id, registry_flag, is_paid, pay_time, agree_time)
@@ -860,7 +805,7 @@ app.post("/zvk-pay-row", async (req, res) => {
         agree_time = CASE
           WHEN EXCLUDED.registry_flag IN ('Да','Обнуление')
             THEN COALESCE(zvk_pay.agree_time, NOW())
-          WHEN EXCLUDED.registry_flag = 'Нет'
+          WHEN COALESCE(EXCLUDED.registry_flag,'') = ''
             THEN NULL
           ELSE zvk_pay.agree_time
         END,
@@ -870,7 +815,7 @@ app.post("/zvk-pay-row", async (req, res) => {
         pay_time = CASE
           WHEN EXCLUDED.is_paid = 'Да'
             THEN COALESCE(zvk_pay.pay_time, NOW())
-          WHEN EXCLUDED.is_paid <> 'Да'
+          WHEN COALESCE(EXCLUDED.is_paid,'') <> 'Да'
             THEN NULL
           ELSE zvk_pay.pay_time
         END
@@ -878,40 +823,154 @@ app.post("/zvk-pay-row", async (req, res) => {
       `,
       [
         Number(zvk_row_id),
-        registry_flag ? String(registry_flag).trim() : null,
-        is_paid ? String(is_paid).trim() : null,
+        reg,
+        paid
       ]
     );
 
-const reg = registry_flag ? String(registry_flag).trim() : "";
-const paid = is_paid ? String(is_paid).trim() : "";
+    // Всегда пересобираем хвост FT после любого изменения реестра/оплаты
+    // 1. определяем FT
+    const ftRowRes = await client.query(
+      `
+      SELECT id_ft
+      FROM zvk
+      WHERE id = $1
+      LIMIT 1
+      `,
+      [Number(zvk_row_id)]
+    );
 
-// если Реестр очистили обратно -> убрать авто-созданный следующий ZFT
-if (reg === "") {
-  await rollbackNextSystemZft(client, Number(zvk_row_id));
-}
+    const id_ft = String(ftRowRes.rows[0]?.id_ft || "").trim();
 
-// если Реестр = Да -> создать хвост
-if (reg === "Да") {
-  await ensureNextSystemZft(client, Number(zvk_row_id), reg);
-}
+    let rebuild = null;
+    let reset = null;
 
-// старая логика тоже остается
-if (paid === "Да" && (reg === "Да" || reg === "Обнуление")) {
-  await ensureNextSystemZft(client, Number(zvk_row_id), reg);
-}
+    if (id_ft) {
+      // 2. есть ли еще обычные строки с Реестр = Да
+      const anyRegistryYes = await client.query(
+        `
+        SELECT 1
+        FROM zvk z
+        JOIN zvk_pay p ON p.zvk_row_id = z.id
+        WHERE z.id_ft = $1
+          AND p.registry_flag = 'Да'
+          AND lower(trim(COALESCE(z.zvk_name,''))) <> 'система'
+        LIMIT 1
+        `,
+        [id_ft]
+      );
+
+      // 3. если больше нет ни одной строки с Реестр=Да -> вернуть начальную форму
+      if (anyRegistryYes.rowCount === 0) {
+        reset = await resetFtToInitialState(client, id_ft);
+      } else {
+        // 4. если есть активные строки -> пересобрать хвост
+        rebuild = await rebuildFtTail(client, Number(zvk_row_id));
+      }
+    }
 
     await client.query("COMMIT");
-    res.json({ success:true, row: r.rows[0] });
+
+    res.json({
+      success: true,
+      row: r.rows[0],
+      rebuild,
+      reset
+    });
 
   } catch (e) {
     await client.query("ROLLBACK");
     console.error("ZVK-PAY-ROW ERROR:", e);
-    res.status(500).json({ success:false, error: e.message });
+    res.status(500).json({ success:false, error:e.message });
   } finally {
     client.release();
   }
 });
+
+async function resetFtToInitialState(client, id_ft) {
+  // 1. найти самый первый ZFT/системную строку
+  const firstRes = await client.query(
+    `
+    SELECT z.id, z.id_zvk
+    FROM zvk z
+    WHERE z.id_ft = $1
+      AND lower(trim(COALESCE(z.zvk_name,''))) = 'система'
+    ORDER BY
+      COALESCE(NULLIF(substring(z.id_zvk from '\\d+'), ''), '0')::int ASC,
+      z.id ASC
+    LIMIT 1
+    `,
+    [id_ft]
+  );
+
+  const firstRow = firstRes.rows[0];
+  if (!firstRow) return { success:false, reason:"FIRST_SYSTEM_NOT_FOUND" };
+
+  const keepRowId = Number(firstRow.id);
+
+  // 2. удалить все остальные строки этого FT
+  const allRows = await client.query(
+    `
+    SELECT id
+    FROM zvk
+    WHERE id_ft = $1
+      AND id <> $2
+    `,
+    [id_ft, keepRowId]
+  );
+
+  for (const row of allRows.rows) {
+    const rid = Number(row.id);
+    await client.query(`DELETE FROM zvk_pay WHERE zvk_row_id = $1`, [rid]);
+    await client.query(`DELETE FROM zvk_status WHERE zvk_row_id = $1`, [rid]);
+    await client.query(`DELETE FROM zvk WHERE id = $1`, [rid]);
+  }
+
+  // 3. у первой системной строки вернуть начальные значения
+  await client.query(
+    `
+    UPDATE zvk
+    SET
+      zvk_name = 'СИСТЕМА',
+      to_pay = 0,
+      request_flag = 'Нет',
+      zvk_date = NOW()
+    WHERE id = $1
+    `,
+    [keepRowId]
+  );
+
+  await client.query(
+    `
+    DELETE FROM zvk_pay
+    WHERE zvk_row_id = $1
+    `,
+    [keepRowId]
+  );
+
+  await client.query(
+    `
+    DELETE FROM zvk_status
+    WHERE zvk_row_id = $1
+    `,
+    [keepRowId]
+  );
+
+  await client.query(
+    `
+    INSERT INTO zvk_pay (zvk_row_id, registry_flag, is_paid, pay_time, agree_time)
+    VALUES ($1, NULL, NULL, NULL, NULL)
+    ON CONFLICT (zvk_row_id) DO UPDATE SET
+      registry_flag = NULL,
+      is_paid = NULL,
+      pay_time = NULL,
+      agree_time = NULL
+    `,
+    [keepRowId]
+  );
+
+  return { success:true, reset:true, keep_row_id: keepRowId, id_zvk: firstRow.id_zvk };
+}
 // =====================================================
 // JOIN: читаем из VIEW ft_zvk_current_v2
 // =====================================================
