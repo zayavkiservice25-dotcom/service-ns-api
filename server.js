@@ -779,15 +779,25 @@ app.post("/zvk-pay-row", async (req, res) => {
 
     await client.query("BEGIN");
 
-    const reg =
+    const rawReg =
       registry_flag === undefined || registry_flag === null
-        ? null
+        ? ""
         : String(registry_flag).trim();
 
-    const paid =
-      is_paid === undefined || is_paid === null
+    const reg =
+      rawReg === "" || rawReg === "-" || rawReg === "—"
         ? null
+        : rawReg;
+
+    const rawPaid =
+      is_paid === undefined || is_paid === null
+        ? ""
         : String(is_paid).trim();
+
+    const paid =
+      rawPaid === "" || rawPaid === "-" || rawPaid === "—"
+        ? null
+        : rawPaid;
 
     const r = await client.query(
       `
@@ -825,7 +835,9 @@ app.post("/zvk-pay-row", async (req, res) => {
       [Number(zvk_row_id), reg, paid]
     );
 
-    // определяем FT
+    let rebuild = null;
+    let deletedTail = null;
+
     const ftRowRes = await client.query(
       `
       SELECT id_ft
@@ -838,36 +850,14 @@ app.post("/zvk-pay-row", async (req, res) => {
 
     const id_ft = String(ftRowRes.rows[0]?.id_ft || "").trim();
 
-    let rebuild = null;
-    let deletedTail = null;
-    let reset = null;
-
     if (id_ft) {
-      // если текущее значение стало пустым -> сначала удалить последний авто-хвост
-      if (reg === null || reg === "") {
+      // если Реестр очистили -> удалить только последний авто-хвост
+      if (reg === null) {
         deletedTail = await deleteLastAutoTailByFt(client, Number(zvk_row_id));
       }
 
-      // проверяем, остались ли еще обычные строки с Реестр=Да
-      const anyRegistryYes = await client.query(
-        `
-        SELECT 1
-        FROM zvk z
-        JOIN zvk_pay p ON p.zvk_row_id = z.id
-        WHERE z.id_ft = $1
-          AND p.registry_flag = 'Да'
-          AND lower(trim(COALESCE(z.zvk_name,''))) <> 'система'
-        LIMIT 1
-        `,
-        [id_ft]
-      );
-
-      // если не осталось ни одной строки с Реестр=Да -> вернуть FT в начальную форму
-      if (anyRegistryYes.rowCount === 0) {
-        reset = await resetFtToInitialState(client, id_ft);
-      } 
-      // если строки с Реестр=Да еще есть -> пересобрать только один хвост
-      else if (reg === "Да" || reg === "Обнуление") {
+      // если Реестр = Да или Обнуление -> пересобрать хвост
+      if (reg === "Да" || reg === "Обнуление") {
         rebuild = await rebuildFtTail(client, Number(zvk_row_id));
       }
     }
@@ -878,8 +868,7 @@ app.post("/zvk-pay-row", async (req, res) => {
       success: true,
       row: r.rows[0],
       rebuild,
-      deletedTail,
-      reset
+      deletedTail
     });
 
   } catch (e) {
@@ -2831,4 +2820,4 @@ async function sendRegistryTelegramNotification({
 // Start
 // =====================================================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Server started on port " + PORT));
+app.listen(PORT, () => console.log("Server started on port " + PORT))
