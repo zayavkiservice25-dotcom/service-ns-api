@@ -646,6 +646,130 @@ app.post("/zvk-status-row", async (req, res) => {
 // ✅ + авто-создание следующего ZFT (СИСТЕМА)
 // ✅ FIX: авто-строка СИСТЕМА создаётся с is_paid=NULL (пусто), а НЕ "Нет"
 // =====================================================
+
+async function ensureNextSystemZft(client, zvk_row_id, currentRegistryFlag) {
+  const zr = await client.query(
+    `
+    SELECT id, id_ft, id_zvk, to_pay
+    FROM zvk
+    WHERE id = $1
+    LIMIT 1
+    `,
+    [Number(zvk_row_id)]
+  );
+
+  const zrow = zr.rows[0];
+  if (!zrow) return { created: false, reason: "ROW_NOT_FOUND" };
+
+  const ft = String(zrow.id_ft || "").trim();
+  const currentIdZvk = String(zrow.id_zvk || "").trim();
+  const currentToPay = Number(zrow.to_pay || 0);
+
+  if (!ft || !currentIdZvk) {
+    return { created: false, reason: "NO_FT_OR_ZFT" };
+  }
+
+  const ftRow = await client.query(
+    `
+    SELECT COALESCE(sum_ft, 0) AS sum_ft
+    FROM ft
+    WHERE id_ft = $1
+    LIMIT 1
+    `,
+    [ft]
+  );
+
+  const ftSum = Number(ftRow.rows[0]?.sum_ft || 0);
+
+  const paidBeforeRow = await client.query(
+    `
+    SELECT COALESCE(SUM(COALESCE(z.to_pay,0)),0) AS paid_sum
+    FROM zvk z
+    JOIN zvk_pay p ON p.zvk_row_id = z.id
+    WHERE z.id_ft = $1
+      AND z.id_zvk = $2
+      AND p.registry_flag = 'Да'
+      AND z.id <> $3
+      AND lower(trim(coalesce(z.zvk_name,''))) <> 'система'
+    `,
+    [ft, currentIdZvk, Number(zvk_row_id)]
+  );
+
+  const alreadyPaid = Number(paidBeforeRow.rows[0]?.paid_sum || 0);
+
+  let remaining = 0;
+  if (String(currentRegistryFlag || "").trim() === "Обнуление") {
+    remaining = 0;
+  } else {
+    remaining = Math.max(ftSum - alreadyPaid - currentToPay, 0);
+  }
+
+  if (remaining <= 0) {
+    return { created: false, reason: "NO_REMAINING" };
+  }
+
+  // ищем уже открытый системный ZFT по этому FT
+  const existing = await client.query(
+    `
+    SELECT z.id, z.id_zvk
+    FROM zvk z
+    LEFT JOIN zvk_pay p ON p.zvk_row_id = z.id
+    WHERE z.id_ft = $1
+      AND z.id_zvk <> $2
+      AND z.zvk_name = 'СИСТЕМА'
+      AND COALESCE(z.request_flag,'') = 'Нет'
+      AND COALESCE(p.registry_flag,'') <> 'Да'
+      AND COALESCE(p.is_paid,'') <> 'Да'
+    ORDER BY z.id DESC
+    LIMIT 1
+    `,
+    [ft, currentIdZvk]
+  );
+
+  if (existing.rowCount > 0) {
+    return {
+      created: false,
+      reason: "ALREADY_EXISTS",
+      id_zvk: existing.rows[0].id_zvk
+    };
+  }
+
+  const created = await client.query(
+    `SELECT 'ZFT' || nextval('zvk_id_seq')::text AS id_zvk`
+  );
+  const newIdZvk = created.rows[0].id_zvk;
+
+  const ins = await client.query(
+    `
+    INSERT INTO zvk (id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag)
+    VALUES ($1, $2, NOW(), 'СИСТЕМА', 0, 'Нет')
+    RETURNING id, id_zvk
+    `,
+    [newIdZvk, ft]
+  );
+
+  const newRowId = ins.rows[0]?.id;
+
+  if (newRowId) {
+    await client.query(
+      `
+      INSERT INTO zvk_pay (zvk_row_id, registry_flag, is_paid, pay_time, agree_time)
+      VALUES ($1, NULL, NULL, NULL, NULL)
+      ON CONFLICT (zvk_row_id) DO NOTHING
+      `,
+      [Number(newRowId)]
+    );
+  }
+
+  return {
+    created: true,
+    id_zvk: newIdZvk,
+    zvk_row_id: newRowId,
+    remaining
+  };
+}
+
+
 app.post("/zvk-pay-row", async (req, res) => {
   const client = await pool.connect();
   try {
@@ -655,11 +779,13 @@ app.post("/zvk-pay-row", async (req, res) => {
       is_admin === true || is_admin === 1 || is_admin === "1" ||
       String(is_admin).toLowerCase() === "true";
 
-    if (!adminOk)
+    if (!adminOk) {
       return res.status(403).json({ success:false, error:"only admin allowed" });
+    }
 
-    if (!zvk_row_id)
+    if (!zvk_row_id) {
       return res.status(400).json({ success:false, error:"zvk_row_id required" });
+    }
 
     await client.query("BEGIN");
 
@@ -703,116 +829,20 @@ app.post("/zvk-pay-row", async (req, res) => {
       ]
     );
 
-    const reg = (registry_flag ? String(registry_flag).trim() : "");
-    const paid = (is_paid ? String(is_paid).trim() : "");
+    const reg = registry_flag ? String(registry_flag).trim() : "";
+    const paid = is_paid ? String(is_paid).trim() : "";
 
-    // ===============================
-    // ✅ АВТО-СОЗДАНИЕ СЛЕДУЮЩЕГО ZFT (СИСТЕМА)
-    // Когда: Реестр=Да/Обнуление и Оплачено=Да
-    // ===============================
+    // 1) Новая логика:
+    // если Реестр = Да и после этого есть остаток -> создаем новый ZFT СИСТЕМА Нет
+    if (reg === "Да") {
+      await ensureNextSystemZft(client, Number(zvk_row_id), reg);
+    }
+
+    // 2) Старая логика тоже остается:
+    // если позже ставят Оплачено = Да, повторно проверяем
+    // дубль не создастся, потому что ensureNextSystemZft уже умеет проверять существующий открытый ZFT
     if (paid === "Да" && (reg === "Да" || reg === "Обнуление")) {
-
-      const zr = await client.query(
-        `SELECT id, id_ft, id_zvk, to_pay
-         FROM zvk
-         WHERE id = $1
-         LIMIT 1`,
-        [Number(zvk_row_id)]
-      );
-
-      const zrow = zr.rows[0];
-
-      if (zrow) {
-        const ft = String(zrow.id_ft);
-        const paidToPay = Number(zrow.to_pay || 0);
-
-        // ✅ берём баланс из последней строки "СИСТЕМА" текущего цикла (id_zvk)
-       
-const ftRow = await client.query(
-  `
-  SELECT COALESCE(sum_ft, 0) AS sum_ft
-  FROM ft
-  WHERE id_ft = $1
-  LIMIT 1
-  `,
-  [ft]
-);
-
-const ftSum = Number(ftRow.rows[0]?.sum_ft || 0);
-
-// сколько уже ушло в реестр по этому циклу ДО текущей строки
-const paidBeforeRow = await client.query(
-  `
-  SELECT COALESCE(SUM(COALESCE(z.to_pay,0)),0) AS paid_sum
-  FROM zvk z
-  JOIN zvk_pay p ON p.zvk_row_id = z.id
-  WHERE z.id_ft = $1
-    AND z.id_zvk = $2
-    AND p.registry_flag = 'Да'
-    AND z.id <> $3
-    AND lower(trim(coalesce(z.zvk_name,''))) <> 'система'
-  `,
-  [ft, String(zrow.id_zvk), Number(zvk_row_id)]
-);
-
-const alreadyPaid = Number(paidBeforeRow.rows[0]?.paid_sum || 0);
-
-let remaining = 0;
-if (reg === "Обнуление") {
-  remaining = 0;
-} else {
-  remaining = Math.max(ftSum - alreadyPaid - paidToPay, 0);
-}
-        // создаем новый ZFT только если остаток > 0
-        if (remaining > 0) {
-
-          // защита от дубля
-          const already = await client.query(
-            `
-            SELECT 1
-            FROM zvk z
-            WHERE z.id_ft = $1
-              AND z.zvk_name = 'СИСТЕМА'
-              AND COALESCE(z.request_flag,'') = 'Нет'
-              AND z.to_pay = $2
-              AND z.id_zvk <> $3
-            ORDER BY z.id DESC
-            LIMIT 1
-            `,
-            [ft, remaining, String(zrow.id_zvk)]
-          );
-
-          if (already.rowCount === 0) {
-            const created = await client.query(
-              `SELECT 'ZFT' || nextval('zvk_id_seq')::text AS id_zvk`
-            );
-            const newIdZvk = created.rows[0].id_zvk;
-
-           const ins = await client.query(
-  `
-  INSERT INTO zvk (id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag)
-  VALUES ($1, $2, NOW(), 'СИСТЕМА', 0, 'Нет')
-  RETURNING id
-  `,
-  [newIdZvk, ft]
-);
-
-            const newRowId = ins.rows[0]?.id;
-
-            // ✅ FIX: не ставим is_paid='Нет' для СИСТЕМА (пусть будет ПУСТО)
-            if (newRowId) {
-              await client.query(
-                `
-                INSERT INTO zvk_pay (zvk_row_id, registry_flag, is_paid, pay_time, agree_time)
-                VALUES ($1, NULL, NULL, NULL, NULL)
-                ON CONFLICT (zvk_row_id) DO NOTHING
-                `,
-                [Number(newRowId)]
-              );
-            }
-          }
-        }
-      }
+      await ensureNextSystemZft(client, Number(zvk_row_id), reg);
     }
 
     await client.query("COMMIT");
@@ -826,7 +856,6 @@ if (reg === "Обнуление") {
     client.release();
   }
 });
-
 // =====================================================
 // JOIN: читаем из VIEW ft_zvk_current_v2
 // =====================================================
