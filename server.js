@@ -769,6 +769,60 @@ async function ensureNextSystemZft(client, zvk_row_id, currentRegistryFlag) {
   };
 }
 
+async function rollbackNextSystemZft(client, zvk_row_id) {
+  const zr = await client.query(
+    `
+    SELECT id, id_ft, id_zvk
+    FROM zvk
+    WHERE id = $1
+    LIMIT 1
+    `,
+    [Number(zvk_row_id)]
+  );
+
+  const zrow = zr.rows[0];
+  if (!zrow) return { success:false, reason:"ROW_NOT_FOUND" };
+
+  const ft = String(zrow.id_ft || "").trim();
+  const currentIdZvk = String(zrow.id_zvk || "").trim();
+
+  if (!ft || !currentIdZvk) {
+    return { success:false, reason:"NO_FT_OR_ZFT" };
+  }
+
+  // ищем следующий открытый авто-системный хвост
+  const nextRes = await client.query(
+    `
+    SELECT z.id, z.id_zvk
+    FROM zvk z
+    LEFT JOIN zvk_pay p ON p.zvk_row_id = z.id
+    WHERE z.id_ft = $1
+      AND z.id_zvk <> $2
+      AND z.zvk_name = 'СИСТЕМА'
+      AND COALESCE(z.request_flag,'') = 'Нет'
+      AND COALESCE(p.registry_flag,'') = ''
+      AND COALESCE(p.is_paid,'') = ''
+    ORDER BY
+      COALESCE(NULLIF(substring(z.id_zvk from '\\d+'), ''), '0')::int DESC,
+      z.id DESC
+    LIMIT 1
+    `,
+    [ft, currentIdZvk]
+  );
+
+  if (!nextRes.rowCount) {
+    return { success:true, deleted:false, reason:"NO_AUTO_TAIL" };
+  }
+
+  const nextRowId = Number(nextRes.rows[0].id);
+  const nextIdZvk = String(nextRes.rows[0].id_zvk || "");
+
+  await client.query(`DELETE FROM zvk_pay WHERE zvk_row_id = $1`, [nextRowId]);
+  await client.query(`DELETE FROM zvk_status WHERE zvk_row_id = $1`, [nextRowId]);
+  await client.query(`DELETE FROM zvk WHERE id = $1`, [nextRowId]);
+
+  return { success:true, deleted:true, id_zvk: nextIdZvk, zvk_row_id: nextRowId };
+}
 
 app.post("/zvk-pay-row", async (req, res) => {
   const client = await pool.connect();
@@ -829,21 +883,23 @@ app.post("/zvk-pay-row", async (req, res) => {
       ]
     );
 
-    const reg = registry_flag ? String(registry_flag).trim() : "";
-    const paid = is_paid ? String(is_paid).trim() : "";
+const reg = registry_flag ? String(registry_flag).trim() : "";
+const paid = is_paid ? String(is_paid).trim() : "";
 
-    // 1) Новая логика:
-    // если Реестр = Да и после этого есть остаток -> создаем новый ZFT СИСТЕМА Нет
-    if (reg === "Да") {
-      await ensureNextSystemZft(client, Number(zvk_row_id), reg);
-    }
+// если Реестр очистили обратно -> убрать авто-созданный следующий ZFT
+if (reg === "") {
+  await rollbackNextSystemZft(client, Number(zvk_row_id));
+}
 
-    // 2) Старая логика тоже остается:
-    // если позже ставят Оплачено = Да, повторно проверяем
-    // дубль не создастся, потому что ensureNextSystemZft уже умеет проверять существующий открытый ZFT
-    if (paid === "Да" && (reg === "Да" || reg === "Обнуление")) {
-      await ensureNextSystemZft(client, Number(zvk_row_id), reg);
-    }
+// если Реестр = Да -> создать хвост
+if (reg === "Да") {
+  await ensureNextSystemZft(client, Number(zvk_row_id), reg);
+}
+
+// старая логика тоже остается
+if (paid === "Да" && (reg === "Да" || reg === "Обнуление")) {
+  await ensureNextSystemZft(client, Number(zvk_row_id), reg);
+}
 
     await client.query("COMMIT");
     res.json({ success:true, row: r.rows[0] });
