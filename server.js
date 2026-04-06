@@ -223,6 +223,28 @@ async function initDb()  {
       raw_data JSONB NOT NULL
     );
   `);
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS public.docs_from_1c (
+    id BIGSERIAL PRIMARY KEY,
+    document_date TIMESTAMPTZ,
+    direction TEXT,
+    organization_bin TEXT,
+    organization_name TEXT,
+    is_foreign_expert BOOLEAN,
+    counterparty_bin TEXT,
+    counterparty_name TEXT,
+    counterparty_id INTEGER,
+    contract_number TEXT,
+    contract_date TIMESTAMPTZ,
+    currency TEXT,
+    counterparty_residence_country TEXT,
+    quantity NUMERIC(18,3),
+    price NUMERIC(18,2),
+    amount NUMERIC(18,2),
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  );
+`);
   // =========================
   // REGISTRY HEAD
   // =========================
@@ -1338,94 +1360,188 @@ app.get("/division-svod", async (req, res) => {
 app.post("/from-1c", async (req, res) => {
   try {
     console.log("=== /from-1c HIT ===");
-    console.log("Content-Type:", req.headers["content-type"]);
-    console.log("Content-Length:", req.headers["content-length"]);
-
-    // что реально пришло
-    console.log("Body typeof:", typeof req.body);
     console.log("Body:", req.body);
 
-    const empty =
-      !req.body ||
-      (typeof req.body === "object" && Object.keys(req.body).length === 0);
+    const items = Array.isArray(req.body) ? req.body : [req.body];
 
-    // если тело пустое — НЕ сохраняем, сразу говорим 1С что пусто
-    if (empty) {
-      console.log("⚠️ EMPTY BODY from 1C");
-      return res.status(400).json({ success: false, error: "EMPTY_JSON_BODY" });
+    if (!items.length) {
+      return res.status(400).json({
+        success: false,
+        error: "EMPTY_JSON_BODY"
+      });
     }
 
-    // сохраняем как есть
-    const result = await pool.query(
-      "INSERT INTO data_from_1c (raw_data) VALUES ($1) RETURNING id",
-      [req.body]
-    );
+    const insertedIds = [];
+
+    for (const data of items) {
+      if (!data || typeof data !== "object" || Object.keys(data).length === 0) {
+        continue;
+      }
+
+      const result = await pool.query(
+        `
+        INSERT INTO public.docs_from_1c (
+          document_date,
+          direction,
+          organization_bin,
+          organization_name,
+          is_foreign_expert,
+          counterparty_bin,
+          counterparty_name,
+          counterparty_id,
+          contract_number,
+          contract_date,
+          currency,
+          counterparty_residence_country,
+          quantity,
+          price,
+          amount
+        )
+        VALUES (
+          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15
+        )
+        RETURNING id
+        `,
+        [
+          data.documentDate || null,
+          data.direction || null,
+          data.organizationBin || null,
+          data.organizationName || null,
+          data.isForeignExpert ?? null,
+          data.counterpartyBin || null,
+          data.counterpartyName || null,
+          data.counterpartyid || null,
+          data.contractNumber || null,
+          data.contractDate || null,
+          data.currency || null,
+          data.counterpartyResidenceCountry || null,
+          data.quantity || null,
+          data.price || null,
+          data.amount || null
+        ]
+      );
+
+      insertedIds.push(result.rows[0].id);
+    }
+
+    if (!insertedIds.length) {
+      return res.status(400).json({
+        success: false,
+        error: "NO_VALID_ITEMS"
+      });
+    }
 
     res.json({
       success: true,
-      message: "Данные сохранены",
-      id: result.rows[0].id,
+      inserted_count: insertedIds.length,
+      ids: insertedIds
     });
+
   } catch (error) {
-    console.error("❌ Ошибка в /from-1c:", error);
-    res.status(500).json({ success: false, error: error.message });
+    console.error("❌ /from-1c error:", error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
   }
 });
 
 // Эндпоинт для просмотра последних записей от 1С
-app.get('/last-data', async (req, res) => {
-    try {
-        const limit = Math.min(Number(req.query.limit || 10), 100);
-        
-        const result = await pool.query(
-            'SELECT id, created_at, raw_data FROM data_from_1c ORDER BY id DESC LIMIT $1',
-            [limit]
-        );
-        
-        res.json({
-            success: true,
-            count: result.rows.length,
-            rows: result.rows
-        });
-    } catch (error) {
-        console.error('❌ Ошибка в /last-data:', error);
-        res.status(500).json({ 
-            success: false, 
-            error: error.message 
-        });
-    }
+app.get("/last-data", async (req, res) => {
+  try {
+    const limit = Math.min(Number(req.query.limit || 10), 100);
+
+    const result = await pool.query(
+      `
+      SELECT
+        id,
+        created_at,
+        document_date,
+        direction,
+        organization_bin,
+        organization_name,
+        is_foreign_expert,
+        counterparty_bin,
+        counterparty_name,
+        counterparty_id,
+        contract_number,
+        contract_date,
+        currency,
+        counterparty_residence_country,
+        quantity,
+        price,
+        amount
+      FROM public.docs_from_1c
+      ORDER BY id DESC
+      LIMIT $1
+      `,
+      [limit]
+    );
+
+    res.json({
+      success: true,
+      count: result.rows.length,
+      rows: result.rows
+    });
+  } catch (error) {
+    console.error("❌ Ошибка в /last-data:", error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
 });
 
 // Эндпоинт для получения конкретной записи по ID
-app.get('/data/:id', async (req, res) => {
-    try {
-        const id = parseInt(req.params.id);
-        
-        const result = await pool.query(
-            'SELECT id, created_at, raw_data FROM data_from_1c WHERE id = $1',
-            [id]
-        );
-        
-        if (result.rows.length === 0) {
-            return res.status(404).json({ 
-                success: false, 
-                error: 'Запись не найдена' 
-            });
-        }
-        
-        res.json({
-            success: true,
-            row: result.rows[0]
-        });
-    } catch (error) {
-        console.error('❌ Ошибка в /data/:id:', error);
-        res.status(500).json({ 
-            success: false, 
-            error: error.message 
-        });
-    }
-});
+app.get("/data/:id", async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
 
+    const result = await pool.query(
+      `
+      SELECT
+        id,
+        created_at,
+        document_date,
+        direction,
+        organization_bin,
+        organization_name,
+        is_foreign_expert,
+        counterparty_bin,
+        counterparty_name,
+        counterparty_id,
+        contract_number,
+        contract_date,
+        currency,
+        counterparty_residence_country,
+        quantity,
+        price,
+        amount
+      FROM public.docs_from_1c
+      WHERE id = $1
+      `,
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: "Запись не найдена"
+      });
+    }
+
+    res.json({
+      success: true,
+      row: result.rows[0]
+    });
+  } catch (error) {
+    console.error("❌ Ошибка в /data/:id:", error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
 app.get("/registry", async (req, res) => {
   try {
     const login = String(req.query.login || "").trim();
