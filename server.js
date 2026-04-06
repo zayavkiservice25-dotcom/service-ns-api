@@ -290,6 +290,7 @@ await pool.query(`
   // =========================
   // REGISTRY ITEMS
   // =========================
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS public.registry_items (
       id bigserial PRIMARY KEY,
@@ -341,6 +342,116 @@ await pool.query(`
     CREATE INDEX IF NOT EXISTS registry_approve_log_registry_id_idx
     ON public.registry_approve_log (registry_id);
   `);
+
+  // =========================
+  // REQUEST HEAD
+  // =========================
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.request_head (
+      id bigserial PRIMARY KEY,
+      request_no bigint,
+      request_date date DEFAULT CURRENT_DATE,
+      created_by text,
+      total_amount numeric(18,2) DEFAULT 0,
+      items_count integer DEFAULT 0,
+      workflow_stage text DEFAULT 'Главный бухгалтер',
+      agree_status text DEFAULT 'На согласовании',
+      archive_flag text DEFAULT 'Нет',
+      pdf_url text,
+      created_at timestamptz DEFAULT now()
+    );
+  `);
+
+  await pool.query(`
+    CREATE SEQUENCE IF NOT EXISTS public.request_no_seq START 1;
+  `);
+
+  await pool.query(`
+    SELECT setval(
+      'public.request_no_seq',
+      COALESCE((SELECT MAX(request_no) FROM public.request_head), 0)
+    );
+  `);
+
+  await pool.query(`
+    ALTER TABLE public.request_head
+    ALTER COLUMN request_no SET DEFAULT nextval('public.request_no_seq');
+  `);
+
+  // =========================
+  // REQUEST ITEMS
+  // =========================
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.request_items (
+      id bigserial PRIMARY KEY,
+      request_id bigint NOT NULL,
+      zvk_row_id bigint,
+      id_ft text,
+      id_zvk text,
+      object text,
+      input_name text,
+      contractor text,
+      pay_purpose text,
+      dds_article text,
+      contract_no text,
+      invoice_no text,
+      invoice_date date,
+      invoice_pdf text,
+      src_d text,
+      src_o text,
+      to_pay numeric(18,2) DEFAULT 0
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS request_items_request_id_idx
+    ON public.request_items (request_id);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS request_items_zvk_row_id_idx
+    ON public.request_items (zvk_row_id);
+  `);
+
+  // =========================
+  // REQUEST APPROVE LOG
+  // =========================
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.request_approve_log (
+      id bigserial PRIMARY KEY,
+      request_id bigint NOT NULL,
+      stage_name text NOT NULL,
+      approver_login text,
+      approver_name text,
+      action_type text NOT NULL,
+      comment_text text,
+      created_at timestamptz DEFAULT now()
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS request_approve_log_request_id_idx
+    ON public.request_approve_log (request_id);
+  `);
+
+  // =========================
+  // REQUEST APPROVAL COLUMNS
+  // =========================
+  await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_buh_name text;`);
+  await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_buh_status text;`);
+  await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_buh_time timestamptz;`);
+  await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_buh_comment text;`);
+
+  await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zam_name text;`);
+  await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zam_status text;`);
+  await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zam_time timestamptz;`);
+  await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zam_comment text;`);
+
+  await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_ud_name text;`);
+  await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_ud_status text;`);
+  await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_ud_time timestamptz;`);
+  await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_ud_comment text;`);
+
 await pool.query(`
   CREATE TABLE IF NOT EXISTS public.io_history (
     id bigserial PRIMARY KEY,
@@ -495,6 +606,396 @@ async function canEditRowByLogin(poolOrClient, zvk_row_id, login) {
 
   return r.rowCount > 0;
 }
+
+app.post("/create-request", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const { row_ids, login, pdf_url } = req.body;
+
+    const ids = Array.isArray(row_ids)
+      ? row_ids.map(x => Number(x)).filter(Boolean)
+      : [];
+
+    if (!ids.length) {
+      return res.status(400).json({ success:false, error:"row_ids required" });
+    }
+
+    if (!login) {
+      return res.status(400).json({ success:false, error:"login required" });
+    }
+
+    await client.query("BEGIN");
+
+    const head = await client.query(`
+      INSERT INTO public.request_head
+        (created_by, pdf_url)
+      VALUES ($1, $2)
+      RETURNING id, request_no
+    `, [
+      String(login || "").trim(),
+      pdf_url ? String(pdf_url).trim() : null
+    ]);
+
+    const request_id = head.rows[0].id;
+    const request_no = head.rows[0].request_no;
+
+    const items = await client.query(`
+      INSERT INTO public.request_items
+      (
+        request_id,
+        zvk_row_id,
+        id_ft,
+        id_zvk,
+        object,
+        input_name,
+        contractor,
+        pay_purpose,
+        dds_article,
+        contract_no,
+        invoice_no,
+        invoice_date,
+        invoice_pdf,
+        src_d,
+        src_o,
+        to_pay
+      )
+      SELECT
+        $1,
+        v.zvk_row_id,
+        v.id_ft,
+        v.id_zvk,
+        v.object,
+        v.input_name,
+        v.contractor,
+        v.pay_purpose,
+        v.dds_article,
+        v.contract_no,
+        v.invoice_no,
+        v.invoice_date,
+        v.invoice_pdf,
+        v.src_d,
+        v.src_o,
+        v.to_pay
+      FROM public.ft_zvk_current_v2 v
+      WHERE v.zvk_row_id = ANY($2::bigint[])
+      RETURNING to_pay
+    `, [request_id, ids]);
+
+    const total = items.rows.reduce((s, r) => s + Number(r.to_pay || 0), 0);
+    const count = items.rows.length;
+
+await client.query(`
+  UPDATE public.request_head
+  SET
+    total_amount = $1,
+    items_count = $2,
+    workflow_stage = 'Главный бухгалтер',
+    agree_status = 'На согласовании',
+
+    acc_buh_name = 'Жасулан Сулейменов',
+    acc_buh_status = 'Ожидает',
+
+    acc_zam_name = NULL,
+    acc_zam_status = NULL,
+    acc_zam_time = NULL,
+    acc_zam_comment = NULL,
+
+    acc_ud_name = NULL,
+    acc_ud_status = NULL,
+    acc_ud_time = NULL,
+    acc_ud_comment = NULL
+  WHERE id = $3
+`, [total, count, request_id]);
+
+    await client.query(`
+      INSERT INTO public.request_approve_log
+        (request_id, stage_name, approver_login, approver_name, action_type, comment_text)
+      VALUES ($1, $2, $3, $4, 'create', $5)
+    `, [
+      request_id,
+      'Инициация',
+      String(login || ""),
+      String(login || ""),
+      'Заявка создана и отправлена на согласование'
+    ]);
+
+    await client.query("COMMIT");
+
+    res.json({
+      success:true,
+      request_id,
+      request_no,
+      total_amount: total,
+      items_count: count
+    });
+
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("CREATE-REQUEST ERROR:", e);
+    res.status(500).json({ success:false, error:e.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/request-list", async (req, res) => {
+  try {
+    const login = String(req.query.login || "").trim().toLowerCase();
+    if (!login) {
+      return res.status(400).json({ success:false, error:"login required" });
+    }
+
+   const fullViewLogins = ["s_zhasulan", "b_erkin"];
+
+    let r;
+
+    if (fullViewLogins.includes(login)) {
+      r = await pool.query(`
+        SELECT
+          id,
+          request_no,
+          request_date,
+          created_by,
+          total_amount,
+          items_count,
+          workflow_stage,
+          agree_status,
+          archive_flag,
+          created_at
+        FROM public.request_head
+        WHERE COALESCE(archive_flag,'Нет') <> 'Да'
+        ORDER BY id DESC
+      `);
+    } else {
+      r = await pool.query(`
+        SELECT
+          id,
+          request_no,
+          request_date,
+          created_by,
+          total_amount,
+          items_count,
+          workflow_stage,
+          agree_status,
+          archive_flag,
+          created_at
+        FROM public.request_head
+        WHERE lower(trim(created_by)) = lower(trim($1))
+          AND COALESCE(archive_flag,'Нет') <> 'Да'
+        ORDER BY id DESC
+      `, [login]);
+    }
+
+    res.json({ success:true, rows:r.rows });
+
+  } catch (e) {
+    console.error("REQUEST-LIST ERROR:", e);
+    res.status(500).json({ success:false, error:e.message });
+  }
+});
+
+app.get("/request-card", async (req, res) => {
+  try {
+    const id = Number(req.query.id);
+
+    if (!id) {
+      return res.status(400).json({ success:false, error:"id required" });
+    }
+
+    const headRes = await pool.query(`
+      SELECT *
+      FROM public.request_head
+      WHERE id = $1
+      LIMIT 1
+    `, [id]);
+
+    if (!headRes.rows.length) {
+      return res.status(404).json({ success:false, error:"request not found" });
+    }
+
+    const itemsRes = await pool.query(`
+      SELECT
+        request_id,
+        zvk_row_id,
+        id_ft,
+        id_zvk,
+        object,
+        input_name,
+        contractor,
+        pay_purpose,
+        dds_article,
+        contract_no,
+        invoice_no,
+        invoice_date,
+        invoice_pdf,
+        src_d,
+        src_o,
+        to_pay
+      FROM public.request_items
+      WHERE request_id = $1
+      ORDER BY id
+    `, [id]);
+
+    const logRes = await pool.query(`
+      SELECT
+        id,
+        stage_name,
+        approver_login,
+        approver_name,
+        action_type,
+        comment_text,
+        created_at
+      FROM public.request_approve_log
+      WHERE request_id = $1
+      ORDER BY id
+    `, [id]);
+
+    res.json({
+      success:true,
+      head: headRes.rows[0],
+      items: itemsRes.rows,
+      log: logRes.rows
+    });
+
+  } catch (e) {
+    console.error("REQUEST-CARD ERROR:", e);
+    res.status(500).json({ success:false, error:e.message });
+  }
+});
+
+app.post("/request-approve", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const {
+      request_id,
+      stage,
+      action,
+      login,
+      name,
+      comment
+    } = req.body;
+
+    if (!request_id) {
+      return res.status(400).json({ success:false, error:"request_id required" });
+    }
+
+    if (!stage) {
+      return res.status(400).json({ success:false, error:"stage required" });
+    }
+
+    if (!action) {
+      return res.status(400).json({ success:false, error:"action required" });
+    }
+
+    const actor = String(login || "").trim().toLowerCase();
+    const stageName = String(stage || "").trim();
+    const actionName = String(action || "").trim();
+
+    // ✅ согласовывает только главбух
+    if (actor !== "s_zhasulan") {
+      return res.status(403).json({ success:false, error:"NO_RIGHTS_TO_APPROVE_REQUEST" });
+    }
+
+    // ✅ у заявки только один этап согласования
+    if (stageName !== "Главный бухгалтер") {
+      return res.status(400).json({ success:false, error:"ONLY_MAIN_ACCOUNTANT_STAGE_ALLOWED" });
+    }
+
+    await client.query("BEGIN");
+
+    const reqRes = await client.query(
+      `SELECT * FROM public.request_head WHERE id = $1 LIMIT 1`,
+      [Number(request_id)]
+    );
+
+    if (!reqRes.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success:false, error:"request not found" });
+    }
+
+    if (actionName === "reject") {
+      await client.query(`
+        UPDATE public.request_head
+        SET
+          acc_buh_status = 'Отклонено',
+          acc_buh_time = NOW(),
+          acc_buh_comment = $2,
+          workflow_stage = 'Инициация',
+          agree_status = 'Отклонено'
+        WHERE id = $1
+      `, [
+        Number(request_id),
+        String(comment || "")
+      ]);
+
+      await client.query(`
+        INSERT INTO public.request_approve_log
+          (request_id, stage_name, approver_login, approver_name, action_type, comment_text)
+        VALUES ($1, $2, $3, $4, 'reject', $5)
+      `, [
+        Number(request_id),
+        'Главный бухгалтер',
+        String(login || ""),
+        String(name || ""),
+        String(comment || "")
+      ]);
+
+      await client.query("COMMIT");
+      return res.json({
+        success:true,
+        action:"reject",
+        moved_to:"Инициация"
+      });
+    }
+
+    if (actionName === "approve") {
+      await client.query(`
+        UPDATE public.request_head
+        SET
+          acc_buh_status = 'Согласовано',
+          acc_buh_time = NOW(),
+          acc_buh_comment = $2,
+          workflow_stage = 'Согласовано',
+          agree_status = 'Согласовано'
+        WHERE id = $1
+      `, [
+        Number(request_id),
+        String(comment || "")
+      ]);
+
+      await client.query(`
+        INSERT INTO public.request_approve_log
+          (request_id, stage_name, approver_login, approver_name, action_type, comment_text)
+        VALUES ($1, $2, $3, $4, 'approve', $5)
+      `, [
+        Number(request_id),
+        'Главный бухгалтер',
+        String(login || ""),
+        String(name || ""),
+        String(comment || "")
+      ]);
+
+      await client.query("COMMIT");
+      return res.json({
+        success:true,
+        action:"approve",
+        moved_to:"Согласовано"
+      });
+    }
+
+    await client.query("ROLLBACK");
+    return res.status(400).json({ success:false, error:"unknown action" });
+
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("REQUEST-APPROVE ERROR:", e);
+    res.status(500).json({ success:false, error:e.message });
+  } finally {
+    client.release();
+  }
+});
 
 app.post("/zvk-save", async (req, res) => {
   try {
