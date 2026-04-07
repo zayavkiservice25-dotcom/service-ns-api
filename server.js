@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const APP_BASE_URL = process.env.APP_BASE_URL;
 const app = express();
-
+const nodemailer = require("nodemailer");
 app.use(cors());
 app.use(express.json({ limit: "20mb" }));
 app.use(express.urlencoded({ extended: true, limit: "20mb" }));
@@ -33,11 +33,31 @@ const pool = new Pool({
     : false                          // без SSL для локальной БД
 });
 
+const MAIL_USER = process.env.MAIL_USER;
+const MAIL_PASS = process.env.MAIL_PASS;
 
+const mailTransporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: MAIL_USER,
+    pass: MAIL_PASS
+  }
+});
 
 function normalizeEmail(v) {
   return String(v || "").trim().toLowerCase();
 }
+
+function generateTempPassword(length = 8) {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+  let result = "";
+  for (let i = 0; i < length; i++) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return result;
+}
+
+
 // =====================================================
 // INIT DB + МИГРАЦИИ
 // =====================================================
@@ -688,6 +708,73 @@ app.post("/login", async (req, res) => {
   }
 });
 
+
+app.post("/forgot-password", async (req, res) => {
+  try {
+    const { email } = req.body || {};
+    const emailNorm = normalizeEmail(email);
+
+    if (!emailNorm) {
+      return res.status(400).json({
+        success: false,
+        message: "Укажите почту"
+      });
+    }
+
+    const userRes = await pool.query(`
+      SELECT id, email, first_name
+      FROM public.users
+      WHERE lower(trim(email)) = $1
+      LIMIT 1
+    `, [emailNorm]);
+
+    if (!userRes.rowCount) {
+      return res.status(404).json({
+        success: false,
+        message: "Пользователь с такой почтой не найден"
+      });
+    }
+
+    const user = userRes.rows[0];
+    const tempPassword = generateTempPassword(8);
+
+    await pool.query(`
+      UPDATE public.users
+      SET password = $2
+      WHERE id = $1
+    `, [user.id, tempPassword]);
+
+    await mailTransporter.sendMail({
+      from: `"Service NS" <${MAIL_USER}>`,
+      to: user.email,
+      subject: "Сброс пароля — Service NS",
+      text:
+        `Здравствуйте${user.first_name ? ", " + user.first_name : ""}!\n\n` +
+        `Ваш временный пароль: ${tempPassword}\n\n` +
+        `Используйте его для входа в систему.\n` +
+        `После входа рекомендуется сменить пароль.\n\n` +
+        `Service NS`,
+      html:
+        `<p>Здравствуйте${user.first_name ? ", " + user.first_name : ""}!</p>` +
+        `<p>Ваш временный пароль: <b>${tempPassword}</b></p>` +
+        `<p>Используйте его для входа в систему.</p>` +
+        `<p>После входа рекомендуется сменить пароль.</p>` +
+        `<p><b>Service NS</b></p>`
+    });
+
+    return res.json({
+      success: true,
+      message: "Новый пароль отправлен на почту"
+    });
+
+  } catch (e) {
+    console.error("FORGOT-PASSWORD ERROR:", e);
+    return res.status(500).json({
+      success: false,
+      message: "Не удалось отправить письмо"
+    });
+  }
+});
 // =====================================================
 // GET FT
 // =====================================================
