@@ -215,36 +215,19 @@ async function initDb()  {
       AND NOT (zvk_name = 'СИСТЕМА' AND COALESCE(request_flag,'') = 'Нет');
   `);
 
-  // ✅ Таблица для данных от 1С
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS data_from_1c (
-      id SERIAL PRIMARY KEY,
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      raw_data JSONB NOT NULL
-    );
-  `);
-
 await pool.query(`
   CREATE TABLE IF NOT EXISTS public.docs_from_1c (
-    id BIGSERIAL PRIMARY KEY,
-    document_date TIMESTAMPTZ,
-    direction TEXT,
-    organization_bin TEXT,
+    doc_number TEXT PRIMARY KEY,
+    doc_date TIMESTAMPTZ,
     organization_name TEXT,
-    is_foreign_expert BOOLEAN,
-    counterparty_bin TEXT,
     counterparty_name TEXT,
-    counterparty_id INTEGER,
-    contract_number TEXT,
-    contract_date TIMESTAMPTZ,
-    currency TEXT,
-    counterparty_residence_country TEXT,
-    quantity NUMERIC(18,3),
-    price NUMERIC(18,2),
-    amount NUMERIC(18,2),
+    total_amount NUMERIC(18,2),
+    items JSONB,
     created_at TIMESTAMPTZ DEFAULT NOW()
   );
 `);
+  
+
   // =========================
   // REGISTRY HEAD
   // =========================
@@ -1860,82 +1843,65 @@ app.get("/division-svod", async (req, res) => {
 // Эндпоинт для приема любых JSON данных от 1С
 app.post("/from-1c", async (req, res) => {
   try {
-    console.log("=== /from-1c HIT ===");
-    console.log("Body:", req.body);
+    console.log("=== /from-1c ===");
+    console.log(req.body);
 
-    const items = Array.isArray(req.body) ? req.body : [req.body];
+    const docs = Array.isArray(req.body) ? req.body : [req.body];
 
-    if (!items.length) {
+    if (!docs.length) {
       return res.status(400).json({
         success: false,
         error: "EMPTY_JSON_BODY"
       });
     }
 
-    const insertedIds = [];
+    let insertedCount = 0;
 
-    for (const data of items) {
-      if (!data || typeof data !== "object" || Object.keys(data).length === 0) {
-        continue;
+    for (const data of docs) {
+      if (!data || typeof data !== "object") continue;
+
+      if (!data.number) {
+        return res.status(400).json({
+          success: false,
+          error: "number required"
+        });
       }
 
-      const result = await pool.query(
+      await pool.query(
         `
         INSERT INTO public.docs_from_1c (
-          document_date,
-          direction,
-          organization_bin,
+          doc_number,
+          doc_date,
           organization_name,
-          is_foreign_expert,
-          counterparty_bin,
           counterparty_name,
-          counterparty_id,
-          contract_number,
-          contract_date,
-          currency,
-          counterparty_residence_country,
-          quantity,
-          price,
-          amount
+          total_amount,
+          items
         )
-        VALUES (
-          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15
-        )
-        RETURNING id
+        VALUES ($1,$2,$3,$4,$5,$6)
+        ON CONFLICT (doc_number) DO UPDATE SET
+          doc_date = EXCLUDED.doc_date,
+          organization_name = EXCLUDED.organization_name,
+          counterparty_name = EXCLUDED.counterparty_name,
+          total_amount = EXCLUDED.total_amount,
+          items = EXCLUDED.items
         `,
         [
-          data.documentDate || null,
-          data.direction || null,
-          data.organizationBin || null,
-          data.organizationName || null,
-          data.isForeignExpert ?? null,
-          data.counterpartyBin || null,
-          data.counterpartyName || null,
-          data.counterpartyid || null,
-          data.contractNumber || null,
-          data.contractDate || null,
-          data.currency || null,
-          data.counterpartyResidenceCountry || null,
-          data.quantity || null,
-          data.price || null,
-          data.amount || null
+          String(data.number).trim(),
+          data.date || null,
+          data.organization_name || null,
+          data.counterparty_name || null,
+          data.total_amount ?? 0,
+          JSON.stringify(data.items || [])
         ]
       );
 
-      insertedIds.push(result.rows[0].id);
-    }
-
-    if (!insertedIds.length) {
-      return res.status(400).json({
-        success: false,
-        error: "NO_VALID_ITEMS"
-      });
+      insertedCount++;
     }
 
     res.json({
       success: true,
-      inserted_count: insertedIds.length,
-      ids: insertedIds
+      inserted_count: insertedCount,
+      message: "Данные приняты"
     });
 
   } catch (error) {
@@ -1952,40 +1918,19 @@ app.get("/last-data", async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit || 10), 100);
 
-    const result = await pool.query(
-      `
-      SELECT
-        id,
-        created_at,
-        document_date,
-        direction,
-        organization_bin,
-        organization_name,
-        is_foreign_expert,
-        counterparty_bin,
-        counterparty_name,
-        counterparty_id,
-        contract_number,
-        contract_date,
-        currency,
-        counterparty_residence_country,
-        quantity,
-        price,
-        amount
+    const result = await pool.query(`
+      SELECT *
       FROM public.docs_from_1c
-      ORDER BY id DESC
+      ORDER BY created_at DESC
       LIMIT $1
-      `,
-      [limit]
-    );
+    `, [limit]);
 
     res.json({
       success: true,
-      count: result.rows.length,
       rows: result.rows
     });
+
   } catch (error) {
-    console.error("❌ Ошибка в /last-data:", error);
     res.status(500).json({
       success: false,
       error: error.message
@@ -1993,35 +1938,19 @@ app.get("/last-data", async (req, res) => {
   }
 });
 
+
 // Эндпоинт для получения конкретной записи по ID
-app.get("/data/:id", async (req, res) => {
+app.get("/data/:number", async (req, res) => {
   try {
-    const id = parseInt(req.params.id);
+    const number = String(req.params.number || "").trim();
 
     const result = await pool.query(
       `
-      SELECT
-        id,
-        created_at,
-        document_date,
-        direction,
-        organization_bin,
-        organization_name,
-        is_foreign_expert,
-        counterparty_bin,
-        counterparty_name,
-        counterparty_id,
-        contract_number,
-        contract_date,
-        currency,
-        counterparty_residence_country,
-        quantity,
-        price,
-        amount
+      SELECT *
       FROM public.docs_from_1c
-      WHERE id = $1
+      WHERE doc_number = $1
       `,
-      [id]
+      [number]
     );
 
     if (result.rows.length === 0) {
@@ -2036,13 +1965,15 @@ app.get("/data/:id", async (req, res) => {
       row: result.rows[0]
     });
   } catch (error) {
-    console.error("❌ Ошибка в /data/:id:", error);
+    console.error("❌ Ошибка в /data/:number:", error);
     res.status(500).json({
       success: false,
       error: error.message
     });
   }
 });
+
+
 app.get("/registry", async (req, res) => {
   try {
     const login = String(req.query.login || "").trim();
