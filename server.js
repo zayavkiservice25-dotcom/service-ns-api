@@ -33,6 +33,11 @@ const pool = new Pool({
     : false                          // без SSL для локальной БД
 });
 
+
+
+function normalizeEmail(v) {
+  return String(v || "").trim().toLowerCase();
+}
 // =====================================================
 // INIT DB + МИГРАЦИИ
 // =====================================================
@@ -227,6 +232,27 @@ await pool.query(`
   );
 `);
   
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS public.users (
+    id bigserial PRIMARY KEY,
+    email text UNIQUE NOT NULL,
+    password text NOT NULL,
+    phone text,
+    last_name text,
+    first_name text,
+    middle_name text,
+    organization_name text,
+    role text DEFAULT 'user',
+    is_active boolean DEFAULT true,
+    created_at timestamptz DEFAULT now()
+  );
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS users_email_idx
+  ON public.users (lower(trim(email)));
+`);
+
 
   // =========================
   // REGISTRY HEAD
@@ -491,6 +517,174 @@ app.get("/db-ping", async (req, res) => {
     res.json({ ok: true, now: r.rows[0].now });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post("/register", async (req, res) => {
+  try {
+    const {
+      email,
+      password,
+      phone,
+      last_name,
+      first_name,
+      middle_name,
+      organization_name
+    } = req.body || {};
+
+    const emailNorm = normalizeEmail(email);
+    const pass = String(password || "").trim();
+
+    if (!emailNorm) {
+      return res.status(400).json({ success:false, message:"Почта обязательна" });
+    }
+
+    if (!pass) {
+      return res.status(400).json({ success:false, message:"Пароль обязателен" });
+    }
+
+    if (!first_name || !last_name) {
+      return res.status(400).json({ success:false, message:"Имя и фамилия обязательны" });
+    }
+
+    const exists = await pool.query(
+      `SELECT id FROM public.users WHERE lower(trim(email)) = $1 LIMIT 1`,
+      [emailNorm]
+    );
+
+    if (exists.rowCount > 0) {
+      return res.status(400).json({
+        success:false,
+        message:"Пользователь с такой почтой уже существует"
+      });
+    }
+
+    const r = await pool.query(`
+      INSERT INTO public.users (
+        email,
+        password,
+        phone,
+        last_name,
+        first_name,
+        middle_name,
+        organization_name,
+        role,
+        is_active
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,'user',true)
+      RETURNING id, email, role, first_name, last_name
+    `, [
+      emailNorm,
+      pass,
+      phone ? String(phone).trim() : null,
+      last_name ? String(last_name).trim() : null,
+      first_name ? String(first_name).trim() : null,
+      middle_name ? String(middle_name).trim() : null,
+      organization_name ? String(organization_name).trim() : null
+    ]);
+
+    return res.json({
+      success:true,
+      user:r.rows[0]
+    });
+
+  } catch (e) {
+    console.error("REGISTER ERROR:", e);
+    return res.status(500).json({
+      success:false,
+      message:"Ошибка сервера"
+    });
+  }
+});
+
+app.post("/login", async (req, res) => {
+  try {
+    const { email, password } = req.body || {};
+
+    const emailNorm = normalizeEmail(email);
+    const pass = String(password || "").trim();
+
+    if (!emailNorm || !pass) {
+      return res.status(400).json({
+        success:false,
+        message:"Введите почту и пароль"
+      });
+    }
+
+    // тестовый админ
+    if (emailNorm === "admin" && pass === "admin") {
+      return res.json({
+        success:true,
+        user:{
+          id: 0,
+          email:"admin",
+          role:"admin",
+          first_name:"Admin",
+          last_name:"Test"
+        }
+      });
+    }
+
+    const r = await pool.query(`
+      SELECT
+        id,
+        email,
+        password,
+        role,
+        is_active,
+        first_name,
+        last_name,
+        middle_name,
+        organization_name,
+        phone
+      FROM public.users
+      WHERE lower(trim(email)) = $1
+      LIMIT 1
+    `, [emailNorm]);
+
+    if (!r.rowCount) {
+      return res.status(401).json({
+        success:false,
+        message:"Пользователь не найден"
+      });
+    }
+
+    const user = r.rows[0];
+
+    if (user.is_active === false) {
+      return res.status(403).json({
+        success:false,
+        message:"Аккаунт отключен"
+      });
+    }
+
+    if (String(user.password || "") !== pass) {
+      return res.status(401).json({
+        success:false,
+        message:"Неверный пароль"
+      });
+    }
+
+    return res.json({
+      success:true,
+      user:{
+        id:user.id,
+        email:user.email,
+        role:user.role,
+        first_name:user.first_name,
+        last_name:user.last_name,
+        middle_name:user.middle_name,
+        organization_name:user.organization_name,
+        phone:user.phone
+      }
+    });
+
+  } catch (e) {
+    console.error("LOGIN ERROR:", e);
+    return res.status(500).json({
+      success:false,
+      message:"Ошибка сервера"
+    });
   }
 });
 
