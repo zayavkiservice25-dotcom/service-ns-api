@@ -3666,6 +3666,125 @@ async function sendRegistryTelegramNotification({
 }
 
 
+//NeW APP
+app.post("/update-profile", async (req, res) => {
+  try {
+    const {
+      email,
+      first_name,
+      last_name,
+      middle_name,
+      phone
+    } = req.body || {};
+
+    const emailNorm = normalizeEmail(email);
+
+    if (!emailNorm) {
+      return res.status(400).json({
+        success: false,
+        message: "Email обязателен"
+      });
+    }
+
+    const r = await pool.query(`
+      UPDATE public.users
+      SET
+        first_name = COALESCE($1, first_name),
+        last_name = COALESCE($2, last_name),
+        middle_name = COALESCE($3, middle_name),
+        phone = COALESCE($4, phone)
+      WHERE lower(trim(email)) = $5
+      RETURNING id, email, first_name, last_name, middle_name, phone
+    `, [
+      first_name ? String(first_name).trim() : null,
+      last_name ? String(last_name).trim() : null,
+      middle_name ? String(middle_name).trim() : null,
+      phone ? String(phone).trim() : null,
+      emailNorm
+    ]);
+
+    if (!r.rowCount) {
+      return res.status(404).json({
+        success: false,
+        message: "Пользователь не найден"
+      });
+    }
+
+    res.json({
+      success: true,
+      user: r.rows[0]
+    });
+
+  } catch (e) {
+    console.error("UPDATE PROFILE ERROR:", e);
+    res.status(500).json({
+      success: false,
+      message: "Ошибка сервера"
+    });
+  }
+});
+
+app.post("/change-password", async (req, res) => {
+  try {
+    const { email, old_password, new_password } = req.body || {};
+
+    const emailNorm = normalizeEmail(email);
+    const oldPass = String(old_password || "").trim();
+    const newPass = String(new_password || "").trim();
+
+    if (!emailNorm || !oldPass || !newPass) {
+      return res.status(400).json({
+        success: false,
+        message: "Заполните все поля"
+      });
+    }
+
+    if (newPass.length < 6) {
+      return res.status(400).json({
+        success: false,
+        message: "Новый пароль должен быть не менее 6 символов"
+      });
+    }
+
+    const userRes = await pool.query(`
+      SELECT id, password
+      FROM public.users
+      WHERE lower(trim(email)) = $1
+      LIMIT 1
+    `, [emailNorm]);
+
+    if (!userRes.rows.length) {
+      return res.status(404).json({
+        success: false,
+        message: "Пользователь не найден"
+      });
+    }
+
+    const user = userRes.rows[0];
+
+    if (String(user.password || "") !== oldPass) {
+      return res.status(400).json({
+        success: false,
+        message: "Старый пароль неверный"
+      });
+    }
+
+    await pool.query(`
+      UPDATE public.users
+      SET password = $1
+      WHERE id = $2
+    `, [newPass, user.id]);
+
+    res.json({ success: true });
+
+  } catch (e) {
+    console.error("CHANGE PASSWORD ERROR:", e);
+    res.status(500).json({
+      success: false,
+      message: "Ошибка сервера"
+    });
+  }
+});
 
 
 // =====================================================
