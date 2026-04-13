@@ -3800,7 +3800,6 @@ app.post("/approve-rows", async (req, res) => {
 
     await client.query("BEGIN");
 
-    // 1. Согласование строк
     await client.query(`
       INSERT INTO public.zvk_status (
         zvk_row_id,
@@ -3819,7 +3818,6 @@ app.post("/approve-rows", async (req, res) => {
         chief_approved = 'Да'
     `, [rowIds]);
 
-    // 2. Если передан request_id — обновляем шапку заявки
     if (Number(request_id)) {
       await client.query(`
         UPDATE public.request_head
@@ -3835,12 +3833,12 @@ app.post("/approve-rows", async (req, res) => {
         INSERT INTO public.request_approve_log
           (request_id, stage_name, approver_login, approver_name, action_type, comment_text)
         VALUES ($1, 'Главный бухгалтер', $2, $2, 'approve', 'Согласовано по выбранным строкам')
-      `, [Number(request_id), login]);
+      `, [Number(request_id), String(login || "")]);
     }
 
     await client.query("COMMIT");
-
     return res.json({ success:true, updated: rowIds.length });
+
   } catch (e) {
     await client.query("ROLLBACK");
     console.error("APPROVE-ROWS ERROR:", e);
@@ -3849,7 +3847,6 @@ app.post("/approve-rows", async (req, res) => {
     client.release();
   }
 });
-
 
 // =====================================================
 // Start
