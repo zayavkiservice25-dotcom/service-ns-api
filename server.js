@@ -3783,7 +3783,7 @@ app.post("/approve-rows", async (req, res) => {
   const client = await pool.connect();
 
   try {
-    const { ids, login } = req.body || {};
+    const { ids, login, request_id } = req.body || {};
 
     const actor = String(login || "").trim().toLowerCase();
     if (actor !== "s_zhasulan") {
@@ -3800,8 +3800,13 @@ app.post("/approve-rows", async (req, res) => {
 
     await client.query("BEGIN");
 
+    // 1. Согласование строк
     await client.query(`
-      INSERT INTO public.zvk_status (zvk_row_id, status_time, chief_approved)
+      INSERT INTO public.zvk_status (
+        zvk_row_id,
+        status_time,
+        chief_approved
+      )
       SELECT
         z.id,
         NOW(),
@@ -3813,6 +3818,25 @@ app.post("/approve-rows", async (req, res) => {
         status_time = NOW(),
         chief_approved = 'Да'
     `, [rowIds]);
+
+    // 2. Если передан request_id — обновляем шапку заявки
+    if (Number(request_id)) {
+      await client.query(`
+        UPDATE public.request_head
+        SET
+          acc_buh_status = 'Согласовано',
+          acc_buh_time = NOW(),
+          workflow_stage = 'Согласовано',
+          agree_status = 'Согласовано'
+        WHERE id = $1
+      `, [Number(request_id)]);
+
+      await client.query(`
+        INSERT INTO public.request_approve_log
+          (request_id, stage_name, approver_login, approver_name, action_type, comment_text)
+        VALUES ($1, 'Главный бухгалтер', $2, $2, 'approve', 'Согласовано по выбранным строкам')
+      `, [Number(request_id), login]);
+    }
 
     await client.query("COMMIT");
 
