@@ -1011,45 +1011,108 @@ app.get("/request-list", async (req, res) => {
       return res.status(400).json({ success:false, error:"login required" });
     }
 
-   const fullViewLogins = ["s_zhasulan", "b_erkin"];
+    const fullViewLogins = ["s_zhasulan", "b_erkin"];
 
     let r;
 
     if (fullViewLogins.includes(login)) {
       r = await pool.query(`
-SELECT
-  id,
-  request_no,
-  request_date,
-  created_by,
-  total_amount,
-  items_count,
-  workflow_stage,
-  agree_status,
-  acc_buh_status,
-  archive_flag,
-  created_at
-FROM public.request_head
-        WHERE COALESCE(archive_flag,'Нет') <> 'Да'
-        ORDER BY id DESC
+        SELECT
+          h.id,
+          h.request_no,
+          h.request_date,
+          h.created_by,
+          h.total_amount,
+          h.items_count,
+          h.workflow_stage,
+          h.agree_status,
+          h.acc_buh_status,
+          h.archive_flag,
+          h.created_at,
+
+          COUNT(i.id) AS total_rows,
+          COUNT(*) FILTER (
+            WHERE COALESCE(s.chief_approved, '') = 'Да'
+          ) AS approved_rows,
+
+          STRING_AGG(
+            DISTINCT CASE
+              WHEN COALESCE(s.chief_approved, '') = 'Да' THEN i.id_zvk
+              ELSE NULL
+            END,
+            ', '
+          ) AS approved_zfts
+
+        FROM public.request_head h
+        LEFT JOIN public.request_items i
+          ON i.request_id = h.id
+        LEFT JOIN public.zvk_status s
+          ON s.zvk_row_id = i.zvk_row_id
+
+        WHERE COALESCE(h.archive_flag, 'Нет') <> 'Да'
+        GROUP BY
+          h.id,
+          h.request_no,
+          h.request_date,
+          h.created_by,
+          h.total_amount,
+          h.items_count,
+          h.workflow_stage,
+          h.agree_status,
+          h.acc_buh_status,
+          h.archive_flag,
+          h.created_at
+        ORDER BY h.id DESC
       `);
     } else {
       r = await pool.query(`
         SELECT
-          id,
-          request_no,
-          request_date,
-          created_by,
-          total_amount,
-          items_count,
-          workflow_stage,
-          agree_status,
-          archive_flag,
-          created_at
-        FROM public.request_head
-        WHERE lower(trim(created_by)) = lower(trim($1))
-          AND COALESCE(archive_flag,'Нет') <> 'Да'
-        ORDER BY id DESC
+          h.id,
+          h.request_no,
+          h.request_date,
+          h.created_by,
+          h.total_amount,
+          h.items_count,
+          h.workflow_stage,
+          h.agree_status,
+          h.acc_buh_status,
+          h.archive_flag,
+          h.created_at,
+
+          COUNT(i.id) AS total_rows,
+          COUNT(*) FILTER (
+            WHERE COALESCE(s.chief_approved, '') = 'Да'
+          ) AS approved_rows,
+
+          STRING_AGG(
+            DISTINCT CASE
+              WHEN COALESCE(s.chief_approved, '') = 'Да' THEN i.id_zvk
+              ELSE NULL
+            END,
+            ', '
+          ) AS approved_zfts
+
+        FROM public.request_head h
+        LEFT JOIN public.request_items i
+          ON i.request_id = h.id
+        LEFT JOIN public.zvk_status s
+          ON s.zvk_row_id = i.zvk_row_id
+
+        WHERE lower(trim(h.created_by)) = lower(trim($1))
+          AND COALESCE(h.archive_flag, 'Нет') <> 'Да'
+        GROUP BY
+          h.id,
+          h.request_no,
+          h.request_date,
+          h.created_by,
+          h.total_amount,
+          h.items_count,
+          h.workflow_stage,
+          h.agree_status,
+          h.acc_buh_status,
+          h.archive_flag,
+          h.created_at
+        ORDER BY h.id DESC
       `, [login]);
     }
 
