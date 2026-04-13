@@ -199,9 +199,10 @@ async function initDb()  {
 
       z.id AS zvk_row_id,
 
-      s.status_time,
-      s.src_d,
-      s.src_o,
+s.status_time,
+s.src_d,
+s.src_o,
+s.status_comment,
 
       p.agree_time,
       p.registry_flag,
@@ -1385,7 +1386,16 @@ app.post("/zvk-save", async (req, res) => {
 // =====================================================
 app.post("/zvk-status-row", async (req, res) => {
   try {
-    const { zvk_row_id, src_d, src_o, login, is_admin, can_edit_all, is_all } = req.body;
+const {
+  zvk_row_id,
+  src_d,
+  src_o,
+  status_comment,
+  login,
+  is_admin,
+  can_edit_all,
+  is_all
+} = req.body;
 
     if (!zvk_row_id)
       return res.status(400).json({ success:false, error:"zvk_row_id required" });
@@ -1406,19 +1416,25 @@ app.post("/zvk-status-row", async (req, res) => {
     }
 
     // --- дальше твой upsert ---
-    const r = await pool.query(
-      `
-      INSERT INTO zvk_status (zvk_row_id, status_time, src_d, src_o)
-      VALUES ($1, NOW(), $2, $3)
-      ON CONFLICT (zvk_row_id)
-      DO UPDATE SET
-        status_time = NOW(),
-        src_d = EXCLUDED.src_d,
-        src_o = EXCLUDED.src_o
-      RETURNING *
-      `,
-      [rid, String(src_d || ""), String(src_o || "")]
-    );
+const r = await pool.query(
+  `
+  INSERT INTO zvk_status (zvk_row_id, status_time, src_d, src_o, status_comment)
+  VALUES ($1, NOW(), $2, $3, $4)
+  ON CONFLICT (zvk_row_id)
+  DO UPDATE SET
+    status_time = NOW(),
+    src_d = EXCLUDED.src_d,
+    src_o = EXCLUDED.src_o,
+    status_comment = EXCLUDED.status_comment
+  RETURNING *
+  `,
+  [
+    rid,
+    String(src_d || ""),
+    String(src_o || ""),
+    String(status_comment || "")
+  ]
+);
 
     res.json({ success:true, row: r.rows[0] });
 
