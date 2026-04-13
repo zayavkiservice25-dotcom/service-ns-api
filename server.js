@@ -3776,6 +3776,34 @@ app.post("/change-password", async (req, res) => {
   }
 });
 
+app.post("/approve-rows", async (req, res) => {
+  try {
+    const { ids, login } = req.body;
+
+    // 🔒 защита
+    if (login !== "S_Zhasulan") {
+      return res.status(403).json({ success:false, error:"Нет доступа" });
+    }
+
+    if (!ids || !ids.length) {
+      return res.json({ success:false, error:"Нет ID" });
+    }
+
+    await pool.query(`
+      UPDATE zvk
+      SET acc_buh = 'Да',
+          acc_buh_time = NOW()
+      WHERE id = ANY($1::int[])
+    `, [ids.map(Number)]);
+
+    res.json({ success:true });
+
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ success:false, error:e.message });
+  }
+});
+
 
 // =====================================================
 // Start
