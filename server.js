@@ -1017,18 +1017,19 @@ app.get("/request-list", async (req, res) => {
 
     if (fullViewLogins.includes(login)) {
       r = await pool.query(`
-        SELECT
-          id,
-          request_no,
-          request_date,
-          created_by,
-          total_amount,
-          items_count,
-          workflow_stage,
-          agree_status,
-          archive_flag,
-          created_at
-        FROM public.request_head
+SELECT
+  id,
+  request_no,
+  request_date,
+  created_by,
+  total_amount,
+  items_count,
+  workflow_stage,
+  agree_status,
+  acc_buh_status,
+  archive_flag,
+  created_at
+FROM public.request_head
         WHERE COALESCE(archive_flag,'Нет') <> 'Да'
         ORDER BY id DESC
       `);
