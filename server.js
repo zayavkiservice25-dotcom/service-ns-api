@@ -3777,30 +3777,49 @@ app.post("/change-password", async (req, res) => {
 });
 
 app.post("/approve-rows", async (req, res) => {
-  try {
-    const { ids, login } = req.body;
+  const client = await pool.connect();
 
-    // 🔒 защита
-    if (login !== "S_Zhasulan") {
+  try {
+    const { ids, login } = req.body || {};
+
+    const actor = String(login || "").trim().toLowerCase();
+    if (actor !== "s_zhasulan") {
       return res.status(403).json({ success:false, error:"Нет доступа" });
     }
 
-    if (!ids || !ids.length) {
-      return res.json({ success:false, error:"Нет ID" });
+    const rowIds = Array.isArray(ids)
+      ? ids.map(x => Number(x)).filter(Boolean)
+      : [];
+
+    if (!rowIds.length) {
+      return res.status(400).json({ success:false, error:"ids required" });
     }
 
-    await pool.query(`
-      UPDATE zvk
-      SET acc_buh = 'Да',
-          acc_buh_time = NOW()
-      WHERE id = ANY($1::int[])
-    `, [ids.map(Number)]);
+    await client.query("BEGIN");
 
-    res.json({ success:true });
+    await client.query(`
+      INSERT INTO public.zvk_status (zvk_row_id, status_time, chief_approved)
+      SELECT
+        z.id,
+        NOW(),
+        'Да'
+      FROM public.zvk z
+      WHERE z.id = ANY($1::bigint[])
+      ON CONFLICT (zvk_row_id)
+      DO UPDATE SET
+        status_time = NOW(),
+        chief_approved = 'Да'
+    `, [rowIds]);
 
+    await client.query("COMMIT");
+
+    return res.json({ success:true, updated: rowIds.length });
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ success:false, error:e.message });
+    await client.query("ROLLBACK");
+    console.error("APPROVE-ROWS ERROR:", e);
+    return res.status(500).json({ success:false, error:e.message });
+  } finally {
+    client.release();
   }
 });
 
