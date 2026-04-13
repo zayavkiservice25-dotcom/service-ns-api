@@ -1081,26 +1081,29 @@ app.get("/request-card", async (req, res) => {
     }
 
     const itemsRes = await pool.query(`
-      SELECT
-        request_id,
-        zvk_row_id,
-        id_ft,
-        id_zvk,
-        object,
-        input_name,
-        contractor,
-        pay_purpose,
-        dds_article,
-        contract_no,
-        invoice_no,
-        invoice_date,
-        invoice_pdf,
-        src_d,
-        src_o,
-        to_pay
-      FROM public.request_items
-      WHERE request_id = $1
-      ORDER BY id
+SELECT
+  i.request_id,
+  i.zvk_row_id,
+  i.id_ft,
+  i.id_zvk,
+  i.object,
+  i.input_name,
+  i.contractor,
+  i.pay_purpose,
+  i.dds_article,
+  i.contract_no,
+  i.invoice_no,
+  i.invoice_date,
+  i.invoice_pdf,
+  i.src_d,
+  i.src_o,
+  i.to_pay,
+  COALESCE(s.chief_approved, '') AS chief_approved
+FROM public.request_items i
+LEFT JOIN public.zvk_status s
+  ON s.zvk_row_id = i.zvk_row_id
+WHERE i.request_id = $1
+ORDER BY i.id
     `, [id]);
 
     const logRes = await pool.query(`
