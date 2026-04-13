@@ -1386,57 +1386,30 @@ app.post("/zvk-save", async (req, res) => {
 // =====================================================
 app.post("/zvk-status-row", async (req, res) => {
   try {
-const {
-  zvk_row_id,
-  src_d,
-  src_o,
-  status_comment,
-  login,
-  is_admin,
-  can_edit_all,
-  is_all
-} = req.body;
+    const { zvk_row_id, src_d, src_o, status_comment } = req.body;
 
-    if (!zvk_row_id)
+    if (!zvk_row_id) {
       return res.status(400).json({ success:false, error:"zvk_row_id required" });
-
-    const rid = Number(zvk_row_id);
-    if (Number.isNaN(rid))
-      return res.status(400).json({ success:false, error:"zvk_row_id must be number" });
-
-    const actor = String(login || "").trim();
-    if (!actor) return res.status(400).json({ success:false, error:"login required" });
-
-    const adminOk = isTruthy(is_admin) || isTruthy(can_edit_all) || String(is_all || "0") === "1";
-
-    // ✅ НЕ админ -> можно менять ТОЛЬКО свои строки (по FT.input_name)
-    if (!adminOk) {
-      const ok = await canEditRowByLogin(pool, rid, actor);
-      if (!ok) return res.status(403).json({ success:false, error:"NO_RIGHTS_THIS_ROW" });
     }
 
-    // --- дальше твой upsert ---
-const r = await pool.query(
-  `
-  INSERT INTO zvk_status (zvk_row_id, status_time, src_d, src_o, status_comment)
-  VALUES ($1, NOW(), $2, $3, $4)
-  ON CONFLICT (zvk_row_id)
-  DO UPDATE SET
-    status_time = NOW(),
-    src_d = EXCLUDED.src_d,
-    src_o = EXCLUDED.src_o,
-    status_comment = EXCLUDED.status_comment
-  RETURNING *
-  `,
-  [
-    rid,
-    String(src_d || ""),
-    String(src_o || ""),
-    String(status_comment || "")
-  ]
-);
+    const r = await pool.query(`
+      INSERT INTO zvk_status (zvk_row_id, status_time, src_d, src_o, status_comment)
+      VALUES ($1, NOW(), $2, $3, $4)
+      ON CONFLICT (zvk_row_id)
+      DO UPDATE SET
+        status_time = NOW(),
+        src_d = COALESCE(EXCLUDED.src_d, zvk_status.src_d),
+        src_o = COALESCE(EXCLUDED.src_o, zvk_status.src_o),
+        status_comment = EXCLUDED.status_comment
+      RETURNING *
+    `, [
+      Number(zvk_row_id),
+      src_d || null,
+      src_o || null,
+      status_comment || ""
+    ]);
 
-    res.json({ success:true, row: r.rows[0] });
+    res.json({ success:true, row:r.rows[0] });
 
   } catch (e) {
     console.error("ZVK-STATUS-ROW ERROR:", e);
