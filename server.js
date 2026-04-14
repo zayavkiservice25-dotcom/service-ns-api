@@ -3843,73 +3843,96 @@ app.post("/change-password", async (req, res) => {
 });
 
 app.post("/approve-rows", async (req, res) => {
-  const client = await pool.connect();
-
   try {
-    const { ids, login, request_id } = req.body || {};
+    const { ids, login, request_id } = req.body;
 
-    const actor = String(login || "").trim().toLowerCase();
-    if (actor !== "s_zhasulan") {
-      return res.status(403).json({ success:false, error:"Нет доступа" });
+    if (!Array.isArray(ids) || !ids.length) {
+      return res.status(400).json({ success: false, error: "ids required" });
+    }
+    if (!login) {
+      return res.status(400).json({ success: false, error: "login required" });
+    }
+    if (!request_id) {
+      return res.status(400).json({ success: false, error: "request_id required" });
     }
 
-    const rowIds = Array.isArray(ids)
-      ? ids.map(x => Number(x)).filter(Boolean)
-      : [];
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
 
-    if (!rowIds.length) {
-      return res.status(400).json({ success:false, error:"ids required" });
-    }
+      const isChief = login === "S_Zhasulan";   // <- ваш логин ГлавБухг
+      const isAdmin = login === "B_Erkin";      // <- замените на логин Админа
 
-    await client.query("BEGIN");
+      if (!isChief && !isAdmin) {
+        throw new Error("Нет прав на согласование");
+      }
 
-    await client.query(`
-      INSERT INTO public.zvk_status (
-        zvk_row_id,
-        status_time,
-        chief_approved
-      )
-      SELECT
-        z.id,
-        NOW(),
-        'Да'
-      FROM public.zvk z
-      WHERE z.id = ANY($1::bigint[])
-      ON CONFLICT (zvk_row_id)
-      DO UPDATE SET
-        status_time = NOW(),
-        chief_approved = 'Да'
-    `, [rowIds]);
+      if (isChief) {
+        await client.query(`
+          UPDATE zvk
+          SET chief_approved = 'Да',
+              chief_approved_by = $1,
+              chief_approved_at = NOW()
+          WHERE id = ANY($2::int[])
+            AND request_id = $3
+        `, [login, ids, request_id]);
+      }
 
-    if (Number(request_id)) {
+      if (isAdmin) {
+        await client.query(`
+          UPDATE zvk
+          SET admin_approved = 'Да',
+              admin_approved_by = $1,
+              admin_approved_at = NOW()
+          WHERE id = ANY($2::int[])
+            AND request_id = $3
+            AND chief_approved = 'Да'
+        `, [login, ids, request_id]);
+      }
+
+      // пересчет шапки заявки
       await client.query(`
-        UPDATE public.request_head
-        SET
-          acc_buh_status = 'Согласовано',
-          acc_buh_time = NOW(),
-          workflow_stage = 'Согласовано',
-          agree_status = 'Согласовано'
-        WHERE id = $1
-      `, [Number(request_id)]);
+        UPDATE requests r
+        SET chief_approved_rows = x.chief_cnt,
+            admin_approved_rows = x.admin_cnt,
+            registry_flag = CASE
+              WHEN x.total_cnt > 0 AND x.admin_cnt = x.total_cnt THEN 'Да'
+              ELSE 'Нет'
+            END,
+            agree_status = CASE
+              WHEN x.total_cnt > 0 AND x.admin_cnt = x.total_cnt THEN 'Согласовано'
+              WHEN x.total_cnt > 0 AND x.chief_cnt = x.total_cnt THEN 'На согласовании у Админа'
+              WHEN x.chief_cnt > 0 THEN 'Частично согласовано ГлавБухг'
+              ELSE 'На согласовании у ГлавБухг'
+            END
+        FROM (
+          SELECT
+            request_id,
+            COUNT(*) AS total_cnt,
+            COUNT(*) FILTER (WHERE chief_approved = 'Да') AS chief_cnt,
+            COUNT(*) FILTER (WHERE admin_approved = 'Да') AS admin_cnt
+          FROM zvk
+          WHERE request_id = $1
+          GROUP BY request_id
+        ) x
+        WHERE r.id = x.request_id
+      `, [request_id]);
 
-      await client.query(`
-        INSERT INTO public.request_approve_log
-          (request_id, stage_name, approver_login, approver_name, action_type, comment_text)
-        VALUES ($1, 'Главный бухгалтер', $2, $2, 'approve', 'Согласовано по выбранным строкам')
-      `, [Number(request_id), String(login || "")]);
+      await client.query("COMMIT");
+      res.json({ success: true });
+
+    } catch (e) {
+      await client.query("ROLLBACK");
+      res.status(500).json({ success: false, error: e.message });
+    } finally {
+      client.release();
     }
-
-    await client.query("COMMIT");
-    return res.json({ success:true, updated: rowIds.length });
 
   } catch (e) {
-    await client.query("ROLLBACK");
-    console.error("APPROVE-ROWS ERROR:", e);
-    return res.status(500).json({ success:false, error:e.message });
-  } finally {
-    client.release();
+    res.status(500).json({ success: false, error: e.message });
   }
 });
+
 
 // =====================================================
 // Start
