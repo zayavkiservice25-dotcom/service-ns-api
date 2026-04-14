@@ -3839,7 +3839,6 @@ app.post("/approve-rows", async (req, res) => {
           agree_status = 'Согласовано'
         WHERE id = $1
       `, [request_id]);
-
     } else {
       throw new Error("У пользователя нет прав на согласование");
     }
