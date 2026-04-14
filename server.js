@@ -740,7 +740,7 @@ app.post("/login", async (req, res) => {
 
 app.get("/profile", async (req, res) => {
   try {
-    const login = String(req.query.login || "").trim();
+    const login = String(req.query.login || "").trim().toLowerCase();
 
     if (!login) {
       return res.status(400).json({
@@ -755,13 +755,13 @@ app.get("/profile", async (req, res) => {
         login,
         email,
         phone,
+        role,
         first_name,
         last_name,
         middle_name,
-        role,
         is_active
       FROM public.users
-      WHERE lower(trim(login)) = lower(trim($1))
+      WHERE lower(trim(login)) = $1
       LIMIT 1
     `, [login]);
 
@@ -776,6 +776,7 @@ app.get("/profile", async (req, res) => {
       success: true,
       user: r.rows[0]
     });
+
   } catch (e) {
     console.error("PROFILE ERROR:", e);
     return res.status(500).json({
