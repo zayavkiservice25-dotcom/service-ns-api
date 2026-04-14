@@ -555,19 +555,24 @@ app.post("/register", async (req, res) => {
   try {
     const {
       email,
+      login,
       password,
       phone,
       last_name,
       first_name,
-      middle_name,
-      organization_name
+      middle_name
     } = req.body || {};
 
     const emailNorm = normalizeEmail(email);
+    const loginNorm = String(login || "").trim().toLowerCase();
     const pass = String(password || "").trim();
 
     if (!emailNorm) {
       return res.status(400).json({ success:false, message:"Почта обязательна" });
+    }
+
+    if (!loginNorm) {
+      return res.status(400).json({ success:false, message:"Логин обязателен" });
     }
 
     if (!pass) {
@@ -578,40 +583,52 @@ app.post("/register", async (req, res) => {
       return res.status(400).json({ success:false, message:"Имя и фамилия обязательны" });
     }
 
-    const exists = await pool.query(
+    const emailExists = await pool.query(
       `SELECT id FROM public.users WHERE lower(trim(email)) = $1 LIMIT 1`,
       [emailNorm]
     );
 
-    if (exists.rowCount > 0) {
+    if (emailExists.rowCount > 0) {
       return res.status(400).json({
         success:false,
         message:"Пользователь с такой почтой уже существует"
       });
     }
 
+    const loginExists = await pool.query(
+      `SELECT id FROM public.users WHERE lower(trim(login)) = $1 LIMIT 1`,
+      [loginNorm]
+    );
+
+    if (loginExists.rowCount > 0) {
+      return res.status(400).json({
+        success:false,
+        message:"Пользователь с таким логином уже существует"
+      });
+    }
+
     const r = await pool.query(`
       INSERT INTO public.users (
         email,
+        login,
         password,
         phone,
         last_name,
         first_name,
         middle_name,
-        organization_name,
         role,
         is_active
       )
       VALUES ($1,$2,$3,$4,$5,$6,$7,'user',true)
-      RETURNING id, email, role, first_name, last_name
+      RETURNING id, email, login, role, first_name, last_name
     `, [
       emailNorm,
+      loginNorm,
       pass,
       phone ? String(phone).trim() : null,
       last_name ? String(last_name).trim() : null,
       first_name ? String(first_name).trim() : null,
-      middle_name ? String(middle_name).trim() : null,
-      organization_name ? String(organization_name).trim() : null
+      middle_name ? String(middle_name).trim() : null
     ]);
 
     return res.json({
@@ -628,27 +645,29 @@ app.post("/register", async (req, res) => {
   }
 });
 
+
 app.post("/login", async (req, res) => {
   try {
-    const { email, password } = req.body || {};
+    const { login, password } = req.body || {};
 
-    const emailNorm = normalizeEmail(email);
+    const loginNorm = String(login || "").trim().toLowerCase();
     const pass = String(password || "").trim();
 
-    if (!emailNorm || !pass) {
+    if (!loginNorm || !pass) {
       return res.status(400).json({
         success:false,
-        message:"Введите почту и пароль"
+        message:"Введите логин и пароль"
       });
     }
 
     // тестовый админ
-    if (emailNorm === "admin" && pass === "admin") {
+    if (loginNorm === "admin" && pass === "admin") {
       return res.json({
         success:true,
         user:{
           id: 0,
           email:"admin",
+          login:"admin",
           role:"admin",
           first_name:"Admin",
           last_name:"Test"
@@ -660,18 +679,18 @@ app.post("/login", async (req, res) => {
       SELECT
         id,
         email,
+        login,
         password,
         role,
         is_active,
         first_name,
         last_name,
         middle_name,
-        organization_name,
         phone
       FROM public.users
-      WHERE lower(trim(email)) = $1
+      WHERE lower(trim(login)) = $1
       LIMIT 1
-    `, [emailNorm]);
+    `, [loginNorm]);
 
     if (!r.rowCount) {
       return res.status(401).json({
@@ -701,11 +720,11 @@ app.post("/login", async (req, res) => {
       user:{
         id:user.id,
         email:user.email,
+        login:user.login,
         role:user.role,
         first_name:user.first_name,
         last_name:user.last_name,
         middle_name:user.middle_name,
-        organization_name:user.organization_name,
         phone:user.phone
       }
     });
