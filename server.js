@@ -1065,37 +1065,7 @@ app.get("/request-list", async (req, res) => {
   }
 });
 
-const itemsRes = await pool.query(`
-  SELECT
-    i.request_id,
-    i.zvk_row_id,
-    i.id_ft,
-    i.id_zvk,
-    i.object,
-    i.input_name,
-    i.contractor,
-    i.pay_purpose,
-    i.dds_article,
-    i.contract_no,
-    i.invoice_no,
-    i.invoice_date,
-    i.invoice_pdf,
-    i.src_d,
-    i.src_o,
-    i.to_pay,
-    COALESCE(s.chief_approved, '') AS chief_approved,
-    CASE
-      WHEN COALESCE(h.acc_zam_status, '') = 'Согласовано' THEN 'Да'
-      ELSE ''
-    END AS admin_approved
-  FROM public.request_items i
-  LEFT JOIN public.zvk_status s
-    ON s.zvk_row_id = i.zvk_row_id
-  LEFT JOIN public.request_head h
-    ON h.id = i.request_id
-  WHERE i.request_id = $1
-  ORDER BY i.id
-`, [id]);
+
 
 app.post("/request-approve", async (req, res) => {
   const client = await pool.connect();
