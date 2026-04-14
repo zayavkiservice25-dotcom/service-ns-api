@@ -1006,121 +1006,56 @@ await client.query(`
 
 app.get("/request-list", async (req, res) => {
   try {
-    const login = String(req.query.login || "").trim().toLowerCase();
-    if (!login) {
-      return res.status(400).json({ success:false, error:"login required" });
-    }
+    const { login } = req.query;
 
-    const fullViewLogins = ["s_zhasulan", "b_erkin"];
+    const q = `
+      SELECT
+        r.id,
+        r.request_no,
+        r.request_date,
+        r.created_by,
+        r.total_amount,
+        r.items_count,
+        r.workflow_stage,
+        r.agree_status,
 
-    let r;
+        COALESCE(x.total_rows, 0) AS total_rows,
+        COALESCE(x.chief_approved_rows, 0) AS chief_approved_rows,
+        COALESCE(x.admin_approved_rows, 0) AS admin_approved_rows,
+        COALESCE(x.approved_zfts_chief, '') AS approved_zfts_chief,
+        COALESCE(x.approved_zfts_admin, '') AS approved_zfts_admin
 
-    if (fullViewLogins.includes(login)) {
-      r = await pool.query(`
+      FROM requests r
+      LEFT JOIN (
         SELECT
-          h.id,
-          h.request_no,
-          h.request_date,
-          h.created_by,
-          h.total_amount,
-          h.items_count,
-          h.workflow_stage,
-          h.agree_status,
-          h.acc_buh_status,
-          h.archive_flag,
-          h.created_at,
-
-          COUNT(i.id) AS total_rows,
-          COUNT(*) FILTER (
-            WHERE COALESCE(s.chief_approved, '') = 'Да'
-          ) AS approved_rows,
+          z.request_id,
+          COUNT(*) AS total_rows,
+          COUNT(*) FILTER (WHERE z.chief_approved = 'Да') AS chief_approved_rows,
+          COUNT(*) FILTER (WHERE z.admin_approved = 'Да') AS admin_approved_rows,
 
           STRING_AGG(
-            DISTINCT CASE
-              WHEN COALESCE(s.chief_approved, '') = 'Да' THEN i.id_zvk
-              ELSE NULL
-            END,
-            ', '
-          ) AS approved_zfts
-
-        FROM public.request_head h
-        LEFT JOIN public.request_items i
-          ON i.request_id = h.id
-        LEFT JOIN public.zvk_status s
-          ON s.zvk_row_id = i.zvk_row_id
-
-        WHERE COALESCE(h.archive_flag, 'Нет') <> 'Да'
-        GROUP BY
-          h.id,
-          h.request_no,
-          h.request_date,
-          h.created_by,
-          h.total_amount,
-          h.items_count,
-          h.workflow_stage,
-          h.agree_status,
-          h.acc_buh_status,
-          h.archive_flag,
-          h.created_at
-        ORDER BY h.id DESC
-      `);
-    } else {
-      r = await pool.query(`
-        SELECT
-          h.id,
-          h.request_no,
-          h.request_date,
-          h.created_by,
-          h.total_amount,
-          h.items_count,
-          h.workflow_stage,
-          h.agree_status,
-          h.acc_buh_status,
-          h.archive_flag,
-          h.created_at,
-
-          COUNT(i.id) AS total_rows,
-          COUNT(*) FILTER (
-            WHERE COALESCE(s.chief_approved, '') = 'Да'
-          ) AS approved_rows,
+            CASE WHEN z.chief_approved = 'Да' THEN COALESCE(z.id_zvk::text, z.id::text) END,
+            ', ' ORDER BY z.id
+          ) AS approved_zfts_chief,
 
           STRING_AGG(
-            DISTINCT CASE
-              WHEN COALESCE(s.chief_approved, '') = 'Да' THEN i.id_zvk
-              ELSE NULL
-            END,
-            ', '
-          ) AS approved_zfts
+            CASE WHEN z.admin_approved = 'Да' THEN COALESCE(z.id_zvk::text, z.id::text) END,
+            ', ' ORDER BY z.id
+          ) AS approved_zfts_admin
 
-        FROM public.request_head h
-        LEFT JOIN public.request_items i
-          ON i.request_id = h.id
-        LEFT JOIN public.zvk_status s
-          ON s.zvk_row_id = i.zvk_row_id
+        FROM zvk z
+        GROUP BY z.request_id
+      ) x ON x.request_id = r.id
 
-        WHERE lower(trim(h.created_by)) = lower(trim($1))
-          AND COALESCE(h.archive_flag, 'Нет') <> 'Да'
-        GROUP BY
-          h.id,
-          h.request_no,
-          h.request_date,
-          h.created_by,
-          h.total_amount,
-          h.items_count,
-          h.workflow_stage,
-          h.agree_status,
-          h.acc_buh_status,
-          h.archive_flag,
-          h.created_at
-        ORDER BY h.id DESC
-      `, [login]);
-    }
+      ORDER BY r.request_date DESC, r.id DESC
+    `;
 
-    res.json({ success:true, rows:r.rows });
+    const { rows } = await pool.query(q);
+    return res.json({ success: true, rows });
 
   } catch (e) {
-    console.error("REQUEST-LIST ERROR:", e);
-    res.status(500).json({ success:false, error:e.message });
+    console.error("request-list error:", e);
+    return res.status(500).json({ success: false, error: e.message });
   }
 });
 
@@ -3843,6 +3778,7 @@ app.post("/change-password", async (req, res) => {
 });
 
 app.post("/approve-rows", async (req, res) => {
+  const client = await pool.connect();
   try {
     const { ids, login, request_id } = req.body;
 
@@ -3856,80 +3792,74 @@ app.post("/approve-rows", async (req, res) => {
       return res.status(400).json({ success: false, error: "request_id required" });
     }
 
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
+    await client.query("BEGIN");
 
-      const isChief = login === "S_Zhasulan";   // <- ваш логин ГлавБухг
-      const isAdmin = login === "B_Erkin";      // <- замените на логин Админа
+    const normIds = ids.map(x => Number(x)).filter(Number.isFinite);
 
-      if (!isChief && !isAdmin) {
-        throw new Error("Нет прав на согласование");
-      }
-
-      if (isChief) {
-        await client.query(`
-          UPDATE zvk
-          SET chief_approved = 'Да',
-              chief_approved_by = $1,
-              chief_approved_at = NOW()
-          WHERE id = ANY($2::int[])
-            AND request_id = $3
-        `, [login, ids, request_id]);
-      }
-
-      if (isAdmin) {
-        await client.query(`
-          UPDATE zvk
-          SET admin_approved = 'Да',
-              admin_approved_by = $1,
-              admin_approved_at = NOW()
-          WHERE id = ANY($2::int[])
-            AND request_id = $3
-            AND chief_approved = 'Да'
-        `, [login, ids, request_id]);
-      }
-
-      // пересчет шапки заявки
-      await client.query(`
-        UPDATE requests r
-        SET chief_approved_rows = x.chief_cnt,
-            admin_approved_rows = x.admin_cnt,
-            registry_flag = CASE
-              WHEN x.total_cnt > 0 AND x.admin_cnt = x.total_cnt THEN 'Да'
-              ELSE 'Нет'
-            END,
-            agree_status = CASE
-              WHEN x.total_cnt > 0 AND x.admin_cnt = x.total_cnt THEN 'Согласовано'
-              WHEN x.total_cnt > 0 AND x.chief_cnt = x.total_cnt THEN 'На согласовании у Админа'
-              WHEN x.chief_cnt > 0 THEN 'Частично согласовано ГлавБухг'
-              ELSE 'На согласовании у ГлавБухг'
-            END
-        FROM (
-          SELECT
-            request_id,
-            COUNT(*) AS total_cnt,
-            COUNT(*) FILTER (WHERE chief_approved = 'Да') AS chief_cnt,
-            COUNT(*) FILTER (WHERE admin_approved = 'Да') AS admin_cnt
-          FROM zvk
-          WHERE request_id = $1
-          GROUP BY request_id
-        ) x
-        WHERE r.id = x.request_id
-      `, [request_id]);
-
-      await client.query("COMMIT");
-      res.json({ success: true });
-
-    } catch (e) {
-      await client.query("ROLLBACK");
-      res.status(500).json({ success: false, error: e.message });
-    } finally {
-      client.release();
+    if (!normIds.length) {
+      throw new Error("correct ids required");
     }
 
+    if (login === "S_Zhasulan") {
+      await client.query(`
+        UPDATE zvk
+           SET chief_approved    = 'Да',
+               chief_approved_by = $1,
+               chief_approved_at = NOW()
+         WHERE id = ANY($2::int[])
+           AND request_id = $3
+      `, [login, normIds, request_id]);
+
+    } else if (login === "B_Erkin") {
+      await client.query(`
+        UPDATE zvk
+           SET admin_approved    = 'Да',
+               admin_approved_by = $1,
+               admin_approved_at = NOW()
+         WHERE id = ANY($2::int[])
+           AND request_id = $3
+           AND chief_approved = 'Да'
+      `, [login, normIds, request_id]);
+
+    } else {
+      throw new Error("У пользователя нет прав на согласование");
+    }
+
+    await client.query(`
+      UPDATE requests r
+         SET agree_status = CASE
+               WHEN x.total_rows > 0 AND x.admin_approved_rows = x.total_rows THEN 'Согласовано'
+               WHEN x.total_rows > 0 AND x.chief_approved_rows = x.total_rows THEN 'На согласовании у Админа'
+               WHEN x.chief_approved_rows > 0 THEN 'Частично согласовано'
+               ELSE 'На согласовании у ГлавБухг'
+             END,
+             workflow_stage = CASE
+               WHEN x.total_rows > 0 AND x.admin_approved_rows = x.total_rows THEN 'Завершено'
+               WHEN x.total_rows > 0 AND x.chief_approved_rows = x.total_rows THEN 'Админ'
+               ELSE 'ГлавБухг'
+             END
+      FROM (
+        SELECT
+          request_id,
+          COUNT(*) AS total_rows,
+          COUNT(*) FILTER (WHERE chief_approved = 'Да') AS chief_approved_rows,
+          COUNT(*) FILTER (WHERE admin_approved = 'Да') AS admin_approved_rows
+        FROM zvk
+        WHERE request_id = $1
+        GROUP BY request_id
+      ) x
+      WHERE r.id = x.request_id
+    `, [request_id]);
+
+    await client.query("COMMIT");
+    return res.json({ success: true });
+
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    await client.query("ROLLBACK");
+    console.error("approve-rows error:", e);
+    return res.status(500).json({ success: false, error: e.message });
+  } finally {
+    client.release();
   }
 });
 
