@@ -738,6 +738,81 @@ app.post("/login", async (req, res) => {
   }
 });
 
+app.get("/profile", async (req, res) => {
+  try {
+    const login = String(req.query.login || "").trim();
+
+    if (!login) {
+      return res.status(400).json({
+        success: false,
+        message: "Не передан login"
+      });
+    }
+
+    const r = await pool.query(`
+      SELECT
+        id,
+        login,
+        email,
+        phone,
+        first_name,
+        last_name,
+        middle_name,
+        role,
+        is_active
+      FROM public.users
+      WHERE lower(trim(login)) = lower(trim($1))
+      LIMIT 1
+    `, [login]);
+
+    if (!r.rowCount) {
+      return res.status(404).json({
+        success: false,
+        message: "Пользователь не найден"
+      });
+    }
+
+    return res.json({
+      success: true,
+      user: r.rows[0]
+    });
+  } catch (e) {
+    console.error("PROFILE ERROR:", e);
+    return res.status(500).json({
+      success: false,
+      message: "Ошибка сервера"
+    });
+  }
+});
+
+app.get("/employees", async (req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT
+        id,
+        login,
+        first_name,
+        last_name,
+        middle_name,
+        role,
+        is_active
+      FROM public.users
+      ORDER BY last_name, first_name
+    `);
+
+    return res.json({
+      success: true,
+      rows: r.rows
+    });
+
+  } catch (e) {
+    console.error("EMPLOYEES ERROR:", e);
+    return res.status(500).json({
+      success: false,
+      message: "Ошибка сервера"
+    });
+  }
+});
 
 app.post("/forgot-password", async (req, res) => {
   try {
