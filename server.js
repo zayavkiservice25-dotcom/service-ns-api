@@ -3895,39 +3895,56 @@ app.post("/approve-rows", async (req, res) => {
         WHERE h.id = x.request_id
       `, [request_id]);
 
-    } else if (loginNorm === "B_Erkin") {
-      const checkRes = await client.query(`
-        SELECT
-          COUNT(*) AS total_rows,
-          COUNT(*) FILTER (WHERE COALESCE(s.chief_approved,'') = 'Да') AS chief_approved_rows
-        FROM public.request_items i
-        LEFT JOIN public.zvk_status s
-          ON s.zvk_row_id = i.zvk_row_id
-        WHERE i.request_id = $1
-      `, [request_id]);
+    }} else if (loginNorm === "B_Erkin") {
+  const checkRes = await client.query(`
+    SELECT
+      COUNT(*) AS total_rows,
+      COUNT(*) FILTER (WHERE COALESCE(s.chief_approved,'') = 'Да') AS chief_approved_rows
+    FROM public.request_items i
+    LEFT JOIN public.zvk_status s
+      ON s.zvk_row_id = i.zvk_row_id
+    WHERE i.request_id = $1
+  `, [request_id]);
 
-      const totalRows = Number(checkRes.rows[0]?.total_rows || 0);
-      const chiefApprovedRows = Number(checkRes.rows[0]?.chief_approved_rows || 0);
+  const totalRows = Number(checkRes.rows[0]?.total_rows || 0);
+  const chiefApprovedRows = Number(checkRes.rows[0]?.chief_approved_rows || 0);
 
-      if (!totalRows) {
-        throw new Error("request items not found");
-      }
+  if (!totalRows) {
+    throw new Error("request items not found");
+  }
 
-      if (chiefApprovedRows !== totalRows) {
-        throw new Error("Сначала ГлавБухг должен согласовать все строки");
-      }
+  if (chiefApprovedRows !== totalRows) {
+    throw new Error("Сначала ГлавБухг должен согласовать все строки");
+  }
 
-      await client.query(`
-        UPDATE public.request_head
-        SET
-          acc_zam_name = 'Еркин',
-          acc_zam_status = 'Согласовано',
-          acc_zam_time = NOW(),
-          workflow_stage = 'Завершено',
-          agree_status = 'Согласовано'
-        WHERE id = $1
-      `, [request_id]);
-    } else {
+  // 1. Обновляем шапку заявки
+  await client.query(`
+    UPDATE public.request_head
+    SET
+      acc_zam_name = 'Еркин',
+      acc_zam_status = 'Согласовано',
+      acc_zam_time = NOW(),
+      workflow_stage = 'Завершено',
+      agree_status = 'Согласовано'
+    WHERE id = $1
+  `, [request_id]);
+
+  // 2. Ставим Реестр = Да по всем строкам заявки
+  await client.query(`
+    INSERT INTO public.zvk_pay (zvk_row_id, registry_flag, agree_time)
+    SELECT
+      i.zvk_row_id,
+      'Да',
+      NOW()
+    FROM public.request_items i
+    WHERE i.request_id = $1
+      AND i.zvk_row_id IS NOT NULL
+    ON CONFLICT (zvk_row_id)
+    DO UPDATE SET
+      registry_flag = 'Да',
+      agree_time = COALESCE(zvk_pay.agree_time, NOW())
+  `, [request_id]);
+} else {
       throw new Error("У пользователя нет прав на согласование");
     }
 
