@@ -138,6 +138,16 @@ async function initDb()  {
     );
   `);
 
+await pool.query(`
+  ALTER TABLE public.zvk_status
+  ADD COLUMN IF NOT EXISTS status_comment text;
+`);
+
+await pool.query(`
+  ALTER TABLE public.zvk_status
+  ADD COLUMN IF NOT EXISTS chief_approved text;
+`);
+
   await pool.query(`
     CREATE UNIQUE INDEX IF NOT EXISTS zvk_status_row_uq
     ON zvk_status (zvk_row_id);
@@ -1073,6 +1083,84 @@ app.get("/request-list", async (req, res) => {
   }
 });
 
+
+app.get("/request-card", async (req, res) => {
+  try {
+    const id = Number(req.query.id);
+
+    if (!id) {
+      return res.status(400).json({ success:false, error:"id required" });
+    }
+
+    const headRes = await pool.query(`
+      SELECT *
+      FROM public.request_head
+      WHERE id = $1
+      LIMIT 1
+    `, [id]);
+
+    if (!headRes.rows.length) {
+      return res.status(404).json({ success:false, error:"request not found" });
+    }
+
+    const itemsRes = await pool.query(`
+      SELECT
+        i.request_id,
+        i.zvk_row_id,
+        i.id_ft,
+        i.id_zvk,
+        i.object,
+        i.input_name,
+        i.contractor,
+        i.pay_purpose,
+        i.dds_article,
+        i.contract_no,
+        i.invoice_no,
+        i.invoice_date,
+        i.invoice_pdf,
+        i.src_d,
+        i.src_o,
+        i.to_pay,
+        COALESCE(s.chief_approved, '') AS chief_approved,
+        CASE
+          WHEN COALESCE(h.acc_zam_status, '') = 'Согласовано' THEN 'Да'
+          ELSE ''
+        END AS admin_approved
+      FROM public.request_items i
+      LEFT JOIN public.zvk_status s
+        ON s.zvk_row_id = i.zvk_row_id
+      LEFT JOIN public.request_head h
+        ON h.id = i.request_id
+      WHERE i.request_id = $1
+      ORDER BY i.id
+    `, [id]);
+
+    const logRes = await pool.query(`
+      SELECT
+        id,
+        stage_name,
+        approver_login,
+        approver_name,
+        action_type,
+        comment_text,
+        created_at
+      FROM public.request_approve_log
+      WHERE request_id = $1
+      ORDER BY id
+    `, [id]);
+
+    res.json({
+      success:true,
+      head: headRes.rows[0],
+      items: itemsRes.rows,
+      log: logRes.rows
+    });
+
+  } catch (e) {
+    console.error("REQUEST-CARD ERROR:", e);
+    res.status(500).json({ success:false, error:e.message });
+  }
+});
 
 
 app.post("/request-approve", async (req, res) => {
