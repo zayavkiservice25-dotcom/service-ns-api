@@ -3895,7 +3895,7 @@ app.post("/approve-rows", async (req, res) => {
         WHERE h.id = x.request_id
       `, [request_id]);
 
-    }} else if (loginNorm === "B_Erkin") {
+    } else if (loginNorm === "B_Erkin") {
   const checkRes = await client.query(`
     SELECT
       COUNT(*) AS total_rows,
