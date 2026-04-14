@@ -1006,8 +1006,6 @@ await client.query(`
 
 app.get("/request-list", async (req, res) => {
   try {
-    const login = String(req.query.login || "").trim();
-
     const q = `
       SELECT
         h.id,
@@ -1023,33 +1021,42 @@ app.get("/request-list", async (req, res) => {
         COALESCE(x.chief_approved_rows, 0) AS chief_approved_rows,
 
         CASE
-          WHEN COALESCE(h.acc_zam_status, '') = 'Согласовано' THEN COALESCE(x.total_rows, 0)
+          WHEN COALESCE(h.acc_zam_status, '') = 'Согласовано'
+          THEN COALESCE(x.total_rows, 0)
           ELSE 0
         END AS admin_approved_rows,
 
         COALESCE(x.approved_zfts_chief, '') AS approved_zfts_chief,
 
         CASE
-          WHEN COALESCE(h.acc_zam_status, '') = 'Согласовано' THEN 'Да'
+          WHEN COALESCE(h.acc_zam_status, '') = 'Согласовано'
+          THEN 'Да'
           ELSE ''
         END AS approved_zfts_admin
 
       FROM public.request_head h
+
       LEFT JOIN (
         SELECT
           i.request_id,
           COUNT(*) AS total_rows,
-          COUNT(*) FILTER (WHERE COALESCE(s.chief_approved,'') = 'Да') AS chief_approved_rows,
+
+          COUNT(*) FILTER (
+            WHERE COALESCE(s.chief_approved,'') = 'Да'
+          ) AS chief_approved_rows,
+
           STRING_AGG(
             CASE
               WHEN COALESCE(s.chief_approved,'') = 'Да'
               THEN COALESCE(i.id_zvk::text, i.zvk_row_id::text)
             END,
-            ', ' ORDER BY i.id
+            ', '
           ) AS approved_zfts_chief
+
         FROM public.request_items i
         LEFT JOIN public.zvk_status s
           ON s.zvk_row_id = i.zvk_row_id
+
         GROUP BY i.request_id
       ) x ON x.request_id = h.id
 
@@ -1057,11 +1064,12 @@ app.get("/request-list", async (req, res) => {
     `;
 
     const { rows } = await pool.query(q);
-    return res.json({ success: true, rows });
+
+    res.json({ success: true, rows });
 
   } catch (e) {
     console.error("request-list error:", e);
-    return res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: e.message });
   }
 });
 
