@@ -690,6 +690,8 @@ app.post("/login", async (req, res) => {
     const loginNorm = String(login || "").trim().toLowerCase();
     const pass = String(password || "").trim();
 
+    console.log("LOGIN TRY:", { loginNorm });
+
     if (!loginNorm || !pass) {
       return res.status(400).json({
         success:false,
@@ -697,40 +699,42 @@ app.post("/login", async (req, res) => {
       });
     }
 
-    // тестовый админ
-if (loginNorm === "admin" && pass === "admin") {
-  return res.json({
-    success:true,
-    user:{
-      id: 0,
-      email:"admin",
-      login:"admin",
-      role:"admin",
-      role_ft:"admin",
-      role_hr:"admin",
-      first_name:"Admin",
-      last_name:"Test"
+    if (loginNorm === "admin" && pass === "admin") {
+      return res.json({
+        success:true,
+        user:{
+          id: 0,
+          email:"admin",
+          login:"admin",
+          role:"admin",
+          role_ft:"admin",
+          role_hr:"admin",
+          first_name:"Admin",
+          last_name:"Test"
+        }
+      });
     }
-  });
-}
-const r = await pool.query(`
-  SELECT
-    id,
-    email,
-    login,
-    password,
-    role,
-    role_ft,
-    role_hr,
-    is_active,
-    first_name,
-    last_name,
-    middle_name,
-    phone
-  FROM public.users
-  WHERE lower(trim(login)) = $1
-  LIMIT 1
-`, [loginNorm]);
+
+    const r = await pool.query(`
+      SELECT
+        id,
+        email,
+        login,
+        password,
+        role,
+        role_ft,
+        role_hr,
+        is_active,
+        first_name,
+        last_name,
+        middle_name,
+        phone
+      FROM public.users
+      WHERE lower(trim(login)) = $1
+      LIMIT 1
+    `, [loginNorm]);
+
+    console.log("LOGIN QUERY ROWS:", r.rowCount);
 
     if (!r.rowCount) {
       return res.status(401).json({
@@ -761,7 +765,6 @@ return res.json({
     id:user.id,
     email:user.email,
     login:user.login,
-    role:user.role,
     role_ft:user.role_ft,
     role_hr:user.role_hr,
     first_name:user.first_name,
@@ -770,12 +773,12 @@ return res.json({
     phone:user.phone
   }
 });
-
   } catch (e) {
-    console.error("LOGIN ERROR:", e);
+    console.error("LOGIN ERROR FULL:", e);
     return res.status(500).json({
       success:false,
-      message:"Ошибка сервера"
+      message:"Ошибка сервера",
+      error:String(e.message || e)
     });
   }
 });
@@ -836,7 +839,6 @@ SELECT
   first_name,
   middle_name,
   organization_name,
-  role,
   role_ft,
   role_hr,
   is_active,
