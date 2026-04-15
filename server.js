@@ -740,16 +740,16 @@ app.post("/login", async (req, res) => {
 
 app.get("/profile", async (req, res) => {
   try {
-    const login = String(req.query.login || "").trim().toLowerCase();
+    const login = String(req.query.login || "").trim();
 
     if (!login) {
       return res.status(400).json({
         success: false,
-        message: "Не передан login"
+        message: "Логин не передан"
       });
     }
 
-    const r = await pool.query(`
+    const q = await pool.query(`
       SELECT
         id,
         login,
@@ -761,25 +761,25 @@ app.get("/profile", async (req, res) => {
         middle_name,
         is_active
       FROM public.users
-      WHERE lower(trim(login)) = $1
+      WHERE lower(trim(login)) = lower(trim($1))
       LIMIT 1
     `, [login]);
 
-    if (!r.rowCount) {
+    if (!q.rows.length) {
       return res.status(404).json({
         success: false,
         message: "Пользователь не найден"
       });
     }
 
-    return res.json({
+    res.json({
       success: true,
-      user: r.rows[0]
+      user: q.rows[0]
     });
 
   } catch (e) {
     console.error("PROFILE ERROR:", e);
-    return res.status(500).json({
+    res.status(500).json({
       success: false,
       message: "Ошибка сервера"
     });
