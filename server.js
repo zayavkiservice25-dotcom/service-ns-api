@@ -297,6 +297,16 @@ await pool.query(`
 `);
 
 
+await pool.query(`
+  ALTER TABLE public.users
+  ADD COLUMN IF NOT EXISTS role_ft text DEFAULT 'user';
+`);
+
+await pool.query(`
+  ALTER TABLE public.users
+  ADD COLUMN IF NOT EXISTS role_hr text DEFAULT 'user';
+`);
+
   // =========================
   // REGISTRY HEAD
   // =========================
@@ -687,22 +697,24 @@ app.post("/login", async (req, res) => {
       });
     }
 
-    const r = await pool.query(`
-      SELECT
-        id,
-        email,
-        login,
-        password,
-        role,
-        is_active,
-        first_name,
-        last_name,
-        middle_name,
-        phone
-      FROM public.users
-      WHERE lower(trim(login)) = $1
-      LIMIT 1
-    `, [loginNorm]);
+const r = await pool.query(`
+  SELECT
+    id,
+    email,
+    login,
+    password,
+    role,
+    role_ft,
+    role_hr,
+    is_active,
+    first_name,
+    last_name,
+    middle_name,
+    phone
+  FROM public.users
+  WHERE lower(trim(login)) = $1
+  LIMIT 1
+`, [loginNorm]);
 
     if (!r.rowCount) {
       return res.status(401).json({
@@ -727,19 +739,21 @@ app.post("/login", async (req, res) => {
       });
     }
 
-    return res.json({
-      success:true,
-      user:{
-        id:user.id,
-        email:user.email,
-        login:user.login,
-        role:user.role,
-        first_name:user.first_name,
-        last_name:user.last_name,
-        middle_name:user.middle_name,
-        phone:user.phone
-      }
-    });
+return res.json({
+  success:true,
+  user:{
+    id:user.id,
+    email:user.email,
+    login:user.login,
+    role:user.role,
+    role_ft:user.role_ft,
+    role_hr:user.role_hr,
+    first_name:user.first_name,
+    last_name:user.last_name,
+    middle_name:user.middle_name,
+    phone:user.phone
+  }
+});
 
   } catch (e) {
     console.error("LOGIN ERROR:", e);
