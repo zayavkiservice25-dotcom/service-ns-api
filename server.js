@@ -819,33 +819,94 @@ ORDER BY id ASC;
 });
 
 app.post("/update-user-roles", async (req, res) => {
-  const { login, role_ft, role_hr } = req.body || {};
-
-  if (!login) {
-    return res.status(400).json({ success: false, message: "Не передан login" });
-  }
+  const client = await pool.connect();
 
   try {
-    const q = await pool.query(
-      `UPDATE users
-       SET role_ft = $1,
-           role_hr = $2
-       WHERE login = $3
-       RETURNING id, login, role_ft, role_hr`,
-      [role_ft || "user", role_hr || "user", login]
-    );
+    const { login, role_ft, role_hr } = req.body || {};
 
-    if (!q.rows.length) {
-      return res.status(404).json({ success: false, message: "Пользователь не найден" });
+    const loginNorm = String(login || "").trim();
+    const newRoleFt = String(role_ft || "user").trim().toLowerCase();
+    const newRoleHr = String(role_hr || "user").trim().toLowerCase();
+
+    if (!loginNorm) {
+      return res.status(400).json({
+        success: false,
+        message: "Не передан login"
+      });
     }
 
-    res.json({
+    await client.query("BEGIN");
+
+    const userRes = await client.query(
+      `
+      SELECT id, login, role_ft, role_hr
+      FROM public.users
+      WHERE lower(trim(login)) = lower(trim($1))
+      LIMIT 1
+      `,
+      [loginNorm]
+    );
+
+    if (!userRes.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({
+        success: false,
+        message: "Пользователь не найден"
+      });
+    }
+
+    const user = userRes.rows[0];
+    const oldRoleFt = String(user.role_ft || "user").trim().toLowerCase();
+    const oldRoleHr = String(user.role_hr || "user").trim().toLowerCase();
+
+    const updRes = await client.query(
+      `
+      UPDATE public.users
+      SET role_ft = $1,
+          role_hr = $2
+      WHERE lower(trim(login)) = lower(trim($3))
+      RETURNING id, login, role_ft, role_hr
+      `,
+      [newRoleFt, newRoleHr, loginNorm]
+    );
+
+    await client.query(
+      `
+      INSERT INTO public.user_role_history
+      (
+        login,
+        old_role_ft,
+        new_role_ft,
+        old_role_hr,
+        new_role_hr,
+        changed_at
+      )
+      VALUES ($1, $2, $3, $4, $5, NOW())
+      `,
+      [
+        user.login,
+        oldRoleFt,
+        newRoleFt,
+        oldRoleHr,
+        newRoleHr
+      ]
+    );
+
+    await client.query("COMMIT");
+
+    return res.json({
       success: true,
-      row: q.rows[0]
+      row: updRes.rows[0]
     });
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ success: false, message: "Ошибка сервера" });
+    await client.query("ROLLBACK");
+    console.error("update-user-roles error:", e);
+    return res.status(500).json({
+      success: false,
+      message: "Ошибка сервера"
+    });
+  } finally {
+    client.release();
   }
 });
 
