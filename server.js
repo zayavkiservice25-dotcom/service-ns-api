@@ -153,7 +153,7 @@ await pool.query(`
     ON zvk_status (zvk_row_id);
   `);
 
--- Добавьте эту миграцию в initDb()
+
 await pool.query(`
   ALTER TABLE public.users 
   ADD COLUMN IF NOT EXISTS login text;
