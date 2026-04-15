@@ -154,16 +154,6 @@ await pool.query(`
   `);
 
 
-await pool.query(`
-  ALTER TABLE public.users 
-  ADD COLUMN IF NOT EXISTS login text;
-`);
-
-await pool.query(`
-  CREATE UNIQUE INDEX IF NOT EXISTS users_login_idx 
-  ON public.users (lower(trim(login)));
-`);
-
   // ✅ Оплата по строке истории (zvk_row_id PK)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS zvk_pay (
@@ -289,6 +279,31 @@ await pool.query(`
     is_active boolean DEFAULT true,
     created_at timestamptz DEFAULT now()
   );
+`);
+
+await pool.query(`
+  ALTER TABLE public.users 
+  ADD COLUMN IF NOT EXISTS login text;
+`);
+
+await pool.query(`
+  ALTER TABLE public.users
+  ADD COLUMN IF NOT EXISTS role_ft text DEFAULT 'user';
+`);
+
+await pool.query(`
+  ALTER TABLE public.users
+  ADD COLUMN IF NOT EXISTS role_hr text DEFAULT 'user';
+`);
+
+await pool.query(`
+  CREATE UNIQUE INDEX IF NOT EXISTS users_login_idx 
+  ON public.users (lower(trim(login)));
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS users_email_idx
+  ON public.users (lower(trim(email)));
 `);
 
 await pool.query(`
@@ -683,20 +698,21 @@ app.post("/login", async (req, res) => {
     }
 
     // тестовый админ
-    if (loginNorm === "admin" && pass === "admin") {
-      return res.json({
-        success:true,
-        user:{
-          id: 0,
-          email:"admin",
-          login:"admin",
-          role:"admin",
-          first_name:"Admin",
-          last_name:"Test"
-        }
-      });
+if (loginNorm === "admin" && pass === "admin") {
+  return res.json({
+    success:true,
+    user:{
+      id: 0,
+      email:"admin",
+      login:"admin",
+      role:"admin",
+      role_ft:"admin",
+      role_hr:"admin",
+      first_name:"Admin",
+      last_name:"Test"
     }
-
+  });
+}
 const r = await pool.query(`
   SELECT
     id,
