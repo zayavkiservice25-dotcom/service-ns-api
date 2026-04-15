@@ -153,6 +153,17 @@ await pool.query(`
     ON zvk_status (zvk_row_id);
   `);
 
+-- Добавьте эту миграцию в initDb()
+await pool.query(`
+  ALTER TABLE public.users 
+  ADD COLUMN IF NOT EXISTS login text;
+`);
+
+await pool.query(`
+  CREATE UNIQUE INDEX IF NOT EXISTS users_login_idx 
+  ON public.users (lower(trim(login)));
+`);
+
   // ✅ Оплата по строке истории (zvk_row_id PK)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS zvk_pay (
@@ -213,6 +224,7 @@ s.status_time,
 s.src_d,
 s.src_o,
 s.status_comment,
+s.chief_approved,
 
       p.agree_time,
       p.registry_flag,
@@ -741,14 +753,12 @@ app.post("/login", async (req, res) => {
 app.get("/profile", async (req, res) => {
   try {
     const login = String(req.query.login || "").trim();
-
+    
     if (!login) {
-      return res.status(400).json({
-        success: false,
-        message: "Логин не передан"
-      });
+      return res.status(400).json({ success: false, message: "Логин не передан" });
     }
 
+    // ✅ Ищем без учета регистра
     const q = await pool.query(`
       SELECT
         id,
@@ -761,10 +771,9 @@ app.get("/profile", async (req, res) => {
         middle_name,
         is_active
       FROM public.users
-      WHERE lower(trim(login)) = lower(trim($1))
+      WHERE lower(trim(login)) = lower(trim($1))  -- ✅ уже есть lower()
       LIMIT 1
     `, [login]);
-
     if (!q.rows.length) {
       return res.status(404).json({
         success: false,
