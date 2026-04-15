@@ -798,16 +798,22 @@ app.get("/profile", async (req, res) => {
 app.get("/employees", async (req, res) => {
   try {
     const r = await pool.query(`
-      SELECT
-        id,
-        login,
-        first_name,
-        last_name,
-        middle_name,
-        role,
-        is_active
-      FROM public.users
-      ORDER BY last_name, first_name
+SELECT
+  id,
+  email,
+  phone,
+  last_name,
+  first_name,
+  middle_name,
+  organization_name,
+  role,
+  role_ft,
+  role_hr,
+  is_active,
+  created_at,
+  login
+FROM users
+ORDER BY id ASC;
     `);
 
     return res.json({
@@ -821,6 +827,37 @@ app.get("/employees", async (req, res) => {
       success: false,
       message: "Ошибка сервера"
     });
+  }
+});
+
+app.post("/update-user-roles", async (req, res) => {
+  const { login, role_ft, role_hr } = req.body || {};
+
+  if (!login) {
+    return res.status(400).json({ success: false, message: "Не передан login" });
+  }
+
+  try {
+    const q = await pool.query(
+      `UPDATE users
+       SET role_ft = $1,
+           role_hr = $2
+       WHERE login = $3
+       RETURNING id, login, role_ft, role_hr`,
+      [role_ft || "user", role_hr || "user", login]
+    );
+
+    if (!q.rows.length) {
+      return res.status(404).json({ success: false, message: "Пользователь не найден" });
+    }
+
+    res.json({
+      success: true,
+      row: q.rows[0]
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ success: false, message: "Ошибка сервера" });
   }
 });
 
