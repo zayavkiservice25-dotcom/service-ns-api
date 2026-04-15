@@ -547,6 +547,24 @@ await pool.query(`
   CREATE INDEX IF NOT EXISTS io_history_created_at_idx
   ON public.io_history (created_at DESC);
 `);
+
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS public.user_role_history (
+    id bigserial PRIMARY KEY,
+    login text NOT NULL,
+    old_role_ft text,
+    new_role_ft text,
+    old_role_hr text,
+    new_role_hr text,
+    changed_at timestamptz DEFAULT now()
+  );
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS user_role_history_login_idx
+  ON public.user_role_history (lower(trim(login)));
+`);
   // =========================
   // APPROVAL COLUMNS
   // =========================
@@ -825,13 +843,22 @@ app.post("/update-user-roles", async (req, res) => {
     const { login, role_ft, role_hr } = req.body || {};
 
     const loginNorm = String(login || "").trim();
-    const newRoleFt = String(role_ft || "user").trim().toLowerCase();
-    const newRoleHr = String(role_hr || "user").trim().toLowerCase();
+    const newRoleFt = String(role_ft || "").trim().toLowerCase();
+    const newRoleHr = String(role_hr || "").trim().toLowerCase();
+
+    const allowedRoles = ["initiator", "operator", "supervisor", "admin"];
 
     if (!loginNorm) {
       return res.status(400).json({
         success: false,
         message: "Не передан login"
+      });
+    }
+
+    if (!allowedRoles.includes(newRoleFt) || !allowedRoles.includes(newRoleHr)) {
+      return res.status(400).json({
+        success: false,
+        message: "Недопустимая роль"
       });
     }
 
@@ -856,8 +883,22 @@ app.post("/update-user-roles", async (req, res) => {
     }
 
     const user = userRes.rows[0];
-    const oldRoleFt = String(user.role_ft || "user").trim().toLowerCase();
-    const oldRoleHr = String(user.role_hr || "user").trim().toLowerCase();
+    const oldRoleFt = String(user.role_ft || "").trim().toLowerCase();
+    const oldRoleHr = String(user.role_hr || "").trim().toLowerCase();
+
+    if (oldRoleFt === newRoleFt && oldRoleHr === newRoleHr) {
+      await client.query("ROLLBACK");
+      return res.json({
+        success: true,
+        message: "Изменений нет",
+        row: {
+          id: user.id,
+          login: user.login,
+          role_ft: user.role_ft,
+          role_hr: user.role_hr
+        }
+      });
+    }
 
     const updRes = await client.query(
       `
@@ -885,9 +926,9 @@ app.post("/update-user-roles", async (req, res) => {
       `,
       [
         user.login,
-        oldRoleFt,
+        oldRoleFt || null,
         newRoleFt,
-        oldRoleHr,
+        oldRoleHr || null,
         newRoleHr
       ]
     );
@@ -899,8 +940,12 @@ app.post("/update-user-roles", async (req, res) => {
       row: updRes.rows[0]
     });
   } catch (e) {
-    await client.query("ROLLBACK");
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {}
+
     console.error("update-user-roles error:", e);
+
     return res.status(500).json({
       success: false,
       message: "Ошибка сервера"
@@ -909,6 +954,7 @@ app.post("/update-user-roles", async (req, res) => {
     client.release();
   }
 });
+
 
 app.post("/forgot-password", async (req, res) => {
   try {
