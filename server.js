@@ -687,102 +687,58 @@ app.post("/login", async (req, res) => {
   try {
     const { login, password } = req.body || {};
 
-    const loginNorm = String(login || "").trim().toLowerCase();
-    const pass = String(password || "").trim();
-
-    console.log("LOGIN TRY:", { loginNorm });
-
-    if (!loginNorm || !pass) {
+    if (!login || !password) {
       return res.status(400).json({
-        success:false,
-        message:"Введите логин и пароль"
+        success: false,
+        message: "Логин и пароль обязательны"
       });
     }
 
-    if (loginNorm === "admin" && pass === "admin") {
-      return res.json({
-        success:true,
-        user:{
-          id: 0,
-          email:"admin",
-          login:"admin",
-          role:"admin",
-          role_ft:"admin",
-          role_hr:"admin",
-          first_name:"Admin",
-          last_name:"Test"
-        }
-      });
-    }
-
-    const r = await pool.query(`
-      SELECT
-        id,
-        email,
-        login,
-        password,
-        role,
-        role_ft,
-        role_hr,
-        is_active,
-        first_name,
-        last_name,
-        middle_name,
-        phone
-      FROM public.users
-      WHERE lower(trim(login)) = $1
+    const q = `
+      SELECT *
+      FROM users
+      WHERE lower(trim(login)) = lower(trim($1))
+        AND is_active = true
       LIMIT 1
-    `, [loginNorm]);
+    `;
 
-    console.log("LOGIN QUERY ROWS:", r.rowCount);
+    const r = await pool.query(q, [login]);
 
-    if (!r.rowCount) {
-      return res.status(401).json({
-        success:false,
-        message:"Пользователь не найден"
+    if (!r.rows.length) {
+      return res.json({
+        success: false,
+        message: "Пользователь не найден"
       });
     }
 
     const user = r.rows[0];
 
-    if (user.is_active === false) {
-      return res.status(403).json({
-        success:false,
-        message:"Аккаунт отключен"
+    if (user.password !== password) {
+      return res.json({
+        success: false,
+        message: "Неверный пароль"
       });
     }
 
-    if (String(user.password || "") !== pass) {
-      return res.status(401).json({
-        success:false,
-        message:"Неверный пароль"
-      });
-    }
+    return res.json({
+      success: true,
+      user: {
+        login: user.login,
+        email: user.email,
+        role: user.role,
+        first_name: user.first_name,
+        last_name: user.last_name
+      }
+    });
 
-return res.json({
-  success:true,
-  user:{
-    id:user.id,
-    email:user.email,
-    login:user.login,
-    role_ft:user.role_ft,
-    role_hr:user.role_hr,
-    first_name:user.first_name,
-    last_name:user.last_name,
-    middle_name:user.middle_name,
-    phone:user.phone
-  }
-});
   } catch (e) {
-    console.error("LOGIN ERROR FULL:", e);
-    return res.status(500).json({
-      success:false,
-      message:"Ошибка сервера",
-      error:String(e.message || e)
+    console.error("LOGIN ERROR:", e);
+    res.status(500).json({
+      success: false,
+      message: "Ошибка сервера"
     });
   }
 });
-
 app.get("/profile", async (req, res) => {
   try {
     const login = String(req.query.login || "").trim();
