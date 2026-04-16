@@ -275,7 +275,6 @@ await pool.query(`
     first_name text,
     middle_name text,
     organization_name text,
-    role text DEFAULT 'user',
     is_active boolean DEFAULT true,
     created_at timestamptz DEFAULT now()
   );
@@ -288,12 +287,12 @@ await pool.query(`
 
 await pool.query(`
   ALTER TABLE public.users
-  ADD COLUMN IF NOT EXISTS role_ft text DEFAULT 'user';
+  ADD COLUMN IF NOT EXISTS role_ft text DEFAULT 'initiator';
 `);
 
 await pool.query(`
   ALTER TABLE public.users
-  ADD COLUMN IF NOT EXISTS role_hr text DEFAULT 'user';
+  ADD COLUMN IF NOT EXISTS role_hr text DEFAULT 'initiator';
 `);
 
 await pool.query(`
@@ -306,21 +305,10 @@ await pool.query(`
   ON public.users (lower(trim(email)));
 `);
 
-await pool.query(`
-  CREATE INDEX IF NOT EXISTS users_email_idx
-  ON public.users (lower(trim(email)));
-`);
 
 
-await pool.query(`
-  ALTER TABLE public.users
-  ADD COLUMN IF NOT EXISTS role_ft text DEFAULT 'user';
-`);
 
-await pool.query(`
-  ALTER TABLE public.users
-  ADD COLUMN IF NOT EXISTS role_hr text DEFAULT 'user';
-`);
+
 
   // =========================
   // REGISTRY HEAD
@@ -664,18 +652,19 @@ app.post("/register", async (req, res) => {
 
     const r = await pool.query(`
       INSERT INTO public.users (
-        email,
-        login,
-        password,
-        phone,
-        last_name,
-        first_name,
-        middle_name,
-        role,
-        is_active
-      )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,'user',true)
-      RETURNING id, email, login, role, first_name, last_name
+  email,
+  login,
+  password,
+  phone,
+  last_name,
+  first_name,
+  middle_name,
+  role_ft,
+  role_hr,
+  is_active
+)
+VALUES ($1,$2,$3,$4,$5,$6,$7,'initiator','initiator',true)
+RETURNING id, email, login, role_ft, role_hr, first_name, last_name
     `, [
       emailNorm,
       loginNorm,
@@ -738,16 +727,17 @@ app.post("/login", async (req, res) => {
       });
     }
 
-    return res.json({
-      success: true,
-      user: {
-        login: user.login,
-        email: user.email,
-        role: user.role,
-        first_name: user.first_name,
-        last_name: user.last_name
-      }
-    });
+return res.json({
+  success: true,
+  user: {
+    login: user.login,
+    email: user.email,
+    role_ft: user.role_ft,
+    role_hr: user.role_hr,
+    first_name: user.first_name,
+    last_name: user.last_name
+  }
+});
 
   } catch (e) {
     console.error("LOGIN ERROR:", e);
@@ -760,27 +750,31 @@ app.post("/login", async (req, res) => {
 app.get("/profile", async (req, res) => {
   try {
     const login = String(req.query.login || "").trim();
-    
+
     if (!login) {
-      return res.status(400).json({ success: false, message: "Логин не передан" });
+      return res.status(400).json({
+        success: false,
+        message: "Логин не передан"
+      });
     }
 
-    // ✅ Ищем без учета регистра
     const q = await pool.query(`
       SELECT
         id,
         login,
         email,
         phone,
-        role,
+        role_ft,
+        role_hr,
         first_name,
         last_name,
         middle_name,
         is_active
       FROM public.users
-      WHERE lower(trim(login)) = lower(trim($1))  -- ✅ уже есть lower()
+      WHERE lower(trim(login)) = lower(trim($1))
       LIMIT 1
     `, [login]);
+
     if (!q.rows.length) {
       return res.status(404).json({
         success: false,
@@ -788,19 +782,20 @@ app.get("/profile", async (req, res) => {
       });
     }
 
-    res.json({
+    return res.json({
       success: true,
       user: q.rows[0]
     });
 
   } catch (e) {
     console.error("PROFILE ERROR:", e);
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
       message: "Ошибка сервера"
     });
   }
 });
+
 
 app.get("/employees", async (req, res) => {
   try {
@@ -955,6 +950,46 @@ app.post("/update-user-roles", async (req, res) => {
   }
 });
 
+app.get("/user-role-history", async (req, res) => {
+  try {
+    const login = String(req.query.login || "").trim();
+
+    if (!login) {
+      return res.status(400).json({
+        success: false,
+        message: "login required"
+      });
+    }
+
+    const r = await pool.query(
+      `
+      SELECT
+        id,
+        login,
+        old_role_ft,
+        new_role_ft,
+        old_role_hr,
+        new_role_hr,
+        changed_at
+      FROM public.user_role_history
+      WHERE lower(trim(login)) = lower(trim($1))
+      ORDER BY changed_at DESC, id DESC
+      `,
+      [login]
+    );
+
+    return res.json({
+      success: true,
+      rows: r.rows
+    });
+  } catch (e) {
+    console.error("USER-ROLE-HISTORY ERROR:", e);
+    return res.status(500).json({
+      success: false,
+      message: "Ошибка сервера"
+    });
+  }
+});
 
 app.post("/forgot-password", async (req, res) => {
   try {
