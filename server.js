@@ -287,12 +287,12 @@ await pool.query(`
 
 await pool.query(`
   ALTER TABLE public.users
-  ADD COLUMN IF NOT EXISTS role_ft text DEFAULT 'initiator';
+  ADD COLUMN IF NOT EXISTS role_ft text;
 `);
 
 await pool.query(`
   ALTER TABLE public.users
-  ADD COLUMN IF NOT EXISTS role_hr text DEFAULT 'initiator';
+  ADD COLUMN IF NOT EXISTS role_hr text;
 `);
 
 await pool.query(`
@@ -650,22 +650,22 @@ app.post("/register", async (req, res) => {
       });
     }
 
-    const r = await pool.query(`
-      INSERT INTO public.users (
-  email,
-  login,
-  password,
-  phone,
-  last_name,
-  first_name,
-  middle_name,
-  role_ft,
-  role_hr,
-  is_active
-)
-VALUES ($1,$2,$3,$4,$5,$6,$7,'initiator','initiator',true)
-RETURNING id, email, login, role_ft, role_hr, first_name, last_name
-    `, [
+const r = await pool.query(`
+  INSERT INTO public.users (
+    email,
+    login,
+    password,
+    phone,
+    last_name,
+    first_name,
+    middle_name,
+    role_ft,
+    role_hr,
+    is_active
+  )
+  VALUES ($1,$2,$3,$4,$5,$6,$7,NULL,NULL,true)
+  RETURNING id, email, login, role_ft, role_hr, first_name, last_name
+`, [
       emailNorm,
       loginNorm,
       pass,
@@ -4228,6 +4228,61 @@ app.post("/approve-rows", async (req, res) => {
     return res.status(500).json({ success: false, error: e.message });
   } finally {
     client.release();
+  }
+});
+
+app.post("/update-row", async (req,res)=>{
+  try{
+    const {
+      zvk_row_id,
+      request_flag,
+      to_pay,
+      src_o,
+      status_comment,
+      is_paid,
+      login
+    } = req.body;
+
+    // запрет если уже в реестре
+    const check = await pool.query(`
+      SELECT registry_flag FROM zvk_pay WHERE zvk_row_id=$1
+    `,[zvk_row_id]);
+
+    if (check.rows[0]?.registry_flag === "Да"){
+      return res.json({ success:false, error:"LOCKED_BY_REGISTRY" });
+    }
+
+    // обновление
+    await pool.query(`
+      UPDATE zvk
+      SET request_flag=$1,
+          to_pay=$2
+      WHERE id=$3
+    `,[request_flag, to_pay, zvk_row_id]);
+
+    await pool.query(`
+      INSERT INTO zvk_status(zvk_row_id, src_o, status_comment)
+      VALUES($1,$2,$3)
+      ON CONFLICT (zvk_row_id)
+      DO UPDATE SET
+        src_o=EXCLUDED.src_o,
+        status_comment=EXCLUDED.status_comment
+    `,[zvk_row_id, src_o, status_comment]);
+
+    // только админ
+    if (is_paid !== null){
+      await pool.query(`
+        UPDATE zvk_pay
+        SET is_paid=$1
+        WHERE zvk_row_id=$2
+      `,[is_paid, zvk_row_id]);
+    }
+
+    res.json({ success:true });
+
+  }catch(e){
+    console.error(e);
+    res.status(500).json({ success:false, error:e.message });
   }
 });
 
