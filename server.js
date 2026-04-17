@@ -4287,6 +4287,79 @@ app.post("/update-row", async (req,res)=>{
 });
 
 
+app.get("/dict/divisions", async (req, res) => {
+  try {
+    const q = await pool.query(`
+      SELECT name
+      FROM spravochnik_division
+      ORDER BY name
+    `);
+    res.json({ success: true, items: q.rows.map(r => r.name) });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.get("/dict/objects", async (req, res) => {
+  try {
+    const q = await pool.query(`
+      SELECT name
+      FROM spravochnik_object
+      ORDER BY name
+    `);
+    res.json({ success: true, items: q.rows.map(r => r.name) });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.get("/dict/dds", async (req, res) => {
+  try {
+    const q = await pool.query(`
+      SELECT name
+      FROM spravochnik_dds
+      ORDER BY name
+    `);
+    res.json({ success: true, items: q.rows.map(r => r.name) });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.get("/dict/contractors", async (req, res) => {
+  try {
+    const q = await pool.query(`
+      SELECT DISTINCT contractor
+      FROM spravochnik_contracts
+      ORDER BY contractor
+    `);
+    res.json({ success: true, items: q.rows.map(r => r.contractor) });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.get("/dict/contracts", async (req, res) => {
+  try {
+    const contractor = String(req.query.contractor || "").trim();
+
+    if (!contractor) {
+      return res.json({ success: true, items: [] });
+    }
+
+    const q = await pool.query(`
+      SELECT contract
+      FROM spravochnik_contracts
+      WHERE contractor = $1
+      ORDER BY contract
+    `, [contractor]);
+
+    res.json({ success: true, items: q.rows.map(r => r.contract) });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 // =====================================================
 // Start
 // =====================================================
