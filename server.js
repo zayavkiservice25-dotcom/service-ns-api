@@ -4360,6 +4360,27 @@ app.get("/dict/contracts", async (req, res) => {
   }
 });
 
+app.get("/dict/source-objects", async (req, res) => {
+  try {
+    const q = await pool.query(`
+      SELECT name
+      FROM spravochnik_istochnikobject
+      ORDER BY name
+    `);
+
+    res.json({
+      success: true,
+      items: q.rows.map(r => r.name)
+    });
+  } catch (e) {
+    console.error("DICT SOURCE OBJECTS ERROR:", e);
+    res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
+
 // =====================================================
 // Start
 // =====================================================
