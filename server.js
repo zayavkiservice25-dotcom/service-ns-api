@@ -853,9 +853,11 @@ app.post("/update-user-roles", async (req, res) => {
   const client = await pool.connect();
 
   try {
-    const { login, role_ft, role_hr } = req.body || {};
+    const { login, role_ft, role_hr, actor_login } = req.body || {};
 
     const loginNorm = String(login || "").trim();
+    const actorLoginNorm = String(actor_login || "").trim();
+
     const newRoleFt = String(role_ft || "").trim().toLowerCase();
     const newRoleHr = String(role_hr || "").trim().toLowerCase();
 
@@ -868,6 +870,13 @@ app.post("/update-user-roles", async (req, res) => {
       });
     }
 
+    if (!actorLoginNorm) {
+      return res.status(400).json({
+        success: false,
+        message: "Не передан actor_login"
+      });
+    }
+
     if (!allowedRoles.includes(newRoleFt) || !allowedRoles.includes(newRoleHr)) {
       return res.status(400).json({
         success: false,
@@ -877,6 +886,42 @@ app.post("/update-user-roles", async (req, res) => {
 
     await client.query("BEGIN");
 
+    // 1. кто делает изменение
+    const actorRes = await client.query(
+      `
+      SELECT id, login, role_ft, role_hr
+      FROM public.users
+      WHERE lower(trim(login)) = lower(trim($1))
+      LIMIT 1
+      `,
+      [actorLoginNorm]
+    );
+
+    if (!actorRes.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({
+        success: false,
+        message: "Текущий пользователь не найден"
+      });
+    }
+
+    const actor = actorRes.rows[0];
+
+    const actorRoleFt = String(actor.role_ft || "").trim().toLowerCase();
+    const actorRoleHr = String(actor.role_hr || "").trim().toLowerCase();
+
+    // 2. только admin может менять роли
+    const isAdmin = actorRoleFt === "admin" || actorRoleHr === "admin";
+
+    if (!isAdmin) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({
+        success: false,
+        message: "Только администратор может изменять роли"
+      });
+    }
+
+    // 3. кого меняем
     const userRes = await client.query(
       `
       SELECT id, login, role_ft, role_hr
@@ -950,6 +995,7 @@ app.post("/update-user-roles", async (req, res) => {
 
     return res.json({
       success: true,
+      message: "Роли успешно обновлены",
       row: updRes.rows[0]
     });
   } catch (e) {
@@ -967,6 +1013,7 @@ app.post("/update-user-roles", async (req, res) => {
     client.release();
   }
 });
+
 
 app.get("/user-role-history", async (req, res) => {
   try {
