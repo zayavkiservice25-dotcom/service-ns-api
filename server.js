@@ -181,6 +181,24 @@ await pool.query(`
   await pool.query(`CREATE INDEX IF NOT EXISTS zvk_status_row_idx ON zvk_status (zvk_row_id);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS zvk_pay_row_idx ON zvk_pay (zvk_row_id);`);
 
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS public.registry_stage_approvals (
+    id bigserial PRIMARY KEY,
+    registry_id bigint NOT NULL,
+    stage_name text NOT NULL,
+    approver_login text NOT NULL,
+    approver_name text,
+    status text DEFAULT 'Ожидает',
+    action_time timestamptz,
+    comment_text text
+  );
+`);
+
+await pool.query(`
+  CREATE UNIQUE INDEX IF NOT EXISTS registry_stage_approvals_uq
+  ON public.registry_stage_approvals (registry_id, stage_name, approver_login);
+`);
+
   // ✅ VIEW: ИСТОРИЯ
   await pool.query(`
     CREATE OR REPLACE VIEW ft_zvk_history_v2 AS
@@ -575,29 +593,7 @@ await pool.query(`
   CREATE INDEX IF NOT EXISTS user_role_history_login_idx
   ON public.user_role_history (lower(trim(login)));
 `);
-  // =========================
-  // APPROVAL COLUMNS
-  // =========================
-  await pool.query(`ALTER TABLE public.registry_head ADD COLUMN IF NOT EXISTS acc_buh_name text;`);
-  await pool.query(`ALTER TABLE public.registry_head ADD COLUMN IF NOT EXISTS acc_buh_status text;`);
-  await pool.query(`ALTER TABLE public.registry_head ADD COLUMN IF NOT EXISTS acc_buh_time timestamptz;`);
-  await pool.query(`ALTER TABLE public.registry_head ADD COLUMN IF NOT EXISTS acc_buh_comment text;`);
-
-  await pool.query(`ALTER TABLE public.registry_head ADD COLUMN IF NOT EXISTS acc_fin_name text;`);
-  await pool.query(`ALTER TABLE public.registry_head ADD COLUMN IF NOT EXISTS acc_fin_status text;`);
-  await pool.query(`ALTER TABLE public.registry_head ADD COLUMN IF NOT EXISTS acc_fin_time timestamptz;`);
-  await pool.query(`ALTER TABLE public.registry_head ADD COLUMN IF NOT EXISTS acc_fin_comment text;`);
-
-  await pool.query(`ALTER TABLE public.registry_head ADD COLUMN IF NOT EXISTS acc_zam_name text;`);
-  await pool.query(`ALTER TABLE public.registry_head ADD COLUMN IF NOT EXISTS acc_zam_status text;`);
-  await pool.query(`ALTER TABLE public.registry_head ADD COLUMN IF NOT EXISTS acc_zam_time timestamptz;`);
-  await pool.query(`ALTER TABLE public.registry_head ADD COLUMN IF NOT EXISTS acc_zam_comment text;`);
-
-  await pool.query(`ALTER TABLE public.registry_head ADD COLUMN IF NOT EXISTS acc_ud_name text;`);
-  await pool.query(`ALTER TABLE public.registry_head ADD COLUMN IF NOT EXISTS acc_ud_status text;`);
-  await pool.query(`ALTER TABLE public.registry_head ADD COLUMN IF NOT EXISTS acc_ud_time timestamptz;`);
-  await pool.query(`ALTER TABLE public.registry_head ADD COLUMN IF NOT EXISTS acc_ud_comment text;`);
-  console.log("DB init OK ✅");
+   console.log("DB init OK ✅");
 }
 
 initDb().catch((e) => console.error("DB init error:", e));
@@ -2794,9 +2790,11 @@ await client.query(`
 
 const APPROVER_LOGINS = [
   "k_marat",
+  "v_shevchenko",
   "k_ermek",
   "k_arailym",
   "zh_elena",
+  "s_zhasulan",
   "b_erkin",
   "b_erkin2"
 ];
@@ -3002,47 +3000,42 @@ app.get("/registry-card", async (req, res) => {
       });
     }
 
-const headRes = await pool.query(`
-  SELECT
-    id,
-    registry_no,
-    registry_date,
-    created_by,
-    division,
-    total_amount,
-    items_count,
-    workflow_stage,
-    agree_status,
-    execution_status,
-    archive_flag,
-    pdf_url,
-    created_at,
-    chat_map,
+    const transfersRes = await pool.query(`
+      SELECT
+        id,
+        registry_id,
+        src_object,
+        acc_from,
+        dds_from,
+        acc_to,
+        dds_to,
+        sum
+      FROM public.registry_transfers
+      WHERE registry_id = $1
+      ORDER BY id
+    `, [id]);
 
-    acc_buh_name,
-    acc_buh_status,
-    acc_buh_time,
-    acc_buh_comment,
-
-    acc_fin_name,
-    acc_fin_status,
-    acc_fin_time,
-    acc_fin_comment,
-
-    acc_zam_name,
-    acc_zam_status,
-    acc_zam_time,
-    acc_zam_comment,
-
-    acc_ud_name,
-    acc_ud_status,
-    acc_ud_time,
-    acc_ud_comment
-
-  FROM registry_head
-  WHERE id = $1
-  LIMIT 1
-`, [id]);
+    const headRes = await pool.query(`
+      SELECT
+        id,
+        registry_no,
+        registry_date,
+        created_by,
+        division,
+        total_amount,
+        items_count,
+        workflow_stage,
+        agree_status,
+        execution_status,
+        archive_flag,
+        pdf_url,
+        created_at,
+        chat_map,
+        pay_account
+      FROM public.registry_head
+      WHERE id = $1
+      LIMIT 1
+    `, [id]);
 
     if (!headRes.rows.length) {
       return res.status(404).json({
@@ -3051,33 +3044,34 @@ const headRes = await pool.query(`
       });
     }
 
-const itemsRes = await pool.query(`
-  SELECT
-    registry_id,
-    zvk_row_id,
-    id_ft,
-    id_zvk,
-    object,
-    input_name,
-    contractor,
-    pay_purpose,
-    dds_article,
-    contract_no,
-    invoice_no,
-    invoice_date,
-    invoice_pdf,
-    src_d,
-    src_o,
-    to_pay
-  FROM registry_items
-  WHERE registry_id = $1
-  ORDER BY id
-`, [id]);
+    const itemsRes = await pool.query(`
+      SELECT
+        registry_id,
+        zvk_row_id,
+        id_ft,
+        id_zvk,
+        object,
+        input_name,
+        contractor,
+        pay_purpose,
+        dds_article,
+        contract_no,
+        invoice_no,
+        invoice_date,
+        invoice_pdf,
+        src_d,
+        src_o,
+        to_pay
+      FROM public.registry_items
+      WHERE registry_id = $1
+      ORDER BY id
+    `, [id]);
 
     res.json({
       success: true,
       head: headRes.rows[0],
-      items: itemsRes.rows
+      items: itemsRes.rows,
+      transfers: transfersRes.rows
     });
 
   } catch (e) {
@@ -3130,223 +3124,214 @@ app.post("/registry-approve", async (req, res) => {
     const stageName = String(stage || "").trim();
     const actionName = String(action || "").trim();
 
-    // ----------------------------
-    // REJECT
-    // ----------------------------
     if (actionName === "reject") {
-      let rejectSql = "";
-      let rejectParams = [];
+      await client.query(`
+        UPDATE public.registry_head
+        SET
+          workflow_stage = 'Черновик',
+          agree_status = 'Отклонено'
+        WHERE id = $1
+      `, [Number(registry_id)]);
 
-      if (stageName === "Главный бухгалтер") {
-        rejectSql = `
-          UPDATE public.registry_head
-          SET
-            acc_buh_status = 'Отклонено',
-            acc_buh_time = NOW(),
-            acc_buh_comment = $2,
-            workflow_stage = 'Инициация',
-            agree_status = 'Отклонено'
-          WHERE id = $1
-        `;
-        rejectParams = [Number(registry_id), String(comment || "")];
-      }
+      await client.query(`
+        UPDATE public.registry_stage_approvals
+        SET
+          status = 'Отклонено',
+          action_time = NOW(),
+          comment_text = $4
+        WHERE registry_id = $1
+          AND stage_name = $2
+          AND lower(trim(approver_login)) = lower(trim($3))
+      `, [
+        Number(registry_id),
+        stageName,
+        String(login || ""),
+        String(comment || "")
+      ]);
 
-      else if (stageName === "Заместитель директора") {
-        rejectSql = `
-          UPDATE public.registry_head
-          SET
-            acc_zam_status = 'Отклонено',
-            acc_zam_time = NOW(),
-            acc_zam_comment = $2,
-            workflow_stage = 'Инициация',
-            agree_status = 'Отклонено'
-          WHERE id = $1
-        `;
-        rejectParams = [Number(registry_id), String(comment || "")];
-      }
-
-      else if (stageName === "Управляющий директор") {
-        rejectSql = `
-          UPDATE public.registry_head
-          SET
-            acc_ud_status = 'Отклонено',
-            acc_ud_time = NOW(),
-            acc_ud_comment = $2,
-            workflow_stage = 'Инициация',
-            agree_status = 'Отклонено'
-          WHERE id = $1
-        `;
-        rejectParams = [Number(registry_id), String(comment || "")];
-      }
-
-      else if (stageName === "Исполнение платежей") {
-        const executor = await getExecutorByRegistry(Number(registry_id), client);
-
-        rejectSql = `
-          UPDATE public.registry_head
-          SET
-            execution_status = 'Отклонено',
-            workflow_stage = 'Инициация',
-            agree_status = 'Отклонено'
-          WHERE id = $1
-        `;
-        rejectParams = [Number(registry_id)];
-
-        await client.query(
-          `
-          INSERT INTO public.registry_approve_log
-            (registry_id, stage_name, approver_login, approver_name, action_type, comment_text)
-          VALUES ($1, $2, $3, $4, 'reject', $5)
-          `,
-          [
-            Number(registry_id),
-            String(stage),
-            executor,
-            executor === "Zh_Elena" ? "Елена" : "Арайлым",
-            String(comment || "")
-          ]
-        );
-
-        await client.query(rejectSql, rejectParams);
-        await client.query("COMMIT");
-
-        return res.json({ success:true, moved_to:"Инициация", action:"reject" });
-      }
-
-      else {
-        await client.query("ROLLBACK");
-        return res.status(400).json({ success:false, error:"unknown stage" });
-      }
-
-      await client.query(rejectSql, rejectParams);
-
-      await client.query(
-        `
+      await client.query(`
         INSERT INTO public.registry_approve_log
           (registry_id, stage_name, approver_login, approver_name, action_type, comment_text)
         VALUES ($1, $2, $3, $4, 'reject', $5)
-        `,
-        [
+      `, [
+        Number(registry_id),
+        stageName,
+        String(login || ""),
+        String(name || ""),
+        String(comment || "")
+      ]);
+
+      await client.query("COMMIT");
+      return res.json({ success:true, moved_to:"Черновик", action:"reject" });
+    }
+
+    if (actionName === "approve") {
+      if (stageName === "Согласование") {
+        await client.query(`
+          UPDATE public.registry_stage_approvals
+          SET
+            status = 'Согласовано',
+            action_time = NOW(),
+            comment_text = $4
+          WHERE registry_id = $1
+            AND stage_name = $2
+            AND lower(trim(approver_login)) = lower(trim($3))
+        `, [
           Number(registry_id),
-          String(stage),
+          "Согласование",
+          String(login || ""),
+          String(comment || "")
+        ]);
+
+        const chk = await client.query(`
+          SELECT
+            COUNT(*) AS total_cnt,
+            COUNT(*) FILTER (WHERE status = 'Согласовано') AS ok_cnt
+          FROM public.registry_stage_approvals
+          WHERE registry_id = $1
+            AND stage_name = 'Согласование'
+        `, [Number(registry_id)]);
+
+        const totalCnt = Number(chk.rows[0]?.total_cnt || 0);
+        const okCnt = Number(chk.rows[0]?.ok_cnt || 0);
+
+        let nextStage = "Согласование";
+
+        if (totalCnt > 0 && totalCnt === okCnt) {
+          nextStage = "Утверждение";
+
+          await client.query(`
+            UPDATE public.registry_head
+            SET
+              workflow_stage = 'Утверждение',
+              agree_status = 'На согласовании'
+            WHERE id = $1
+          `, [Number(registry_id)]);
+
+          const approvers = getApproverByStage("Утверждение");
+          for (const a of approvers) {
+            await client.query(`
+              INSERT INTO public.registry_stage_approvals
+                (registry_id, stage_name, approver_login, approver_name, status)
+              VALUES ($1, $2, $3, $4, 'Ожидает')
+              ON CONFLICT (registry_id, stage_name, approver_login)
+              DO NOTHING
+            `, [
+              Number(registry_id),
+              "Утверждение",
+              String(a.login || "").trim(),
+              String(a.name || "").trim()
+            ]);
+          }
+        }
+
+        await client.query(`
+          INSERT INTO public.registry_approve_log
+            (registry_id, stage_name, approver_login, approver_name, action_type, comment_text)
+          VALUES ($1, $2, $3, $4, 'approve', $5)
+        `, [
+          Number(registry_id),
+          stageName,
           String(login || ""),
           String(name || ""),
           String(comment || "")
-        ]
-      );
+        ]);
 
-      await client.query("COMMIT");
-      return res.json({ success:true, moved_to:"Инициация", action:"reject" });
-    }
-
-    // ----------------------------
-    // APPROVE
-    // ----------------------------
-    if (actionName === "approve") {
-      let approveSql = "";
-      let approveParams = [];
-      let nextStage = "";
-
-      if (stageName === "Главный бухгалтер") {
-        approveSql = `
-          UPDATE public.registry_head
-          SET
-            acc_buh_status = 'Согласовано',
-            acc_buh_time = NOW(),
-            acc_buh_comment = $2,
-            workflow_stage = 'Заместитель директора',
-            agree_status = 'На согласовании'
-          WHERE id = $1
-        `;
-        approveParams = [Number(registry_id), String(comment || "")];
-        nextStage = "Заместитель директора";
+        await client.query("COMMIT");
+        return res.json({ success:true, moved_to: nextStage, action:"approve" });
       }
 
-      else if (stageName === "Заместитель директора") {
-        approveSql = `
-          UPDATE public.registry_head
+      if (stageName === "Утверждение") {
+        await client.query(`
+          UPDATE public.registry_stage_approvals
           SET
-            acc_zam_status = 'Согласовано',
-            acc_zam_time = NOW(),
-            acc_zam_comment = $2,
-            workflow_stage = 'Управляющий директор',
-            agree_status = 'На согласовании'
-          WHERE id = $1
-        `;
-        approveParams = [Number(registry_id), String(comment || "")];
-        nextStage = "Управляющий директор";
-      }
+            status = 'Согласовано',
+            action_time = NOW(),
+            comment_text = $4
+          WHERE registry_id = $1
+            AND stage_name = $2
+            AND lower(trim(approver_login)) = lower(trim($3))
+        `, [
+          Number(registry_id),
+          "Утверждение",
+          String(login || ""),
+          String(comment || "")
+        ]);
 
-      else if (stageName === "Управляющий директор") {
-        approveSql = `
+        await client.query(`
           UPDATE public.registry_head
           SET
-            acc_ud_status = 'Согласовано',
-            acc_ud_time = NOW(),
-            acc_ud_comment = $2,
             workflow_stage = 'Исполнение платежей',
             agree_status = 'Согласовано'
           WHERE id = $1
-        `;
-        approveParams = [Number(registry_id), String(comment || "")];
-        nextStage = "Исполнение платежей";
+        `, [Number(registry_id)]);
+
+        await client.query(`
+          INSERT INTO public.registry_approve_log
+            (registry_id, stage_name, approver_login, approver_name, action_type, comment_text)
+          VALUES ($1, $2, $3, $4, 'approve', $5)
+        `, [
+          Number(registry_id),
+          stageName,
+          String(login || ""),
+          String(name || ""),
+          String(comment || "")
+        ]);
+
+        await client.query("COMMIT");
+        return res.json({ success:true, moved_to:"Исполнение платежей", action:"approve" });
       }
 
-      else if (stageName === "Исполнение платежей") {
-        approveSql = `
+      if (stageName === "Исполнение платежей") {
+        await client.query(`
           UPDATE public.registry_head
           SET
             execution_status = 'На исполнении',
             workflow_stage = 'Контроль и архивирование',
             agree_status = 'Согласовано'
           WHERE id = $1
-        `;
-        approveParams = [Number(registry_id)];
-        nextStage = "Контроль и архивирование";
-      }
+        `, [Number(registry_id)]);
 
-      else {
-        await client.query("ROLLBACK");
-        return res.status(400).json({ success:false, error:"unknown stage" });
-      }
-
-      await client.query(approveSql, approveParams);
-
-      await client.query(
-        `
-        INSERT INTO public.registry_approve_log
-          (registry_id, stage_name, approver_login, approver_name, action_type, comment_text)
-        VALUES ($1, $2, $3, $4, 'approve', $5)
-        `,
-        [
+        await client.query(`
+          INSERT INTO public.registry_approve_log
+            (registry_id, stage_name, approver_login, approver_name, action_type, comment_text)
+          VALUES ($1, $2, $3, $4, 'approve', $5)
+        `, [
           Number(registry_id),
-          String(stage),
+          stageName,
           String(login || ""),
           String(name || ""),
           String(comment || "")
-        ]
-      );
+        ]);
 
-      await client.query("COMMIT");
+        await client.query("COMMIT");
+        return res.json({ success:true, moved_to:"Контроль и архивирование", action:"approve" });
+      }
 
- if (nextStage) {
-  try {
-    const savedChatMap = reg.chat_map || {};
+      if (stageName === "Контроль и архивирование") {
+        await client.query(`
+          UPDATE public.registry_head
+          SET
+            archive_flag = 'Да',
+            execution_status = 'Исполнено'
+          WHERE id = $1
+        `, [Number(registry_id)]);
 
-    await sendRegistryTelegramNotification({
-      registryId: registry_id,
-      registryNo: reg.registry_no,
-      stage: nextStage,
-      totalAmount: reg.total_amount,
-      createdBy: reg.created_by || "",
-      chatMap: savedChatMap
-    });
-  } catch (tgErr) {
-    console.error("telegram next stage notify error:", tgErr);
-  }
-}
+        await client.query(`
+          INSERT INTO public.registry_approve_log
+            (registry_id, stage_name, approver_login, approver_name, action_type, comment_text)
+          VALUES ($1, $2, $3, $4, 'archive', $5)
+        `, [
+          Number(registry_id),
+          stageName,
+          String(login || ""),
+          String(name || ""),
+          String(comment || "")
+        ]);
 
-      return res.json({ success:true, moved_to:nextStage, action:"approve" });
+        await client.query("COMMIT");
+        return res.json({ success:true, moved_to:"Архив", action:"approve" });
+      }
     }
 
     await client.query("ROLLBACK");
@@ -3360,7 +3345,6 @@ app.post("/registry-approve", async (req, res) => {
     client.release();
   }
 });
-
 
 app.post("/registry-move-stage", async (req, res) => {
   const client = await pool.connect();
@@ -3436,11 +3420,16 @@ await sendRegistryTelegramNotification({
       return res.json({ success:true, moved_to: toS });
     }
 
-    const allowed =
-      (actor === "k_marat"    && fromS === "Заместитель директора" && toS === "Управляющий директор") ||
-      ((actor === "k_arailym" || actor === "zh_elena") &&
-        fromS === "Исполнение платежей" &&
-        toS === "Контроль и архивирование");
+const allowed = [
+  "k_marat",
+  "v_shevchenko",
+  "k_ermek",
+  "k_arailym",
+  "zh_elena",
+  "s_zhasulan",
+  "b_erkin",
+  "b_erkin2"
+].includes(actor);
 
     if (!allowed) {
       await client.query("ROLLBACK");
@@ -3651,23 +3640,61 @@ async function sendTelegramMessage(chatId, text, replyMarkup) {
 function getApproverByStage(stage) {
   const s = String(stage || "").trim();
 
-  if (s === "Заместитель директора") {
-    return { login: "K_Marat", name: "Марат Койлыбаев" };
+  if (s === "Согласование") {
+    return [
+      { login: "K_Marat", name: "Койлибаев Марат" },
+      { login: "V_Shevchenko", name: "Шевченко Владимир" }
+    ];
   }
 
-  if (s === "Управляющий директор") {
-    return { login: "K_Ermek", name: "Ермек Касенов" };
-  }
-
-  if (s === "Исполнение платежей") {
-    return { login: "K_Arailym", name: "Арайлым" };
+  if (s === "Утверждение") {
+    return [
+      { login: "K_Ermek", name: "Ермек Касенов" }
+    ];
   }
 
   if (s === "Контроль и архивирование") {
-    return { login: "B_Erkin", name: "B_Erkin" };
+    return [
+      { login: "b_erkin", name: "Еркин" }
+    ];
   }
 
-  return { login: "telegram_user", name: "Telegram" };
+  return [];
+}
+const DIVISION_EXECUTORS = {
+  "Дорога":        { login: "K_Arailym",   name: "Арайлым Касенова" },
+  "Механизация":   { login: "K_Arailym",   name: "Арайлым Касенова" },
+  "Мост":          { login: "K_Arailym",   name: "Арайлым Касенова" },
+  "Офис":          { login: "K_Arailym",   name: "Арайлым Касенова" },
+  "Сети":          { login: "K_Arailym",   name: "Арайлым Касенова" },
+  "СК Жилой дом":  { login: "Zh_Elena",    name: "Елена Жбанкова" },
+  "Sapa asphalt":  { login: "S_Zhasulan",  name: "Жасулан Сулейменов" },
+  "Smart Estate":  { login: "Zh_Elena",    name: "Елена Жбанкова" }
+};
+
+async function getRegistryDivisions(registryId, client) {
+  const r = await client.query(`
+    SELECT DISTINCT TRIM(COALESCE(src_d,'')) AS src_d
+    FROM public.registry_items
+    WHERE registry_id = $1
+      AND NULLIF(TRIM(COALESCE(src_d,'')), '') IS NOT NULL
+  `, [Number(registryId)]);
+
+  return r.rows.map(x => String(x.src_d || "").trim()).filter(Boolean);
+}
+
+async function getExecutorsByRegistry(registryId, client) {
+  const divisions = await getRegistryDivisions(registryId, client);
+  const map = new Map();
+
+  for (const div of divisions) {
+    const person = DIVISION_EXECUTORS[div];
+    if (person) {
+      map.set(String(person.login).toLowerCase(), person);
+    }
+  }
+
+  return Array.from(map.values());
 }
 
 
@@ -3700,8 +3727,14 @@ app.post("/telegram-webhook", async (req, res) => {
       const data = String(cb.data || "");
 
     const [action, registryId, stage] = data.split("|");
+let approver = null;
 
-let approver = getApproverByStage(stage);
+if (String(stage || "").trim() === "Согласование") {
+  approver = { login: "K_Marat", name: "Койлибаев Марат" };
+} else {
+  const list = getApproverByStage(stage);
+  approver = Array.isArray(list) ? (list[0] || null) : list;
+}
 
 if (String(stage || "").trim() === "Исполнение платежей") {
   const client = await pool.connect();
@@ -3758,23 +3791,8 @@ const resp = await fetch(`${APP_BASE_URL}/registry-approve`, {
 });
 
 async function getExecutorByRegistry(registryId, client) {
-  const r = await client.query(`
-    SELECT DISTINCT TRIM(COALESCE(src_d,'')) AS src_d
-    FROM registry_items
-    WHERE registry_id = $1
-  `, [registryId]);
-
-  const divisions = r.rows.map(x => x.src_d);
-
-  const elenaDivs = [
-    "СК Жилой дом",
-    "Sapa asphalt",
-    "Smart Estate"
-  ];
-
-  const hasElena = divisions.some(d => elenaDivs.includes(d));
-
-  return hasElena ? "Zh_Elena" : "K_Arailym";
+  const list = await getExecutorsByRegistry(registryId, client);
+  return list.length ? list[0].login : "K_Arailym";
 }
 
 
@@ -4400,6 +4418,23 @@ app.post("/registry-submit", async (req, res) => {
       WHERE id = $1
     `, [Number(registry_id)]);
 
+    const approvers = getApproverByStage("Согласование");
+
+    for (const a of approvers) {
+      await client.query(`
+        INSERT INTO public.registry_stage_approvals
+          (registry_id, stage_name, approver_login, approver_name, status)
+        VALUES ($1, $2, $3, $4, 'Ожидает')
+        ON CONFLICT (registry_id, stage_name, approver_login)
+        DO NOTHING
+      `, [
+        Number(registry_id),
+        "Согласование",
+        String(a.login || "").trim(),
+        String(a.name || "").trim()
+      ]);
+    }
+
     await client.query(`
       INSERT INTO public.registry_approve_log
       (
@@ -4453,6 +4488,7 @@ app.post("/registry-submit", async (req, res) => {
     client.release();
   }
 });
+
 
 app.get("/dict/divisions", async (req, res) => {
   try {
