@@ -330,6 +330,10 @@ await pool.query(`
       created_at timestamptz DEFAULT now()
     );
   `);
+await pool.query(`
+  ALTER TABLE public.registry_head
+  ADD COLUMN IF NOT EXISTS pay_account text;
+`);
 
 await pool.query(`
   ALTER TABLE public.registry_head
@@ -376,6 +380,24 @@ await pool.query(`
       to_pay numeric(18,2) DEFAULT 0
     );
   `);
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS public.registry_transfers (
+    id bigserial PRIMARY KEY,
+    registry_id bigint NOT NULL,
+    src_object text,
+    acc_from text,
+    dds_from text,
+    acc_to text,
+    dds_to text,
+    sum numeric(18,2) DEFAULT 0
+  );
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS registry_transfers_registry_id_idx
+  ON public.registry_transfers (registry_id);
+`);
 
 await pool.query(`
   ALTER TABLE public.registry_items
@@ -2737,37 +2759,17 @@ app.post("/create-registry", async (req, res) => {
       WHERE id = $3
     `, [total, count, registry_id]);
 
-    await client.query(`
-      UPDATE public.registry_head
-      SET
-        workflow_stage = 'Главный бухгалтер',
-        agree_status = 'На согласовании',
-
-        acc_buh_name = 'Жасулан Сулейменов',
-        acc_buh_status = 'Ожидает',
-
-        acc_zam_name = 'Марат Койлыбаев',
-        acc_zam_status = 'Ожидает',
-
-        acc_ud_name = 'Ермек Касенов',
-        acc_ud_status = 'Ожидает'
-      WHERE id = $1
-    `, [registry_id]);
+await client.query(`
+  UPDATE public.registry_head
+  SET
+    workflow_stage = 'Черновик',
+    agree_status = 'Черновик'
+  WHERE id = $1
+`, [registry_id]);
 
     await client.query("COMMIT");
 
-    try {
-      await sendRegistryTelegramNotification({
-        registryId: registry_id,
-        registryNo: registry_no,
-        stage: "Главный бухгалтер",
-        totalAmount: total,
-        createdBy: login || "",
-        chatMap: chat_map || {}
-      });
-    } catch (tgErr) {
-      console.error("telegram registry notify error:", tgErr);
-    }
+
 
     res.json({
       success: true,
@@ -2791,7 +2793,6 @@ app.post("/create-registry", async (req, res) => {
 
 
 const APPROVER_LOGINS = [
-  "s_zhasulan",
   "k_marat",
   "k_ermek",
   "k_arailym",
@@ -2865,6 +2866,7 @@ app.get("/registry-list", async (req, res) => {
         LEFT JOIN public.registry_items i
           ON i.registry_id = h.id
         WHERE COALESCE(h.archive_flag, 'Нет') <> 'Да'
+  AND COALESCE(h.workflow_stage, '') <> 'Черновик'
         GROUP BY
           h.id,
           h.registry_no,
@@ -2903,6 +2905,7 @@ app.get("/registry-list", async (req, res) => {
         LEFT JOIN public.registry_items i
           ON i.registry_id = h.id
         WHERE COALESCE(h.archive_flag, 'Нет') <> 'Да'
+  AND COALESCE(h.workflow_stage, '') <> 'Черновик'
           AND EXISTS (
             SELECT 1
             FROM public.registry_items i2
@@ -2951,6 +2954,7 @@ app.get("/registry-list", async (req, res) => {
         LEFT JOIN public.registry_items i
           ON i.registry_id = h.id
         WHERE COALESCE(h.archive_flag, 'Нет') <> 'Да'
+  AND COALESCE(h.workflow_stage, '') <> 'Черновик'
           AND EXISTS (
             SELECT 1
             FROM public.registry_items i2
@@ -3433,7 +3437,6 @@ await sendRegistryTelegramNotification({
     }
 
     const allowed =
-      (actor === "s_zhasulan" && fromS === "Главный бухгалтер" && toS === "Заместитель директора") ||
       (actor === "k_marat"    && fromS === "Заместитель директора" && toS === "Управляющий директор") ||
       ((actor === "k_arailym" || actor === "zh_elena") &&
         fromS === "Исполнение платежей" &&
@@ -3648,10 +3651,6 @@ async function sendTelegramMessage(chatId, text, replyMarkup) {
 function getApproverByStage(stage) {
   const s = String(stage || "").trim();
 
-  if (s === "Главный бухгалтер") {
-    return { login: "S_Zhasulan", name: "Жасулан Сулейменов" };
-  }
-
   if (s === "Заместитель директора") {
     return { login: "K_Marat", name: "Марат Койлыбаев" };
   }
@@ -3798,7 +3797,6 @@ async function getWatchersByRegistry(registryId, client) {
   const executor = await getExecutorByRegistry(registryId, client);
 
   const excluded = new Set([
-    "S_Zhasulan", // главный бухгалтер
     "K_Marat",    // заместитель директора
     "K_Ermek",    // утверждающий
     executor      // исполнитель
@@ -3841,11 +3839,9 @@ async function sendRegistryTelegramNotification({
 
     let approverLogin = "";
 
-    if (stage === "Главный бухгалтер") {
-      approverLogin = "s_zhasulan";
-    } else if (stage === "Заместитель директора") {
+    if (stage === "Согласование") {
       approverLogin = "k_marat";
-    } else if (stage === "Управляющий директор") {
+    } else if (stage === "Утверждение") {
       approverLogin = "k_ermek";
     } else if (stage === "Исполнение платежей") {
       const client = await pool.connect();
@@ -4286,6 +4282,177 @@ app.post("/update-row", async (req,res)=>{
   }
 });
 
+app.post("/registry-save", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const { registry_id, login, pay_account, transfers } = req.body || {};
+
+    if (!registry_id) {
+      return res.status(400).json({ success:false, error:"registry_id required" });
+    }
+
+    await client.query("BEGIN");
+
+    await client.query(`
+      UPDATE public.registry_head
+      SET pay_account = $2
+      WHERE id = $1
+    `, [Number(registry_id), String(pay_account || "").trim() || null]);
+
+    await client.query(`
+      DELETE FROM public.registry_transfers
+      WHERE registry_id = $1
+    `, [Number(registry_id)]);
+
+    const rows = Array.isArray(transfers) ? transfers : [];
+
+    for (const row of rows) {
+      await client.query(`
+        INSERT INTO public.registry_transfers
+        (
+          registry_id,
+          src_object,
+          acc_from,
+          dds_from,
+          acc_to,
+          dds_to,
+          sum
+        )
+        VALUES ($1,$2,$3,$4,$5,$6,$7)
+      `, [
+        Number(registry_id),
+        String(row.src_object || "").trim() || null,
+        String(row.acc_from || "").trim() || null,
+        String(row.dds_from || "").trim() || null,
+        String(row.acc_to || "").trim() || null,
+        String(row.dds_to || "").trim() || null,
+        Number(row.sum || 0)
+      ]);
+    }
+
+    await client.query("COMMIT");
+    res.json({ success:true });
+
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("REGISTRY-SAVE ERROR:", e);
+    res.status(500).json({ success:false, error:e.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/registry-submit", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const { registry_id, login, pay_account, transfers } = req.body || {};
+
+    if (!registry_id) {
+      return res.status(400).json({ success:false, error:"registry_id required" });
+    }
+
+    await client.query("BEGIN");
+
+    await client.query(`
+      UPDATE public.registry_head
+      SET pay_account = $2
+      WHERE id = $1
+    `, [Number(registry_id), String(pay_account || "").trim() || null]);
+
+    await client.query(`
+      DELETE FROM public.registry_transfers
+      WHERE registry_id = $1
+    `, [Number(registry_id)]);
+
+    const rows = Array.isArray(transfers) ? transfers : [];
+
+    for (const row of rows) {
+      await client.query(`
+        INSERT INTO public.registry_transfers
+        (
+          registry_id,
+          src_object,
+          acc_from,
+          dds_from,
+          acc_to,
+          dds_to,
+          sum
+        )
+        VALUES ($1,$2,$3,$4,$5,$6,$7)
+      `, [
+        Number(registry_id),
+        String(row.src_object || "").trim() || null,
+        String(row.acc_from || "").trim() || null,
+        String(row.dds_from || "").trim() || null,
+        String(row.acc_to || "").trim() || null,
+        String(row.dds_to || "").trim() || null,
+        Number(row.sum || 0)
+      ]);
+    }
+
+    await client.query(`
+      UPDATE public.registry_head
+      SET
+        workflow_stage = 'Согласование',
+        agree_status = 'На согласовании'
+      WHERE id = $1
+    `, [Number(registry_id)]);
+
+    await client.query(`
+      INSERT INTO public.registry_approve_log
+      (
+        registry_id,
+        stage_name,
+        approver_login,
+        approver_name,
+        action_type,
+        comment_text
+      )
+      VALUES ($1, $2, $3, $4, 'submit', $5)
+    `, [
+      Number(registry_id),
+      'Черновик -> Согласование',
+      String(login || ""),
+      String(login || ""),
+      'Реестр отправлен из карточки'
+    ]);
+
+    const regRes = await client.query(`
+      SELECT id, registry_no, total_amount, created_by, chat_map
+      FROM public.registry_head
+      WHERE id = $1
+      LIMIT 1
+    `, [Number(registry_id)]);
+
+    await client.query("COMMIT");
+
+    const reg = regRes.rows[0];
+
+    try {
+      await sendRegistryTelegramNotification({
+        registryId: reg.id,
+        registryNo: reg.registry_no,
+        stage: "Согласование",
+        totalAmount: reg.total_amount,
+        createdBy: reg.created_by || "",
+        chatMap: reg.chat_map || {}
+      });
+    } catch (tgErr) {
+      console.error("telegram submit notify error:", tgErr);
+    }
+
+    res.json({ success:true });
+
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("REGISTRY-SUBMIT ERROR:", e);
+    res.status(500).json({ success:false, error:e.message });
+  } finally {
+    client.release();
+  }
+});
 
 app.get("/dict/divisions", async (req, res) => {
   try {
@@ -4380,6 +4547,43 @@ app.get("/dict/source-objects", async (req, res) => {
     });
   }
 });
+
+app.get("/registry-dict/accounts", async (req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT name
+      FROM public.spr_account
+      ORDER BY name
+    `);
+
+    res.json({
+      success: true,
+      items: r.rows.map(x => x.name)
+    });
+
+  } catch (e) {
+    res.status(500).json({ success:false, error:e.message });
+  }
+});
+
+app.get("/registry-dict/dds", async (req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT name
+      FROM public.spr_dds_registry
+      ORDER BY name
+    `);
+
+    res.json({
+      success: true,
+      items: r.rows.map(x => x.name)
+    });
+
+  } catch (e) {
+    res.status(500).json({ success:false, error:e.message });
+  }
+});
+
 
 // =====================================================
 // Start
