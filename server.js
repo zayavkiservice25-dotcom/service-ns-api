@@ -2748,20 +2748,30 @@ app.post("/create-registry", async (req, res) => {
     }
 
     // 3️⃣ обновляем шапку
-    await client.query(`
-      UPDATE registry_head
-      SET total_amount = $1,
-          items_count = $2
-      WHERE id = $3
-    `, [total, count, registry_id]);
+// 3️⃣ определяем дивизион из строк реестра
+let divisionText = null;
 
+if (!isEmptyRegistry) {
+  const divRes = await client.query(`
+    SELECT STRING_AGG(DISTINCT NULLIF(TRIM(src_d), ''), ', ') AS division_text
+    FROM public.registry_items
+    WHERE registry_id = $1
+  `, [registry_id]);
+
+  divisionText = String(divRes.rows[0]?.division_text || "").trim() || null;
+}
+
+// 4️⃣ обновляем шапку
 await client.query(`
   UPDATE public.registry_head
   SET
+    total_amount = $1,
+    items_count = $2,
+    division = $3,
     workflow_stage = 'Черновик',
     agree_status = 'Черновик'
-  WHERE id = $1
-`, [registry_id]);
+  WHERE id = $4
+`, [total, count, divisionText, registry_id]);
 
     await client.query("COMMIT");
 
@@ -2843,7 +2853,9 @@ app.get("/registry-list", async (req, res) => {
       return res.status(400).json({ success:false, error:"login required" });
     }
 
-    // 1. Согласующие видят всё
+    const watcherDivisions = getWatcherDivisions(login);
+
+    // 1) Согласующие видят всё
     if (APPROVER_LOGINS.includes(login)) {
       const r = await pool.query(`
         SELECT
@@ -2855,6 +2867,8 @@ app.get("/registry-list", async (req, res) => {
           h.total_amount,
           h.workflow_stage,
           h.archive_flag,
+          h.division,
+          h.pay_account,
           COALESCE(
             STRING_AGG(DISTINCT NULLIF(TRIM(i.src_d), ''), ', ')
               FILTER (WHERE NULLIF(TRIM(i.src_d), '') IS NOT NULL),
@@ -2864,7 +2878,7 @@ app.get("/registry-list", async (req, res) => {
         LEFT JOIN public.registry_items i
           ON i.registry_id = h.id
         WHERE COALESCE(h.archive_flag, 'Нет') <> 'Да'
-  AND COALESCE(h.workflow_stage, '') <> 'Черновик'
+          AND COALESCE(h.workflow_stage, '') <> 'Черновик'
         GROUP BY
           h.id,
           h.registry_no,
@@ -2873,16 +2887,16 @@ app.get("/registry-list", async (req, res) => {
           h.items_count,
           h.total_amount,
           h.workflow_stage,
-          h.archive_flag
+          h.archive_flag,
+          h.division,
+          h.pay_account
         ORDER BY h.id DESC
       `);
 
       return res.json({ success:true, rows:r.rows });
     }
 
-    // 2. Наблюдатели видят только свои дивизионы
-    const watcherDivisions = getWatcherDivisions(login);
-
+    // 2) Наблюдатели видят только свои дивизионы
     if (watcherDivisions.length > 0) {
       const r = await pool.query(`
         SELECT
@@ -2894,6 +2908,8 @@ app.get("/registry-list", async (req, res) => {
           h.total_amount,
           h.workflow_stage,
           h.archive_flag,
+          h.division,
+          h.pay_account,
           COALESCE(
             STRING_AGG(DISTINCT NULLIF(TRIM(i.src_d), ''), ', ')
               FILTER (WHERE NULLIF(TRIM(i.src_d), '') IS NOT NULL),
@@ -2903,7 +2919,7 @@ app.get("/registry-list", async (req, res) => {
         LEFT JOIN public.registry_items i
           ON i.registry_id = h.id
         WHERE COALESCE(h.archive_flag, 'Нет') <> 'Да'
-  AND COALESCE(h.workflow_stage, '') <> 'Черновик'
+          AND COALESCE(h.workflow_stage, '') <> 'Черновик'
           AND EXISTS (
             SELECT 1
             FROM public.registry_items i2
@@ -2918,63 +2934,105 @@ app.get("/registry-list", async (req, res) => {
           h.items_count,
           h.total_amount,
           h.workflow_stage,
-          h.archive_flag
+          h.archive_flag,
+          h.division,
+          h.pay_account
         ORDER BY h.id DESC
       `, [watcherDivisions]);
 
       return res.json({ success:true, rows:r.rows });
     }
-    // 3. Сотрудники видят только те реестры, где встречается их input_name
-    const employeeCheck = await pool.query(`
-      SELECT 1
-      FROM public.registry_items
-      WHERE lower(trim(COALESCE(input_name,''))) = lower(trim($1))
-      LIMIT 1
+
+    // 3) Создатель реестра видит свои
+    const createdRes = await pool.query(`
+      SELECT
+        h.id,
+        h.registry_no,
+        h.registry_date,
+        h.created_by,
+        h.items_count,
+        h.total_amount,
+        h.workflow_stage,
+        h.archive_flag,
+        h.division,
+        h.pay_account,
+        COALESCE(
+          STRING_AGG(DISTINCT NULLIF(TRIM(i.src_d), ''), ', ')
+            FILTER (WHERE NULLIF(TRIM(i.src_d), '') IS NOT NULL),
+          ''
+        ) AS src_d
+      FROM public.registry_head h
+      LEFT JOIN public.registry_items i
+        ON i.registry_id = h.id
+      WHERE COALESCE(h.archive_flag, 'Нет') <> 'Да'
+        AND COALESCE(h.workflow_stage, '') <> 'Черновик'
+        AND lower(trim(COALESCE(h.created_by,''))) = lower(trim($1))
+      GROUP BY
+        h.id,
+        h.registry_no,
+        h.registry_date,
+        h.created_by,
+        h.items_count,
+        h.total_amount,
+        h.workflow_stage,
+        h.archive_flag,
+        h.division,
+        h.pay_account
+      ORDER BY h.id DESC
     `, [login]);
 
-    if (employeeCheck.rowCount > 0) {
-      const r = await pool.query(`
-        SELECT
-          h.id,
-          h.registry_no,
-          h.registry_date,
-          h.created_by,
-          h.items_count,
-          h.total_amount,
-          h.workflow_stage,
-          h.archive_flag,
-          COALESCE(
-            STRING_AGG(DISTINCT NULLIF(TRIM(i.src_d), ''), ', ')
-              FILTER (WHERE NULLIF(TRIM(i.src_d), '') IS NOT NULL),
-            ''
-          ) AS src_d
-        FROM public.registry_head h
-        LEFT JOIN public.registry_items i
-          ON i.registry_id = h.id
-        WHERE COALESCE(h.archive_flag, 'Нет') <> 'Да'
-  AND COALESCE(h.workflow_stage, '') <> 'Черновик'
-          AND EXISTS (
-            SELECT 1
-            FROM public.registry_items i2
-            WHERE i2.registry_id = h.id
-              AND lower(trim(COALESCE(i2.input_name,''))) = lower(trim($1))
-          )
-        GROUP BY
-          h.id,
-          h.registry_no,
-          h.registry_date,
-          h.created_by,
-          h.items_count,
-          h.total_amount,
-          h.workflow_stage,
-          h.archive_flag
-        ORDER BY h.id DESC
-      `, [login]);
-
-      return res.json({ success:true, rows:r.rows });
+    if (createdRes.rowCount > 0) {
+      return res.json({ success:true, rows: createdRes.rows });
     }
 
-    // 4. Остальным доступа нет
+    // 4) Сотрудник видит только те реестры, где его login есть в input_name
+    const employeeRes = await pool.query(`
+      SELECT
+        h.id,
+        h.registry_no,
+        h.registry_date,
+        h.created_by,
+        h.items_count,
+        h.total_amount,
+        h.workflow_stage,
+        h.archive_flag,
+        h.division,
+        h.pay_account,
+        COALESCE(
+          STRING_AGG(DISTINCT NULLIF(TRIM(i.src_d), ''), ', ')
+            FILTER (WHERE NULLIF(TRIM(i.src_d), '') IS NOT NULL),
+          ''
+        ) AS src_d
+      FROM public.registry_head h
+      LEFT JOIN public.registry_items i
+        ON i.registry_id = h.id
+      WHERE COALESCE(h.archive_flag, 'Нет') <> 'Да'
+        AND COALESCE(h.workflow_stage, '') <> 'Черновик'
+        AND EXISTS (
+          SELECT 1
+          FROM public.registry_items i2
+          WHERE i2.registry_id = h.id
+            AND lower(trim(COALESCE(i2.input_name,''))) = lower(trim($1))
+        )
+      GROUP BY
+        h.id,
+        h.registry_no,
+        h.registry_date,
+        h.created_by,
+        h.items_count,
+        h.total_amount,
+        h.workflow_stage,
+        h.archive_flag,
+        h.division,
+        h.pay_account
+      ORDER BY h.id DESC
+    `, [login]);
+
+    if (employeeRes.rowCount > 0) {
+      return res.json({ success:true, rows: employeeRes.rows });
+    }
+
+    // 5) Остальным нельзя
     return res.status(403).json({
       success:false,
       error:"NO_ACCESS_TO_REGISTRY"
@@ -2983,8 +3041,8 @@ app.get("/registry-list", async (req, res) => {
   } catch (e) {
     console.error("REGISTRY-LIST ERROR:", e);
     res.status(500).json({
-      success: false,
-      error: e.message
+      success:false,
+      error:e.message
     });
   }
 });
@@ -2992,6 +3050,7 @@ app.get("/registry-list", async (req, res) => {
 app.get("/registry-card", async (req, res) => {
   try {
     const id = Number(req.query.id);
+    const login = String(req.query.login || "").trim().toLowerCase();
 
     if (!id) {
       return res.status(400).json({
@@ -3000,21 +3059,14 @@ app.get("/registry-card", async (req, res) => {
       });
     }
 
-    const transfersRes = await pool.query(`
-      SELECT
-        id,
-        registry_id,
-        src_object,
-        acc_from,
-        dds_from,
-        acc_to,
-        dds_to,
-        sum
-      FROM public.registry_transfers
-      WHERE registry_id = $1
-      ORDER BY id
-    `, [id]);
+    if (!login) {
+      return res.status(400).json({
+        success: false,
+        error: "login required"
+      });
+    }
 
+    // 1) читаем шапку
     const headRes = await pool.query(`
       SELECT
         id,
@@ -3044,6 +3096,69 @@ app.get("/registry-card", async (req, res) => {
       });
     }
 
+    const head = headRes.rows[0];
+
+    // 2) права доступа
+    const isApprover = APPROVER_LOGINS.includes(login);
+
+    const isCreator =
+      String(head.created_by || "").trim().toLowerCase() === login;
+
+    const watcherDivisions = getWatcherDivisions(login);
+    let isWatcher = false;
+
+    if (watcherDivisions.length > 0) {
+      const watcherRes = await pool.query(`
+        SELECT 1
+        FROM public.registry_items
+        WHERE registry_id = $1
+          AND TRIM(COALESCE(src_d,'')) = ANY($2::text[])
+        LIMIT 1
+      `, [id, watcherDivisions]);
+
+      isWatcher = watcherRes.rowCount > 0;
+    }
+
+    const employeeRes = await pool.query(`
+      SELECT 1
+      FROM public.registry_items
+      WHERE registry_id = $1
+        AND lower(trim(COALESCE(input_name,''))) = lower(trim($2))
+      LIMIT 1
+    `, [id, login]);
+
+    const isEmployeeInside = employeeRes.rowCount > 0;
+
+    const canView =
+      isApprover ||
+      isCreator ||
+      isWatcher ||
+      isEmployeeInside;
+
+    if (!canView) {
+      return res.status(403).json({
+        success: false,
+        error: "NO_ACCESS_TO_REGISTRY_CARD"
+      });
+    }
+
+    // 3) transfers
+    const transfersRes = await pool.query(`
+      SELECT
+        id,
+        registry_id,
+        src_object,
+        acc_from,
+        dds_from,
+        acc_to,
+        dds_to,
+        sum
+      FROM public.registry_transfers
+      WHERE registry_id = $1
+      ORDER BY id
+    `, [id]);
+
+    // 4) items
     const itemsRes = await pool.query(`
       SELECT
         registry_id,
@@ -3067,9 +3182,9 @@ app.get("/registry-card", async (req, res) => {
       ORDER BY id
     `, [id]);
 
-    res.json({
+    return res.json({
       success: true,
-      head: headRes.rows[0],
+      head,
       items: itemsRes.rows,
       transfers: transfersRes.rows
     });
@@ -4312,11 +4427,25 @@ app.post("/registry-save", async (req, res) => {
 
     await client.query("BEGIN");
 
-    await client.query(`
-      UPDATE public.registry_head
-      SET pay_account = $2
-      WHERE id = $1
-    `, [Number(registry_id), String(pay_account || "").trim() || null]);
+const divRes = await client.query(`
+  SELECT STRING_AGG(DISTINCT NULLIF(TRIM(src_d), ''), ', ') AS division_text
+  FROM public.registry_items
+  WHERE registry_id = $1
+`, [Number(registry_id)]);
+
+const divisionText = String(divRes.rows[0]?.division_text || "").trim() || null;
+
+await client.query(`
+  UPDATE public.registry_head
+  SET
+    pay_account = $2,
+    division = $3
+  WHERE id = $1
+`, [
+  Number(registry_id),
+  String(pay_account || "").trim() || null,
+  divisionText
+]);
 
     await client.query(`
       DELETE FROM public.registry_transfers
@@ -4373,11 +4502,25 @@ app.post("/registry-submit", async (req, res) => {
 
     await client.query("BEGIN");
 
-    await client.query(`
-      UPDATE public.registry_head
-      SET pay_account = $2
-      WHERE id = $1
-    `, [Number(registry_id), String(pay_account || "").trim() || null]);
+const divRes = await client.query(`
+  SELECT STRING_AGG(DISTINCT NULLIF(TRIM(src_d), ''), ', ') AS division_text
+  FROM public.registry_items
+  WHERE registry_id = $1
+`, [Number(registry_id)]);
+
+const divisionText = String(divRes.rows[0]?.division_text || "").trim() || null;
+
+await client.query(`
+  UPDATE public.registry_head
+  SET
+    pay_account = $2,
+    division = $3
+  WHERE id = $1
+`, [
+  Number(registry_id),
+  String(pay_account || "").trim() || null,
+  divisionText
+]);
 
     await client.query(`
       DELETE FROM public.registry_transfers
@@ -4417,6 +4560,10 @@ app.post("/registry-submit", async (req, res) => {
         agree_status = 'На согласовании'
       WHERE id = $1
     `, [Number(registry_id)]);
+await client.query(`
+  DELETE FROM public.registry_stage_approvals
+  WHERE registry_id = $1
+`, [Number(registry_id)]);
 
     const approvers = getApproverByStage("Согласование");
 
