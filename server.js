@@ -3049,24 +3049,34 @@ app.get("/registry-list", async (req, res) => {
 
 app.get("/registry-card", async (req, res) => {
   try {
-    const id = Number(req.query.id);
-    const login = String(req.query.login || "").trim().toLowerCase();
+    console.log("REGISTRY-CARD query =", req.query);
 
-    if (!id) {
+    const rawId = String(req.query.id || "").trim();
+    const id = Number(rawId);
+
+    if (!rawId || !Number.isFinite(id) || id <= 0) {
       return res.status(400).json({
         success: false,
-        error: "id required"
+        error: "id required",
+        got: req.query.id || null
       });
     }
 
-    if (!login) {
-      return res.status(400).json({
-        success: false,
-        error: "login required"
-      });
-    }
+    const transfersRes = await pool.query(`
+      SELECT
+        id,
+        registry_id,
+        src_object,
+        acc_from,
+        dds_from,
+        acc_to,
+        dds_to,
+        sum
+      FROM public.registry_transfers
+      WHERE registry_id = $1
+      ORDER BY id
+    `, [id]);
 
-    // 1) читаем шапку
     const headRes = await pool.query(`
       SELECT
         id,
@@ -3098,67 +3108,16 @@ app.get("/registry-card", async (req, res) => {
 
     const head = headRes.rows[0];
 
-    // 2) права доступа
-    const isApprover = APPROVER_LOGINS.includes(login);
-
-    const isCreator =
-      String(head.created_by || "").trim().toLowerCase() === login;
-
-    const watcherDivisions = getWatcherDivisions(login);
-    let isWatcher = false;
-
-    if (watcherDivisions.length > 0) {
-      const watcherRes = await pool.query(`
-        SELECT 1
+    if (!String(head.division || "").trim()) {
+      const divRes = await pool.query(`
+        SELECT STRING_AGG(DISTINCT NULLIF(TRIM(src_d), ''), ', ') AS division_text
         FROM public.registry_items
         WHERE registry_id = $1
-          AND TRIM(COALESCE(src_d,'')) = ANY($2::text[])
-        LIMIT 1
-      `, [id, watcherDivisions]);
+      `, [id]);
 
-      isWatcher = watcherRes.rowCount > 0;
+      head.division = String(divRes.rows[0]?.division_text || "").trim() || "";
     }
 
-    const employeeRes = await pool.query(`
-      SELECT 1
-      FROM public.registry_items
-      WHERE registry_id = $1
-        AND lower(trim(COALESCE(input_name,''))) = lower(trim($2))
-      LIMIT 1
-    `, [id, login]);
-
-    const isEmployeeInside = employeeRes.rowCount > 0;
-
-    const canView =
-      isApprover ||
-      isCreator ||
-      isWatcher ||
-      isEmployeeInside;
-
-    if (!canView) {
-      return res.status(403).json({
-        success: false,
-        error: "NO_ACCESS_TO_REGISTRY_CARD"
-      });
-    }
-
-    // 3) transfers
-    const transfersRes = await pool.query(`
-      SELECT
-        id,
-        registry_id,
-        src_object,
-        acc_from,
-        dds_from,
-        acc_to,
-        dds_to,
-        sum
-      FROM public.registry_transfers
-      WHERE registry_id = $1
-      ORDER BY id
-    `, [id]);
-
-    // 4) items
     const itemsRes = await pool.query(`
       SELECT
         registry_id,
@@ -3191,13 +3150,12 @@ app.get("/registry-card", async (req, res) => {
 
   } catch (e) {
     console.error("REGISTRY CARD ERROR:", e);
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
       error: e.message
     });
   }
 });
-
 app.post("/registry-approve", async (req, res) => {
   const client = await pool.connect();
 
