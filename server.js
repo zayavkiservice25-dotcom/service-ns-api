@@ -3,6 +3,7 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const path = require("path");
+const axios = require("axios");
 const { Pool } = require("pg");
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const APP_BASE_URL = process.env.APP_BASE_URL;
@@ -1339,14 +1340,13 @@ try {
   console.error("notify initiator created error:", e);
 }
 try {
-  await sendRequestTelegramNotification({
-    requestId: request_id,
-    requestNo: request_no,
-    stage: "Главный бухгалтер",
-    totalAmount: total,
-    createdBy: String(login || "").trim(),
-    chatMap: chat_map || {}
-  });
+await sendRequestTelegramNotification({
+  requestId: request_id,
+  requestNo: request_no,
+  stage: "Главный бухгалтер",
+  totalAmount: total,
+  createdBy: String(login || "").trim()
+});
 } catch (tgErr) {
   console.error("request telegram notify error:", tgErr);
 }
@@ -1605,32 +1605,30 @@ if (actor === "s_zhasulan" && actionName === "approve") {
   await client.query(`
     UPDATE public.request_head
     SET
-      acc_buh_name = $2,
       acc_buh_status = 'Согласовано',
       acc_buh_time = NOW(),
-      acc_buh_comment = $3,
+      acc_buh_comment = $2,
       workflow_stage = 'Админ',
-      agree_status = 'На согласовании у Админа'
+      agree_status = 'На согласовании'
     WHERE id = $1
   `, [
     Number(request_id),
-    String(name || "Жасулан Сулейменов"),
-    String(comment || "")
-  ]);
-
-  await client.query(`
-    INSERT INTO public.request_approve_log
-      (request_id, stage_name, approver_login, approver_name, action_type, comment_text)
-    VALUES ($1,$2,$3,$4,'approve',$5)
-  `, [
-    Number(request_id),
-    "Главный бухгалтер",
-    String(login || ""),
-    String(name || "Жасулан Сулейменов"),
     String(comment || "")
   ]);
 
   await client.query("COMMIT");
+
+  try {
+await sendRequestTelegramNotification({
+  requestId: Number(request_id),
+  requestNo: reqHead.request_no,
+  stage: "Админ",
+  totalAmount: Number(reqHead.total_amount || 0),
+  createdBy: String(reqHead.created_by || "").trim()
+});
+  } catch (tgErr) {
+    console.error("request telegram notify admin error:", tgErr);
+  }
 
   return res.json({
     success:true,
@@ -1638,7 +1636,6 @@ if (actor === "s_zhasulan" && actionName === "approve") {
     moved_to:"Админ"
   });
 }
-
     // =========================
     // ✅ АДМИН СОГЛАСУЕТ
     // =========================
@@ -5147,82 +5144,98 @@ async function sendRequestTelegramNotification({
   requestNo,
   stage,
   totalAmount,
-  createdBy,
-  chatMap = {}
+  createdBy
 }) {
   try {
-    let approverLogin = "";
-    let approverName = "";
+    const stageName = String(stage || "").trim();
 
-    if (stage === "Главный бухгалтер") {
-      approverLogin = "s_zhasulan";
-      approverName = "Жасулан Сулейменов";
-    } else if (stage === "Админ") {
-      approverLogin = "b_erkin";
-      approverName = "B_Erkin";
-    }
+    let targetLogin = "";
+    let stageLabel = "";
 
-    const approverLoginNorm = String(approverLogin || "").trim().toLowerCase();
-
-    let approverChatId =
-      chatMap?.[approverLoginNorm] ||
-      chatMap?.[approverLogin] ||
-      "";
-
-    if (!approverChatId) {
-      const q = await pool.query(
-        `
-        SELECT chat_id
-        FROM public.users
-        WHERE lower(trim(login)) = lower(trim($1))
-        LIMIT 1
-        `,
-        [approverLoginNorm]
-      );
-
-      approverChatId = String(q.rows[0]?.chat_id || "").trim();
-    }
-
-    if (!approverChatId) {
-      console.log("chat_id не найден для заявки:", approverLoginNorm);
+    if (stageName === "Главный бухгалтер") {
+      targetLogin = "s_zhasulan";
+      stageLabel = "Главный бухгалтер";
+    } else if (stageName === "Админ") {
+      targetLogin = "b_erkin";
+      stageLabel = "Админ";
+    } else {
+      console.log("sendRequestTelegramNotification: неизвестный этап:", stageName);
       return;
     }
 
-    const openUrl =
-      `https://script.google.com/macros/s/AKfycbySY2CFP3WJ9M_MW5HiDZvSScGCTn2SCOLW68SS1Gt5q-CsHGk9lve06PkeKnuZwZ-j/exec` +
-      `?page=requestCard` +
-      `&id=${encodeURIComponent(requestId)}` +
-      `&login=${encodeURIComponent(approverLogin)}` +
-      `&fullName=${encodeURIComponent(approverName)}` +
-      `&role=${encodeURIComponent("admin")}`;
+    const userRes = await pool.query(`
+      SELECT chat_id, first_name, last_name, login
+      FROM public.users
+      WHERE lower(trim(login)) = lower(trim($1))
+      LIMIT 1
+    `, [targetLogin]);
 
-    const amountText = Number(totalAmount || 0).toLocaleString("ru-RU", {
+    if (!userRes.rows.length) {
+      console.log("❌ Пользователь для Telegram не найден:", targetLogin);
+      return;
+    }
+
+    const userRow = userRes.rows[0];
+    const chatId = String(userRow.chat_id || "").trim();
+
+    if (!chatId) {
+      console.log("❌ chat_id пустой у пользователя:", targetLogin);
+      return;
+    }
+
+    const approverName =
+      [userRow.last_name, userRow.first_name]
+        .filter(Boolean)
+        .join(" ")
+        .trim() || userRow.login || targetLogin;
+
+    const safeRequestId = Number(requestId);
+    const safeRequestNo = requestNo ?? "";
+    const safeTotal = Number(totalAmount || 0).toLocaleString("ru-RU", {
       minimumFractionDigits: 2,
       maximumFractionDigits: 2
     });
 
+    const openUrl = `${APP_BASE_URL}?page=request_card&id=${safeRequestId}`;
+
     const text =
-      `📌 <b>Заявка на согласовании</b>\n\n` +
-      `№ заявки: <b>${requestNo}</b>\n` +
-      `Инициатор: <b>${createdBy || "-"}</b>\n` +
-      `Этап: <b>${stage}</b>\n` +
-      `Сумма: <b>${amountText}</b>`;
+      `📄 Заявка №${safeRequestNo}\n` +
+      `👤 Инициатор: ${String(createdBy || "").trim() || "-"}\n` +
+      `💰 Сумма: ${safeTotal}\n` +
+      `📍 Этап: ${stageLabel}\n` +
+      `👨‍💼 Получатель: ${approverName}`;
 
-    const replyMarkup = {
-      inline_keyboard: [
-        [
-          { text: "✅ Согласовать", callback_data: `request_approve|${requestId}|${stage}` },
-          { text: "❌ Отклонить", callback_data: `request_reject|${requestId}|${stage}` }
-        ],
-        [
-          { text: "📄 Открыть заявку", url: openUrl }
-        ]
-      ]
-    };
+    await axios.post(
+      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+      {
+        chat_id: chatId,
+        text,
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: "🔍 Открыть заявку",
+                url: openUrl
+              }
+            ]
+          ]
+        }
+      },
+      {
+        timeout: 15000
+      }
+    );
 
-    await sendTelegramMessage(approverChatId, text, replyMarkup);
+    console.log("✅ Telegram уведомление отправлено:", {
+      stage: stageLabel,
+      targetLogin,
+      chatId,
+      requestId: safeRequestId,
+      requestNo: safeRequestNo
+    });
+
   } catch (e) {
-    console.error("sendRequestTelegramNotification error:", e);
+    console.error("❌ sendRequestTelegramNotification error:", e?.response?.data || e.message || e);
   }
 }
 
