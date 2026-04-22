@@ -1577,33 +1577,67 @@ app.post("/request-approve", async (req, res) => {
       return res.json({ success:true, action:"reject" });
     }
 
-    // =========================
-    // ✅ ГЛАВБУХ СОГЛАСУЕТ
-    // =========================
-    if (actor === "s_zhasulan" && actionName === "approve") {
+ // =========================
+// ✅ ГЛАВБУХ СОГЛАСУЕТ
+// =========================
+if (actor === "s_zhasulan" && actionName === "approve") {
 
-      await client.query(`
-        UPDATE public.request_head
-        SET
-          acc_buh_status = 'Согласовано',
-          acc_buh_time = NOW(),
-          acc_buh_comment = $2,
-          workflow_stage = 'Админ',
-          agree_status = 'На согласовании'
-        WHERE id = $1
-      `, [
-        Number(request_id),
-        String(comment || "")
-      ]);
+  const itemRes = await client.query(`
+    SELECT zvk_row_id
+    FROM public.request_items
+    WHERE request_id = $1
+  `, [Number(request_id)]);
 
-      await client.query("COMMIT");
+  const ids = itemRes.rows.map(x => Number(x.zvk_row_id)).filter(Boolean);
 
-      return res.json({
-        success:true,
-        stage:"Главбух",
-        moved_to:"Админ"
-      });
-    }
+  if (ids.length) {
+    await client.query(`
+      INSERT INTO public.zvk_status (zvk_row_id, chief_approved, status_time)
+      SELECT x, 'Да', NOW()
+      FROM unnest($1::bigint[]) AS x
+      ON CONFLICT (zvk_row_id)
+      DO UPDATE SET
+        chief_approved = 'Да',
+        status_time = NOW()
+    `, [ids]);
+  }
+
+  await client.query(`
+    UPDATE public.request_head
+    SET
+      acc_buh_name = $2,
+      acc_buh_status = 'Согласовано',
+      acc_buh_time = NOW(),
+      acc_buh_comment = $3,
+      workflow_stage = 'Админ',
+      agree_status = 'На согласовании у Админа'
+    WHERE id = $1
+  `, [
+    Number(request_id),
+    String(name || "Жасулан Сулейменов"),
+    String(comment || "")
+  ]);
+
+  await client.query(`
+    INSERT INTO public.request_approve_log
+      (request_id, stage_name, approver_login, approver_name, action_type, comment_text)
+    VALUES ($1,$2,$3,$4,'approve',$5)
+  `, [
+    Number(request_id),
+    "Главный бухгалтер",
+    String(login || ""),
+    String(name || "Жасулан Сулейменов"),
+    String(comment || "")
+  ]);
+
+  await client.query("COMMIT");
+
+  return res.json({
+    success:true,
+    stage:"Главбух",
+    moved_to:"Админ"
+  });
+}
 
     // =========================
     // ✅ АДМИН СОГЛАСУЕТ
