@@ -1243,46 +1243,47 @@ const head = await client.query(`
     const request_id = head.rows[0].id;
     const request_no = head.rows[0].request_no;
 
-    const items = await client.query(`
-      INSERT INTO public.request_items
-      (
-        request_id,
-        zvk_row_id,
-        id_ft,
-        id_zvk,
-        object,
-        input_name,
-        contractor,
-        pay_purpose,
-        dds_article,
-        contract_no,
-        invoice_no,
-        invoice_date,
-        invoice_pdf,
-   i.src_d,
-i.src_o,
-v.to_pay
-FROM public.ft_zvk_current_v2 v
-        $1,
-        v.zvk_row_id,
-        v.id_ft,
-        v.id_zvk,
-        v.object,
-        v.input_name,
-        v.contractor,
-        v.pay_purpose,
-        v.dds_article,
-        v.contract_no,
-        v.invoice_no,
-        v.invoice_date,
-        v.invoice_pdf,
-        v.src_d,
-        v.src_o,
-        v.to_pay
-      FROM public.ft_zvk_current_v2 v
-      WHERE v.zvk_row_id = ANY($2::bigint[])
-      RETURNING to_pay
-    `, [request_id, ids]);
+const items = await client.query(`
+  INSERT INTO public.request_items
+  (
+    request_id,
+    zvk_row_id,
+    id_ft,
+    id_zvk,
+    object,
+    input_name,
+    contractor,
+    pay_purpose,
+    dds_article,
+    contract_no,
+    invoice_no,
+    invoice_date,
+    invoice_pdf,
+    src_d,
+    src_o,
+    to_pay
+  )
+  SELECT
+    $1,
+    v.zvk_row_id,
+    v.id_ft,
+    v.id_zvk,
+    v.object,
+    v.input_name,
+    v.contractor,
+    v.pay_purpose,
+    v.dds_article,
+    v.contract_no,
+    v.invoice_no,
+    v.invoice_date,
+    v.invoice_pdf,
+    v.src_d,
+    v.src_o,
+    v.to_pay
+  FROM public.ft_zvk_current_v2 v
+  WHERE v.zvk_row_id = ANY($2::bigint[])
+  RETURNING to_pay
+`, [request_id, ids]);
 
     const total = items.rows.reduce((s, r) => s + Number(r.to_pay || 0), 0);
     const count = items.rows.length;
