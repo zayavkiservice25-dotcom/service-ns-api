@@ -5210,16 +5210,26 @@ async function sendRequestTelegramNotification({
       {
         chat_id: chatId,
         text,
-        reply_markup: {
-          inline_keyboard: [
-            [
-              {
-                text: "🔍 Открыть заявку",
-                url: openUrl
-              }
-            ]
-          ]
-        }
+   reply_markup: {
+  inline_keyboard: [
+    [
+      {
+        text: "✅ Согласовать",
+        callback_data: `request_approve|${safeRequestId}|${stageLabel}`
+      },
+      {
+        text: "❌ Отклонить",
+        callback_data: `request_reject|${safeRequestId}|${stageLabel}`
+      }
+    ],
+    [
+      {
+        text: "🔍 Открыть заявку",
+        url: openUrl
+      }
+    ]
+  ]
+}
       },
       {
         timeout: 15000
