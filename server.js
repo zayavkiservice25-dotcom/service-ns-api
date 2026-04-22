@@ -174,6 +174,16 @@ await pool.query(`
     );
   `);
 
+await pool.query(`
+  ALTER TABLE public.users
+  ADD COLUMN IF NOT EXISTS chat_id text;
+`);
+
+await pool.query(`
+  ALTER TABLE public.request_head
+  ADD COLUMN IF NOT EXISTS chat_map jsonb;
+`);
+
   // индексы
   await pool.query(`CREATE INDEX IF NOT EXISTS zvk_idx_ft_date ON zvk (id_ft, zvk_date DESC);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS zvk_idx_zvk_date ON zvk (id_zvk, zvk_date DESC);`);
@@ -4961,14 +4971,35 @@ async function sendRequestTelegramNotification({
       approverLogin = "b_erkin";
     }
 
-    const approverChatId = chatMap[String(approverLogin || "").toLowerCase()] || "";
+    const approverLoginNorm = String(approverLogin || "").trim().toLowerCase();
+
+    let approverChatId =
+      chatMap?.[approverLoginNorm] ||
+      chatMap?.[approverLogin] ||
+      "";
+
+    // fallback в users.chat_id
     if (!approverChatId) {
-      console.log("chat_id не найден для заявки:", approverLogin);
+      const q = await pool.query(
+        `
+        SELECT chat_id
+        FROM public.users
+        WHERE lower(trim(login)) = lower(trim($1))
+        LIMIT 1
+        `,
+        [approverLoginNorm]
+      );
+
+      approverChatId = String(q.rows[0]?.chat_id || "").trim();
+    }
+
+    if (!approverChatId) {
+      console.log("chat_id не найден для заявки:", approverLoginNorm);
       return;
     }
 
     const openUrl =
-      `https://script.google.com/macros/s/ТВОЙ_WEBAPP_ID/exec?page=request_card&id=${requestId}`;
+      `https://script.google.com/macros/s/AKfycbySY2CFP3WJ9M_MW5HiDZvSScGCTn2SCOLW68SS1Gt5q-CsHGk9lve06PkeKnuZwZ-j/exec?page=requestCard&id=${requestId}`;
 
     const amountText = Number(totalAmount || 0).toLocaleString("ru-RU", {
       minimumFractionDigits: 2,
@@ -4977,20 +5008,14 @@ async function sendRequestTelegramNotification({
 
     const text =
       `📌 <b>Заявка на согласовании</b>\n\n` +
-      `Заявка №: <b>${requestNo}</b>\n` +
+      `№ заявки: <b>${requestNo}</b>\n` +
       `Инициатор: <b>${createdBy || "-"}</b>\n` +
       `Этап: <b>${stage}</b>\n` +
       `Сумма: <b>${amountText}</b>`;
 
     const replyMarkup = {
       inline_keyboard: [
-        [
-          { text: "✅ Согласовать", callback_data: `request_approve|${requestId}|${stage}` },
-          { text: "❌ Отклонить", callback_data: `request_reject|${requestId}|${stage}` }
-        ],
-        [
-          { text: "📄 Открыть заявку", url: openUrl }
-        ]
+        [{ text: "📄 Открыть заявку", url: openUrl }]
       ]
     };
 
