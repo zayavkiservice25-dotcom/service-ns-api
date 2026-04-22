@@ -174,15 +174,6 @@ await pool.query(`
     );
   `);
 
-await pool.query(`
-  ALTER TABLE public.users
-  ADD COLUMN IF NOT EXISTS chat_id text;
-`);
-
-await pool.query(`
-  ALTER TABLE public.request_head
-  ADD COLUMN IF NOT EXISTS chat_map jsonb;
-`);
 
   // индексы
   await pool.query(`CREATE INDEX IF NOT EXISTS zvk_idx_ft_date ON zvk (id_ft, zvk_date DESC);`);
@@ -306,6 +297,10 @@ await pool.query(`
     is_active boolean DEFAULT true,
     created_at timestamptz DEFAULT now()
   );
+`);
+await pool.query(`
+  ALTER TABLE public.users
+  ADD COLUMN IF NOT EXISTS chat_id text;
 `);
 
 await pool.query(`
@@ -476,6 +471,11 @@ await pool.query(`
       created_at timestamptz DEFAULT now()
     );
   `);
+
+await pool.query(`
+  ALTER TABLE public.request_head
+  ADD COLUMN IF NOT EXISTS chat_map jsonb;
+`);
 
   await pool.query(`
     CREATE SEQUENCE IF NOT EXISTS public.request_no_seq START 1;
@@ -1535,27 +1535,8 @@ app.post("/request-approve", async (req, res) => {
       return res.status(400).json({ success:false, error:"request_id required" });
     }
 
-    if (!stage) {
-      return res.status(400).json({ success:false, error:"stage required" });
-    }
-
-    if (!action) {
-      return res.status(400).json({ success:false, error:"action required" });
-    }
-
     const actor = String(login || "").trim().toLowerCase();
-    const stageName = String(stage || "").trim();
     const actionName = String(action || "").trim();
-
-    // согласовывает только главбух
-    if (actor !== "s_zhasulan") {
-      return res.status(403).json({ success:false, error:"NO_RIGHTS_TO_APPROVE_REQUEST" });
-    }
-
-    // у заявки только один этап согласования
-    if (stageName !== "Главный бухгалтер") {
-      return res.status(400).json({ success:false, error:"ONLY_MAIN_ACCOUNTANT_STAGE_ALLOWED" });
-    }
 
     await client.query("BEGIN");
 
@@ -1571,60 +1552,70 @@ app.post("/request-approve", async (req, res) => {
 
     const reqHead = reqRes.rows[0];
 
+    // =========================
+    // ❌ ОТКЛОНЕНИЕ
+    // =========================
     if (actionName === "reject") {
       await client.query(`
         UPDATE public.request_head
         SET
-          acc_buh_status = 'Отклонено',
-          acc_buh_time = NOW(),
-          acc_buh_comment = $2,
+          acc_buh_status = CASE
+            WHEN $2 = 's_zhasulan' THEN 'Отклонено'
+            ELSE acc_buh_status
+          END,
+          acc_zam_status = CASE
+            WHEN $2 = 'b_erkin' THEN 'Отклонено'
+            ELSE acc_zam_status
+          END,
           workflow_stage = 'Инициация',
           agree_status = 'Отклонено'
         WHERE id = $1
-      `, [
-        Number(request_id),
-        String(comment || "")
-      ]);
-
-      await client.query(`
-        INSERT INTO public.request_approve_log
-          (request_id, stage_name, approver_login, approver_name, action_type, comment_text)
-        VALUES ($1, $2, $3, $4, 'reject', $5)
-      `, [
-        Number(request_id),
-        'Главный бухгалтер',
-        String(login || ""),
-        String(name || ""),
-        String(comment || "")
-      ]);
+      `, [Number(request_id), actor]);
 
       await client.query("COMMIT");
 
-      try {
-        await notifyRequestRejectedToInitiator({
-          requestNo: reqHead.request_no,
-          createdBy: reqHead.created_by,
-          comment: String(comment || ""),
-          chatMap: reqHead.chat_map || {}
-        });
-      } catch (e) {
-        console.error("notify reject error:", e);
-      }
-
-      return res.json({
-        success:true,
-        action:"reject",
-        moved_to:"Инициация"
-      });
+      return res.json({ success:true, action:"reject" });
     }
 
-    if (actionName === "approve") {
+    // =========================
+    // ✅ ГЛАВБУХ СОГЛАСУЕТ
+    // =========================
+    if (actor === "s_zhasulan" && actionName === "approve") {
+
       await client.query(`
         UPDATE public.request_head
         SET
           acc_buh_status = 'Согласовано',
           acc_buh_time = NOW(),
           acc_buh_comment = $2,
+          workflow_stage = 'Админ',
+          agree_status = 'На согласовании'
+        WHERE id = $1
+      `, [
+        Number(request_id),
+        String(comment || "")
+      ]);
+
+      await client.query("COMMIT");
+
+      return res.json({
+        success:true,
+        stage:"Главбух",
+        moved_to:"Админ"
+      });
+    }
+
+    // =========================
+    // ✅ АДМИН СОГЛАСУЕТ
+    // =========================
+    if (actor === "b_erkin" && actionName === "approve") {
+
+      await client.query(`
+        UPDATE public.request_head
+        SET
+          acc_zam_status = 'Согласовано',
+          acc_zam_time = NOW(),
+          acc_zam_comment = $2,
           workflow_stage = 'Согласовано',
           agree_status = 'Согласовано'
         WHERE id = $1
@@ -1633,39 +1624,21 @@ app.post("/request-approve", async (req, res) => {
         String(comment || "")
       ]);
 
-      await client.query(`
-        INSERT INTO public.request_approve_log
-          (request_id, stage_name, approver_login, approver_name, action_type, comment_text)
-        VALUES ($1, $2, $3, $4, 'approve', $5)
-      `, [
-        Number(request_id),
-        'Главный бухгалтер',
-        String(login || ""),
-        String(name || ""),
-        String(comment || "")
-      ]);
-
       await client.query("COMMIT");
-
-      try {
-        await notifyRequestApprovedToInitiator({
-          requestNo: reqHead.request_no,
-          createdBy: reqHead.created_by,
-          chatMap: reqHead.chat_map || {}
-        });
-      } catch (e) {
-        console.error("notify approve error:", e);
-      }
 
       return res.json({
         success:true,
-        action:"approve",
-        moved_to:"Согласовано"
+        stage:"Админ",
+        final:true
       });
     }
 
     await client.query("ROLLBACK");
-    return res.status(400).json({ success:false, error:"unknown action" });
+
+    return res.status(403).json({
+      success:false,
+      error:"NO_RIGHTS"
+    });
 
   } catch (e) {
     try {
@@ -1673,11 +1646,16 @@ app.post("/request-approve", async (req, res) => {
     } catch (_) {}
 
     console.error("REQUEST-APPROVE ERROR:", e);
-    return res.status(500).json({ success:false, error:e.message });
+
+    return res.status(500).json({
+      success:false,
+      error:e.message
+    });
   } finally {
     client.release();
   }
 });
+
 
 app.post("/zvk-save", async (req, res) => {
   try {
@@ -3869,6 +3847,9 @@ app.post("/telegram-webhook", async (req, res) => {
   try {
     const update = req.body || {};
 
+    // =====================================================
+    // Обычные сообщения боту
+    // =====================================================
     if (update.message) {
       const msg = update.message;
       const chatId = String(msg.chat?.id || "");
@@ -3879,85 +3860,257 @@ app.post("/telegram-webhook", async (req, res) => {
           chatId,
           "Бот подключен ✅\nНапишите ваш логин системы."
         );
-      } else if (text) {
+        return res.sendStatus(200);
+      }
+
+      if (text) {
         await sendTelegramMessage(
           chatId,
           `Ваш chat_id: <b>${chatId}</b>\nЛогин: <b>${text}</b>`
         );
+        return res.sendStatus(200);
       }
     }
 
+    // =====================================================
+    // Нажатия на inline-кнопки
+    // =====================================================
     if (update.callback_query) {
       const cb = update.callback_query;
-      const callbackId = cb.id;
+      const callbackId = String(cb.id || "");
       const chatId = String(cb.message?.chat?.id || "");
-      const data = String(cb.data || "");
+      const data = String(cb.data || "").trim();
 
+      if (!data) {
+        return res.sendStatus(200);
+      }
 
+      const parts = data.split("|");
+      const action = String(parts[0] || "").trim();
 
-    const [action, registryId, stage] = data.split("|");
-let approver = null;
+      // =====================================================
+      // ЗАЯВКИ
+      // callback_data:
+      // request_approve|requestId|stage
+      // request_reject|requestId|stage
+      // =====================================================
+      if (action === "request_approve" || action === "request_reject") {
+        const requestId = Number(parts[1] || 0);
+        const stage = String(parts[2] || "").trim();
 
-if (String(stage || "").trim() === "Согласование") {
-  approver = { login: "K_Marat", name: "Койлибаев Марат" };
-} else {
-  const list = getApproverByStage(stage);
-  approver = Array.isArray(list) ? (list[0] || null) : list;
-}
+        if (!requestId || !stage) {
+          await answerTelegramCallback(callbackId, "Некорректные данные заявки");
+          return res.sendStatus(200);
+        }
 
-if (String(stage || "").trim() === "Исполнение платежей") {
-  const client = await pool.connect();
-  try {
-    const executor = await getExecutorByRegistry(Number(registryId), client);
+        const requestAction = action === "request_approve" ? "approve" : "reject";
 
-    if (executor === "Zh_Elena") {
-      approver = { login: "Zh_Elena", name: "Елена" };
-    } else {
-      approver = { login: "K_Arailym", name: "Арайлым" };
-    }
-  } finally {
-    client.release();
-  }
-}
+        // пока заявки согласует только Жасулан
+        const approver = {
+          login: "s_zhasulan",
+          name: "Жасулан Сулейменов"
+        };
 
-const resp = await fetch(`${APP_BASE_URL}/registry-approve`, {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({
-    registry_id: Number(registryId),
-    stage: stage,
-    action: action,
-    login: approver.login,
-    name: approver.name,
-    comment: action === "reject" ? "Отклонено из Telegram" : "Согласовано из Telegram"
-  })
-});
+        const resp = await fetch(`${APP_BASE_URL}/request-approve`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            request_id: requestId,
+            stage: stage,
+            action: requestAction,
+            login: approver.login,
+            name: approver.name,
+            comment:
+              requestAction === "reject"
+                ? "Отклонено из Telegram"
+                : "Согласовано из Telegram"
+          })
+        });
 
-      const result = await resp.json();
+        const result = await resp.json().catch(() => ({}));
 
-      await tgRequest("answerCallbackQuery", {
-        callback_query_id: callbackId,
-        text: result?.success
-          ? (action === "approve" ? "Согласовано" : "Отклонено")
-          : (result?.error || "Ошибка")
-      });
+        if (!resp.ok || result.success === false) {
+          console.error("request telegram approve error:", result);
+          await answerTelegramCallback(
+            callbackId,
+            result.error || result.message || "Ошибка согласования заявки"
+          );
+          return res.sendStatus(200);
+        }
 
-      if (result?.success) {
+        await answerTelegramCallback(
+          callbackId,
+          requestAction === "approve"
+            ? "Заявка согласована"
+            : "Заявка отклонена"
+        );
+
         await sendTelegramMessage(
           chatId,
-          action === "approve"
-            ? `✅ Реестр №${registryId} согласован`
-            : `❌ Реестр №${registryId} отклонён`
+          requestAction === "approve"
+            ? `✅ Заявка №${requestId} согласована`
+            : `❌ Заявка №${requestId} отклонена`
         );
+
+        return res.sendStatus(200);
       }
+
+      // =====================================================
+      // РЕЕСТРЫ
+      // callback_data:
+      // approve|registryId|stage
+      // reject|registryId|stage
+      // =====================================================
+      const registryAction = String(parts[0] || "").trim();
+      const registryId = Number(parts[1] || 0);
+      const stage = String(parts[2] || "").trim();
+
+      if (!registryId || !stage) {
+        await answerTelegramCallback(callbackId, "Некорректные данные реестра");
+        return res.sendStatus(200);
+      }
+
+      let approver = null;
+
+      if (stage === "Согласование") {
+        approver = { login: "K_Marat", name: "Койлибаев Марат" };
+      } else {
+        const list = getApproverByStage(stage);
+        approver = Array.isArray(list) ? (list[0] || null) : list;
+      }
+
+      if (stage === "Исполнение платежей") {
+        const client = await pool.connect();
+        try {
+          const executor = await getExecutorByRegistry(Number(registryId), client);
+
+          if (executor === "Zh_Elena") {
+            approver = { login: "Zh_Elena", name: "Елена" };
+          } else {
+            approver = { login: "K_Arailym", name: "Арайлым" };
+          }
+        } finally {
+          client.release();
+        }
+      }
+
+      if (!approver || !approver.login) {
+        await answerTelegramCallback(callbackId, "Не найден согласующий");
+        return res.sendStatus(200);
+      }
+
+      const resp = await fetch(`${APP_BASE_URL}/registry-approve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          registry_id: Number(registryId),
+          stage: stage,
+          action: registryAction,
+          login: approver.login,
+          name: approver.name,
+          comment:
+            registryAction === "reject"
+              ? "Отклонено из Telegram"
+              : "Согласовано из Telegram"
+        })
+      });
+
+      const result = await resp.json().catch(() => ({}));
+
+      if (!resp.ok || result.success === false) {
+        console.error("registry telegram approve error:", result);
+        await answerTelegramCallback(
+          callbackId,
+          result.error || result.message || "Ошибка согласования реестра"
+        );
+        return res.sendStatus(200);
+      }
+
+      await answerTelegramCallback(
+        callbackId,
+        registryAction === "approve"
+          ? "Реестр согласован"
+          : "Реестр отклонен"
+      );
+
+      await sendTelegramMessage(
+        chatId,
+        registryAction === "approve"
+          ? `✅ Реестр №${registryId} согласован`
+          : `❌ Реестр №${registryId} отклонен`
+      );
+
+      return res.sendStatus(200);
     }
 
-    return res.json({ ok: true });
+    return res.sendStatus(200);
   } catch (e) {
-    console.error("TELEGRAM WEBHOOK ERROR:", e);
-    return res.status(500).json({ ok: false, error: e.message });
+    console.error("telegram webhook error:", e);
+    return res.sendStatus(500);
   }
 });
+
+async function sendTelegramMessage(chatId, text, replyMarkup = null) {
+  try {
+    const body = {
+      chat_id: String(chatId || "").trim(),
+      text: String(text || ""),
+      parse_mode: "HTML"
+    };
+
+    if (replyMarkup) {
+      body.reply_markup = replyMarkup;
+    }
+
+    const resp = await fetch(
+      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      }
+    );
+
+    const result = await resp.json().catch(() => ({}));
+
+    if (!resp.ok || result.ok === false) {
+      console.error("sendTelegramMessage error:", result);
+    }
+
+    return result;
+  } catch (e) {
+    console.error("sendTelegramMessage fatal error:", e);
+    return null;
+  }
+}
+
+async function answerTelegramCallback(callbackId, text) {
+  try {
+    const resp = await fetch(
+      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/answerCallbackQuery`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          callback_query_id: String(callbackId || ""),
+          text: String(text || ""),
+          show_alert: false
+        })
+      }
+    );
+
+    const result = await resp.json().catch(() => ({}));
+
+    if (!resp.ok || result.ok === false) {
+      console.error("answerTelegramCallback error:", result);
+    }
+
+    return result;
+  } catch (e) {
+    console.error("answerTelegramCallback fatal error:", e);
+    return null;
+  }
+}
 
 async function getUserChatIdByLogin(login, chatMap = {}) {
   const loginNorm = String(login || "").trim().toLowerCase();
@@ -4954,6 +5107,7 @@ await client.query(`
     client.release();
   }
 });
+
 async function sendRequestTelegramNotification({
   requestId,
   requestNo,
@@ -4964,11 +5118,14 @@ async function sendRequestTelegramNotification({
 }) {
   try {
     let approverLogin = "";
+    let approverName = "";
 
     if (stage === "Главный бухгалтер") {
       approverLogin = "s_zhasulan";
+      approverName = "Жасулан Сулейменов";
     } else if (stage === "Админ") {
       approverLogin = "b_erkin";
+      approverName = "B_Erkin";
     }
 
     const approverLoginNorm = String(approverLogin || "").trim().toLowerCase();
@@ -4978,7 +5135,6 @@ async function sendRequestTelegramNotification({
       chatMap?.[approverLogin] ||
       "";
 
-    // fallback в users.chat_id
     if (!approverChatId) {
       const q = await pool.query(
         `
@@ -4999,7 +5155,12 @@ async function sendRequestTelegramNotification({
     }
 
     const openUrl =
-      `https://script.google.com/macros/s/AKfycbySY2CFP3WJ9M_MW5HiDZvSScGCTn2SCOLW68SS1Gt5q-CsHGk9lve06PkeKnuZwZ-j/exec?page=requestCard&id=${requestId}`;
+      `https://script.google.com/macros/s/AKfycbySY2CFP3WJ9M_MW5HiDZvSScGCTn2SCOLW68SS1Gt5q-CsHGk9lve06PkeKnuZwZ-j/exec` +
+      `?page=requestCard` +
+      `&id=${encodeURIComponent(requestId)}` +
+      `&login=${encodeURIComponent(approverLogin)}` +
+      `&fullName=${encodeURIComponent(approverName)}` +
+      `&role=${encodeURIComponent("admin")}`;
 
     const amountText = Number(totalAmount || 0).toLocaleString("ru-RU", {
       minimumFractionDigits: 2,
@@ -5015,7 +5176,13 @@ async function sendRequestTelegramNotification({
 
     const replyMarkup = {
       inline_keyboard: [
-        [{ text: "📄 Открыть заявку", url: openUrl }]
+        [
+          { text: "✅ Согласовать", callback_data: `request_approve|${requestId}|${stage}` },
+          { text: "❌ Отклонить", callback_data: `request_reject|${requestId}|${stage}` }
+        ],
+        [
+          { text: "📄 Открыть заявку", url: openUrl }
+        ]
       ]
     };
 
