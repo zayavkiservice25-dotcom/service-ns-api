@@ -552,10 +552,6 @@ await pool.query(`
   await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zam_time timestamptz;`);
   await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zam_comment text;`);
 
-  await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_ud_name text;`);
-  await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_ud_status text;`);
-  await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_ud_time timestamptz;`);
-  await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_ud_comment text;`);
 
 await pool.query(`
   CREATE TABLE IF NOT EXISTS public.io_history (
@@ -1293,19 +1289,19 @@ FROM public.ft_zvk_current_v2 v
 
 await client.query(`
  UPDATE public.request_head
-SET
-  total_amount = $1,
-  items_count = $2,
-  workflow_stage = 'Главный бухгалтер',
-  agree_status = 'На согласовании',
+ SET
+   total_amount = $1,
+   items_count = $2,
+   workflow_stage = 'Главный бухгалтер',
+   agree_status = 'На согласовании',
 
-  acc_buh_name = 'Жасулан Сулейменов',
-  acc_buh_status = 'Ожидает',
+   acc_buh_name = 'Жасулан Сулейменов',
+   acc_buh_status = 'Ожидает',
 
-  acc_director_name = 'B_Erkin',
-  acc_director_status = 'Ожидает'
+   acc_zam_name = 'B_Erkin',
+   acc_zam_status = 'Ожидает'
 
-WHERE id = $3
+ WHERE id = $3
 `, [total, count, request_id]);
 
     await client.query(`
@@ -1321,7 +1317,16 @@ WHERE id = $3
     ]);
 
     await client.query("COMMIT");
-
+try {
+  await notifyRequestCreatedToInitiator({
+    requestNo: request_no,
+    createdBy: String(login || "").trim(),
+    totalAmount: total,
+    chatMap: chat_map || {}
+  });
+} catch (e) {
+  console.error("notify initiator created error:", e);
+}
 try {
   await sendRequestTelegramNotification({
     requestId: request_id,
@@ -1351,6 +1356,8 @@ try {
     client.release();
   }
 });
+
+
 
 app.get("/request-list", async (req, res) => {
   try {
@@ -1500,7 +1507,6 @@ app.get("/request-card", async (req, res) => {
   }
 });
 
-
 app.post("/request-approve", async (req, res) => {
   const client = await pool.connect();
 
@@ -1530,12 +1536,12 @@ app.post("/request-approve", async (req, res) => {
     const stageName = String(stage || "").trim();
     const actionName = String(action || "").trim();
 
-    // ✅ согласовывает только главбух
+    // согласовывает только главбух
     if (actor !== "s_zhasulan") {
       return res.status(403).json({ success:false, error:"NO_RIGHTS_TO_APPROVE_REQUEST" });
     }
 
-    // ✅ у заявки только один этап согласования
+    // у заявки только один этап согласования
     if (stageName !== "Главный бухгалтер") {
       return res.status(400).json({ success:false, error:"ONLY_MAIN_ACCOUNTANT_STAGE_ALLOWED" });
     }
@@ -1551,6 +1557,8 @@ app.post("/request-approve", async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(404).json({ success:false, error:"request not found" });
     }
+
+    const reqHead = reqRes.rows[0];
 
     if (actionName === "reject") {
       await client.query(`
@@ -1580,6 +1588,18 @@ app.post("/request-approve", async (req, res) => {
       ]);
 
       await client.query("COMMIT");
+
+      try {
+        await notifyRequestRejectedToInitiator({
+          requestNo: reqHead.request_no,
+          createdBy: reqHead.created_by,
+          comment: String(comment || ""),
+          chatMap: reqHead.chat_map || {}
+        });
+      } catch (e) {
+        console.error("notify reject error:", e);
+      }
+
       return res.json({
         success:true,
         action:"reject",
@@ -1615,6 +1635,17 @@ app.post("/request-approve", async (req, res) => {
       ]);
 
       await client.query("COMMIT");
+
+      try {
+        await notifyRequestApprovedToInitiator({
+          requestNo: reqHead.request_no,
+          createdBy: reqHead.created_by,
+          chatMap: reqHead.chat_map || {}
+        });
+      } catch (e) {
+        console.error("notify approve error:", e);
+      }
+
       return res.json({
         success:true,
         action:"approve",
@@ -1626,9 +1657,12 @@ app.post("/request-approve", async (req, res) => {
     return res.status(400).json({ success:false, error:"unknown action" });
 
   } catch (e) {
-    await client.query("ROLLBACK");
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {}
+
     console.error("REQUEST-APPROVE ERROR:", e);
-    res.status(500).json({ success:false, error:e.message });
+    return res.status(500).json({ success:false, error:e.message });
   } finally {
     client.release();
   }
@@ -3913,6 +3947,74 @@ const resp = await fetch(`${APP_BASE_URL}/registry-approve`, {
     return res.status(500).json({ ok: false, error: e.message });
   }
 });
+
+async function getUserChatIdByLogin(login, chatMap = {}) {
+  const loginNorm = String(login || "").trim().toLowerCase();
+
+  const fromMap =
+    chatMap?.[loginNorm] ||
+    chatMap?.[login] ||
+    "";
+
+  if (fromMap) return String(fromMap).trim();
+
+  const q = await pool.query(
+    `
+    SELECT chat_id
+    FROM public.users
+    WHERE lower(trim(login)) = lower(trim($1))
+    LIMIT 1
+    `,
+    [loginNorm]
+  );
+
+  return String(q.rows[0]?.chat_id || "").trim();
+}
+
+async function notifyRequestCreatedToInitiator({
+  requestNo,
+  createdBy,
+  totalAmount,
+  chatMap
+}) {
+  const chatId = await getUserChatIdByLogin(createdBy, chatMap);
+  if (!chatId) return;
+
+  await sendTelegramMessage(
+    chatId,
+    `✅ Заявка №${requestNo} создана\nСумма: ${Number(totalAmount || 0).toLocaleString("ru-RU")} ₸`
+  );
+}
+
+async function notifyRequestApprovedToInitiator({
+  requestNo,
+  createdBy,
+  chatMap
+}) {
+  const chatId = await getUserChatIdByLogin(createdBy, chatMap);
+  if (!chatId) return;
+
+  await sendTelegramMessage(
+    chatId,
+    `✅ Заявка №${requestNo} согласована`
+  );
+}
+
+async function notifyRequestRejectedToInitiator({
+  requestNo,
+  createdBy,
+  comment,
+  chatMap
+}) {
+  const chatId = await getUserChatIdByLogin(createdBy, chatMap);
+  if (!chatId) return;
+
+  await sendTelegramMessage(
+    chatId,
+    `❌ Заявка №${requestNo} отклонена\nКомментарий: ${String(comment || "-")}`
+  );
+}
+
 app.post("/request-approve-telegram", async (req, res) => {
   const client = await pool.connect();
 
@@ -4076,8 +4178,25 @@ app.post("/request-approve-telegram", async (req, res) => {
           String(comment || "")
         ]);
 
-        await client.query("COMMIT");
-        return res.json({ success:true });
+await client.query("COMMIT");
+
+const reqHead = reqRes.rows[0];
+
+try {
+  await notifyRequestApprovedToInitiator({
+    requestNo: reqHead.request_no,
+    createdBy: reqHead.created_by,
+    chatMap: reqHead.chat_map || {}
+  });
+} catch (e) {
+  console.error("notify approve error:", e);
+}
+
+return res.json({
+  success:true,
+  action:"approve",
+  moved_to:"Согласовано"
+});
       }
     }
 
