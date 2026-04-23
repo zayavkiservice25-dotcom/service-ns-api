@@ -1553,6 +1553,34 @@ app.post("/request-approve", async (req, res) => {
 
     const reqHead = reqRes.rows[0];
 
+// ❗ БЛОК ПОВТОРНОГО СОГЛАСОВАНИЯ
+
+if (actor === "s_zhasulan") {
+  if (
+    String(reqHead.acc_buh_status || "").trim() === "Согласовано" ||
+    String(reqHead.acc_buh_status || "").trim() === "Отклонено"
+  ) {
+    await client.query("ROLLBACK");
+    return res.status(400).json({
+      success: false,
+      error: "Главбух уже принял решение"
+    });
+  }
+}
+
+if (actor === "b_erkin") {
+  if (
+    String(reqHead.acc_zam_status || "").trim() === "Согласовано" ||
+    String(reqHead.acc_zam_status || "").trim() === "Отклонено"
+  ) {
+    await client.query("ROLLBACK");
+    return res.status(400).json({
+      success: false,
+      error: "Админ уже принял решение"
+    });
+  }
+}
+
     // =========================
     // ❌ ОТКЛОНЕНИЕ
     // =========================
@@ -4011,32 +4039,42 @@ app.post("/telegram-webhook", async (req, res) => {
     return res.sendStatus(200);
   }
 
-  const resp = await fetch(`${APP_BASE_URL}/request-approve`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      request_id: requestId,
-      stage: stage,
-      action: requestAction,
-      login: approver.login,
-      name: approver.name,
-      comment:
-        requestAction === "reject"
-          ? "Отклонено из Telegram"
-          : "Согласовано из Telegram"
-    })
+const resp = await fetch(`${APP_BASE_URL}/request-approve`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({
+    request_id: requestId,
+    stage: stage,
+    action: requestAction,
+    login: approver.login,
+    name: approver.name,
+    comment:
+      requestAction === "reject"
+        ? "Отклонено из Telegram"
+        : "Согласовано из Telegram"
+  })
+});
+
+const result = await resp.json().catch(() => ({}));
+
+if (!resp.ok || result.success === false) {
+  console.error("request telegram approve error:", result);
+  await answerTelegramCallback(
+    callbackId,
+    result.error || result.message || "Ошибка согласования заявки"
+  );
+  return res.sendStatus(200);
+}
+
+const messageId = cb.message?.message_id;
+
+try {
+  await editTelegramReplyMarkup(chatId, messageId, {
+    inline_keyboard: []
   });
-
-  const result = await resp.json().catch(() => ({}));
-
-  if (!resp.ok || result.success === false) {
-    console.error("request telegram approve error:", result);
-    await answerTelegramCallback(
-      callbackId,
-      result.error || result.message || "Ошибка согласования заявки"
-    );
-    return res.sendStatus(200);
-  }
+} catch (e) {
+  console.error("edit telegram buttons error:", e);
+}
 
   await answerTelegramCallback(
     callbackId,
@@ -4290,6 +4328,34 @@ async function notifyRequestApprovedToInitiator({
   }
 
   await sendTelegramMessage(chatId, text);
+}
+
+async function editTelegramReplyMarkup(chatId, messageId, replyMarkup) {
+  if (!TELEGRAM_BOT_TOKEN) return;
+
+  await axios.post(
+    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageReplyMarkup`,
+    {
+      chat_id: chatId,
+      message_id: messageId,
+      reply_markup: replyMarkup
+    }
+  );
+}
+
+async function editTelegramMessageText(chatId, messageId, text, replyMarkup = { inline_keyboard: [] }) {
+  if (!TELEGRAM_BOT_TOKEN) return;
+
+  await axios.post(
+    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText`,
+    {
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      parse_mode: "HTML",
+      reply_markup: replyMarkup
+    }
+  );
 }
 
 async function notifyRequestRejectedToInitiator({
