@@ -1634,11 +1634,12 @@ if (actor === "s_zhasulan" && actionName === "approve") {
   await client.query("COMMIT");
 
   try {
-    await notifyRequestApprovedToInitiator({
-      requestNo: reqHead.request_no,
-      createdBy: reqHead.created_by,
-      chatMap: reqHead.chat_map || {}
-    });
+await notifyRequestApprovedToInitiator({
+  requestNo: reqHead.request_no,
+  createdBy: reqHead.created_by,
+  chatMap: reqHead.chat_map || {},
+  stage: "Главный бухгалтер"
+});
   } catch (e) {
     console.error("notify chief approve error:", e);
   }
@@ -1679,16 +1680,35 @@ if (actor === "b_erkin" && actionName === "approve") {
     Number(request_id),
     String(comment || "")
   ]);
+const itemRes = await client.query(`
+  SELECT zvk_row_id
+  FROM public.request_items
+  WHERE request_id = $1
+`, [Number(request_id)]);
 
+const ids = itemRes.rows.map(x => Number(x.zvk_row_id)).filter(Boolean);
+
+if (ids.length) {
+  await client.query(`
+    INSERT INTO public.zvk_pay (zvk_row_id, registry_flag, agree_time)
+    SELECT x, 'Да', NOW()
+    FROM unnest($1::bigint[]) AS x
+    ON CONFLICT (zvk_row_id)
+    DO UPDATE SET
+      registry_flag = 'Да',
+      agree_time = NOW()
+  `, [ids]);
+}
   await client.query("COMMIT");
 
   // ✅ УВЕДОМЛЕНИЕ ИНИЦИАТОРУ (ФИНАЛ)
   try {
-    await notifyRequestApprovedToInitiator({
-      requestNo: reqHead.request_no,
-      createdBy: reqHead.created_by,
-      chatMap: reqHead.chat_map || {}
-    });
+await notifyRequestApprovedToInitiator({
+  requestNo: reqHead.request_no,
+  createdBy: reqHead.created_by,
+  chatMap: reqHead.chat_map || {},
+  stage: "Админ"
+});
   } catch (e) {
     console.error("notify final approve error:", e);
   }
@@ -4234,7 +4254,7 @@ async function notifyRequestCreatedToInitiator({
   const chatId = await getUserChatIdByLogin(createdBy, chatMap);
   if (!chatId) return;
 
-  const openUrl = `${APP_BASE_URL}?page=request_card&id=${Number(requestId)}`;
+  const openUrl = `https://script.google.com/macros/s/AKfycbzsGyiWAPgJB6mtEHTOMRpeiRhTFeUpOw1L36fo8SeM4eaxcZmTGvRPhD2-nvRwuBzx/exec?page=request_card&id=${Number(requestId)}`;
 
   await sendTelegramMessage(
     chatId,
@@ -4255,15 +4275,21 @@ async function notifyRequestCreatedToInitiator({
 async function notifyRequestApprovedToInitiator({
   requestNo,
   createdBy,
-  chatMap
+  chatMap,
+  stage
 }) {
   const chatId = await getUserChatIdByLogin(createdBy, chatMap);
   if (!chatId) return;
 
-  await sendTelegramMessage(
-    chatId,
-    `✅ Заявка №${requestNo} согласована`
-  );
+  let text = `✅ Заявка №${requestNo} согласована`;
+
+  if (stage === "Главный бухгалтер") {
+    text = `✅ ГлавБухг согласовал заявку №${requestNo}`;
+  } else if (stage === "Админ") {
+    text = `✅ Админ утвердил заявку №${requestNo}`;
+  }
+
+  await sendTelegramMessage(chatId, text);
 }
 
 async function notifyRequestRejectedToInitiator({
