@@ -2905,8 +2905,7 @@ ORDER BY
 
 app.get("/svod-object", async (req, res) => {
   try {
-
-    const result = await pool.query(`
+    const q = await pool.query(`
       SELECT
         object_name,
         amount_in,
@@ -2918,17 +2917,15 @@ app.get("/svod-object", async (req, res) => {
       ORDER BY object_name
     `);
 
-    res.json({
+    return res.json({
       ok: true,
-      rows: result.rows
+      rows: q.rows
     });
-
-  } catch (err) {
-    console.error("❌ /svod-object error:", err);
-
-    res.status(500).json({
+  } catch (e) {
+    console.error("SVOD OBJECT ERROR:", e);
+    return res.status(500).json({
       ok: false,
-      error: err.message
+      error: e.message
     });
   }
 });
@@ -5740,7 +5737,6 @@ app.get("/registry-dict/dds", async (req, res) => {
       success: true,
       items: r.rows.map(x => x.name)
     });
-
   } catch (e) {
     res.status(500).json({ success:false, error:e.message });
   }
