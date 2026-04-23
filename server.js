@@ -597,6 +597,25 @@ await pool.query(`
 `);
 
 await pool.query(`
+  CREATE TABLE IF NOT EXISTS public.notifications (
+    id bigserial PRIMARY KEY,
+    user_login text NOT NULL,
+    type text NOT NULL,              -- request / registry
+    title text NOT NULL,
+    message text,
+    entity_id bigint,
+    entity_page text,                -- request_card / registry_card
+    is_read boolean DEFAULT false,
+    created_at timestamptz DEFAULT now()
+  );
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS notifications_user_login_idx
+  ON public.notifications (lower(trim(user_login)), is_read, created_at DESC);
+`);
+
+await pool.query(`
   CREATE INDEX IF NOT EXISTS user_role_history_login_idx
   ON public.user_role_history (lower(trim(login)));
 `);
@@ -1240,81 +1259,78 @@ app.post("/create-request", async (req, res) => {
 
     await client.query("BEGIN");
 
-const head = await client.query(`
-  INSERT INTO public.request_head
-    (created_by, pdf_url, chat_map)
-  VALUES ($1, $2, $3::jsonb)
-  RETURNING id, request_no
-`, [
-  String(login || "").trim(),
-  pdf_url ? String(pdf_url).trim() : null,
-  JSON.stringify(chat_map || {})
-]);
+    const head = await client.query(`
+      INSERT INTO public.request_head
+        (created_by, pdf_url, chat_map)
+      VALUES ($1, $2, $3::jsonb)
+      RETURNING id, request_no
+    `, [
+      String(login || "").trim(),
+      pdf_url ? String(pdf_url).trim() : null,
+      JSON.stringify(chat_map || {})
+    ]);
 
     const request_id = head.rows[0].id;
     const request_no = head.rows[0].request_no;
 
-const items = await client.query(`
-  INSERT INTO public.request_items
-  (
-    request_id,
-    zvk_row_id,
-    id_ft,
-    id_zvk,
-    object,
-    input_name,
-    contractor,
-    pay_purpose,
-    dds_article,
-    contract_no,
-    invoice_no,
-    invoice_date,
-    invoice_pdf,
-    src_d,
-    src_o,
-    to_pay
-  )
-  SELECT
-    $1,
-    v.zvk_row_id,
-    v.id_ft,
-    v.id_zvk,
-    v.object,
-    v.input_name,
-    v.contractor,
-    v.pay_purpose,
-    v.dds_article,
-    v.contract_no,
-    v.invoice_no,
-    v.invoice_date,
-    v.invoice_pdf,
-    v.src_d,
-    v.src_o,
-    v.to_pay
-  FROM public.ft_zvk_current_v2 v
-  WHERE v.zvk_row_id = ANY($2::bigint[])
-  RETURNING to_pay
-`, [request_id, ids]);
+    const items = await client.query(`
+      INSERT INTO public.request_items
+      (
+        request_id,
+        zvk_row_id,
+        id_ft,
+        id_zvk,
+        object,
+        input_name,
+        contractor,
+        pay_purpose,
+        dds_article,
+        contract_no,
+        invoice_no,
+        invoice_date,
+        invoice_pdf,
+        src_d,
+        src_o,
+        to_pay
+      )
+      SELECT
+        $1,
+        v.zvk_row_id,
+        v.id_ft,
+        v.id_zvk,
+        v.object,
+        v.input_name,
+        v.contractor,
+        v.pay_purpose,
+        v.dds_article,
+        v.contract_no,
+        v.invoice_no,
+        v.invoice_date,
+        v.invoice_pdf,
+        v.src_d,
+        v.src_o,
+        v.to_pay
+      FROM public.ft_zvk_current_v2 v
+      WHERE v.zvk_row_id = ANY($2::bigint[])
+      RETURNING to_pay
+    `, [request_id, ids]);
 
     const total = items.rows.reduce((s, r) => s + Number(r.to_pay || 0), 0);
     const count = items.rows.length;
 
-await client.query(`
- UPDATE public.request_head
- SET
-   total_amount = $1,
-   items_count = $2,
-   workflow_stage = 'Главный бухгалтер',
-   agree_status = 'На согласовании',
-
-   acc_buh_name = 'Жасулан Сулейменов',
-   acc_buh_status = 'Ожидает',
-
-   acc_zam_name = 'B_Erkin',
-   acc_zam_status = 'Ожидает'
-
- WHERE id = $3
-`, [total, count, request_id]);
+    await client.query(`
+      UPDATE public.request_head
+      SET
+        total_amount = $1,
+        items_count = $2,
+        workflow_stage = 'Главный бухгалтер',
+        agree_status = 'На согласовании',
+        acc_buh_name = 'Жасулан Сулейменов',
+        acc_buh_status = 'Ожидает',
+        acc_zam_name = 'B_Erkin',
+        acc_zam_status = 'Ожидает'
+      WHERE id = $3
+    `, [total, count, request_id]);
 
     await client.query(`
       INSERT INTO public.request_approve_log
@@ -1329,28 +1345,43 @@ await client.query(`
     ]);
 
     await client.query("COMMIT");
-try {
-await notifyRequestCreatedToInitiator({
-  requestId: request_id,
-  requestNo: request_no,
-  createdBy: String(login || "").trim(),
-  totalAmount: total,
-  chatMap: chat_map || {}
-});
-} catch (e) {
-  console.error("notify initiator created error:", e);
-}
-try {
-await sendRequestTelegramNotification({
-  requestId: request_id,
-  requestNo: request_no,
-  stage: "Главный бухгалтер",
-  totalAmount: total,
-  createdBy: String(login || "").trim()
-});
-} catch (tgErr) {
-  console.error("request telegram notify error:", tgErr);
-}
+
+    try {
+      await notifyRequestCreatedToInitiator({
+        requestId: request_id,
+        requestNo: request_no,
+        createdBy: String(login || "").trim(),
+        totalAmount: total,
+        chatMap: chat_map || {}
+      });
+    } catch (e) {
+      console.error("notify initiator created error:", e);
+    }
+
+    try {
+      await sendRequestTelegramNotification({
+        requestId: request_id,
+        requestNo: request_no,
+        stage: "Главный бухгалтер",
+        totalAmount: total,
+        createdBy: String(login || "").trim()
+      });
+    } catch (tgErr) {
+      console.error("request telegram notify error:", tgErr);
+    }
+
+    try {
+      await createNotification({
+        userLogin: String(login || "").trim(),
+        type: "request",
+        title: `Заявка №${request_no} создана`,
+        message: `Сумма: ${Number(total || 0).toLocaleString("ru-RU")} ₸`,
+        entityId: request_id,
+        entityPage: "request_card"
+      });
+    } catch (e) {
+      console.error("create notification request created error:", e);
+    }
 
     res.json({
       success:true,
@@ -1368,7 +1399,6 @@ await sendRequestTelegramNotification({
     client.release();
   }
 });
-
 
 
 app.get("/request-list", async (req, res) => {
@@ -1553,37 +1583,32 @@ app.post("/request-approve", async (req, res) => {
 
     const reqHead = reqRes.rows[0];
 
-// ❗ БЛОК ПОВТОРНОГО СОГЛАСОВАНИЯ
+    if (actor === "s_zhasulan") {
+      if (
+        String(reqHead.acc_buh_status || "").trim() === "Согласовано" ||
+        String(reqHead.acc_buh_status || "").trim() === "Отклонено"
+      ) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          success: false,
+          error: "Главбух уже принял решение"
+        });
+      }
+    }
 
-if (actor === "s_zhasulan") {
-  if (
-    String(reqHead.acc_buh_status || "").trim() === "Согласовано" ||
-    String(reqHead.acc_buh_status || "").trim() === "Отклонено"
-  ) {
-    await client.query("ROLLBACK");
-    return res.status(400).json({
-      success: false,
-      error: "Главбух уже принял решение"
-    });
-  }
-}
+    if (actor === "b_erkin") {
+      if (
+        String(reqHead.acc_zam_status || "").trim() === "Согласовано" ||
+        String(reqHead.acc_zam_status || "").trim() === "Отклонено"
+      ) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          success: false,
+          error: "Админ уже принял решение"
+        });
+      }
+    }
 
-if (actor === "b_erkin") {
-  if (
-    String(reqHead.acc_zam_status || "").trim() === "Согласовано" ||
-    String(reqHead.acc_zam_status || "").trim() === "Отклонено"
-  ) {
-    await client.query("ROLLBACK");
-    return res.status(400).json({
-      success: false,
-      error: "Админ уже принял решение"
-    });
-  }
-}
-
-    // =========================
-    // ❌ ОТКЛОНЕНИЕ
-    // =========================
     if (actionName === "reject") {
       await client.query(`
         UPDATE public.request_head
@@ -1601,152 +1626,209 @@ if (actor === "b_erkin") {
         WHERE id = $1
       `, [Number(request_id), actor]);
 
+      await client.query(`
+        INSERT INTO public.request_approve_log
+          (request_id, stage_name, approver_login, approver_name, action_type, comment_text)
+        VALUES ($1,$2,$3,$4,'reject',$5)
+      `, [
+        Number(request_id),
+        String(stage || ""),
+        String(login || ""),
+        String(name || ""),
+        String(comment || "")
+      ]);
+
       await client.query("COMMIT");
+
+      try {
+        await createNotification({
+          userLogin: reqHead.created_by,
+          type: "request",
+          title: `Заявка №${reqHead.request_no} отклонена`,
+          message: String(comment || "Заявка была отклонена"),
+          entityId: Number(request_id),
+          entityPage: "request_card"
+        });
+      } catch (e) {
+        console.error("create notification request reject error:", e);
+      }
 
       return res.json({ success:true, action:"reject" });
     }
 
- // =========================
-// ✅ ГЛАВБУХ СОГЛАСУЕТ
-// =========================
-if (actor === "s_zhasulan" && actionName === "approve") {
+    if (actor === "s_zhasulan" && actionName === "approve") {
+      const itemRes = await client.query(`
+        SELECT zvk_row_id
+        FROM public.request_items
+        WHERE request_id = $1
+      `, [Number(request_id)]);
 
-  const itemRes = await client.query(`
-    SELECT zvk_row_id
-    FROM public.request_items
-    WHERE request_id = $1
-  `, [Number(request_id)]);
+      const ids = itemRes.rows.map(x => Number(x.zvk_row_id)).filter(Boolean);
 
-  const ids = itemRes.rows.map(x => Number(x.zvk_row_id)).filter(Boolean);
+      if (ids.length) {
+        await client.query(`
+          INSERT INTO public.zvk_status (zvk_row_id, chief_approved, status_time)
+          SELECT x, 'Да', NOW()
+          FROM unnest($1::bigint[]) AS x
+          ON CONFLICT (zvk_row_id)
+          DO UPDATE SET
+            chief_approved = 'Да',
+            status_time = NOW()
+        `, [ids]);
+      }
 
-  if (ids.length) {
-    await client.query(`
-      INSERT INTO public.zvk_status (zvk_row_id, chief_approved, status_time)
-      SELECT x, 'Да', NOW()
-      FROM unnest($1::bigint[]) AS x
-      ON CONFLICT (zvk_row_id)
-      DO UPDATE SET
-        chief_approved = 'Да',
-        status_time = NOW()
-    `, [ids]);
-  }
+      await client.query(`
+        UPDATE public.request_head
+        SET
+          acc_buh_name = $2,
+          acc_buh_status = 'Согласовано',
+          acc_buh_time = NOW(),
+          acc_buh_comment = $3,
+          workflow_stage = 'Админ',
+          agree_status = 'На согласовании'
+        WHERE id = $1
+      `, [
+        Number(request_id),
+        String(name || "Жасулан Сулейменов"),
+        String(comment || "")
+      ]);
 
-  await client.query(`
-    UPDATE public.request_head
-    SET
-      acc_buh_name = $2,
-      acc_buh_status = 'Согласовано',
-      acc_buh_time = NOW(),
-      acc_buh_comment = $3,
-      workflow_stage = 'Админ',
-      agree_status = 'На согласовании'
-    WHERE id = $1
-  `, [
-    Number(request_id),
-    String(name || "Жасулан Сулейменов"),
-    String(comment || "")
-  ]);
+      await client.query(`
+        INSERT INTO public.request_approve_log
+          (request_id, stage_name, approver_login, approver_name, action_type, comment_text)
+        VALUES ($1,$2,$3,$4,'approve',$5)
+      `, [
+        Number(request_id),
+        "Главный бухгалтер",
+        String(login || ""),
+        String(name || ""),
+        String(comment || "")
+      ]);
 
-  await client.query(`
-    INSERT INTO public.request_approve_log
-      (request_id, stage_name, approver_login, approver_name, action_type, comment_text)
-    VALUES ($1,$2,$3,$4,'approve',$5)
-  `, [
-    Number(request_id),
-    "Главный бухгалтер",
-    String(login || ""),
-    String(name || ""),
-    String(comment || "")
-  ]);
+      await client.query("COMMIT");
 
-  await client.query("COMMIT");
+      try {
+        await notifyRequestApprovedToInitiator({
+          requestNo: reqHead.request_no,
+          createdBy: reqHead.created_by,
+          chatMap: reqHead.chat_map || {},
+          stage: "Главный бухгалтер"
+        });
+      } catch (e) {
+        console.error("notify chief approve error:", e);
+      }
 
-  try {
-await notifyRequestApprovedToInitiator({
-  requestNo: reqHead.request_no,
-  createdBy: reqHead.created_by,
-  chatMap: reqHead.chat_map || {},
-  stage: "Главный бухгалтер"
-});
-  } catch (e) {
-    console.error("notify chief approve error:", e);
-  }
+      try {
+        await createNotification({
+          userLogin: reqHead.created_by,
+          type: "request",
+          title: `ГлавБухг согласовал заявку №${reqHead.request_no}`,
+          message: "Заявка переведена на этап Админ",
+          entityId: Number(request_id),
+          entityPage: "request_card"
+        });
+      } catch (e) {
+        console.error("create notification chief approve error:", e);
+      }
 
-  try {
-    await sendRequestTelegramNotification({
-      requestId: Number(request_id),
-      requestNo: reqHead.request_no,
-      stage: "Админ",
-      totalAmount: Number(reqHead.total_amount || 0),
-      createdBy: String(reqHead.created_by || "").trim()
-    });
-  } catch (tgErr) {
-    console.error("request telegram notify admin error:", tgErr);
-  }
+      try {
+        await sendRequestTelegramNotification({
+          requestId: Number(request_id),
+          requestNo: reqHead.request_no,
+          stage: "Админ",
+          totalAmount: Number(reqHead.total_amount || 0),
+          createdBy: String(reqHead.created_by || "").trim()
+        });
+      } catch (tgErr) {
+        console.error("request telegram notify admin error:", tgErr);
+      }
 
-  return res.json({
-    success:true,
-    stage:"Главбух",
-    moved_to:"Админ"
-  });
-}
-    // =========================
-    // ✅ АДМИН СОГЛАСУЕТ
-    // =========================
-if (actor === "b_erkin" && actionName === "approve") {
+      return res.json({
+        success:true,
+        stage:"Главбух",
+        moved_to:"Админ"
+      });
+    }
 
-  await client.query(`
-    UPDATE public.request_head
-    SET
-      acc_zam_status = 'Согласовано',
-      acc_zam_time = NOW(),
-      acc_zam_comment = $2,
-      workflow_stage = 'Согласовано',
-      agree_status = 'Согласовано'
-    WHERE id = $1
-  `, [
-    Number(request_id),
-    String(comment || "")
-  ]);
-const itemRes = await client.query(`
-  SELECT zvk_row_id
-  FROM public.request_items
-  WHERE request_id = $1
-`, [Number(request_id)]);
+    if (actor === "b_erkin" && actionName === "approve") {
+      await client.query(`
+        UPDATE public.request_head
+        SET
+          acc_zam_status = 'Согласовано',
+          acc_zam_time = NOW(),
+          acc_zam_comment = $2,
+          workflow_stage = 'Согласовано',
+          agree_status = 'Согласовано'
+        WHERE id = $1
+      `, [
+        Number(request_id),
+        String(comment || "")
+      ]);
 
-const ids = itemRes.rows.map(x => Number(x.zvk_row_id)).filter(Boolean);
+      const itemRes = await client.query(`
+        SELECT zvk_row_id
+        FROM public.request_items
+        WHERE request_id = $1
+      `, [Number(request_id)]);
 
-if (ids.length) {
-  await client.query(`
-    INSERT INTO public.zvk_pay (zvk_row_id, registry_flag, agree_time)
-    SELECT x, 'Да', NOW()
-    FROM unnest($1::bigint[]) AS x
-    ON CONFLICT (zvk_row_id)
-    DO UPDATE SET
-      registry_flag = 'Да',
-      agree_time = NOW()
-  `, [ids]);
-}
-  await client.query("COMMIT");
+      const ids = itemRes.rows.map(x => Number(x.zvk_row_id)).filter(Boolean);
 
-  // ✅ УВЕДОМЛЕНИЕ ИНИЦИАТОРУ (ФИНАЛ)
-  try {
-await notifyRequestApprovedToInitiator({
-  requestNo: reqHead.request_no,
-  createdBy: reqHead.created_by,
-  chatMap: reqHead.chat_map || {},
-  stage: "Админ"
-});
-  } catch (e) {
-    console.error("notify final approve error:", e);
-  }
+      if (ids.length) {
+        await client.query(`
+          INSERT INTO public.zvk_pay (zvk_row_id, registry_flag, agree_time)
+          SELECT x, 'Да', NOW()
+          FROM unnest($1::bigint[]) AS x
+          ON CONFLICT (zvk_row_id)
+          DO UPDATE SET
+            registry_flag = 'Да',
+            agree_time = NOW()
+        `, [ids]);
+      }
 
-  return res.json({
-    success:true,
-    stage:"Админ",
-    final:true
-  });
-}
+      await client.query(`
+        INSERT INTO public.request_approve_log
+          (request_id, stage_name, approver_login, approver_name, action_type, comment_text)
+        VALUES ($1,$2,$3,$4,'approve',$5)
+      `, [
+        Number(request_id),
+        "Админ",
+        String(login || ""),
+        String(name || ""),
+        String(comment || "")
+      ]);
+
+      await client.query("COMMIT");
+
+      try {
+        await notifyRequestApprovedToInitiator({
+          requestNo: reqHead.request_no,
+          createdBy: reqHead.created_by,
+          chatMap: reqHead.chat_map || {},
+          stage: "Админ"
+        });
+      } catch (e) {
+        console.error("notify final approve error:", e);
+      }
+
+      try {
+        await createNotification({
+          userLogin: reqHead.created_by,
+          type: "request",
+          title: `Админ утвердил заявку №${reqHead.request_no}`,
+          message: "Заявка полностью согласована",
+          entityId: Number(request_id),
+          entityPage: "request_card"
+        });
+      } catch (e) {
+        console.error("create notification admin approve error:", e);
+      }
+
+      return res.json({
+        success:true,
+        stage:"Админ",
+        final:true
+      });
+    }
 
     await client.query("ROLLBACK");
 
@@ -1770,7 +1852,6 @@ await notifyRequestApprovedToInitiator({
     client.release();
   }
 });
-
 
 app.post("/zvk-save", async (req, res) => {
   try {
@@ -4372,6 +4453,129 @@ async function notifyRequestRejectedToInitiator({
     `❌ Заявка №${requestNo} отклонена\nКомментарий: ${String(comment || "-")}`
   );
 }
+
+// =========================
+// 🔔 СОЗДАНИЕ УВЕДОМЛЕНИЯ
+// =========================
+async function createNotification({
+  userLogin,
+  type,
+  title,
+  message,
+  entityId,
+  entityPage
+}) {
+  try {
+    if (!userLogin) return;
+
+    await pool.query(`
+      INSERT INTO public.notifications
+      (
+        user_login,
+        type,
+        title,
+        message,
+        entity_id,
+        entity_page
+      )
+      VALUES ($1,$2,$3,$4,$5,$6)
+    `, [
+      String(userLogin || "").trim(),
+      String(type || "").trim(),
+      String(title || "").trim(),
+      String(message || "").trim(),
+      entityId ? Number(entityId) : null,
+      entityPage ? String(entityPage).trim() : null
+    ]);
+
+  } catch (e) {
+    console.error("createNotification error:", e);
+  }
+}
+
+// =========================
+// 🔔 СПИСОК УВЕДОМЛЕНИЙ
+// =========================
+app.get("/notifications", async (req, res) => {
+  try {
+    const login = String(req.query.login || "").trim();
+
+    if (!login) {
+      return res.status(400).json({
+        success:false,
+        error:"login required"
+      });
+    }
+
+    const r = await pool.query(`
+      SELECT
+        id,
+        type,
+        title,
+        message,
+        entity_id,
+        entity_page,
+        is_read,
+        created_at
+      FROM public.notifications
+      WHERE lower(trim(user_login)) = lower(trim($1))
+      ORDER BY created_at DESC
+      LIMIT 100
+    `, [login]);
+
+    res.json({
+      success: true,
+      rows: r.rows
+    });
+
+  } catch (e) {
+    res.status(500).json({ success:false, error:e.message });
+  }
+});
+app.post("/notifications/read", async (req, res) => {
+  try {
+    const { id, login } = req.body || {};
+
+    if (!id || !login) {
+      return res.status(400).json({ success:false, error:"id and login required" });
+    }
+
+    await pool.query(`
+      UPDATE public.notifications
+      SET is_read = true
+      WHERE id = $1
+        AND lower(trim(user_login)) = lower(trim($2))
+    `, [Number(id), String(login).trim().toLowerCase()]);
+
+    return res.json({ success:true });
+  } catch (e) {
+    console.error("NOTIFICATIONS READ ERROR:", e);
+    return res.status(500).json({ success:false, error:e.message });
+  }
+});
+
+app.post("/notifications/read-all", async (req, res) => {
+  try {
+    const { login } = req.body || {};
+
+    if (!login) {
+      return res.status(400).json({ success:false, error:"login required" });
+    }
+
+    await pool.query(`
+      UPDATE public.notifications
+      SET is_read = true
+      WHERE lower(trim(user_login)) = lower(trim($1))
+        AND is_read = false
+    `, [String(login).trim().toLowerCase()]);
+
+    return res.json({ success:true });
+  } catch (e) {
+    console.error("NOTIFICATIONS READ ALL ERROR:", e);
+    return res.status(500).json({ success:false, error:e.message });
+  }
+});
+
 
 app.post("/request-approve-telegram", async (req, res) => {
   const client = await pool.connect();
