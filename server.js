@@ -1330,12 +1330,13 @@ await client.query(`
 
     await client.query("COMMIT");
 try {
-  await notifyRequestCreatedToInitiator({
-    requestNo: request_no,
-    createdBy: String(login || "").trim(),
-    totalAmount: total,
-    chatMap: chat_map || {}
-  });
+await notifyRequestCreatedToInitiator({
+  requestId: request_id,
+  requestNo: request_no,
+  createdBy: String(login || "").trim(),
+  totalAmount: total,
+  chatMap: chat_map || {}
+});
 } catch (e) {
   console.error("notify initiator created error:", e);
 }
@@ -1605,27 +1606,51 @@ if (actor === "s_zhasulan" && actionName === "approve") {
   await client.query(`
     UPDATE public.request_head
     SET
+      acc_buh_name = $2,
       acc_buh_status = 'Согласовано',
       acc_buh_time = NOW(),
-      acc_buh_comment = $2,
+      acc_buh_comment = $3,
       workflow_stage = 'Админ',
       agree_status = 'На согласовании'
     WHERE id = $1
   `, [
     Number(request_id),
+    String(name || "Жасулан Сулейменов"),
+    String(comment || "")
+  ]);
+
+  await client.query(`
+    INSERT INTO public.request_approve_log
+      (request_id, stage_name, approver_login, approver_name, action_type, comment_text)
+    VALUES ($1,$2,$3,$4,'approve',$5)
+  `, [
+    Number(request_id),
+    "Главный бухгалтер",
+    String(login || ""),
+    String(name || ""),
     String(comment || "")
   ]);
 
   await client.query("COMMIT");
 
   try {
-await sendRequestTelegramNotification({
-  requestId: Number(request_id),
-  requestNo: reqHead.request_no,
-  stage: "Админ",
-  totalAmount: Number(reqHead.total_amount || 0),
-  createdBy: String(reqHead.created_by || "").trim()
-});
+    await notifyRequestApprovedToInitiator({
+      requestNo: reqHead.request_no,
+      createdBy: reqHead.created_by,
+      chatMap: reqHead.chat_map || {}
+    });
+  } catch (e) {
+    console.error("notify chief approve error:", e);
+  }
+
+  try {
+    await sendRequestTelegramNotification({
+      requestId: Number(request_id),
+      requestNo: reqHead.request_no,
+      stage: "Админ",
+      totalAmount: Number(reqHead.total_amount || 0),
+      createdBy: String(reqHead.created_by || "").trim()
+    });
   } catch (tgErr) {
     console.error("request telegram notify admin error:", tgErr);
   }
@@ -1639,30 +1664,41 @@ await sendRequestTelegramNotification({
     // =========================
     // ✅ АДМИН СОГЛАСУЕТ
     // =========================
-    if (actor === "b_erkin" && actionName === "approve") {
+if (actor === "b_erkin" && actionName === "approve") {
 
-      await client.query(`
-        UPDATE public.request_head
-        SET
-          acc_zam_status = 'Согласовано',
-          acc_zam_time = NOW(),
-          acc_zam_comment = $2,
-          workflow_stage = 'Согласовано',
-          agree_status = 'Согласовано'
-        WHERE id = $1
-      `, [
-        Number(request_id),
-        String(comment || "")
-      ]);
+  await client.query(`
+    UPDATE public.request_head
+    SET
+      acc_zam_status = 'Согласовано',
+      acc_zam_time = NOW(),
+      acc_zam_comment = $2,
+      workflow_stage = 'Согласовано',
+      agree_status = 'Согласовано'
+    WHERE id = $1
+  `, [
+    Number(request_id),
+    String(comment || "")
+  ]);
 
-      await client.query("COMMIT");
+  await client.query("COMMIT");
 
-      return res.json({
-        success:true,
-        stage:"Админ",
-        final:true
-      });
-    }
+  // ✅ УВЕДОМЛЕНИЕ ИНИЦИАТОРУ (ФИНАЛ)
+  try {
+    await notifyRequestApprovedToInitiator({
+      requestNo: reqHead.request_no,
+      createdBy: reqHead.created_by,
+      chatMap: reqHead.chat_map || {}
+    });
+  } catch (e) {
+    console.error("notify final approve error:", e);
+  }
+
+  return res.json({
+    success:true,
+    stage:"Админ",
+    final:true
+  });
+}
 
     await client.query("ROLLBACK");
 
@@ -3926,66 +3962,88 @@ app.post("/telegram-webhook", async (req, res) => {
       // request_reject|requestId|stage
       // =====================================================
       if (action === "request_approve" || action === "request_reject") {
-        const requestId = Number(parts[1] || 0);
-        const stage = String(parts[2] || "").trim();
+  const requestId = Number(parts[1] || 0);
+  const stage = String(parts[2] || "").trim();
 
-        if (!requestId || !stage) {
-          await answerTelegramCallback(callbackId, "Некорректные данные заявки");
-          return res.sendStatus(200);
-        }
+  if (!requestId || !stage) {
+    await answerTelegramCallback(callbackId, "Некорректные данные заявки");
+    return res.sendStatus(200);
+  }
 
-        const requestAction = action === "request_approve" ? "approve" : "reject";
+  const requestAction = action === "request_approve" ? "approve" : "reject";
 
-        // пока заявки согласует только Жасулан
-        const approver = {
-          login: "s_zhasulan",
-          name: "Жасулан Сулейменов"
-        };
+  let approver = null;
 
-        const resp = await fetch(`${APP_BASE_URL}/request-approve`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            request_id: requestId,
-            stage: stage,
-            action: requestAction,
-            login: approver.login,
-            name: approver.name,
-            comment:
-              requestAction === "reject"
-                ? "Отклонено из Telegram"
-                : "Согласовано из Telegram"
-          })
-        });
+  if (stage === "Главный бухгалтер") {
+    approver = {
+      login: "s_zhasulan",
+      name: "Жасулан Сулейменов"
+    };
+  } else if (stage === "Админ") {
+    approver = {
+      login: "b_erkin",
+      name: "Баймагамбетов Еркин"
+    };
+  }
 
-        const result = await resp.json().catch(() => ({}));
+  if (!approver) {
+    await answerTelegramCallback(callbackId, "Не найден согласующий по этапу");
+    return res.sendStatus(200);
+  }
 
-        if (!resp.ok || result.success === false) {
-          console.error("request telegram approve error:", result);
-          await answerTelegramCallback(
-            callbackId,
-            result.error || result.message || "Ошибка согласования заявки"
-          );
-          return res.sendStatus(200);
-        }
+  const resp = await fetch(`${APP_BASE_URL}/request-approve`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      request_id: requestId,
+      stage: stage,
+      action: requestAction,
+      login: approver.login,
+      name: approver.name,
+      comment:
+        requestAction === "reject"
+          ? "Отклонено из Telegram"
+          : "Согласовано из Telegram"
+    })
+  });
 
-        await answerTelegramCallback(
-          callbackId,
-          requestAction === "approve"
-            ? "Заявка согласована"
-            : "Заявка отклонена"
-        );
+  const result = await resp.json().catch(() => ({}));
 
-        await sendTelegramMessage(
-          chatId,
-          requestAction === "approve"
-            ? `✅ Заявка №${requestId} согласована`
-            : `❌ Заявка №${requestId} отклонена`
-        );
+  if (!resp.ok || result.success === false) {
+    console.error("request telegram approve error:", result);
+    await answerTelegramCallback(
+      callbackId,
+      result.error || result.message || "Ошибка согласования заявки"
+    );
+    return res.sendStatus(200);
+  }
 
-        return res.sendStatus(200);
-      }
+  await answerTelegramCallback(
+    callbackId,
+    requestAction === "approve"
+      ? "Заявка согласована"
+      : "Заявка отклонена"
+  );
 
+  // берем номер заявки, а не requestId
+  const headRes = await pool.query(`
+    SELECT request_no
+    FROM public.request_head
+    WHERE id = $1
+    LIMIT 1
+  `, [requestId]);
+
+  const requestNo = headRes.rows[0]?.request_no || requestId;
+
+  await sendTelegramMessage(
+    chatId,
+    requestAction === "approve"
+      ? `✅ Заявка №${requestNo} согласована`
+      : `❌ Заявка №${requestNo} отклонена`
+  );
+
+  return res.sendStatus(200);
+}
       // =====================================================
       // РЕЕСТРЫ
       // callback_data:
@@ -4167,6 +4225,7 @@ async function getUserChatIdByLogin(login, chatMap = {}) {
 }
 
 async function notifyRequestCreatedToInitiator({
+  requestId,
   requestNo,
   createdBy,
   totalAmount,
@@ -4175,9 +4234,21 @@ async function notifyRequestCreatedToInitiator({
   const chatId = await getUserChatIdByLogin(createdBy, chatMap);
   if (!chatId) return;
 
+  const openUrl = `${APP_BASE_URL}?page=request_card&id=${Number(requestId)}`;
+
   await sendTelegramMessage(
     chatId,
-    `✅ Заявка №${requestNo} создана\nСумма: ${Number(totalAmount || 0).toLocaleString("ru-RU")} ₸`
+    `✅ Заявка №${requestNo} создана\n💰 Сумма: ${Number(totalAmount || 0).toLocaleString("ru-RU")} ₸`,
+    {
+      inline_keyboard: [
+        [
+          {
+            text: "🔍 Открыть заявку",
+            url: openUrl
+          }
+        ]
+      ]
+    }
   );
 }
 
