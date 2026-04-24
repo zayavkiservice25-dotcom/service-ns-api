@@ -5742,6 +5742,25 @@ app.get("/registry-dict/dds", async (req, res) => {
   }
 });
 
+app.get("/division-dicts", async (req, res) => {
+  try {
+    const [divs, objects, dds] = await Promise.all([
+      pool.query(`SELECT name FROM public.spravochnik_division ORDER BY name`),
+      pool.query(`SELECT name FROM public.spravochnik_istochnikobject ORDER BY name`),
+      pool.query(`SELECT name FROM public.spravochnik_dds ORDER BY name`)
+    ]);
+
+    res.json({
+      success: true,
+      divs: divs.rows.map(r => r.name),
+      objects: objects.rows.map(r => r.name),
+      dds: dds.rows.map(r => r.name)
+    });
+  } catch (e) {
+    res.status(500).json({ success:false, error:e.message });
+  }
+});
+
 
 // =====================================================
 // Start
