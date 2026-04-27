@@ -3967,245 +3967,6 @@ app.get("/registry-archive-list", async (req,res)=>{
   }
 });
 
-async function tgRequest(method, payload) {
-  const resp = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload || {})
-  });
-
-  const data = await resp.json();
-  if (!data.ok) {
-    throw new Error(data.description || "Telegram API error");
-  }
-  return data.result;
-}
-
-function getApproverByStage(stage) {
-  const s = String(stage || "").trim();
-
-  if (s === "Согласование") {
-    return [
-      { login: "K_Marat", name: "Койлибаев Марат" },
-      { login: "V_Shevchenko", name: "Шевченко Владимир" }
-    ];
-  }
-
-  if (s === "Утверждение") {
-    return [
-      { login: "K_Ermek", name: "Ермек Касенов" }
-    ];
-  }
-
-  if (s === "Контроль и архивирование") {
-    return [
-      { login: "b_erkin", name: "Еркин" }
-    ];
-  }
-
-  return [];
-}
-const DIVISION_EXECUTORS = {
-  "Дорога":        { login: "K_Arailym",   name: "Арайлым Касенова" },
-  "Механизация":   { login: "K_Arailym",   name: "Арайлым Касенова" },
-  "Мост":          { login: "K_Arailym",   name: "Арайлым Касенова" },
-  "Офис":          { login: "K_Arailym",   name: "Арайлым Касенова" },
-  "Сети":          { login: "K_Arailym",   name: "Арайлым Касенова" },
-  "СК Жилой дом":  { login: "Zh_Elena",    name: "Елена Жбанкова" },
-  "Sapa asphalt":  { login: "S_Zhasulan",  name: "Жасулан Сулейменов" },
-  "Smart Estate":  { login: "Zh_Elena",    name: "Елена Жбанкова" }
-};
-
-async function getRegistryDivisions(registryId, client) {
-  const r = await client.query(`
-    SELECT DISTINCT TRIM(COALESCE(src_d,'')) AS src_d
-    FROM public.registry_items
-    WHERE registry_id = $1
-      AND NULLIF(TRIM(COALESCE(src_d,'')), '') IS NOT NULL
-  `, [Number(registryId)]);
-
-  return r.rows.map(x => String(x.src_d || "").trim()).filter(Boolean);
-}
-
-async function getExecutorsByRegistry(registryId, client) {
-  const divisions = await getRegistryDivisions(registryId, client);
-  const map = new Map();
-
-  for (const div of divisions) {
-    const person = DIVISION_EXECUTORS[div];
-    if (person) {
-      map.set(String(person.login).toLowerCase(), person);
-    }
-  }
-
-  return Array.from(map.values());
-}
-
-
-app.post("/telegram-webhook", async (req, res) => {
-  try {
-    const update = req.body || {};
-
-    if (update.message) {
-      const msg = update.message;
-      const chatId = String(msg.chat?.id || "");
-      const text = String(msg.text || "").trim();
-
-      if (text === "/start") {
-        await sendTelegramMessage(chatId, "Бот подключен ✅\nНапишите ваш логин системы.");
-        return res.sendStatus(200);
-      }
-
-      if (text) {
-        await sendTelegramMessage(chatId, `Ваш chat_id: <b>${chatId}</b>\nЛогин: <b>${text}</b>`);
-        return res.sendStatus(200);
-      }
-    }
-
-    if (update.callback_query) {
-      const cb = update.callback_query;
-      const callbackId = String(cb.id || "");
-      const chatId = String(cb.message?.chat?.id || "");
-      const data = String(cb.data || "").trim();
-
-      if (!data) return res.sendStatus(200);
-
-      const parts = data.split("|");
-      const action = String(parts[0] || "").trim();
-
-      // =========================
-      // ЗАЯВКИ
-      // =========================
-      if (action === "request_approve" || action === "request_reject") {
-        const requestId = Number(parts[1] || 0);
-        const stage = String(parts[2] || "").trim();
-
-        if (!requestId || !stage) {
-          await answerTelegramCallback(callbackId, "Некорректные данные заявки");
-          return res.sendStatus(200);
-        }
-
-        const requestAction = action === "request_approve" ? "approve" : "reject";
-
-        let approver = null;
-
-        if (stage === "Главный бухгалтер") {
-          approver = { login: "s_zhasulan", name: "Жасулан Сулейменов" };
-        } else if (stage === "Админ") {
-          approver = { login: "b_erkin", name: "Баймагамбетов Еркин" };
-        }
-
-        if (!approver) {
-          await answerTelegramCallback(callbackId, "Не найден согласующий по этапу");
-          return res.sendStatus(200);
-        }
-
-        const resp = await fetch(`${APP_BASE_URL}/request-approve`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            request_id: requestId,
-            stage,
-            action: requestAction,
-            login: approver.login,
-            name: approver.name,
-            comment: requestAction === "reject"
-              ? "Отклонено из Telegram"
-              : "Согласовано из Telegram"
-          })
-        });
-
-        const result = await resp.json().catch(() => ({}));
-
-        if (!resp.ok || result.success === false) {
-          await answerTelegramCallback(callbackId, result.error || result.message || "Ошибка согласования заявки");
-          return res.sendStatus(200);
-        }
-
-        try {
-          await editTelegramReplyMarkup(chatId, cb.message?.message_id, { inline_keyboard: [] });
-        } catch (e) {
-          console.error("edit request telegram buttons error:", e);
-        }
-
-        await answerTelegramCallback(
-          callbackId,
-          requestAction === "approve" ? "Заявка согласована" : "Заявка отклонена"
-        );
-
-        return res.sendStatus(200);
-      }
-
-      // =========================
-      // РЕЕСТРЫ
-      // callback_data:
-      // approve|registryId|stage|login|name
-      // reject|registryId|stage|login|name
-      // =========================
-      if (action === "approve" || action === "reject") {
-        const registryAction = action;
-        const registryId = Number(parts[1] || 0);
-        const stage = String(parts[2] || "").trim();
-        const login = String(parts[3] || "").trim().toLowerCase();
-        const name = decodeURIComponent(String(parts[4] || login || "").trim());
-
-        if (!registryId || !stage || !login) {
-          await answerTelegramCallback(callbackId, "Некорректные данные реестра");
-          return res.sendStatus(200);
-        }
-
-        const resp = await fetch(`${APP_BASE_URL}/registry-approve`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            registry_id: registryId,
-            stage,
-            action: registryAction,
-            login,
-            name,
-            comment: registryAction === "reject"
-              ? "Отклонено из Telegram"
-              : "Согласовано из Telegram"
-          })
-        });
-
-        const result = await resp.json().catch(() => ({}));
-
-        if (!resp.ok || result.success === false) {
-          console.error("registry telegram approve error:", result);
-          await answerTelegramCallback(callbackId, result.error || result.message || "Ошибка согласования реестра");
-          return res.sendStatus(200);
-        }
-
-        try {
-          await editTelegramReplyMarkup(chatId, cb.message?.message_id, { inline_keyboard: [] });
-        } catch (e) {
-          console.error("edit registry telegram buttons error:", e);
-        }
-
-        await answerTelegramCallback(
-          callbackId,
-          registryAction === "approve" ? "Реестр согласован" : "Реестр отклонен"
-        );
-
-        await sendRegistryTelegramNotification({
-          registryId,
-          action: registryAction,
-          actorLogin: login,
-          actorName: name
-        });
-
-        return res.sendStatus(200);
-      }
-    }
-
-    return res.sendStatus(200);
-
-  } catch (e) {
-    console.error("telegram webhook error:", e);
-    return res.sendStatus(500);
-  }
-});
 async function sendTelegramMessage(chatId, text, replyMarkup = null) {
   try {
     const body = {
@@ -4255,16 +4016,27 @@ async function answerTelegramCallback(callbackId, text) {
       }
     );
 
-    const result = await resp.json().catch(() => ({}));
-
-    if (!resp.ok || result.ok === false) {
-      console.error("answerTelegramCallback error:", result);
-    }
-
-    return result;
+    return await resp.json().catch(() => ({}));
   } catch (e) {
     console.error("answerTelegramCallback fatal error:", e);
     return null;
+  }
+}
+
+async function editTelegramReplyMarkup(chatId, messageId, replyMarkup) {
+  if (!TELEGRAM_BOT_TOKEN || !chatId || !messageId) return;
+
+  try {
+    await axios.post(
+      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageReplyMarkup`,
+      {
+        chat_id: chatId,
+        message_id: messageId,
+        reply_markup: replyMarkup
+      }
+    );
+  } catch (e) {
+    console.error("editTelegramReplyMarkup error:", e?.response?.data || e.message || e);
   }
 }
 
@@ -4291,100 +4063,6 @@ async function getUserChatIdByLogin(login, chatMap = {}) {
   return String(q.rows[0]?.chat_id || "").trim();
 }
 
-async function notifyRequestCreatedToInitiator({
-  requestId,
-  requestNo,
-  createdBy,
-  totalAmount,
-  chatMap
-}) {
-  const chatId = await getUserChatIdByLogin(createdBy, chatMap);
-  if (!chatId) return;
-
-  const openUrl = `https://script.google.com/macros/s/AKfycbzsGyiWAPgJB6mtEHTOMRpeiRhTFeUpOw1L36fo8SeM4eaxcZmTGvRPhD2-nvRwuBzx/exec?page=request_card&id=${Number(requestId)}`;
-
-  await sendTelegramMessage(
-    chatId,
-    `✅ Заявка №${requestNo} создана\n💰 Сумма: ${Number(totalAmount || 0).toLocaleString("ru-RU")} ₸`,
-    {
-      inline_keyboard: [
-        [
-          {
-            text: "🔍 Открыть заявку",
-            url: openUrl
-          }
-        ]
-      ]
-    }
-  );
-}
-
-async function notifyRequestApprovedToInitiator({
-  requestNo,
-  createdBy,
-  chatMap,
-  stage
-}) {
-  const chatId = await getUserChatIdByLogin(createdBy, chatMap);
-  if (!chatId) return;
-
-  let text = `✅ Заявка №${requestNo} согласована`;
-
-  if (stage === "Главный бухгалтер") {
-    text = `✅ ГлавБухг согласовал заявку №${requestNo}`;
-  } else if (stage === "Админ") {
-    text = `✅ Админ утвердил заявку №${requestNo}`;
-  }
-
-  await sendTelegramMessage(chatId, text);
-}
-
-async function editTelegramReplyMarkup(chatId, messageId, replyMarkup) {
-  if (!TELEGRAM_BOT_TOKEN) return;
-
-  await axios.post(
-    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageReplyMarkup`,
-    {
-      chat_id: chatId,
-      message_id: messageId,
-      reply_markup: replyMarkup
-    }
-  );
-}
-
-async function editTelegramMessageText(chatId, messageId, text, replyMarkup = { inline_keyboard: [] }) {
-  if (!TELEGRAM_BOT_TOKEN) return;
-
-  await axios.post(
-    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText`,
-    {
-      chat_id: chatId,
-      message_id: messageId,
-      text,
-      parse_mode: "HTML",
-      reply_markup: replyMarkup
-    }
-  );
-}
-
-async function notifyRequestRejectedToInitiator({
-  requestNo,
-  createdBy,
-  comment,
-  chatMap
-}) {
-  const chatId = await getUserChatIdByLogin(createdBy, chatMap);
-  if (!chatId) return;
-
-  await sendTelegramMessage(
-    chatId,
-    `❌ Заявка №${requestNo} отклонена\nКомментарий: ${String(comment || "-")}`
-  );
-}
-
-// =========================
-// 🔔 СОЗДАНИЕ УВЕДОМЛЕНИЯ
-// =========================
 async function createNotification({
   userLogin,
   type,
@@ -4419,332 +4097,6 @@ async function createNotification({
   } catch (e) {
     console.error("createNotification error:", e);
   }
-}
-
-// =========================
-// 🔔 СПИСОК УВЕДОМЛЕНИЙ
-// =========================
-app.get("/notifications", async (req, res) => {
-  try {
-    const login = String(req.query.login || "").trim();
-
-    if (!login) {
-      return res.status(400).json({
-        success:false,
-        error:"login required"
-      });
-    }
-
-    const r = await pool.query(`
-      SELECT
-        id,
-        type,
-        title,
-        message,
-        entity_id,
-        entity_page,
-        is_read,
-        created_at
-      FROM public.notifications
-      WHERE lower(trim(user_login)) = lower(trim($1))
-      ORDER BY created_at DESC
-      LIMIT 100
-    `, [login]);
-
-    res.json({
-      success: true,
-      rows: r.rows
-    });
-
-  } catch (e) {
-    res.status(500).json({ success:false, error:e.message });
-  }
-});
-app.post("/notifications/read", async (req, res) => {
-  try {
-    const { id, login } = req.body || {};
-
-    if (!id || !login) {
-      return res.status(400).json({ success:false, error:"id and login required" });
-    }
-
-    await pool.query(`
-      UPDATE public.notifications
-      SET is_read = true
-      WHERE id = $1
-        AND lower(trim(user_login)) = lower(trim($2))
-    `, [Number(id), String(login).trim().toLowerCase()]);
-
-    return res.json({ success:true });
-  } catch (e) {
-    console.error("NOTIFICATIONS READ ERROR:", e);
-    return res.status(500).json({ success:false, error:e.message });
-  }
-});
-
-app.post("/notifications/read-all", async (req, res) => {
-  try {
-    const { login } = req.body || {};
-
-    if (!login) {
-      return res.status(400).json({ success:false, error:"login required" });
-    }
-
-    await pool.query(`
-      UPDATE public.notifications
-      SET is_read = true
-      WHERE lower(trim(user_login)) = lower(trim($1))
-        AND is_read = false
-    `, [String(login).trim().toLowerCase()]);
-
-    return res.json({ success:true });
-  } catch (e) {
-    console.error("NOTIFICATIONS READ ALL ERROR:", e);
-    return res.status(500).json({ success:false, error:e.message });
-  }
-});
-
-
-app.post("/request-approve-telegram", async (req, res) => {
-  const client = await pool.connect();
-
-  try {
-    const { request_id, stage, action, login, name, comment } = req.body || {};
-
-    if (!request_id) {
-      return res.status(400).json({ success:false, error:"request_id required" });
-    }
-
-    await client.query("BEGIN");
-
-    const reqRes = await client.query(`
-      SELECT *
-      FROM public.request_head
-      WHERE id = $1
-      LIMIT 1
-    `, [Number(request_id)]);
-
-    if (!reqRes.rows.length) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ success:false, error:"request not found" });
-    }
-
-    const head = reqRes.rows[0];
-
-    if (action === "reject") {
-      await client.query(`
-        UPDATE public.request_head
-        SET
-          agree_status = 'Отклонено',
-          workflow_stage = 'Инициация'
-        WHERE id = $1
-      `, [Number(request_id)]);
-
-      await client.query(`
-        INSERT INTO public.request_approve_log
-          (request_id, stage_name, approver_login, approver_name, action_type, comment_text)
-        VALUES ($1,$2,$3,$4,'reject',$5)
-      `, [
-        Number(request_id),
-        stage,
-        String(login || ""),
-        String(name || ""),
-        String(comment || "")
-      ]);
-
-      await client.query("COMMIT");
-      return res.json({ success:true });
-    }
-
-    if (action === "approve") {
-      if (String(stage || "").trim() === "Главный бухгалтер") {
-        const itemRes = await client.query(`
-          SELECT zvk_row_id
-          FROM public.request_items
-          WHERE request_id = $1
-        `, [Number(request_id)]);
-
-        const ids = itemRes.rows.map(x => Number(x.zvk_row_id)).filter(Boolean);
-
-        if (ids.length) {
-          await client.query(`
-            INSERT INTO public.zvk_status (zvk_row_id, chief_approved, status_time)
-            SELECT x, 'Да', NOW()
-            FROM unnest($1::bigint[]) AS x
-            ON CONFLICT (zvk_row_id)
-            DO UPDATE SET
-              chief_approved = 'Да',
-              status_time = NOW()
-          `, [ids]);
-        }
-
-        await client.query(`
-          UPDATE public.request_head
-          SET
-            acc_buh_name = $2,
-            acc_buh_status = 'Согласовано',
-            acc_buh_time = NOW(),
-            acc_buh_comment = $3,
-            workflow_stage = 'Админ',
-            agree_status = 'На согласовании у Админа'
-          WHERE id = $1
-        `, [
-          Number(request_id),
-          String(name || ""),
-          String(comment || "")
-        ]);
-
-        await client.query(`
-          INSERT INTO public.request_approve_log
-            (request_id, stage_name, approver_login, approver_name, action_type, comment_text)
-          VALUES ($1,$2,$3,$4,'approve',$5)
-        `, [
-          Number(request_id),
-          "Главный бухгалтер",
-          String(login || ""),
-          String(name || ""),
-          String(comment || "")
-        ]);
-
-        await client.query("COMMIT");
-
-        try {
-          await sendRequestTelegramNotification({
-            requestId: head.id,
-            requestNo: head.request_no,
-            stage: "Админ",
-            totalAmount: head.total_amount,
-            createdBy: head.created_by || "",
-            chatMap: head.chat_map || {}
-          });
-        } catch (e) {
-          console.error(e);
-        }
-
-        return res.json({ success:true });
-      }
-
-      if (String(stage || "").trim() === "Админ") {
-        await client.query(`
-          UPDATE public.request_head
-          SET
-            acc_zam_name = $2,
-            acc_zam_status = 'Согласовано',
-            acc_zam_time = NOW(),
-            acc_zam_comment = $3,
-            workflow_stage = 'Завершено',
-            agree_status = 'Согласовано'
-          WHERE id = $1
-        `, [
-          Number(request_id),
-          String(name || ""),
-          String(comment || "")
-        ]);
-
-        await client.query(`
-          INSERT INTO public.zvk_pay (zvk_row_id, registry_flag, agree_time)
-          SELECT
-            i.zvk_row_id,
-            'Да',
-            NOW()
-          FROM public.request_items i
-          WHERE i.request_id = $1
-            AND i.zvk_row_id IS NOT NULL
-          ON CONFLICT (zvk_row_id)
-          DO UPDATE SET
-            registry_flag = 'Да',
-            agree_time = COALESCE(zvk_pay.agree_time, NOW())
-        `, [Number(request_id)]);
-
-        await client.query(`
-          INSERT INTO public.request_approve_log
-            (request_id, stage_name, approver_login, approver_name, action_type, comment_text)
-          VALUES ($1,$2,$3,$4,'approve',$5)
-        `, [
-          Number(request_id),
-          "Админ",
-          String(login || ""),
-          String(name || ""),
-          String(comment || "")
-        ]);
-
-await client.query("COMMIT");
-
-const reqHead = reqRes.rows[0];
-
-try {
-  await notifyRequestApprovedToInitiator({
-    requestNo: reqHead.request_no,
-    createdBy: reqHead.created_by,
-    chatMap: reqHead.chat_map || {}
-  });
-} catch (e) {
-  console.error("notify approve error:", e);
-}
-
-return res.json({
-  success:true,
-  action:"approve",
-  moved_to:"Согласовано"
-});
-      }
-    }
-
-    await client.query("ROLLBACK");
-    return res.status(400).json({ success:false, error:"unknown action" });
-
-  } catch (e) {
-    await client.query("ROLLBACK");
-    console.error("request-approve-telegram error:", e);
-    return res.status(500).json({ success:false, error:e.message });
-  } finally {
-    client.release();
-  }
-});
-
-
-async function getExecutorByRegistry(registryId, client) {
-  const list = await getExecutorsByRegistry(registryId, client);
-  return list.length ? list[0].login : "K_Arailym";
-}
-
-
-
-async function getWatchersByRegistry(registryId, client) {
-  const r = await client.query(`
-    SELECT DISTINCT TRIM(COALESCE(src_d,'')) AS src_d
-    FROM registry_items
-    WHERE registry_id = $1
-  `, [registryId]);
-
-  const divisions = r.rows.map(x => x.src_d);
-  const watchers = new Set();
-
-  for (const d of divisions) {
-    const list = DIVISION_WATCHERS[d] || [];
-    list.forEach(w => watchers.add(w));
-  }
-
-  const executor = await getExecutorByRegistry(registryId, client);
-
-  const excluded = new Set([
-    "K_Marat",    // заместитель директора
-    "K_Ermek",    // утверждающий
-    executor      // исполнитель
-  ]);
-
-  return Array.from(watchers).filter(w => !excluded.has(w));
-}
-
-async function getRegistryChatMap(registryId, client) {
-  const r = await client.query(`
-    SELECT chat_map
-    FROM public.registry_head
-    WHERE id = $1
-    LIMIT 1
-  `, [Number(registryId)]);
-
-  return r.rows[0]?.chat_map || {};
 }
 
 async function sendRegistryTelegramNotification({
@@ -4852,40 +4204,43 @@ async function sendRegistryTelegramNotification({
       ? approvedCurrent.map(a => `✅ ${a.approver_name || a.approver_login}`).join("\n")
       : "Пока нет";
 
-    let title = `📌 <b>Реестр на этапе: ${currentStage}</b>`;
+    let titleText = `Реестр №${regNo} на этапе ${currentStage}`;
+    let titleHtml = `📌 <b>Реестр на этапе: ${currentStage}</b>`;
 
     if (action === "approve") {
-      title = `✅ <b>${actorName || actorLogin} согласовал реестр</b>`;
+      titleText = `Реестр №${regNo} согласован`;
+      titleHtml = `✅ <b>${actorName || actorLogin} согласовал реестр</b>`;
     }
 
     if (action === "reject") {
-      title = `❌ <b>${actorName || actorLogin} отклонил реестр</b>`;
+      titleText = `Реестр №${regNo} отклонен`;
+      titleHtml = `❌ <b>${actorName || actorLogin} отклонил реестр</b>`;
     }
 
     const infoText =
-      `${title}\n\n` +
+      `${titleHtml}\n\n` +
       `Реестр №: <b>${regNo}</b>\n` +
       `Инициатор: <b>${head.created_by || createdBy || "-"}</b>\n` +
       `Этап: <b>${currentStage}</b>\n` +
-      `Сумма: <b>${amount.toLocaleString("ru-RU", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</b>\n\n` +
+      `Сумма: <b>${amount.toLocaleString("ru-RU", {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2
+      })}</b>\n\n` +
       `<b>Согласовали:</b>\n${approvedText}\n\n` +
       `<b>Остались:</b>\n${pendingText}`;
 
     const usersToNotify = new Set();
 
-    // 1. Инициатор
     if (head.created_by) {
       usersToNotify.add(String(head.created_by).trim().toLowerCase());
     }
 
-    // 2. Все согласующие
     approvals.forEach(a => {
       if (a.approver_login) {
         usersToNotify.add(String(a.approver_login).trim().toLowerCase());
       }
     });
 
-    // 3. Все ВводИмя из строк реестра
     const inputUsersRes = await client.query(`
       SELECT DISTINCT lower(trim(COALESCE(input_name,''))) AS login
       FROM public.registry_items
@@ -4894,32 +4249,46 @@ async function sendRegistryTelegramNotification({
     `, [Number(registryId)]);
 
     inputUsersRes.rows.forEach(u => {
-      if (u.login) usersToNotify.add(String(u.login).trim().toLowerCase());
+      if (u.login) {
+        usersToNotify.add(String(u.login).trim().toLowerCase());
+      }
     });
 
-    // 4. Кто нажал кнопку
     if (actorLogin) {
       usersToNotify.add(String(actorLogin).trim().toLowerCase());
     }
 
-    // Уведомление всем: инициатор + согласующие + ВводИмя
     for (const login of usersToNotify) {
-      const chatId = await getUserChatIdByLogin(login, finalChatMap);
-      if (!chatId) continue;
-
-      await sendTelegramMessage(chatId, infoText, {
-        inline_keyboard: [
-          [
-            {
-              text: "🔍 Открыть реестр",
-              url: openUrl
-            }
-          ]
-        ]
+      await createNotification({
+        userLogin: login,
+        type: "registry",
+        title: titleText,
+        message:
+          action === "approve"
+            ? `${actorName || actorLogin} согласовал. Этап: ${currentStage}`
+            : action === "reject"
+              ? `${actorName || actorLogin} отклонил. Этап: ${currentStage}`
+              : `Этап: ${currentStage}. Сумма: ${amount.toLocaleString("ru-RU")} ₸`,
+        entityId: Number(registryId),
+        entityPage: "registryCard"
       });
+
+      const chatId = await getUserChatIdByLogin(login, finalChatMap);
+
+      if (chatId) {
+        await sendTelegramMessage(chatId, infoText, {
+          inline_keyboard: [
+            [
+              {
+                text: "🔍 Открыть реестр",
+                url: openUrl
+              }
+            ]
+          ]
+        });
+      }
     }
 
-    // Кнопки согласовать/отклонить только тем, кто должен согласовать текущий этап
     for (const a of pendingCurrent) {
       const approverLoginNorm = String(a.approver_login || "").trim().toLowerCase();
       const approverName = String(a.approver_name || a.approver_login || "").trim();
@@ -4932,7 +4301,10 @@ async function sendRegistryTelegramNotification({
         `📌 <b>Нужно согласовать реестр</b>\n\n` +
         `Реестр №: <b>${regNo}</b>\n` +
         `Этап: <b>${currentStage}</b>\n` +
-        `Сумма: <b>${amount.toLocaleString("ru-RU", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</b>`,
+        `Сумма: <b>${amount.toLocaleString("ru-RU", {
+          minimumFractionDigits: 2,
+          maximumFractionDigits: 2
+        })}</b>`,
         {
           inline_keyboard: [
             [
@@ -4962,7 +4334,6 @@ async function sendRegistryTelegramNotification({
     client.release();
   }
 }
-
 
 //NeW APP
 app.post("/update-profile", async (req, res) => {
@@ -5585,7 +4956,14 @@ async function sendRequestTelegramNotification({
         timeout: 15000
       }
     );
-
+    await createNotification({
+      userLogin: targetLogin,
+      type: "request",
+      title: `Заявка №${safeRequestNo} на согласовании`,
+      message: `Этап: ${stageLabel}. Сумма: ${safeTotal} ₸`,
+      entityId: safeRequestId,
+      entityPage: "request_card"
+    });
     console.log("✅ Telegram уведомление отправлено:", {
       stage: stageLabel,
       targetLogin,
