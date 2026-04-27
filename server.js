@@ -3405,13 +3405,29 @@ app.get("/registry-card", async (req, res) => {
       WHERE registry_id = $1
       ORDER BY id
     `, [id]);
+const approvalsRes = await pool.query(`
+  SELECT
+    id,
+    registry_id,
+    stage_name,
+    approver_login,
+    approver_name,
+    status,
+    action_time,
+    comment_text
+  FROM public.registry_stage_approvals
+  WHERE registry_id = $1
+  ORDER BY id
+`, [id]);
 
-    return res.json({
-      success: true,
-      head,
-      items: itemsRes.rows,
-      transfers: transfersRes.rows
-    });
+
+return res.json({
+  success: true,
+  head,
+  items: itemsRes.rows,
+  transfers: transfersRes.rows,
+  approvals: approvalsRes.rows
+});
 
   } catch (e) {
     console.error("REGISTRY CARD ERROR:", e);
