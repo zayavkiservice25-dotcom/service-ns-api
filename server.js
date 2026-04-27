@@ -4099,6 +4099,37 @@ async function createNotification({
   }
 }
 
+function getApproverByStage(stage) {
+  const s = String(stage || "").trim();
+
+  if (s === "Согласование") {
+    return [
+      { login: "K_Marat", name: "Койлибаев Марат" },
+      { login: "V_Shevchenko", name: "Шевченко Владимир" }
+    ];
+  }
+
+  if (s === "Утверждение") {
+    return [
+      { login: "K_Ermek", name: "Ермек Касенов" }
+    ];
+  }
+
+  if (s === "Исполнение платежей") {
+    return [
+      { login: "K_Arailym", name: "Арайлым Касенова" }
+    ];
+  }
+
+  if (s === "Контроль и архивирование") {
+    return [
+      { login: "b_erkin", name: "Еркин" }
+    ];
+  }
+
+  return [];
+}
+
 async function sendRegistryTelegramNotification({
   registryId,
   registryNo,
