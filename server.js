@@ -5157,6 +5157,55 @@ app.get("/division-dicts", async (req, res) => {
 });
 
 
+app.get("/notifications", async (req, res) => {
+  try {
+    const login = String(req.query.login || "").trim();
+    const filter = String(req.query.filter || "all").trim();
+
+    if (!login) {
+      return res.status(400).json({ success:false, error:"login required" });
+    }
+
+    let whereFilter = "";
+    if (filter === "unread") whereFilter = "AND is_read = false";
+    if (filter === "read") whereFilter = "AND is_read = true";
+
+    const r = await pool.query(`
+      SELECT
+        id,
+        type,
+        title,
+        message,
+        entity_id,
+        entity_page,
+        is_read,
+        created_at
+      FROM public.notifications
+      WHERE lower(trim(user_login)) = lower(trim($1))
+      ${whereFilter}
+      ORDER BY created_at DESC
+      LIMIT 100
+    `, [login]);
+
+    const cnt = await pool.query(`
+      SELECT COUNT(*)::int AS unread_count
+      FROM public.notifications
+      WHERE lower(trim(user_login)) = lower(trim($1))
+        AND is_read = false
+    `, [login]);
+
+    return res.json({
+      success: true,
+      rows: r.rows,
+      unread_count: Number(cnt.rows[0]?.unread_count || 0)
+    });
+
+  } catch (e) {
+    return res.status(500).json({ success:false, error:e.message });
+  }
+});
+
+
 // =====================================================
 // Start
 // =====================================================
