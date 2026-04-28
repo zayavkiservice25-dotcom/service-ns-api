@@ -1610,51 +1610,89 @@ app.post("/request-approve", async (req, res) => {
     }
 
     if (actionName === "reject") {
-      await client.query(`
-        UPDATE public.request_head
-        SET
-          acc_buh_status = CASE
-            WHEN $2 = 's_zhasulan' THEN 'Отклонено'
-            ELSE acc_buh_status
-          END,
-          acc_zam_status = CASE
-            WHEN $2 = 'b_erkin' THEN 'Отклонено'
-            ELSE acc_zam_status
-          END,
-          workflow_stage = 'Инициация',
-          agree_status = 'Отклонено'
-        WHERE id = $1
-      `, [Number(request_id), actor]);
+  let backStage = "Черновик";
 
-      await client.query(`
-        INSERT INTO public.request_approve_log
-          (request_id, stage_name, approver_login, approver_name, action_type, comment_text)
-        VALUES ($1,$2,$3,$4,'reject',$5)
-      `, [
-        Number(request_id),
-        String(stage || ""),
-        String(login || ""),
-        String(name || ""),
-        String(comment || "")
-      ]);
+  if (stageName === "Утверждение") {
+    backStage = "Согласование";
+  } else if (stageName === "Исполнение платежей") {
+    backStage = "Утверждение";
+  } else if (stageName === "Контроль и архивирование") {
+    backStage = "Исполнение платежей";
+  }
 
-      await client.query("COMMIT");
+  await client.query(`
+    UPDATE public.registry_head
+    SET
+      workflow_stage = $2,
+      agree_status = 'На согласовании'
+    WHERE id = $1
+  `, [Number(registry_id), backStage]);
 
-      try {
-        await createNotification({
-          userLogin: reqHead.created_by,
-          type: "request",
-          title: `Заявка №${reqHead.request_no} отклонена`,
-          message: String(comment || "Заявка была отклонена"),
-          entityId: Number(request_id),
-          entityPage: "request_card"
-        });
-      } catch (e) {
-        console.error("create notification request reject error:", e);
-      }
+  await client.query(`
+    UPDATE public.registry_stage_approvals
+    SET
+      status = 'Отклонено',
+      action_time = NOW(),
+      comment_text = $4
+    WHERE registry_id = $1
+      AND stage_name = $2
+      AND lower(trim(approver_login)) = lower(trim($3))
+  `, [
+    Number(registry_id),
+    stageName,
+    String(login || ""),
+    String(comment || "")
+  ]);
 
-      return res.json({ success:true, action:"reject" });
-    }
+  await client.query(`
+    DELETE FROM public.registry_stage_approvals
+    WHERE registry_id = $1
+      AND stage_name <> $2
+      AND stage_name IN ('Утверждение','Исполнение платежей','Контроль и архивирование')
+  `, [Number(registry_id), backStage]);
+
+  await client.query(`
+    UPDATE public.registry_stage_approvals
+    SET
+      status = 'Ожидает',
+      action_time = NULL,
+      comment_text = NULL
+    WHERE registry_id = $1
+      AND stage_name = $2
+  `, [Number(registry_id), backStage]);
+
+  await client.query(`
+    INSERT INTO public.registry_approve_log
+      (registry_id, stage_name, approver_login, approver_name, action_type, comment_text)
+    VALUES ($1, $2, $3, $4, 'reject', $5)
+  `, [
+    Number(registry_id),
+    `${stageName} -> ${backStage}`,
+    String(login || ""),
+    String(name || ""),
+    String(comment || "")
+  ]);
+
+  await client.query("COMMIT");
+
+  try {
+    await sendRegistryTelegramNotification({
+      registryId: Number(registry_id),
+      stage: backStage,
+      action: "reject",
+      actorLogin: String(login || ""),
+      actorName: String(name || "")
+    });
+  } catch (e) {
+    console.error("registry reject notify error:", e);
+  }
+
+  return res.json({
+    success: true,
+    moved_to: backStage,
+    action: "reject"
+  });
+}
 
     if (actor === "s_zhasulan" && actionName === "approve") {
       const itemRes = await client.query(`
@@ -4235,18 +4273,20 @@ async function sendRegistryTelegramNotification({
       ? approvedCurrent.map(a => `✅ ${a.approver_name || a.approver_login}`).join("\n")
       : "Пока нет";
 
-    let titleText = `Реестр №${regNo} на этапе ${currentStage}`;
-    let titleHtml = `📌 <b>Реестр на этапе: ${currentStage}</b>`;
+const actorText = String(actorName || actorLogin || "").trim();
 
-    if (action === "approve") {
-      titleText = `Реестр №${regNo} согласован`;
-      titleHtml = `✅ <b>${actorName || actorLogin} согласовал реестр</b>`;
-    }
+let titleText = `Реестр №${regNo} на этапе ${currentStage}`;
+let titleHtml = `📌 <b>Реестр на этапе: ${currentStage}</b>`;
 
-    if (action === "reject") {
-      titleText = `Реестр №${regNo} отклонен`;
-      titleHtml = `❌ <b>${actorName || actorLogin} отклонил реестр</b>`;
-    }
+if (action === "approve") {
+  titleText = `${actorText} согласовал реестр №${regNo}`;
+  titleHtml = `✅ <b>${actorText} согласовал реестр</b>`;
+}
+
+if (action === "reject") {
+  titleText = `${actorText} отклонил реестр №${regNo}`;
+  titleHtml = `❌ <b>${actorText} отклонил реестр</b>`;
+}
 
     const infoText =
       `${titleHtml}\n\n` +
@@ -5204,7 +5244,64 @@ app.get("/notifications", async (req, res) => {
     return res.status(500).json({ success:false, error:e.message });
   }
 });
+app.post("/notifications/read-all", async (req, res) => {
+  try {
+    const { login } = req.body || {};
 
+    if (!login) {
+      return res.status(400).json({
+        success:false,
+        error:"login required"
+      });
+    }
+
+    await pool.query(`
+      UPDATE public.notifications
+      SET is_read = true
+      WHERE lower(trim(user_login)) = lower(trim($1))
+    `, [String(login).trim()]);
+
+    return res.json({ success:true });
+
+  } catch (e) {
+    console.error("READ ALL ERROR:", e);
+    return res.status(500).json({
+      success:false,
+      error:e.message
+    });
+  }
+});
+app.post("/notifications/read", async (req, res) => {
+  try {
+    const { id, login } = req.body || {};
+
+    if (!id || !login) {
+      return res.status(400).json({
+        success:false,
+        error:"id and login required"
+      });
+    }
+
+    await pool.query(`
+      UPDATE public.notifications
+      SET is_read = true
+      WHERE id = $1
+        AND lower(trim(user_login)) = lower(trim($2))
+    `, [
+      Number(id),
+      String(login).trim()
+    ]);
+
+    return res.json({ success:true });
+
+  } catch (e) {
+    console.error("READ ONE ERROR:", e);
+    return res.status(500).json({
+      success:false,
+      error:e.message
+    });
+  }
+});
 
 // =====================================================
 // Start
