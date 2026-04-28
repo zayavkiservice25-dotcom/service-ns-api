@@ -3637,7 +3637,7 @@ app.post("/registry-approve", async (req, res) => {
         await client.query(`
           UPDATE public.registry_stage_approvals
           SET
-            status = 'Согласовано',
+            status = 'Утверждено',
             action_time = NOW(),
             comment_text = $4
           WHERE registry_id = $1
