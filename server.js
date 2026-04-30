@@ -2200,7 +2200,7 @@ if (hasReset.rowCount > 0) {
      VALUES ($1, $2, NOW(), 'СИСТЕМА', $3, 'Нет')
       RETURNING id, id_zvk
       `,
-      [newIdZvk, ft, remaining]
+      [newIdZvk, ft, ftSum]
     );
 
     const newRowId = Number(ins.rows[0].id);
