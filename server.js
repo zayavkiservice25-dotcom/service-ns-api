@@ -2016,10 +2016,11 @@ app.post("/zvk-status-row", async (req, res) => {
     const { zvk_row_id, src_d, src_o, status_comment, login, is_admin, can_edit_all, is_all } = req.body;
 
     const rid = Number(zvk_row_id);
-    if (Number.isNaN(rid)) {
+    if (isNaN(rid)) {
       return res.status(400).json({ success: false, error: "zvk_row_id must be a number" });
     }
 
+    // Проверка прав
     const actor = String(login || "").trim();
     const adminOk = isTruthy(is_admin) || isTruthy(can_edit_all) || String(is_all || "0") === "1";
     if (!adminOk) {
@@ -2059,7 +2060,6 @@ app.post("/zvk-status-row", async (req, res) => {
     res.status(500).json({ success: false, error: e.message });
   }
 });
-
 // =====================================================
 // ✅ Оплата/Реестр — ПО СТРОКЕ истории (zvk_row_id)
 // POST /zvk-pay-row  { is_admin, zvk_row_id, registry_flag, is_paid }
