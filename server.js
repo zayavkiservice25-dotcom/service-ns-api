@@ -270,7 +270,6 @@ s.chief_approved,
     SELECT *
     FROM ranked
     WHERE rn = 1
-      AND NOT (zvk_name = 'СИСТЕМА' AND COALESCE(request_flag,'') = 'Нет');
   `);
 
 await pool.query(`
