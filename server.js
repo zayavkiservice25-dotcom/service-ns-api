@@ -1893,36 +1893,18 @@ app.post("/request-approve", async (req, res) => {
 
 app.post("/zvk-save", async (req, res) => {
   try {
-    const {
-      id_ft,
-      user_name,
-      to_pay,
-      request_flag,
-      login,
-      is_admin,
-      is_all,
-      can_edit_all
-    } = req.body;
+    const { id_ft, user_name, to_pay, request_flag, login, is_admin, is_all, can_edit_all } = req.body;
 
-    if (!id_ft) {
-      return res.status(400).json({ success:false, error:"id_ft is required" });
-    }
+    if (!id_ft) return res.status(400).json({ success:false, error:"id_ft is required" });
 
     const actor = String(login || user_name || "").trim();
-    if (!actor) {
-      return res.status(400).json({ success:false, error:"login required" });
-    }
+    if (!actor) return res.status(400).json({ success:false, error:"login required" });
 
-    const adminOk =
-      isTruthy(is_admin) ||
-      isTruthy(is_all) ||
-      isTruthy(can_edit_all);
+    const adminOk = isTruthy(is_admin) || isTruthy(is_all) || isTruthy(can_edit_all);
 
     if (!adminOk) {
       const ok = await canEditFtByLogin(pool, id_ft, actor);
-      if (!ok) {
-        return res.status(403).json({ success:false, error:"NO_RIGHTS_THIS_FT" });
-      }
+      if (!ok) return res.status(403).json({ success:false, error:"NO_RIGHTS_THIS_FT" });
     }
 
     const ft = String(id_ft).trim();
@@ -1938,7 +1920,7 @@ app.post("/zvk-save", async (req, res) => {
     }
 
     const sumFtRow = await pool.query(
-      `SELECT COALESCE(sum_ft, 0) AS sum_ft FROM ft WHERE id_ft = $1 LIMIT 1`,
+      `SELECT COALESCE(sum_ft, 0) AS sum_ft FROM ft WHERE id_ft=$1 LIMIT 1`,
       [ft]
     );
 
@@ -1986,7 +1968,7 @@ app.post("/zvk-save", async (req, res) => {
 
       if (lastRowId) {
         const paid = await pool.query(
-          `SELECT is_paid FROM zvk_pay WHERE zvk_row_id = $1`,
+          `SELECT is_paid FROM zvk_pay WHERE zvk_row_id=$1`,
           [Number(lastRowId)]
         );
 
@@ -2000,20 +1982,12 @@ app.post("/zvk-save", async (req, res) => {
       const created = await pool.query(
         `SELECT 'ZFT' || nextval('zvk_id_seq')::text AS id_zvk`
       );
-
       id_zvk = created.rows[0].id_zvk;
     }
 
     const r = await pool.query(
       `
-      INSERT INTO zvk (
-        id_zvk,
-        id_ft,
-        zvk_date,
-        zvk_name,
-        to_pay,
-        request_flag
-      )
+      INSERT INTO zvk (id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag)
       VALUES ($1, $2, NOW(), $3, $4, $5)
       RETURNING id, id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag
       `,
@@ -2032,6 +2006,8 @@ app.post("/zvk-save", async (req, res) => {
     return res.status(500).json({ success:false, error:e.message });
   }
 });
+
+
 // =====================================================
 // ✅ Источник по строке истории
 // POST /zvk-status-row  { zvk_row_id, src_d, src_o }
@@ -2197,10 +2173,10 @@ if (hasReset.rowCount > 0) {
     const ins = await client.query(
       `
       INSERT INTO zvk (id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag)
-     VALUES ($1, $2, NOW(), 'СИСТЕМА', $3, 'Нет')
+      VALUES ($1, $2, NOW(), 'СИСТЕМА', $3, 'Нет')
       RETURNING id, id_zvk
       `,
-      [newIdZvk, ft, ftSum]
+      [newIdZvk, ft, remaining]
     );
 
     const newRowId = Number(ins.rows[0].id);
@@ -2452,13 +2428,15 @@ async function resetFtToInitialState(client, id_ft) {
   // 3. у первой системной строки вернуть начальные значения
   await client.query(
     `
-    UPDATE zvk
-    SET
-      zvk_name = 'СИСТЕМА',
-      to_pay = 0,
-      request_flag = 'Нет',
-      zvk_date = NOW()
-    WHERE id = $1
+UPDATE zvk z
+SET
+  zvk_name = 'СИСТЕМА',
+  to_pay = COALESCE(f.sum_ft, 0),
+  request_flag = 'Нет',
+  zvk_date = NOW()
+FROM ft f
+WHERE z.id = $1
+  AND f.id_ft = z.id_ft
     `,
     [keepRowId]
   );
