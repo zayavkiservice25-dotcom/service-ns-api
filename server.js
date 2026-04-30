@@ -2015,56 +2015,51 @@ app.post("/zvk-status-row", async (req, res) => {
   try {
     const { zvk_row_id, src_d, src_o, status_comment, login, is_admin, can_edit_all, is_all } = req.body;
 
-    if (!zvk_row_id)
-      return res.status(400).json({ success:false, error:"zvk_row_id required" });
-
     const rid = Number(zvk_row_id);
-    if (Number.isNaN(rid))
-      return res.status(400).json({ success:false, error:"zvk_row_id must be number" });
+    if (Number.isNaN(rid)) {
+      return res.status(400).json({ success: false, error: "zvk_row_id must be a number" });
+    }
 
     const actor = String(login || "").trim();
-    if (!actor) return res.status(400).json({ success:false, error:"login required" });
-
     const adminOk = isTruthy(is_admin) || isTruthy(can_edit_all) || String(is_all || "0") === "1";
-
     if (!adminOk) {
       const ok = await canEditRowByLogin(pool, rid, actor);
-      if (!ok) return res.status(403).json({ success:false, error:"NO_RIGHTS_THIS_ROW" });
+      if (!ok) return res.status(403).json({ success: false, error: "NO_RIGHTS_THIS_ROW" });
     }
 
     const hasStatusComment = Object.prototype.hasOwnProperty.call(req.body, "status_comment");
 
-    const r = await pool.query(
+    const result = await pool.query(
       `
       INSERT INTO zvk_status (zvk_row_id, status_time, src_d, src_o, status_comment)
       VALUES ($1, NOW(), $2, $3, $4)
       ON CONFLICT (zvk_row_id)
       DO UPDATE SET
         status_time = NOW(),
-        src_d = COALESCE(EXCLUDED.src_d, zvk_status.src_d),
-        src_o = COALESCE(EXCLUDED.src_o, zvk_status.src_o),
+        src_d = CASE
+                  WHEN EXCLUDED.src_d IS NULL THEN NULL
+                  ELSE COALESCE(EXCLUDED.src_d, zvk_status.src_d)
+                END,
+        src_o = CASE
+                  WHEN EXCLUDED.src_o IS NULL THEN NULL
+                  ELSE COALESCE(EXCLUDED.src_o, zvk_status.src_o)
+                END,
         status_comment = CASE
-          WHEN $5 THEN EXCLUDED.status_comment
-          ELSE zvk_status.status_comment
-        END
+                           WHEN $5 THEN EXCLUDED.status_comment
+                           ELSE zvk_status.status_comment
+                         END
       RETURNING *
       `,
-      [
-        rid,
-        src_d ?? null,
-        src_o ?? null,
-        hasStatusComment ? String(status_comment || "") : null,
-        hasStatusComment
-      ]
+      [rid, src_d ?? null, src_o ?? null, hasStatusComment ? String(status_comment || "") : null, hasStatusComment]
     );
 
-    res.json({ success:true, row: r.rows[0] });
-
+    res.json({ success: true, row: result.rows[0] });
   } catch (e) {
     console.error("ZVK-STATUS-ROW ERROR:", e);
-    res.status(500).json({ success:false, error:e.message });
+    res.status(500).json({ success: false, error: e.message });
   }
 });
+
 // =====================================================
 // ✅ Оплата/Реестр — ПО СТРОКЕ истории (zvk_row_id)
 // POST /zvk-pay-row  { is_admin, zvk_row_id, registry_flag, is_paid }
