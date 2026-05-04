@@ -2515,13 +2515,22 @@ app.get("/ft-zvk-join", async (req, res) => {
     const where = [];
     const params = [];
 
-    if (paidMode === "paid") {
-      where.push(`COALESCE(v.is_paid, '') = 'Да'`);
-    } else if (paidMode === "all") {
-      // ничего не фильтруем
-    } else {
-      where.push(`COALESCE(v.is_paid, '') <> 'Да'`);
-    }
+// ✅ Разделение оплаченных только для Админа
+if (isAdmin || isAll) {
+  if (paidMode === "paid") {
+    where.push(`(
+      COALESCE(v.is_paid, '') = 'Да'
+      OR COALESCE(v.registry_flag, '') = 'Обнуление'
+    )`);
+  } else {
+    where.push(`(
+      COALESCE(v.is_paid, '') <> 'Да'
+      AND COALESCE(v.registry_flag, '') <> 'Обнуление'
+    )`);
+  }
+}
+
+// ✅ Для инициатора/оператора НЕ фильтруем оплаченные вообще
 
     if (!(isAdmin || isAll || isOperator)) {
       params.push(login);
