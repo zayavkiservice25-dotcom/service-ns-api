@@ -1941,17 +1941,23 @@ app.post("/zvk-save", async (req, res) => {
 
     // ✅ Только при первом создании:
     // ЗаявИмя = СИСТЕМА, Заявка = Нет, К оплате = Сумма
-    const finalName = isFirst
-      ? "СИСТЕМА"
-      : String(user_name || actor || "СИСТЕМА").trim();
+let finalName;
+let finalToPay;
+let finalFlag;
 
-    const finalToPay = isFirst
-      ? sumFt
-      : toPayNum;
-
-    const finalFlag = isFirst
-      ? "Нет"
-      : flag;
+if (isFirst) {
+  finalName = "СИСТЕМА";
+  finalToPay = sumFt;
+  finalFlag = "Нет";
+} else if (flag === "Нет") {
+  finalName = "СИСТЕМА";
+  finalToPay = toPayNum;
+  finalFlag = "Нет";
+} else {
+  finalName = String(user_name || actor || "СИСТЕМА").trim();
+  finalToPay = toPayNum;
+  finalFlag = flag;
+}
 
     const lastCycle = await pool.query(
       `
