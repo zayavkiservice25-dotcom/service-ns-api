@@ -2733,33 +2733,16 @@ app.get("/division-svod", async (req, res) => {
 
   try {
     const r = await client.query(`
-      WITH zayavka AS (
-        SELECT
-          TRIM(src_o) AS object_name,
-          SUM(COALESCE(to_pay,0)) AS ft_zayavka
-        FROM public.ft_zvk_current_v2
-        WHERE request_flag = 'Да'
-          AND COALESCE(registry_flag,'') <> 'Да'
-          AND COALESCE(is_paid,'') <> 'Да'
-        GROUP BY 1
-      )
-
       SELECT
-        s.object_name,
-        s.amount_in,
-        s.to_pay,
-        s.balance,
-        s.registry,
-        s.balance_registry,
-
-        COALESCE(z.ft_zayavka,0) AS ft_zayavka,
-        COALESCE(s.balance_registry,0) - COALESCE(z.ft_zayavka,0) AS balance_zayavka
-
-      FROM public.svod_object_v1 s
-      LEFT JOIN zayavka z
-        ON TRIM(z.object_name) = TRIM(s.object_name)
-
-      ORDER BY s.object_name
+        division_dds,
+        amount_in,
+        amount_out,
+        to_pay_paid,
+        balance,
+        to_pay_registry,
+        balance_after_registry
+      FROM public.division_svod_web_v1
+      ORDER BY division_dds
     `);
 
     res.json({ ok: true, rows: r.rows });
