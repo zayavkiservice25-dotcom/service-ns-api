@@ -1894,16 +1894,22 @@ app.post("/zvk-save", async (req, res) => {
   try {
     const { id_ft, user_name, to_pay, request_flag, login, is_admin, is_all, can_edit_all } = req.body;
 
-    if (!id_ft) return res.status(400).json({ success:false, error:"id_ft is required" });
+    if (!id_ft) {
+      return res.status(400).json({ success:false, error:"id_ft is required" });
+    }
 
     const actor = String(login || user_name || "").trim();
-    if (!actor) return res.status(400).json({ success:false, error:"login required" });
+    if (!actor) {
+      return res.status(400).json({ success:false, error:"login required" });
+    }
 
     const adminOk = isTruthy(is_admin) || isTruthy(is_all) || isTruthy(can_edit_all);
 
     if (!adminOk) {
       const ok = await canEditFtByLogin(pool, id_ft, actor);
-      if (!ok) return res.status(403).json({ success:false, error:"NO_RIGHTS_THIS_FT" });
+      if (!ok) {
+        return res.status(403).json({ success:false, error:"NO_RIGHTS_THIS_FT" });
+      }
     }
 
     const ft = String(id_ft).trim();
@@ -1919,26 +1925,38 @@ app.post("/zvk-save", async (req, res) => {
     }
 
     const sumFtRow = await pool.query(
-      `SELECT COALESCE(sum_ft, 0) AS sum_ft FROM ft WHERE id_ft=$1 LIMIT 1`,
+      `SELECT COALESCE(sum_ft, 0) AS sum_ft FROM public.ft WHERE id_ft = $1 LIMIT 1`,
       [ft]
     );
 
     const sumFt = Number(sumFtRow.rows[0]?.sum_ft || 0);
 
-    const name =
-      flag === "Нет"
-        ? "СИСТЕМА"
-        : String(user_name || actor || "СИСТЕМА").trim();
+    // ✅ Проверяем: это первая заявка по FT или уже есть история
+    const exists = await pool.query(
+      `SELECT 1 FROM public.zvk WHERE id_ft = $1 LIMIT 1`,
+      [ft]
+    );
 
-    const finalToPay =
-      flag === "Нет"
-        ? sumFt
-        : toPayNum;
+    const isFirst = exists.rowCount === 0;
+
+    // ✅ Только при первом создании:
+    // ЗаявИмя = СИСТЕМА, Заявка = Нет, К оплате = Сумма
+    const finalName = isFirst
+      ? "СИСТЕМА"
+      : String(user_name || actor || "СИСТЕМА").trim();
+
+    const finalToPay = isFirst
+      ? sumFt
+      : toPayNum;
+
+    const finalFlag = isFirst
+      ? "Нет"
+      : flag;
 
     const lastCycle = await pool.query(
       `
       SELECT z.id_zvk
-      FROM zvk z
+      FROM public.zvk z
       WHERE z.id_ft = $1
       ORDER BY
         COALESCE(NULLIF(substring(z.id_zvk from '\\d+'), ''), '0')::int DESC,
@@ -1955,7 +1973,7 @@ app.post("/zvk-save", async (req, res) => {
       const lastRow = await pool.query(
         `
         SELECT z.id
-        FROM zvk z
+        FROM public.zvk z
         WHERE z.id_zvk = $1
         ORDER BY z.zvk_date DESC NULLS LAST, z.id DESC
         LIMIT 1
@@ -1967,7 +1985,7 @@ app.post("/zvk-save", async (req, res) => {
 
       if (lastRowId) {
         const paid = await pool.query(
-          `SELECT is_paid FROM zvk_pay WHERE zvk_row_id=$1`,
+          `SELECT is_paid FROM public.zvk_pay WHERE zvk_row_id = $1`,
           [Number(lastRowId)]
         );
 
@@ -1979,18 +1997,20 @@ app.post("/zvk-save", async (req, res) => {
 
     if (!id_zvk) {
       const created = await pool.query(
-        `SELECT 'ZFT' || nextval('zvk_id_seq')::text AS id_zvk`
+        `SELECT 'ZFT' || nextval('public.zvk_id_seq')::text AS id_zvk`
       );
       id_zvk = created.rows[0].id_zvk;
     }
 
     const r = await pool.query(
       `
-      INSERT INTO zvk (id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag)
-      VALUES ($1, $2, NOW(), $3, $4, $5)
+      INSERT INTO public.zvk
+        (id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag)
+      VALUES
+        ($1, $2, NOW(), $3, $4, $5)
       RETURNING id, id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag
       `,
-      [id_zvk, ft, name, finalToPay, flag]
+      [id_zvk, ft, finalName, finalToPay, finalFlag]
     );
 
     return res.json({
@@ -2005,7 +2025,6 @@ app.post("/zvk-save", async (req, res) => {
     return res.status(500).json({ success:false, error:e.message });
   }
 });
-
 
 // =====================================================
 // ✅ Источник по строке истории
