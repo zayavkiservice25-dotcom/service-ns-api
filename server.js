@@ -2495,7 +2495,6 @@ WHERE z.id = $1
 // JOIN: читаем из VIEW ft_zvk_current_v2
 // =====================================================
 
-
 app.get("/ft-zvk-join", async (req, res) => {
   try {
     const login = String(req.query.login || "").trim();
@@ -2504,59 +2503,61 @@ app.get("/ft-zvk-join", async (req, res) => {
     const isAll      = String(req.query.is_all || "0") === "1";
     const isOperator = String(req.query.is_operator || "0") === "1";
 
-    if (!login) return res.status(400).json({ success:false, error:"login is required" });
+    // active = без оплаченных
+    // paid = только оплаченные
+    // all = все
+    const paidMode = String(req.query.paid || "active").trim();
 
-    let query = "";
-    let params = [];
-
-    if (isAdmin || isAll || isOperator) {
-      // ✅ B_Erkin / Админ / Оператор / Супервайзер видят всё БЕЗ LIMIT
-      query = `
-        SELECT v.*
-        FROM ft_zvk_current_v2 v
-        ORDER BY
-          COALESCE(NULLIF(substring(v.id_ft from '\\d+'), ''), '0')::int DESC,
-          v.zvk_date DESC NULLS LAST,
-          v.zvk_row_id DESC
-      `;
-    } else {
-      // ✅ остальным тоже убираем лимит, но оставляем только свои строки
-      query = `
-        SELECT v.*
-        FROM ft_zvk_current_v2 v
-        WHERE lower(trim(v.input_name)) = lower(trim($1))
-        ORDER BY
-          COALESCE(NULLIF(substring(v.id_ft from '\\d+'), ''), '0')::int DESC,
-          v.zvk_date DESC NULLS LAST,
-          v.zvk_row_id DESC
-      `;
-      params = [login];
+    if (!login) {
+      return res.status(400).json({ success:false, error:"login is required" });
     }
+
+    const where = [];
+    const params = [];
+
+    if (paidMode === "paid") {
+      where.push(`COALESCE(v.is_paid, '') = 'Да'`);
+    } else if (paidMode === "all") {
+      // ничего не фильтруем
+    } else {
+      where.push(`COALESCE(v.is_paid, '') <> 'Да'`);
+    }
+
+    if (!(isAdmin || isAll || isOperator)) {
+      params.push(login);
+      where.push(`lower(trim(v.input_name)) = lower(trim($${params.length}))`);
+    }
+
+    const limit = paidMode === "paid" ? 500 : 1500;
+    params.push(limit);
+
+    const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+    const query = `
+      SELECT v.*
+      FROM public.ft_zvk_current_v2 v
+      ${whereSql}
+      ORDER BY
+        COALESCE(NULLIF(substring(v.id_ft from '\\d+'), ''), '0')::int DESC,
+        v.zvk_date DESC NULLS LAST,
+        v.zvk_row_id DESC
+      LIMIT $${params.length}
+    `;
 
     const r = await pool.query(query, params);
 
-    const loginNorm = normLogin(login);
-
-    const rows = r.rows.map(x => ({
-      ...x,
-      can_edit: (isAdmin || isAll)
-        ? true
-        : (normLogin(x.input_name) === loginNorm)
-    }));
-
-    res.json({
+    return res.json({
       success: true,
-      rows,
-      count: rows.length,
-      isAdmin,
-      isOperator
+      rows: r.rows,
+      paidMode
     });
 
   } catch (e) {
     console.error("FT-ZVK-JOIN ERROR:", e);
-    res.status(500).json({ success:false, error:e.message });
+    return res.status(500).json({ success:false, error:e.message });
   }
 });
+
 // =====================================================
 // SAVE FT (создать FT + авто ZFT + строка СИСТЕМА)
 // =====================================================
