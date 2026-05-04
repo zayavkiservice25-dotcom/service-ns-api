@@ -2728,11 +2728,7 @@ app.get("/io-history", async (req, res) => {
   }
 });
 
-app.get("/division-svod", async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const r = await client.query(`
-      SELECT
+app.get("/division-svod", async (req, res) => {const client = await pool.connect();try {const r = await client.query(      SELECT
         division_dds,
         amount_in,
         amount_out,
@@ -2742,15 +2738,7 @@ app.get("/division-svod", async (req, res) => {
         balance_after_registry
       FROM public.division_svod_web_v1
       ORDER BY division_dds
-    `);
-    res.json({ ok: true, rows: r.rows });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ ok: false, error: String(e.message || e) });
-  } finally {
-    client.release();
-  }
-});
+   );res.json({ ok: true, rows: r.rows });} catch (e) {console.error(e);res.status(500).json({ ok: false, error: String(e.message || e) });} finally {client.release();}});
 
 // =====================================================
 // ✅ НОВЫЕ ЭНДПОИНТЫ ДЛЯ 1С
@@ -2937,29 +2925,30 @@ ORDER BY
 });
 
 app.get("/svod-object", async (req, res) => {
+  const client = await pool.connect();
+
   try {
-    const q = await pool.query(`
+    const r = await client.query(`
       SELECT
         object_name,
         amount_in,
         to_pay,
         balance,
         registry,
-        balance_registry
+        balance_registry,
+        ft_zayavka,
+        balance_zayavka
       FROM public.svod_object_v1
       ORDER BY object_name
     `);
 
-    return res.json({
-      ok: true,
-      rows: q.rows
-    });
+    res.json({ ok: true, rows: r.rows });
+
   } catch (e) {
-    console.error("SVOD OBJECT ERROR:", e);
-    return res.status(500).json({
-      ok: false,
-      error: e.message
-    });
+    console.error("SVOD-OBJECT ERROR:", e);
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  } finally {
+    client.release();
   }
 });
 
