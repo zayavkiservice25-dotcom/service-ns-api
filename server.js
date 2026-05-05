@@ -2521,17 +2521,19 @@ app.get("/ft-zvk-join", async (req, res) => {
 
 // ✅ Разделение оплаченных только для Админа
 if (isAdmin || isAll) {
-  if (paidMode === "paid") {
-    where.push(`(
-      COALESCE(v.is_paid, '') = 'Да'
-      OR COALESCE(v.registry_flag, '') = 'Обнуление'
-    )`);
-  } else {
-    where.push(`(
-      COALESCE(v.is_paid, '') <> 'Да'
-      AND COALESCE(v.registry_flag, '') <> 'Обнуление'
-    )`);
-  }
+if (paidMode === "paid") {
+  where.push(`(
+    COALESCE(v.is_paid, '') = 'Да'
+    OR COALESCE(v.registry_flag, '') = 'Обнуление'
+    OR COALESCE(v.request_flag, '') = 'Обнуление'
+  )`);
+} else {
+  where.push(`(
+    COALESCE(v.is_paid, '') <> 'Да'
+    AND COALESCE(v.registry_flag, '') <> 'Обнуление'
+    AND COALESCE(v.request_flag, '') <> 'Обнуление'
+  )`);
+}
 }
 
 // ✅ Для инициатора/оператора НЕ фильтруем оплаченные вообще
