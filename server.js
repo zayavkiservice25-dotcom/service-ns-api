@@ -2231,14 +2231,18 @@ app.post("/zvk-pay-row", async (req, res) => {
   const client = await pool.connect();
 
   try {
-    const { is_admin, zvk_row_id, registry_flag, is_paid } = req.body;
+    const { is_admin, zvk_row_id, registry_flag, is_paid, login } = req.body;
+
+    const actor = String(login || "").trim().toLowerCase();
 
     const adminOk =
       is_admin === true || is_admin === 1 || is_admin === "1" ||
       String(is_admin).toLowerCase() === "true";
 
-    if (!adminOk) {
-      return res.status(403).json({ success:false, error:"only admin allowed" });
+    const payOk = adminOk || actor === "b_erkin";
+
+    if (!payOk) {
+      return res.status(403).json({ success:false, error:"only b_erkin/admin allowed" });
     }
 
     if (!zvk_row_id) {
