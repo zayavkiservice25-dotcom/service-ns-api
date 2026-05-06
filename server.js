@@ -1402,6 +1402,25 @@ app.post("/create-request", async (req, res) => {
 
 app.get("/request-list", async (req, res) => {
   try {
+    const login = String(req.query.login || "").trim().toLowerCase();
+    const roleFt = String(req.query.role_ft || "").trim().toLowerCase();
+
+    const canViewAll =
+      roleFt === "admin" ||
+      roleFt === "админ" ||
+      roleFt === "администратор" ||
+      roleFt === "supervisor" ||
+      roleFt === "супервайзер";
+
+    const params = [];
+    let where = "";
+
+    // ❗ если НЕ админ и НЕ супервайзер → только свои
+    if (!canViewAll) {
+      params.push(login);
+      where = `WHERE lower(trim(h.created_by)) = $1`;
+    }
+
     const q = `
       SELECT
         h.id,
@@ -1456,10 +1475,12 @@ app.get("/request-list", async (req, res) => {
         GROUP BY i.request_id
       ) x ON x.request_id = h.id
 
+      ${where}
+
       ORDER BY h.request_date DESC, h.id DESC
     `;
 
-    const { rows } = await pool.query(q);
+    const { rows } = await pool.query(q, params);
 
     res.json({ success: true, rows });
 
