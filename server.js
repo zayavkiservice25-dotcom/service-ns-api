@@ -5344,31 +5344,42 @@ app.post("/notifications/read", async (req, res) => {
 
 app.get("/matrix-sources", async (req, res) => {
   try {
+    const { date_from, date_to } = req.query;
+
+    const params = [];
+    let where = `
+      WHERE COALESCE(TRIM(src_o), '') <> ''
+        AND COALESCE(TRIM(object), '') <> ''
+        AND COALESCE(TRIM(is_paid), '') = 'Да'
+    `;
+
+    if (date_from) {
+      params.push(date_from);
+      where += ` AND pay_time::date >= $${params.length}::date`;
+    }
+
+    if (date_to) {
+      params.push(date_to);
+      where += ` AND pay_time::date <= $${params.length}::date`;
+    }
+
     const result = await pool.query(`
       SELECT
         object,
         src_o,
         to_pay,
-        is_paid
+        is_paid,
+        pay_time
       FROM public.ft_zvk_current_v2
-      WHERE COALESCE(TRIM(src_o), '') <> ''
-        AND COALESCE(TRIM(object), '') <> ''
-        AND COALESCE(TRIM(is_paid), '') = 'Да'
-    `);
+      ${where}
+    `, params);
 
-    res.json({
-      success: true,
-      rows: result.rows
-    });
+    res.json({ success:true, rows: result.rows });
 
   } catch (e) {
-    res.status(500).json({
-      success: false,
-      error: e.message
-    });
+    res.status(500).json({ success:false, error:e.message });
   }
 });
-
 // =====================================================
 // Start
 // =====================================================
