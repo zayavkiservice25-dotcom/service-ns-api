@@ -5342,6 +5342,33 @@ app.post("/notifications/read", async (req, res) => {
   }
 });
 
+app.get("/matrix-sources", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        object,
+        src_o,
+        to_pay,
+        is_paid
+      FROM public.ft_zvk_current_v2
+      WHERE COALESCE(TRIM(src_o), '') <> ''
+        AND COALESCE(TRIM(object), '') <> ''
+        AND COALESCE(TRIM(is_paid), '') = 'Да'
+    `);
+
+    res.json({
+      success: true,
+      rows: result.rows
+    });
+
+  } catch (e) {
+    res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
+
 // =====================================================
 // Start
 // =====================================================
