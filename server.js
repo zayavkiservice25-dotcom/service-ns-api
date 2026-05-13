@@ -5401,6 +5401,94 @@ app.get("/matrix-sources", async (req, res) => {
     res.status(500).json({ success:false, error:e.message });
   }
 });
+
+
+// =====================================================
+// TELEGRAM WEBHOOK
+// =====================================================
+app.post("/telegram-webhook", async (req, res) => {
+  try {
+    console.log("TELEGRAM UPDATE:", JSON.stringify(req.body));
+
+    const update = req.body;
+
+    if (update.message) {
+      const msg = update.message;
+
+      const chatId = String(msg.chat?.id || "");
+      const text = String(msg.text || "").trim();
+
+      if (!chatId) {
+        return res.sendStatus(200);
+      }
+
+      // =========================
+      // START
+      // =========================
+      if (text === "/start") {
+
+        await axios.post(
+          `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+          {
+            chat_id: chatId,
+            text:
+              "Бот подключен ✅\n\n" +
+              "Напишите ваш логин системы.\n" +
+              "Например:\nadmin\nb_erkin"
+          }
+        );
+
+        return res.sendStatus(200);
+      }
+
+      // =========================
+      // СОХРАНЕНИЕ CHAT_ID
+      // =========================
+      if (text) {
+
+        const upd = await pool.query(`
+          UPDATE public.users
+          SET chat_id = $1
+          WHERE lower(trim(login)) = lower(trim($2))
+          RETURNING login
+        `, [chatId, text]);
+
+        if (!upd.rowCount) {
+
+          await axios.post(
+            `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+            {
+              chat_id: chatId,
+              text:
+                `❌ Логин "${text}" не найден.\n` +
+                `Попробуйте снова.`
+            }
+          );
+
+          return res.sendStatus(200);
+        }
+
+        await axios.post(
+          `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+          {
+            chat_id: chatId,
+            text:
+              `✅ Telegram подключен\n\n` +
+              `Логин: ${upd.rows[0].login}`
+          }
+        );
+
+        return res.sendStatus(200);
+      }
+    }
+
+    return res.sendStatus(200);
+
+  } catch (e) {
+    console.error("TELEGRAM WEBHOOK ERROR:", e);
+    return res.sendStatus(200);
+  }
+});
 // =====================================================
 // Start
 // =====================================================
