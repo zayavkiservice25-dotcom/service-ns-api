@@ -5434,7 +5434,7 @@ app.post("/telegram-webhook", async (req, res) => {
             text:
               "Бот подключен ✅\n\n" +
               "Напишите ваш логин системы.\n" +
-              "Например:\nadmin\nb_erkin"
+              "Например:\na_sagyndyk\nb_erkin"
           }
         );
 
