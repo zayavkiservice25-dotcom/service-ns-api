@@ -1968,11 +1968,11 @@ let finalFlag;
 
 if (isFirst) {
   finalName = "СИСТЕМА";
-  finalToPay = sumFt;
+  finalToPay = 0;
   finalFlag = "Нет";
 } else if (flag === "Нет") {
   finalName = "СИСТЕМА";
-  finalToPay = toPayNum;
+  finalToPay = 0;
   finalFlag = "Нет";
 } else {
   finalName = String(user_name || actor || "СИСТЕМА").trim();
