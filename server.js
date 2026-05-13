@@ -2053,6 +2053,87 @@ if (isFirst) {
   }
 });
 
+app.post("/zvk-bulk-request-flag", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const { row_ids, request_flag, login, is_admin, is_all, can_edit_all } = req.body || {};
+
+    const ids = Array.isArray(row_ids)
+      ? row_ids.map(x => Number(x)).filter(Boolean)
+      : [];
+
+    const actor = String(login || "").trim();
+    const flag = String(request_flag || "").trim();
+
+    if (!ids.length) {
+      return res.status(400).json({ success:false, error:"row_ids required" });
+    }
+
+    if (!actor) {
+      return res.status(400).json({ success:false, error:"login required" });
+    }
+
+    if (!["Да", "Нет", "Обнуление"].includes(flag)) {
+      return res.status(400).json({ success:false, error:"bad request_flag" });
+    }
+
+    const adminOk =
+      isTruthy(is_admin) ||
+      isTruthy(is_all) ||
+      isTruthy(can_edit_all) ||
+      actor.toLowerCase() === "b_erkin";
+
+    if (!adminOk) {
+      return res.status(403).json({ success:false, error:"NO_RIGHTS" });
+    }
+
+    await client.query("BEGIN");
+
+    await client.query(`
+      UPDATE public.zvk
+      SET
+        request_flag = $2,
+        zvk_name = CASE
+          WHEN $2 = 'Нет' THEN 'СИСТЕМА'
+          ELSE $3
+        END,
+        to_pay = CASE
+          WHEN $2 = 'Нет' THEN 0
+          ELSE to_pay
+        END,
+        zvk_date = NOW()
+      WHERE id = ANY($1::bigint[])
+    `, [ids, flag, actor]);
+
+    await client.query(`
+      INSERT INTO public.zvk_status (zvk_row_id, src_o, status_time)
+      SELECT x, CASE WHEN $2 = 'Нет' THEN '' ELSE COALESCE(s.src_o, '') END, NOW()
+      FROM unnest($1::bigint[]) AS x
+      LEFT JOIN public.zvk_status s ON s.zvk_row_id = x
+      ON CONFLICT (zvk_row_id)
+      DO UPDATE SET
+        src_o = CASE WHEN $2 = 'Нет' THEN '' ELSE public.zvk_status.src_o END,
+        status_time = NOW()
+    `, [ids, flag]);
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success:true,
+      updated: ids.length,
+      request_flag: flag
+    });
+
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+    console.error("zvk-bulk-request-flag error:", e);
+    return res.status(500).json({ success:false, error:e.message });
+  } finally {
+    client.release();
+  }
+});
+
 // =====================================================
 // ✅ Источник по строке истории
 // POST /zvk-status-row  { zvk_row_id, src_d, src_o }
