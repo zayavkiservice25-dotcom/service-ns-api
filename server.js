@@ -2623,16 +2623,25 @@ app.get("/ft-zvk-join", async (req, res) => {
 
 // ✅ Разделение оплаченных только для Админа
 if (isAdmin || isAll) {
-if (paidMode === "paid") {
-  where.push(`(
-    COALESCE(v.is_paid, '') = 'Да'
-    OR COALESCE(v.registry_flag, '') = 'Обнуление'
-  )`);
-} else {
-  where.push(`(
-    COALESCE(v.is_paid, '') <> 'Да'
-  )`);
-}
+  if (paidMode === "paid") {
+    // ✅ Оплаченные: только Оплачено = Да
+    // ❌ Реестр = Обнуление сюда НЕ входит
+    where.push(`(
+      COALESCE(v.is_paid, '') = 'Да'
+      AND COALESCE(v.registry_flag, '') <> 'Обнуление'
+    )`);
+  } else if (paidMode === "reset") {
+    // ✅ Обнуленные: любые Заявка, но Реестр = Обнуление
+    where.push(`(
+      COALESCE(v.registry_flag, '') = 'Обнуление'
+    )`);
+  } else {
+    // ✅ Обычная таблица: активные, без оплаченных и без обнуленных реестров
+    where.push(`(
+      COALESCE(v.is_paid, '') <> 'Да'
+      AND COALESCE(v.registry_flag, '') <> 'Обнуление'
+    )`);
+  }
 }
 
 // ✅ Для инициатора/оператора НЕ фильтруем оплаченные вообще
@@ -2642,7 +2651,7 @@ if (paidMode === "paid") {
       where.push(`lower(trim(v.input_name)) = lower(trim($${params.length}))`);
     }
 
-    const limit = paidMode === "paid" ? 500 : 1500;
+    const limit = (paidMode === "paid" || paidMode === "reset") ? 500 : 1500;
     params.push(limit);
 
     const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
