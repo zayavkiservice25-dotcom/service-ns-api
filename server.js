@@ -5473,18 +5473,44 @@ app.get("/matrix-sources", async (req, res) => {
 
     const result = await pool.query(`
       SELECT
+        id_ft,
+        id_zvk,
+        input_date,
+        zvk_date,
+        pay_time,
+
+        division,
         object,
+        contractor,
+        pay_purpose,
+        dds_article,
+        contract_no,
+        invoice_no,
+        invoice_date,
+        invoice_pdf,
+
+        src_d,
         src_o,
         to_pay,
-        is_paid,
-        pay_time
+        request_flag,
+        status_comment,
+        chief_approved,
+        registry_flag,
+        is_paid
+
       FROM public.ft_zvk_current_v2
       ${where}
+      ORDER BY 
+        pay_time DESC NULLS LAST,
+        object,
+        src_o,
+        contractor
     `, params);
 
     res.json({ success:true, rows: result.rows });
 
   } catch (e) {
+    console.error("matrix-sources error:", e);
     res.status(500).json({ success:false, error:e.message });
   }
 });
