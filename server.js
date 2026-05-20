@@ -843,21 +843,22 @@ app.get("/profile", async (req, res) => {
 app.get("/employees", async (req, res) => {
   try {
     const r = await pool.query(`
-SELECT
-  id,
-  email,
-  phone,
-  last_name,
-  first_name,
-  middle_name,
-  organization_name,
-  role_ft,
-  role_hr,
-  is_active,
-  created_at,
-  login
-FROM users
-ORDER BY id ASC;
+      SELECT
+        id,
+        email,
+        phone,
+        last_name,
+        first_name,
+        middle_name,
+        organization_name,
+        role_ft,
+        role_hr,
+        role_lzk,
+        is_active,
+        created_at,
+        login
+      FROM public.users
+      ORDER BY id ASC;
     `);
 
     return res.json({
@@ -873,20 +874,20 @@ ORDER BY id ASC;
     });
   }
 });
-
 app.post("/update-user-roles", async (req, res) => {
   const client = await pool.connect();
 
   try {
-    const { login, role_ft, role_hr, actor_login } = req.body || {};
+    const { login, role_ft, role_hr, role_lzk, actor_login } = req.body || {};
 
     const loginNorm = String(login || "").trim();
     const actorLoginNorm = String(actor_login || "").trim();
 
     const newRoleFt = String(role_ft || "").trim().toLowerCase();
     const newRoleHr = String(role_hr || "").trim().toLowerCase();
+    const newRoleLzk = String(role_lzk || "").trim().toLowerCase();
 
-    const allowedRoles = ["initiator", "operator", "supervisor", "admin"];
+    const allowedRoles = ["initiator", "operator", "supervisor", "admin", "pto"];
 
     if (!loginNorm) {
       return res.status(400).json({
@@ -902,7 +903,11 @@ app.post("/update-user-roles", async (req, res) => {
       });
     }
 
-    if (!allowedRoles.includes(newRoleFt) || !allowedRoles.includes(newRoleHr)) {
+    if (
+      !allowedRoles.includes(newRoleFt) ||
+      !allowedRoles.includes(newRoleHr) ||
+      !allowedRoles.includes(newRoleLzk)
+    ) {
       return res.status(400).json({
         success: false,
         message: "Недопустимая роль"
@@ -911,16 +916,12 @@ app.post("/update-user-roles", async (req, res) => {
 
     await client.query("BEGIN");
 
-    // 1. кто делает изменение
-    const actorRes = await client.query(
-      `
-      SELECT id, login, role_ft, role_hr
+    const actorRes = await client.query(`
+      SELECT id, login, role_ft, role_hr, role_lzk
       FROM public.users
       WHERE lower(trim(login)) = lower(trim($1))
       LIMIT 1
-      `,
-      [actorLoginNorm]
-    );
+    `, [actorLoginNorm]);
 
     if (!actorRes.rows.length) {
       await client.query("ROLLBACK");
@@ -930,28 +931,23 @@ app.post("/update-user-roles", async (req, res) => {
       });
     }
 
-const actor = actorRes.rows[0];
+    const actor = actorRes.rows[0];
+    const isMainAdmin = String(actor.login || "").trim().toLowerCase() === "admin";
 
-// только логин admin может менять роли
-const isMainAdmin = String(actor.login || "").trim().toLowerCase() === "admin";
+    if (!isMainAdmin) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({
+        success: false,
+        message: "Только пользователь admin может изменять роли"
+      });
+    }
 
-if (!isMainAdmin) {
-  await client.query("ROLLBACK");
-  return res.status(403).json({
-    success: false,
-    message: "Только пользователь admin может изменять роли"
-  });
-}
-    // 3. кого меняем
-    const userRes = await client.query(
-      `
-      SELECT id, login, role_ft, role_hr
+    const userRes = await client.query(`
+      SELECT id, login, role_ft, role_hr, role_lzk
       FROM public.users
       WHERE lower(trim(login)) = lower(trim($1))
       LIMIT 1
-      `,
-      [loginNorm]
-    );
+    `, [loginNorm]);
 
     if (!userRes.rows.length) {
       await client.query("ROLLBACK");
@@ -962,10 +958,16 @@ if (!isMainAdmin) {
     }
 
     const user = userRes.rows[0];
+
     const oldRoleFt = String(user.role_ft || "").trim().toLowerCase();
     const oldRoleHr = String(user.role_hr || "").trim().toLowerCase();
+    const oldRoleLzk = String(user.role_lzk || "").trim().toLowerCase();
 
-    if (oldRoleFt === newRoleFt && oldRoleHr === newRoleHr) {
+    if (
+      oldRoleFt === newRoleFt &&
+      oldRoleHr === newRoleHr &&
+      oldRoleLzk === newRoleLzk
+    ) {
       await client.query("ROLLBACK");
       return res.json({
         success: true,
@@ -974,24 +976,22 @@ if (!isMainAdmin) {
           id: user.id,
           login: user.login,
           role_ft: user.role_ft,
-          role_hr: user.role_hr
+          role_hr: user.role_hr,
+          role_lzk: user.role_lzk
         }
       });
     }
 
-    const updRes = await client.query(
-      `
+    const updRes = await client.query(`
       UPDATE public.users
       SET role_ft = $1,
-          role_hr = $2
-      WHERE lower(trim(login)) = lower(trim($3))
-      RETURNING id, login, role_ft, role_hr
-      `,
-      [newRoleFt, newRoleHr, loginNorm]
-    );
+          role_hr = $2,
+          role_lzk = $3
+      WHERE lower(trim(login)) = lower(trim($4))
+      RETURNING id, login, role_ft, role_hr, role_lzk
+    `, [newRoleFt, newRoleHr, newRoleLzk, loginNorm]);
 
-    await client.query(
-      `
+    await client.query(`
       INSERT INTO public.user_role_history
       (
         login,
@@ -999,18 +999,20 @@ if (!isMainAdmin) {
         new_role_ft,
         old_role_hr,
         new_role_hr,
+        old_role_lzk,
+        new_role_lzk,
         changed_at
       )
-      VALUES ($1, $2, $3, $4, $5, NOW())
-      `,
-      [
-        user.login,
-        oldRoleFt || null,
-        newRoleFt,
-        oldRoleHr || null,
-        newRoleHr
-      ]
-    );
+      VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+    `, [
+      user.login,
+      oldRoleFt || null,
+      newRoleFt,
+      oldRoleHr || null,
+      newRoleHr,
+      oldRoleLzk || null,
+      newRoleLzk
+    ]);
 
     await client.query("COMMIT");
 
@@ -1019,6 +1021,7 @@ if (!isMainAdmin) {
       message: "Роли успешно обновлены",
       row: updRes.rows[0]
     });
+
   } catch (e) {
     try {
       await client.query("ROLLBACK");
@@ -1030,6 +1033,7 @@ if (!isMainAdmin) {
       success: false,
       message: "Ошибка сервера"
     });
+
   } finally {
     client.release();
   }
@@ -1047,22 +1051,24 @@ app.get("/user-role-history", async (req, res) => {
       });
     }
 
-    const r = await pool.query(
-      `
-      SELECT
-        id,
-        login,
-        old_role_ft,
-        new_role_ft,
-        old_role_hr,
-        new_role_hr,
-        changed_at
-      FROM public.user_role_history
-      WHERE lower(trim(login)) = lower(trim($1))
-      ORDER BY changed_at DESC, id DESC
-      `,
-      [login]
-    );
+const r = await pool.query(
+  `
+  SELECT
+    id,
+    login,
+    old_role_ft,
+    new_role_ft,
+    old_role_hr,
+    new_role_hr,
+    old_role_lzk,
+    new_role_lzk,
+    changed_at
+  FROM public.user_role_history
+  WHERE lower(trim(login)) = lower(trim($1))
+  ORDER BY changed_at DESC, id DESC
+  `,
+  [login]
+);
 
     return res.json({
       success: true,
