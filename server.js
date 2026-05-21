@@ -887,7 +887,7 @@ app.post("/update-user-roles", async (req, res) => {
     const newRoleHr = String(role_hr || "").trim().toLowerCase();
     const newRoleLzk = String(role_lzk || "").trim().toLowerCase();
 
-    const allowedRoles = ["initiator", "operator", "supervisor", "admin", "pto"];
+    const allowedRoles = ["initiator", "operator", "supervisor", "admin", "pto", "editor"];
 
     if (!loginNorm) {
       return res.status(400).json({
