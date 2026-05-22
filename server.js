@@ -777,6 +777,7 @@ return res.json({
     email: user.email,
     role_ft: user.role_ft,
     role_hr: user.role_hr,
+    role_lzk: user.role_lzk,
     first_name: user.first_name,
     last_name: user.last_name
   }
@@ -802,18 +803,19 @@ app.get("/profile", async (req, res) => {
     }
 
     const q = await pool.query(`
-      SELECT
-        id,
-        login,
-        email,
-        phone,
-        role_ft,
-        role_hr,
-        first_name,
-        last_name,
-        middle_name,
-        is_active
-      FROM public.users
+SELECT
+  id,
+  login,
+  email,
+  phone,
+  role_ft,
+  role_hr,
+  role_lzk,
+  first_name,
+  last_name,
+  middle_name,
+  is_active
+FROM public.users
       WHERE lower(trim(login)) = lower(trim($1))
       LIMIT 1
     `, [login]);
