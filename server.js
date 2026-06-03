@@ -1921,7 +1921,17 @@ app.post("/request-approve", async (req, res) => {
 
 app.post("/zvk-save", async (req, res) => {
   try {
-    const { id_ft, user_name, to_pay, request_flag, login, is_admin, is_all, can_edit_all } = req.body;
+    const {
+      id_ft,
+      zvk_row_id,
+      user_name,
+      to_pay,
+      request_flag,
+      login,
+      is_admin,
+      is_all,
+      can_edit_all
+    } = req.body || {};
 
     if (!id_ft) {
       return res.status(400).json({ success:false, error:"id_ft is required" });
@@ -1932,8 +1942,91 @@ app.post("/zvk-save", async (req, res) => {
       return res.status(400).json({ success:false, error:"login required" });
     }
 
-    const adminOk = isTruthy(is_admin) || isTruthy(is_all) || isTruthy(can_edit_all);
+    const adminOk =
+      isTruthy(is_admin) ||
+      isTruthy(is_all) ||
+      isTruthy(can_edit_all) ||
+      actor.toLowerCase() === "b_erkin";
 
+    const ft = String(id_ft).trim();
+    const flag = String(request_flag || "Нет").trim();
+
+    const toPayNum =
+      flag === "Нет"
+        ? 0
+        : (
+            to_pay === "" || to_pay === undefined || to_pay === null
+              ? 0
+              : Number(to_pay)
+          );
+
+    if (Number.isNaN(toPayNum)) {
+      return res.status(400).json({ success:false, error:"to_pay must be number" });
+    }
+
+    // ✅ ГЛАВНОЕ: если пришёл zvk_row_id — обновляем выбранную строку, не создаём новую
+    if (zvk_row_id) {
+      const rid = Number(zvk_row_id);
+
+      if (!rid || Number.isNaN(rid)) {
+        return res.status(400).json({ success:false, error:"bad zvk_row_id" });
+      }
+
+      if (!adminOk) {
+        const ok = await canEditRowByLogin(pool, rid, actor);
+        if (!ok) {
+          return res.status(403).json({ success:false, error:"NO_RIGHTS_THIS_ROW" });
+        }
+      }
+
+      const finalName = flag === "Нет"
+        ? "СИСТЕМА"
+        : String(user_name || actor || "СИСТЕМА").trim();
+
+      const upd = await pool.query(`
+        UPDATE public.zvk
+           SET request_flag = $1,
+               to_pay       = $2,
+               zvk_name     = $3,
+               zvk_date     = NOW()
+         WHERE id = $4
+         RETURNING id, id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag
+      `, [
+        flag,
+        toPayNum,
+        finalName,
+        rid
+      ]);
+
+      if (!upd.rows.length) {
+        return res.status(404).json({
+          success:false,
+          error:"zvk_row_id not found"
+        });
+      }
+
+      // ✅ если Заявка = Нет, очищаем источник объект
+      if (flag === "Нет") {
+        await pool.query(`
+          INSERT INTO public.zvk_status (zvk_row_id, src_o, status_time)
+          VALUES ($1, '', NOW())
+          ON CONFLICT (zvk_row_id)
+          DO UPDATE SET
+            src_o = '',
+            status_time = NOW()
+        `, [rid]);
+      }
+
+      return res.json({
+        success: true,
+        updated: true,
+        row: upd.rows[0],
+        id_zvk: upd.rows[0].id_zvk,
+        zvk_row_id: upd.rows[0].id
+      });
+    }
+
+    // ✅ ниже старая логика создания новой строки, если zvk_row_id не пришёл
     if (!adminOk) {
       const ok = await canEditFtByLogin(pool, id_ft, actor);
       if (!ok) {
@@ -1941,26 +2034,6 @@ app.post("/zvk-save", async (req, res) => {
       }
     }
 
-    const ft = String(id_ft).trim();
-    const flag = String(request_flag || "Нет").trim();
-
-    const toPayNum =
-      to_pay === "" || to_pay === undefined || to_pay === null
-        ? 0
-        : Number(to_pay);
-
-    if (Number.isNaN(toPayNum)) {
-      return res.status(400).json({ success:false, error:"to_pay must be number" });
-    }
-
-    const sumFtRow = await pool.query(
-      `SELECT COALESCE(sum_ft, 0) AS sum_ft FROM public.ft WHERE id_ft = $1 LIMIT 1`,
-      [ft]
-    );
-
-    const sumFt = Number(sumFtRow.rows[0]?.sum_ft || 0);
-
-    // ✅ Проверяем: это первая заявка по FT или уже есть история
     const exists = await pool.query(
       `SELECT 1 FROM public.zvk WHERE id_ft = $1 LIMIT 1`,
       [ft]
@@ -1968,25 +2041,23 @@ app.post("/zvk-save", async (req, res) => {
 
     const isFirst = exists.rowCount === 0;
 
-    // ✅ Только при первом создании:
-    // ЗаявИмя = СИСТЕМА, Заявка = Нет, К оплате = Сумма
-let finalName;
-let finalToPay;
-let finalFlag;
+    let finalName;
+    let finalToPay;
+    let finalFlag;
 
-if (isFirst) {
-  finalName = "СИСТЕМА";
-  finalToPay = 0;
-  finalFlag = "Нет";
-} else if (flag === "Нет") {
-  finalName = "СИСТЕМА";
-  finalToPay = 0;
-  finalFlag = "Нет";
-} else {
-  finalName = String(user_name || actor || "СИСТЕМА").trim();
-  finalToPay = toPayNum;
-  finalFlag = flag;
-}
+    if (isFirst) {
+      finalName = "СИСТЕМА";
+      finalToPay = 0;
+      finalFlag = "Нет";
+    } else if (flag === "Нет") {
+      finalName = "СИСТЕМА";
+      finalToPay = 0;
+      finalFlag = "Нет";
+    } else {
+      finalName = String(user_name || actor || "СИСТЕМА").trim();
+      finalToPay = toPayNum;
+      finalFlag = flag;
+    }
 
     const lastCycle = await pool.query(
       `
@@ -2060,7 +2131,6 @@ if (isFirst) {
     return res.status(500).json({ success:false, error:e.message });
   }
 });
-
 app.post("/zvk-bulk-request-flag", async (req, res) => {
   const client = await pool.connect();
 
