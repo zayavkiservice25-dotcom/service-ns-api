@@ -2522,7 +2522,20 @@ app.post("/zvk-pay-row", async (req, res) => {
         deletedTail = await deleteLastAutoTailByFt(client, Number(zvk_row_id));
       }
 
-     // если Реестр = Да -> пересобрать хвост
+    
+// ✅ если Реестр = Обнуление -> очистить Источник Объект
+if (reg === "Обнуление") {
+  await client.query(`
+    INSERT INTO public.zvk_status (zvk_row_id, src_o, status_time)
+    VALUES ($1, '', NOW())
+    ON CONFLICT (zvk_row_id)
+    DO UPDATE SET
+      src_o = '',
+      status_time = NOW()
+  `, [Number(zvk_row_id)]);
+}
+
+// если Реестр = Да -> пересобрать хвост
 if (reg === "Да") {
   rebuild = await rebuildFtTail(client, Number(zvk_row_id));
 }
