@@ -1197,6 +1197,84 @@ app.get("/ft", async (req, res) => {
 });
 
 // =====================================================
+// ✅ b_erkin может менять основные поля FT
+// POST /ft-update-main
+// =====================================================
+app.post("/ft-update-main", async (req, res) => {
+  try {
+    const {
+      id_ft,
+      login,
+      division,
+      object,
+      contractor,
+      pay_purpose,
+      dds_article,
+      contract_no,
+      invoice_no,
+      sum_ft
+    } = req.body || {};
+
+    const actor = String(login || "").trim().toLowerCase();
+    const idFt = String(id_ft || "").trim();
+
+    if (!idFt) {
+      return res.status(400).json({ success:false, error:"id_ft required" });
+    }
+
+    // ✅ доступ только b_erkin
+    if (actor !== "b_erkin") {
+      return res.status(403).json({ success:false, error:"NO_RIGHTS" });
+    }
+
+    const sumNum = Number(
+      String(sum_ft || 0)
+        .replace(/\s/g, "")
+        .replace(",", ".")
+    );
+
+    if (!Number.isFinite(sumNum)) {
+      return res.status(400).json({ success:false, error:"sum_ft must be number" });
+    }
+
+    const r = await pool.query(`
+      UPDATE public.ft
+      SET
+        division = $2,
+        "object" = $3,
+        contractor = $4,
+        pay_purpose = $5,
+        dds_article = $6,
+        contract_no = $7,
+        invoice_no = $8,
+        sum_ft = $9
+      WHERE id_ft = $1
+      RETURNING *
+    `, [
+      idFt,
+      String(division || "").trim(),
+      String(object || "").trim(),
+      String(contractor || "").trim(),
+      String(pay_purpose || "").trim(),
+      String(dds_article || "").trim(),
+      String(contract_no || "").trim(),
+      String(invoice_no || "").trim(),
+      sumNum
+    ]);
+
+    if (!r.rowCount) {
+      return res.status(404).json({ success:false, error:"FT_NOT_FOUND" });
+    }
+
+    return res.json({ success:true, row:r.rows[0] });
+
+  } catch (e) {
+    console.error("FT-UPDATE-MAIN ERROR:", e);
+    return res.status(500).json({ success:false, error:e.message });
+  }
+});
+
+// =====================================================
 // SAVE (история) — /zvk-save
 // ✅ Пока ПОСЛЕДНЯЯ строка цикла НЕ оплачена -> пишем в тот же id_zvk
 // ✅ Если ПОСЛЕДНЯЯ строка оплачена -> создаём новый id_zvk
@@ -2241,7 +2319,11 @@ app.post("/zvk-status-row", async (req, res) => {
 
     // Проверка прав
     const actor = String(login || "").trim();
-    const adminOk = isTruthy(is_admin) || isTruthy(can_edit_all) || String(is_all || "0") === "1";
+    const adminOk =
+  isTruthy(is_admin) ||
+  isTruthy(can_edit_all) ||
+  String(is_all || "0") === "1" ||
+  actor.toLowerCase() === "b_erkin";
     if (!adminOk) {
       const ok = await canEditRowByLogin(pool, rid, actor);
       if (!ok) return res.status(403).json({ success: false, error: "NO_RIGHTS_THIS_ROW" });
