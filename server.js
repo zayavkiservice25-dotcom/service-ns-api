@@ -889,7 +889,15 @@ app.post("/update-user-roles", async (req, res) => {
     const newRoleHr = String(role_hr || "").trim().toLowerCase();
     const newRoleLzk = String(role_lzk || "").trim().toLowerCase();
 
-    const allowedRoles = ["initiator", "operator", "supervisor", "admin", "pto", "editor"];
+    const allowedRoles = [
+  "initiator",
+  "operator",
+  "supervisor",
+  "admin",
+  "pto",
+  "editor",
+  "supplier"
+];
 
     if (!loginNorm) {
       return res.status(400).json({
@@ -1949,16 +1957,22 @@ app.post("/zvk-save", async (req, res) => {
       actor.toLowerCase() === "b_erkin";
 
     const ft = String(id_ft).trim();
-    const flag = String(request_flag || "Нет").trim();
+   let flag = String(request_flag || "Нет").trim();
 
-    const toPayNum =
-      flag === "Нет"
+if (!["Да", "Нет", "Обнуление"].includes(flag)) {
+  flag = "Нет";
+}
+
+// ✅ ЖЁСТКО: если пришло Нет — сумма 0 и имя СИСТЕМА
+const isNoRequest = flag === "Нет";
+
+const toPayNum = isNoRequest
+  ? 0
+  : (
+      to_pay === "" || to_pay === undefined || to_pay === null
         ? 0
-        : (
-            to_pay === "" || to_pay === undefined || to_pay === null
-              ? 0
-              : Number(to_pay)
-          );
+        : Number(to_pay)
+    );
 
     if (Number.isNaN(toPayNum)) {
       return res.status(400).json({ success:false, error:"to_pay must be number" });
