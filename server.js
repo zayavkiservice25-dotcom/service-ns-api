@@ -582,6 +582,26 @@ await pool.query(`
   ON public.io_history (created_at DESC);
 `);
 
+await pool.query(`
+  ALTER TABLE public.prihod6
+  ADD COLUMN IF NOT EXISTS io_history_id bigint;
+`);
+
+await pool.query(`
+  ALTER TABLE public.perevod7
+  ADD COLUMN IF NOT EXISTS io_history_id bigint;
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS prihod6_io_history_id_idx
+  ON public.prihod6 (io_history_id);
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS perevod7_io_history_id_idx
+  ON public.perevod7 (io_history_id);
+`);
+
 
 await pool.query(`
   CREATE TABLE IF NOT EXISTS public.user_role_history (
@@ -2958,79 +2978,164 @@ app.post("/save-ft", async (req, res) => {
   }
 });
 
+// =====================================================
+// СОЗДАНИЕ ВХ / ИСХ + ИСТОРИЯ
+// =====================================================
 app.post("/io-save", async (req, res) => {
   const client = await pool.connect();
+
   try {
     const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
-    if (!rows.length) {
-      return res.status(400).json({ success:false, error:"rows required" });
-    }
 
-    const toNum = (v) => {
-      if (v === null || v === undefined || v === "") return null;
-      const n = Number(String(v).replace(/\s/g,"").replace(",", "."));
-      return Number.isFinite(n) ? n : null;
-    };
+    if (!rows.length) {
+      return res.status(400).json({
+        success: false,
+        error: "rows required"
+      });
+    }
 
     await client.query("BEGIN");
 
-    let insPrihod = 0;
-    let insPerevod = 0;
-    let insHistory = 0;
+    let inserted = 0;
 
-    for (const r of rows) {
-      const sum = toNum(r.sum);
-      if (sum === null) continue;
+    for (const row of rows) {
+      const inputDate = String(row?.input_date || "").trim();
+      const objectName = String(row?.object || "").trim();
+      const divIn = String(row?.div_in || "").trim();
+      const ddsIn = String(row?.dds_in || "").trim();
+      const divOut = String(row?.div_out || "").trim();
+      const ddsOut = String(row?.dds_out || "").trim();
 
-      const inputDate = r.input_date || null;
-      const obj    = r.object || null;
-      const divIn  = r.div_in || null;
-      const ddsIn  = r.dds_in || null;
-      const divOut = r.div_out || null;
-      const ddsOut = r.dds_out || null;
-
-      await client.query(
-        `INSERT INTO public.prihod6 (amount_in, object_name, division_in, dds_in)
-         VALUES ($1,$2,$3,$4)`,
-        [sum, obj, divIn, ddsIn]
+      const sumValue = Number(
+        String(row?.sum || "")
+          .replace(/\s/g, "")
+          .replace(",", ".")
       );
-      insPrihod++;
 
-      await client.query(
-        `INSERT INTO public.perevod7 (amount_out, object_name, division_out, dds_out)
-         VALUES ($1,$2,$3,$4)`,
-        [sum, obj, divOut, ddsOut]
-      );
-      insPerevod++;
+      if (!Number.isFinite(sumValue) || sumValue <= 0) {
+        throw new Error("Введите правильную сумму");
+      }
 
-      await client.query(
-        `INSERT INTO public.io_history
-          (input_date_text, sum_value, object_name, div_in, dds_in, div_out, dds_out)
-         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-        [inputDate, sum, obj, divIn, ddsIn, divOut, ddsOut]
+      if (!objectName) {
+        throw new Error("Источник Объект не указан");
+      }
+
+      if (!divIn) {
+        throw new Error("Дивизион Вх не указан");
+      }
+
+      if (!ddsIn) {
+        throw new Error("ДДСвх не указан");
+      }
+
+      if (!divOut) {
+        throw new Error("Дивизион Исх не указан");
+      }
+
+      if (!ddsOut) {
+        throw new Error("ДДСисх не указан");
+      }
+
+      // 1. Сначала создаём историю
+      const historyResult = await client.query(
+        `
+        INSERT INTO public.io_history
+        (
+          input_date_text,
+          sum_value,
+          object_name,
+          div_in,
+          dds_in,
+          div_out,
+          dds_out
+        )
+        VALUES ($1,$2,$3,$4,$5,$6,$7)
+        RETURNING id
+        `,
+        [
+          inputDate,
+          sumValue,
+          objectName,
+          divIn,
+          ddsIn,
+          divOut,
+          ddsOut
+        ]
       );
-      insHistory++;
+
+      const historyId = Number(historyResult.rows[0].id);
+
+      // 2. Создаём ВХ
+      await client.query(
+        `
+        INSERT INTO public.prihod6
+        (
+          amount_in,
+          object_name,
+          division_in,
+          dds_in,
+          io_history_id
+        )
+        VALUES ($1,$2,$3,$4,$5)
+        `,
+        [
+          sumValue,
+          objectName,
+          divIn,
+          ddsIn,
+          historyId
+        ]
+      );
+
+      // 3. Создаём ИСХ
+      await client.query(
+        `
+        INSERT INTO public.perevod7
+        (
+          amount_out,
+          object_name,
+          division_out,
+          dds_out,
+          io_history_id
+        )
+        VALUES ($1,$2,$3,$4,$5)
+        `,
+        [
+          sumValue,
+          objectName,
+          divOut,
+          ddsOut,
+          historyId
+        ]
+      );
+
+      inserted++;
     }
 
     await client.query("COMMIT");
 
-    res.json({
-      success:true,
-      inserted:{
-        prihod6: insPrihod,
-        perevod7: insPerevod,
-        io_history: insHistory
-      }
+    return res.json({
+      success: true,
+      inserted
     });
 
   } catch (e) {
-    await client.query("ROLLBACK");
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {}
+
     console.error("IO-SAVE ERROR:", e);
-    res.status(500).json({ success:false, error:e.message });
+
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+
   } finally {
     client.release();
   }
 });
+
 
 app.get("/io-history", async (req, res) => {
   const client = await pool.connect();
@@ -3059,6 +3164,228 @@ app.get("/io-history", async (req, res) => {
   } catch (e) {
     console.error("IO-HISTORY ERROR:", e);
     res.status(500).json({ success:false, error:e.message });
+  } finally {
+    client.release();
+  }
+});
+
+// =====================================================
+// ИЗМЕНЕНИЕ ЗАПИСИ ВХ / ИСХ ИЗ ИСТОРИИ
+// =====================================================
+app.put("/io-history/:id", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const historyId = Number(req.params.id);
+    const login = String(req.body?.login || "").trim();
+
+    if (!Number.isInteger(historyId) || historyId <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: "Некорректный ID записи"
+      });
+    }
+
+    if (!login) {
+      return res.status(400).json({
+        success: false,
+        error: "Логин не передан"
+      });
+    }
+
+    // Проверка пользователя
+    const userResult = await client.query(
+      `
+      SELECT login, role_ft, is_active
+      FROM public.users
+      WHERE lower(trim(login)) = lower(trim($1))
+      LIMIT 1
+      `,
+      [login]
+    );
+
+    if (!userResult.rows.length) {
+      return res.status(404).json({
+        success: false,
+        error: "Пользователь не найден"
+      });
+    }
+
+    const user = userResult.rows[0];
+
+    if (user.is_active === false) {
+      return res.status(403).json({
+        success: false,
+        error: "Пользователь отключён"
+      });
+    }
+
+    const role = String(user.role_ft || "")
+      .trim()
+      .toLowerCase();
+
+    const loginLower = String(user.login || "")
+      .trim()
+      .toLowerCase();
+
+    const canEdit =
+      role === "admin" ||
+      role === "админ" ||
+      role === "администратор" ||
+      loginLower === "b_erkin";
+
+    if (!canEdit) {
+      return res.status(403).json({
+        success: false,
+        error: "Нет доступа на изменение"
+      });
+    }
+
+    const inputDate = String(req.body?.input_date || "").trim();
+    const objectName = String(req.body?.object || "").trim();
+    const divIn = String(req.body?.div_in || "").trim();
+    const ddsIn = String(req.body?.dds_in || "").trim();
+    const divOut = String(req.body?.div_out || "").trim();
+    const ddsOut = String(req.body?.dds_out || "").trim();
+
+    const sumValue = Number(
+      String(req.body?.sum || "")
+        .replace(/\s/g, "")
+        .replace(",", ".")
+    );
+
+    if (!Number.isFinite(sumValue) || sumValue <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: "Введите правильную сумму"
+      });
+    }
+
+    if (!objectName) {
+      return res.status(400).json({
+        success: false,
+        error: "Источник Объект не указан"
+      });
+    }
+
+    if (!divIn || !ddsIn || !divOut || !ddsOut) {
+      return res.status(400).json({
+        success: false,
+        error: "Заполните все поля"
+      });
+    }
+
+    await client.query("BEGIN");
+
+    const oldResult = await client.query(
+      `
+      SELECT *
+      FROM public.io_history
+      WHERE id = $1
+      LIMIT 1
+      `,
+      [historyId]
+    );
+
+    if (!oldResult.rows.length) {
+      await client.query("ROLLBACK");
+
+      return res.status(404).json({
+        success: false,
+        error: "Запись истории не найдена"
+      });
+    }
+
+    // Обновляем историю
+    await client.query(
+      `
+      UPDATE public.io_history
+      SET
+        input_date_text = $1,
+        sum_value = $2,
+        object_name = $3,
+        div_in = $4,
+        dds_in = $5,
+        div_out = $6,
+        dds_out = $7
+      WHERE id = $8
+      `,
+      [
+        inputDate,
+        sumValue,
+        objectName,
+        divIn,
+        ddsIn,
+        divOut,
+        ddsOut,
+        historyId
+      ]
+    );
+
+    // Обновляем ВХ
+    const prihodResult = await client.query(
+      `
+      UPDATE public.prihod6
+      SET
+        amount_in = $1,
+        object_name = $2,
+        division_in = $3,
+        dds_in = $4
+      WHERE io_history_id = $5
+      `,
+      [
+        sumValue,
+        objectName,
+        divIn,
+        ddsIn,
+        historyId
+      ]
+    );
+
+    // Обновляем ИСХ
+    const perevodResult = await client.query(
+      `
+      UPDATE public.perevod7
+      SET
+        amount_out = $1,
+        object_name = $2,
+        division_out = $3,
+        dds_out = $4
+      WHERE io_history_id = $5
+      `,
+      [
+        sumValue,
+        objectName,
+        divOut,
+        ddsOut,
+        historyId
+      ]
+    );
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success: true,
+      updated: {
+        history: 1,
+        prihod: prihodResult.rowCount,
+        perevod: perevodResult.rowCount
+      },
+      old_record: prihodResult.rowCount === 0 || perevodResult.rowCount === 0
+    });
+
+  } catch (e) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {}
+
+    console.error("IO-HISTORY UPDATE ERROR:", e);
+
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+
   } finally {
     client.release();
   }
