@@ -3170,7 +3170,8 @@ app.get("/io-history", async (req, res) => {
 });
 
 // =====================================================
-// ИЗМЕНЕНИЕ ЗАПИСИ ВХ / ИСХ ИЗ ИСТОРИИ
+// ИЗМЕНЕНИЕ ВХ / ИСХ ИЗ ИСТОРИИ
+// Работает и для новых, и для старых записей
 // =====================================================
 app.put("/io-history/:id", async (req, res) => {
   const client = await pool.connect();
@@ -3193,7 +3194,6 @@ app.put("/io-history/:id", async (req, res) => {
       });
     }
 
-    // Проверка пользователя
     const userResult = await client.query(
       `
       SELECT login, role_ft, is_active
@@ -3224,7 +3224,7 @@ app.put("/io-history/:id", async (req, res) => {
       .trim()
       .toLowerCase();
 
-    const loginLower = String(user.login || "")
+    const actorLogin = String(user.login || "")
       .trim()
       .toLowerCase();
 
@@ -3232,7 +3232,7 @@ app.put("/io-history/:id", async (req, res) => {
       role === "admin" ||
       role === "админ" ||
       role === "администратор" ||
-      loginLower === "b_erkin";
+      actorLogin === "b_erkin";
 
     if (!canEdit) {
       return res.status(403).json({
@@ -3277,9 +3277,19 @@ app.put("/io-history/:id", async (req, res) => {
 
     await client.query("BEGIN");
 
+    // Берём старые значения до изменения
     const oldResult = await client.query(
       `
-      SELECT *
+      SELECT
+        id,
+        created_at,
+        input_date_text,
+        sum_value,
+        object_name,
+        div_in,
+        dds_in,
+        div_out,
+        dds_out
       FROM public.io_history
       WHERE id = $1
       LIMIT 1
@@ -3296,7 +3306,173 @@ app.put("/io-history/:id", async (req, res) => {
       });
     }
 
-    // Обновляем историю
+    const old = oldResult.rows[0];
+
+    // =================================================
+    // 1. ПРИХОД
+    // Сначала пробуем по io_history_id
+    // =================================================
+    let prihodResult = await client.query(
+      `
+      UPDATE public.prihod6
+      SET
+        amount_in = $1,
+        object_name = $2,
+        division_in = $3,
+        dds_in = $4
+      WHERE io_history_id = $5
+      `,
+      [
+        sumValue,
+        objectName,
+        divIn,
+        ddsIn,
+        historyId
+      ]
+    );
+
+    // Если старая запись и io_history_id пустой
+    if (prihodResult.rowCount === 0) {
+      prihodResult = await client.query(
+        `
+        UPDATE public.prihod6
+        SET
+          amount_in = $1,
+          object_name = $2,
+          division_in = $3,
+          dds_in = $4,
+          io_history_id = $5
+        WHERE ctid = (
+          SELECT ctid
+          FROM public.prihod6
+          WHERE io_history_id IS NULL
+            AND COALESCE(amount_in, 0) = COALESCE($6::numeric, 0)
+            AND trim(COALESCE(object_name, '')) =
+                trim(COALESCE($7::text, ''))
+            AND trim(COALESCE(division_in, '')) =
+                trim(COALESCE($8::text, ''))
+            AND trim(COALESCE(dds_in, '')) =
+                trim(COALESCE($9::text, ''))
+          ORDER BY
+            ABS(
+              EXTRACT(
+                EPOCH FROM (
+                  doc_time - COALESCE($10::timestamptz, doc_time)
+                )
+              )
+            ) ASC,
+            doc_time DESC
+          LIMIT 1
+        )
+        `,
+        [
+          sumValue,
+          objectName,
+          divIn,
+          ddsIn,
+          historyId,
+
+          old.sum_value,
+          old.object_name,
+          old.div_in,
+          old.dds_in,
+          old.created_at
+        ]
+      );
+    }
+
+    // =================================================
+    // 2. ПЕРЕВОД
+    // Сначала пробуем по io_history_id
+    // =================================================
+    let perevodResult = await client.query(
+      `
+      UPDATE public.perevod7
+      SET
+        amount_out = $1,
+        object_name = $2,
+        division_out = $3,
+        dds_out = $4
+      WHERE io_history_id = $5
+      `,
+      [
+        sumValue,
+        objectName,
+        divOut,
+        ddsOut,
+        historyId
+      ]
+    );
+
+    // Если старая запись и io_history_id пустой
+    if (perevodResult.rowCount === 0) {
+      perevodResult = await client.query(
+        `
+        UPDATE public.perevod7
+        SET
+          amount_out = $1,
+          object_name = $2,
+          division_out = $3,
+          dds_out = $4,
+          io_history_id = $5
+        WHERE ctid = (
+          SELECT ctid
+          FROM public.perevod7
+          WHERE io_history_id IS NULL
+            AND COALESCE(amount_out, 0) = COALESCE($6::numeric, 0)
+            AND trim(COALESCE(object_name, '')) =
+                trim(COALESCE($7::text, ''))
+            AND trim(COALESCE(division_out, '')) =
+                trim(COALESCE($8::text, ''))
+            AND trim(COALESCE(dds_out, '')) =
+                trim(COALESCE($9::text, ''))
+          ORDER BY
+            ABS(
+              EXTRACT(
+                EPOCH FROM (
+                  doc_time - COALESCE($10::timestamptz, doc_time)
+                )
+              )
+            ) ASC,
+            doc_time DESC
+          LIMIT 1
+        )
+        `,
+        [
+          sumValue,
+          objectName,
+          divOut,
+          ddsOut,
+          historyId,
+
+          old.sum_value,
+          old.object_name,
+          old.div_out,
+          old.dds_out,
+          old.created_at
+        ]
+      );
+    }
+
+    if (
+      prihodResult.rowCount === 0 ||
+      perevodResult.rowCount === 0
+    ) {
+      await client.query("ROLLBACK");
+
+      return res.status(404).json({
+        success: false,
+        error:
+          "Связанные строки в prihod6 или perevod7 не найдены. " +
+          "История и база не были изменены.",
+        updated: {
+          prihod: prihodResult.rowCount,
+          perevod: perevodResult.rowCount
+        }
+      });
+    }
+
+    // Историю меняем только после успешного изменения базы
     await client.query(
       `
       UPDATE public.io_history
@@ -3322,56 +3498,16 @@ app.put("/io-history/:id", async (req, res) => {
       ]
     );
 
-    // Обновляем ВХ
-    const prihodResult = await client.query(
-      `
-      UPDATE public.prihod6
-      SET
-        amount_in = $1,
-        object_name = $2,
-        division_in = $3,
-        dds_in = $4
-      WHERE io_history_id = $5
-      `,
-      [
-        sumValue,
-        objectName,
-        divIn,
-        ddsIn,
-        historyId
-      ]
-    );
-
-    // Обновляем ИСХ
-    const perevodResult = await client.query(
-      `
-      UPDATE public.perevod7
-      SET
-        amount_out = $1,
-        object_name = $2,
-        division_out = $3,
-        dds_out = $4
-      WHERE io_history_id = $5
-      `,
-      [
-        sumValue,
-        objectName,
-        divOut,
-        ddsOut,
-        historyId
-      ]
-    );
-
     await client.query("COMMIT");
 
     return res.json({
       success: true,
+      message: "История и база обновлены",
       updated: {
         history: 1,
         prihod: prihodResult.rowCount,
         perevod: perevodResult.rowCount
-      },
-      old_record: prihodResult.rowCount === 0 || perevodResult.rowCount === 0
+      }
     });
 
   } catch (e) {
