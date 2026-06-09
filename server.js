@@ -671,6 +671,22 @@ app.post("/register", async (req, res) => {
 
     const emailNorm = normalizeEmail(email);
     const loginNorm = String(login || "").trim().toLowerCase();
+const loginOriginal = String(login || "").trim();
+
+if (/[А-Яа-яЁё]/.test(loginOriginal)) {
+  return res.status(400).json({
+    success: false,
+    message: "В логине нельзя использовать русские буквы"
+  });
+}
+
+if (!/^[A-Za-z]_[A-Za-z]+$/.test(loginOriginal)) {
+  return res.status(400).json({
+    success: false,
+    message:
+      "Логин должен быть в формате A_Sagyndyk: первая буква фамилии, затем _ и имя"
+  });
+}
     const pass = String(password || "").trim();
 
     if (!emailNorm) {
