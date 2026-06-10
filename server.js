@@ -912,6 +912,7 @@ app.get("/employees", async (req, res) => {
     });
   }
 });
+
 app.post("/update-user-roles", async (req, res) => {
   const client = await pool.connect();
 
@@ -950,9 +951,9 @@ app.post("/update-user-roles", async (req, res) => {
     }
 
     if (
-      !allowedRoles.includes(newRoleFt) ||
-      !allowedRoles.includes(newRoleHr) ||
-      !allowedRoles.includes(newRoleLzk)
+      (newRoleFt && !allowedRoles.includes(newRoleFt)) ||
+      (newRoleHr && !allowedRoles.includes(newRoleHr)) ||
+      (newRoleLzk && !allowedRoles.includes(newRoleLzk))
     ) {
       return res.status(400).json({
         success: false,
@@ -1030,9 +1031,9 @@ app.post("/update-user-roles", async (req, res) => {
 
     const updRes = await client.query(`
       UPDATE public.users
-      SET role_ft = $1,
-          role_hr = $2,
-          role_lzk = $3
+      SET role_ft = NULLIF($1, ''),
+          role_hr = NULLIF($2, ''),
+          role_lzk = NULLIF($3, '')
       WHERE lower(trim(login)) = lower(trim($4))
       RETURNING id, login, role_ft, role_hr, role_lzk
     `, [newRoleFt, newRoleHr, newRoleLzk, loginNorm]);
