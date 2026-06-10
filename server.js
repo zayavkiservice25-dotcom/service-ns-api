@@ -2874,21 +2874,18 @@ if (isAdmin || isAll) {
       where.push(`lower(trim(v.input_name)) = lower(trim($${params.length}))`);
     }
 
-    const limit = (paidMode === "paid" || paidMode === "reset") ? 500 : 1500;
-    params.push(limit);
 
     const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
 
-    const query = `
-      SELECT v.*
-      FROM public.ft_zvk_current_v2 v
-      ${whereSql}
-      ORDER BY
-        COALESCE(NULLIF(substring(v.id_ft from '\\d+'), ''), '0')::int DESC,
-        v.zvk_date DESC NULLS LAST,
-        v.zvk_row_id DESC
-      LIMIT $${params.length}
-    `;
+const query = `
+  SELECT v.*
+  FROM public.ft_zvk_current_v2 v
+  ${whereSql}
+  ORDER BY
+    COALESCE(NULLIF(substring(v.id_ft from '\\d+'), ''), '0')::int DESC,
+    v.zvk_date DESC NULLS LAST,
+    v.zvk_row_id DESC
+`;
 
     const r = await pool.query(query, params);
 
