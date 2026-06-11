@@ -3926,28 +3926,47 @@ app.post("/request-items-paid-bulk", async (req, res) => {
 
   try {
     const request_id = Number(req.body?.request_id);
+
     const row_ids = Array.isArray(req.body?.row_ids)
       ? req.body.row_ids.map(Number).filter(Boolean)
       : [];
+
     const loginNorm = String(req.body?.login || "").trim().toLowerCase();
+    const paidValue = String(req.body?.is_paid || "").trim();
 
     if (!request_id) {
-      return res.status(400).json({ success:false, error:"request_id required" });
+      return res.status(400).json({
+        success: false,
+        error: "request_id required"
+      });
     }
 
     if (!row_ids.length) {
-      return res.status(400).json({ success:false, error:"row_ids required" });
+      return res.status(400).json({
+        success: false,
+        error: "row_ids required"
+      });
     }
 
+    if (!["Да", "Нет"].includes(paidValue)) {
+      return res.status(400).json({
+        success: false,
+        error: "is_paid must be Да or Нет"
+      });
+    }
+
+    // ✅ Оплату могут ставить только эти пользователи
     const canPay =
-      loginNorm === "k_ermek" ||
+      loginNorm === "zh_elena" ||
+      loginNorm === "k_arailym" ||
+      loginNorm === "s_zhasulan" ||
       loginNorm === "b_erkin" ||
       loginNorm === "admin";
 
     if (!canPay) {
       return res.status(403).json({
-        success:false,
-        error:"Нет прав ставить Оплачено"
+        success: false,
+        error: "Нет прав ставить Оплачено"
       });
     }
 
@@ -3964,32 +3983,35 @@ app.post("/request-items-paid-bulk", async (req, res) => {
       throw new Error("Заявка не найдена");
     }
 
-    if (String(head.rows[0].approve_ermek_status || "") !== "Согласовано") {
-      throw new Error("Оплачено можно ставить только после утверждения Ермек");
+    const approveStatus = String(head.rows[0].approve_ermek_status || "").trim();
+
+    if (!["Согласовано", "Утверждено", "Да"].includes(approveStatus)) {
+      throw new Error("Оплачено можно ставить только после утверждения Ермека");
     }
 
     await client.query(`
-      INSERT INTO public.zvk_pay (zvk_row_id, is_paid, pay_time)
+      INSERT INTO public.zvk_pay
+        (zvk_row_id, is_paid, pay_time)
       SELECT
         i.zvk_row_id,
-        'Да',
-        NOW()
+        CASE WHEN $3 = 'Да' THEN 'Да' ELSE NULL END,
+        CASE WHEN $3 = 'Да' THEN NOW() ELSE NULL END
       FROM public.request_items i
       WHERE i.request_id = $1
         AND i.zvk_row_id = ANY($2::bigint[])
         AND i.zvk_row_id IS NOT NULL
       ON CONFLICT (zvk_row_id)
       DO UPDATE SET
-        is_paid = 'Да',
-        pay_time = COALESCE(public.zvk_pay.pay_time, NOW())
-    `, [request_id, row_ids]);
+        is_paid = EXCLUDED.is_paid,
+        pay_time = EXCLUDED.pay_time
+    `, [request_id, row_ids, paidValue]);
 
     await client.query("COMMIT");
-ф
+
     return res.json({
-      success:true,
+      success: true,
       request_id,
-      paid:"Да",
+      paid: paidValue,
       updated: row_ids.length
     });
 
@@ -3997,16 +4019,16 @@ app.post("/request-items-paid-bulk", async (req, res) => {
     try { await client.query("ROLLBACK"); } catch (_) {}
 
     console.error("request-items-paid-bulk error:", e);
+
     return res.status(500).json({
-      success:false,
-      error:e.message
+      success: false,
+      error: e.message
     });
 
   } finally {
     client.release();
   }
 });
-
 app.post("/update-row", async (req,res)=>{
   try{
     const {
