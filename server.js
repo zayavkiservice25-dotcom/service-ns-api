@@ -1288,129 +1288,149 @@ app.post("/create-request", async (req, res) => {
       : [];
 
     if (!ids.length) {
-      return res.status(400).json({ success:false, error:"row_ids required" });
+      return res.status(400).json({
+        success: false,
+        error: "row_ids required"
+      });
     }
 
     if (!login) {
-      return res.status(400).json({ success:false, error:"login required" });
+      return res.status(400).json({
+        success: false,
+        error: "login required"
+      });
     }
 
     await client.query("BEGIN");
 
-    const head = await client.query(`
-      INSERT INTO public.request_head (created_by)
-      VALUES ($1)
-      RETURNING id, request_no
-    `, [
-      String(login || "").trim()
-    ]);
+    const createdRequests = [];
 
-    const request_id = head.rows[0].id;
-    const request_no = head.rows[0].request_no;
+    for (const oneRowId of ids) {
+      const head = await client.query(`
+        INSERT INTO public.request_head (created_by)
+        VALUES ($1)
+        RETURNING id, request_no
+      `, [
+        String(login || "").trim()
+      ]);
 
-    const items = await client.query(`
-      INSERT INTO public.request_items
-      (
+      const request_id = head.rows[0].id;
+      const request_no = head.rows[0].request_no;
+
+      const items = await client.query(`
+        INSERT INTO public.request_items
+        (
+          request_id,
+          zvk_row_id,
+          id_ft,
+          id_zvk,
+          object,
+          division,
+          input_name,
+          contractor,
+          pay_purpose,
+          dds_article,
+          contract_no,
+          invoice_no,
+          invoice_date,
+          invoice_pdf,
+          src_d,
+          src_o,
+          to_pay
+        )
+        SELECT
+          $1,
+          v.zvk_row_id,
+          v.id_ft,
+          v.id_zvk,
+          v.object,
+          v.division,
+          v.input_name,
+          v.contractor,
+          v.pay_purpose,
+          v.dds_article,
+          v.contract_no,
+          v.invoice_no,
+          v.invoice_date,
+          v.invoice_pdf,
+          v.src_d,
+          v.src_o,
+          v.to_pay
+        FROM public.ft_zvk_current_v2 v
+        WHERE v.zvk_row_id = $2
+        RETURNING to_pay
+      `, [request_id, oneRowId]);
+
+      const total = items.rows.reduce((s, r) => s + Number(r.to_pay || 0), 0);
+      const count = items.rows.length;
+
+      await client.query(`
+        UPDATE public.request_head
+        SET
+          total_amount = $1,
+          items_count = $2,
+
+          acc_shevchenko_name = 'Шевченко Владимир',
+          acc_shevchenko_status = 'Ожидает',
+          acc_shevchenko_time = NULL,
+          acc_shevchenko_comment = NULL,
+
+          acc_marat_name = 'Койлибаев Марат',
+          acc_marat_status = 'Ожидает',
+          acc_marat_time = NULL,
+          acc_marat_comment = NULL,
+
+          acc_ermek_name = 'Касенов Ермек',
+          acc_ermek_status = 'Ожидает',
+          acc_ermek_time = NULL,
+          acc_ermek_comment = NULL,
+
+          approve_ermek_name = 'Касенов Ермек',
+          approve_ermek_status = 'Ожидает',
+          approve_ermek_time = NULL,
+          approve_ermek_comment = NULL
+        WHERE id = $3
+      `, [total, count, request_id]);
+
+      await client.query(`
+        INSERT INTO public.request_approve_log
+          (request_id, stage_name, approver_login, approver_name, action_type, comment_text)
+        VALUES ($1, $2, $3, $4, 'create', $5)
+      `, [
         request_id,
-        zvk_row_id,
-        id_ft,
-        id_zvk,
-        object,
-        division,
-        input_name,
-        contractor,
-        pay_purpose,
-        dds_article,
-        contract_no,
-        invoice_no,
-        invoice_date,
-        invoice_pdf,
-        src_d,
-        src_o,
-        to_pay
-      )
-      SELECT
-        $1,
-        v.zvk_row_id,
-        v.id_ft,
-        v.id_zvk,
-        v.object,
-        v.input_name,
-        v.contractor,
-        v.pay_purpose,
-        v.dds_article,
-        v.contract_no,
-        v.invoice_no,
-        v.invoice_date,
-        v.invoice_pdf,
-        v.src_d,
-        v.src_o,
-        v.to_pay
-      FROM public.ft_zvk_current_v2 v
-      WHERE v.zvk_row_id = ANY($2::bigint[])
-      RETURNING to_pay
-    `, [request_id, ids]);
+        'Инициация',
+        String(login || ""),
+        String(login || ""),
+        'Заявка создана'
+      ]);
 
-    const total = items.rows.reduce((s, r) => s + Number(r.to_pay || 0), 0);
-    const count = items.rows.length;
-
-    await client.query(`
-      UPDATE public.request_head
-      SET
-        total_amount = $1,
-        items_count = $2,
-
-        acc_shevchenko_name = 'Шевченко Владимир',
-        acc_shevchenko_status = 'Ожидает',
-        acc_shevchenko_time = NULL,
-        acc_shevchenko_comment = NULL,
-
-        acc_marat_name = 'Койлибаев Марат',
-        acc_marat_status = 'Ожидает',
-        acc_marat_time = NULL,
-        acc_marat_comment = NULL,
-
-        acc_ermek_name = 'Касенов Ермек',
-        acc_ermek_status = 'Ожидает',
-        acc_ermek_time = NULL,
-        acc_ermek_comment = NULL,
-
-        approve_ermek_name = 'Касенов Ермек',
-        approve_ermek_status = 'Ожидает',
-        approve_ermek_time = NULL,
-        approve_ermek_comment = NULL
-      WHERE id = $3
-    `, [total, count, request_id]);
-
-    await client.query(`
-      INSERT INTO public.request_approve_log
-        (request_id, stage_name, approver_login, approver_name, action_type, comment_text)
-      VALUES ($1, $2, $3, $4, 'create', $5)
-    `, [
-      request_id,
-      'Инициация',
-      String(login || ""),
-      String(login || ""),
-      'Заявка создана'
-    ]);
+      createdRequests.push({
+        request_id,
+        request_no,
+        row_id: oneRowId,
+        total_amount: total,
+        items_count: count
+      });
+    }
 
     await client.query("COMMIT");
 
     return res.json({
-      success:true,
-      request_id,
-      request_no,
-      total_amount: total,
-      items_count: count
+      success: true,
+      count: createdRequests.length,
+      requests: createdRequests,
+      request_id: createdRequests[0]?.request_id || null,
+      request_no: createdRequests[0]?.request_no || null
     });
 
   } catch (e) {
     try { await client.query("ROLLBACK"); } catch (_) {}
 
     console.error("CREATE-REQUEST ERROR:", e);
+
     return res.status(500).json({
-      success:false,
-      error:e.message
+      success: false,
+      error: e.message
     });
 
   } finally {
