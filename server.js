@@ -3891,10 +3891,13 @@ app.post("/approve-rows", async (req, res) => {
       comment
     ]);
 
-    // Любой из 3 согласующих согласовал => Реестр = Да
-    if (action === "agree") {
-      await setRequestRegistryYes(client, request_id);
-    }
+// Согласование или утверждение Ермека => авто Реестр = Да
+if (
+  action === "agree" ||
+  (action === "approve" && loginNorm === "k_ermek")
+) {
+  await setRequestRegistryYes(client, request_id);
+}
 
     await client.query("COMMIT");
 
@@ -3904,7 +3907,10 @@ app.post("/approve-rows", async (req, res) => {
       login: loginNorm,
       action,
       status: statusText,
-      registry_flag: action === "agree" ? "Да" : ""
+      registry_flag: (
+  action === "agree" ||
+  (action === "approve" && loginNorm === "k_ermek")
+) ? "Да" : ""
     });
 
   } catch (e) {
