@@ -1438,6 +1438,125 @@ app.post("/create-request", async (req, res) => {
   }
 });
 
+app.post("/create-registry", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const { row_ids, login } = req.body || {};
+
+    const ids = Array.isArray(row_ids)
+      ? row_ids.map(x => Number(x)).filter(Boolean)
+      : [];
+
+    if (!ids.length) {
+      return res.status(400).json({
+        success: false,
+        error: "row_ids required"
+      });
+    }
+
+    if (!login) {
+      return res.status(400).json({
+        success: false,
+        error: "login required"
+      });
+    }
+
+    await client.query("BEGIN");
+
+    const head = await client.query(`
+      INSERT INTO public.registry_head
+        (created_by, workflow_stage, agree_status, archive_flag)
+      VALUES
+        ($1, 'Инициация', 'Черновик', 'Нет')
+      RETURNING id, registry_no
+    `, [
+      String(login || "").trim()
+    ]);
+
+    const registry_id = head.rows[0].id;
+    const registry_no = head.rows[0].registry_no;
+
+    const items = await client.query(`
+      INSERT INTO public.registry_items
+      (
+        registry_id,
+        zvk_row_id,
+        id_ft,
+        id_zvk,
+        object,
+        contractor,
+        pay_purpose,
+        dds_article,
+        contract_no,
+        invoice_no,
+        invoice_date,
+        invoice_pdf,
+        src_d,
+        src_o,
+        to_pay
+      )
+      SELECT
+        $1,
+        v.zvk_row_id,
+        v.id_ft,
+        v.id_zvk,
+        v.object,
+        v.contractor,
+        v.pay_purpose,
+        v.dds_article,
+        v.contract_no,
+        v.invoice_no,
+        v.invoice_date,
+        v.invoice_pdf,
+        v.src_d,
+        v.src_o,
+        v.to_pay
+      FROM public.ft_zvk_current_v2 v
+      WHERE v.zvk_row_id = ANY($2::bigint[])
+      RETURNING to_pay, zvk_row_id
+    `, [registry_id, ids]);
+
+    if (!items.rowCount) {
+      throw new Error("Строки для реестра не найдены");
+    }
+
+    const total = items.rows.reduce((s, r) => s + Number(r.to_pay || 0), 0);
+    const count = items.rows.length;
+
+    await client.query(`
+      UPDATE public.registry_head
+      SET
+        total_amount = $1,
+        items_count = $2
+      WHERE id = $3
+    `, [total, count, registry_id]);
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success: true,
+      registry_id,
+      registry_no,
+      total_amount: total,
+      items_count: count
+    });
+
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+
+    console.error("CREATE-REGISTRY ERROR:", e);
+
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+
+  } finally {
+    client.release();
+  }
+});
+
 app.get("/request-list", async (req, res) => {
   try {
     const login = String(req.query.login || "").trim().toLowerCase();
