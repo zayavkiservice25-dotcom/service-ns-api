@@ -1557,6 +1557,200 @@ app.post("/create-registry", async (req, res) => {
   }
 });
 
+app.get("/registry-card", async (req, res) => {
+  try {
+    const id = Number(req.query.id);
+
+    if (!id) {
+      return res.status(400).json({
+        success: false,
+        error: "id required"
+      });
+    }
+
+    const headRes = await pool.query(`
+      SELECT
+        id,
+        registry_no,
+        registry_date,
+        created_by,
+        division,
+        total_amount,
+        items_count,
+        workflow_stage,
+        agree_status,
+        execution_status,
+        archive_flag,
+        pdf_url,
+        pay_account,
+        registry_mode,
+        created_at
+      FROM public.registry_head
+      WHERE id = $1
+      LIMIT 1
+    `, [id]);
+
+    if (!headRes.rowCount) {
+      return res.status(404).json({
+        success: false,
+        error: "Реестр не найден"
+      });
+    }
+
+    const itemsRes = await pool.query(`
+      SELECT
+        id,
+        registry_id,
+        zvk_row_id,
+        id_ft,
+        id_zvk,
+        object,
+        contractor,
+        pay_purpose,
+        dds_article,
+        contract_no,
+        invoice_no,
+        invoice_date,
+        invoice_pdf,
+        src_d,
+        src_o,
+        to_pay,
+        created_at
+      FROM public.registry_items
+      WHERE registry_id = $1
+      ORDER BY id
+    `, [id]);
+
+    const transfersRes = await pool.query(`
+      SELECT
+        id,
+        registry_id,
+        src_o,
+        debit_account,
+        debit_dds,
+        credit_account,
+        credit_dds,
+        amount,
+        created_at
+      FROM public.registry_transfers
+      WHERE registry_id = $1
+      ORDER BY id
+    `, [id]);
+
+    return res.json({
+      success: true,
+      head: headRes.rows[0],
+      items: itemsRes.rows,
+      transfers: transfersRes.rows
+    });
+
+  } catch (e) {
+    console.error("REGISTRY-CARD ERROR:", e);
+
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
+
+app.post("/registry-save", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const registry_id = Number(req.body?.registry_id);
+    const login = String(req.body?.login || "").trim();
+    const transfers = Array.isArray(req.body?.transfers)
+      ? req.body.transfers
+      : [];
+
+    if (!registry_id) {
+      return res.status(400).json({
+        success: false,
+        error: "registry_id required"
+      });
+    }
+
+    await client.query("BEGIN");
+
+    const exists = await client.query(`
+      SELECT id
+      FROM public.registry_head
+      WHERE id = $1
+      LIMIT 1
+    `, [registry_id]);
+
+    if (!exists.rowCount) {
+      throw new Error("Реестр не найден");
+    }
+
+    await client.query(`
+      DELETE FROM public.registry_transfers
+      WHERE registry_id = $1
+    `, [registry_id]);
+
+    for (const t of transfers) {
+      const amount = Number(
+        String(t.amount || 0)
+          .replace(/\s/g, "")
+          .replace(",", ".")
+      ) || 0;
+
+      await client.query(`
+        INSERT INTO public.registry_transfers
+        (
+          registry_id,
+          src_o,
+          debit_account,
+          debit_dds,
+          credit_account,
+          credit_dds,
+          amount
+        )
+        VALUES ($1,$2,$3,$4,$5,$6,$7)
+      `, [
+        registry_id,
+        String(t.src_o || "").trim(),
+        String(t.debit_account || "").trim(),
+        String(t.debit_dds || "").trim(),
+        String(t.credit_account || "").trim(),
+        String(t.credit_dds || "").trim(),
+        amount
+      ]);
+    }
+
+    await client.query(`
+      UPDATE public.registry_head
+      SET
+        workflow_stage = COALESCE(workflow_stage, 'Инициация'),
+        agree_status = COALESCE(agree_status, 'Черновик')
+      WHERE id = $1
+    `, [registry_id]);
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success: true,
+      registry_id,
+      saved: true,
+      transfers_count: transfers.length
+    });
+
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+
+    console.error("REGISTRY-SAVE ERROR:", e);
+
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+
+  } finally {
+    client.release();
+  }
+});
+
 app.get("/request-list", async (req, res) => {
   try {
     const login = String(req.query.login || "").trim().toLowerCase();
