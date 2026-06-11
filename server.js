@@ -1392,25 +1392,55 @@ app.post("/create-request", async (req, res) => {
         WHERE id = $3
       `, [total, count, request_id]);
 
-      await client.query(`
-        INSERT INTO public.request_approve_log
-          (request_id, stage_name, approver_login, approver_name, action_type, comment_text)
-        VALUES ($1, $2, $3, $4, 'create', $5)
-      `, [
-        request_id,
-        'Инициация',
-        String(login || ""),
-        String(login || ""),
-        'Заявка создана'
-      ]);
+await client.query(`
+  INSERT INTO public.request_approve_log
+    (request_id, stage_name, approver_login, approver_name, action_type, comment_text)
+  VALUES ($1, $2, $3, $4, 'create', $5)
+`, [
+  request_id,
+  'Инициация',
+  String(login || ""),
+  String(login || ""),
+  'Заявка создана'
+]);
 
-      createdRequests.push({
-        request_id,
-        request_no,
-        row_id: oneRowId,
-        total_amount: total,
-        items_count: count
-      });
+// ✅ Уведомление согласующим, когда заявка попала в "Отправленные заявки"
+const notifyUsers = [
+  "v_shevchenko",
+  "k_marat",
+  "k_ermek"
+];
+
+for (const userLogin of notifyUsers) {
+  await client.query(`
+    INSERT INTO public.notifications
+      (
+        user_login,
+        type,
+        title,
+        message,
+        entity_id,
+        entity_page,
+        is_read,
+        created_at
+      )
+    VALUES
+      ($1, 'request', $2, $3, $4, 'request_card', false, NOW())
+  `, [
+    userLogin,
+    `Заявка №${request_no} создана`,
+    `Заявка попала в отправленные заявки. Сумма: ${Number(total || 0).toLocaleString("ru-RU")} ₸`,
+    request_id
+  ]);
+}
+
+createdRequests.push({
+  request_id,
+  request_no,
+  row_id: oneRowId,
+  total_amount: total,
+  items_count: count
+});
     }
 
     await client.query("COMMIT");
