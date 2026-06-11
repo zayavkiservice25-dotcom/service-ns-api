@@ -1583,8 +1583,8 @@ app.get("/registry-card", async (req, res) => {
         archive_flag,
         pdf_url,
         pay_account,
-        registry_mode,
-        created_at
+        chat_map,
+        registry_mode
       FROM public.registry_head
       WHERE id = $1
       LIMIT 1
@@ -1605,6 +1605,7 @@ app.get("/registry-card", async (req, res) => {
         id_ft,
         id_zvk,
         object,
+        input_name,
         contractor,
         pay_purpose,
         dds_article,
@@ -1613,26 +1614,9 @@ app.get("/registry-card", async (req, res) => {
         invoice_date,
         invoice_pdf,
         src_d,
-        src_o,
-        to_pay,
-        created_at
+        COALESCE(src_o, '') AS src_o,
+        to_pay
       FROM public.registry_items
-      WHERE registry_id = $1
-      ORDER BY id
-    `, [id]);
-
-    const transfersRes = await pool.query(`
-      SELECT
-        id,
-        registry_id,
-        src_o,
-        debit_account,
-        debit_dds,
-        credit_account,
-        credit_dds,
-        amount,
-        created_at
-      FROM public.registry_transfers
       WHERE registry_id = $1
       ORDER BY id
     `, [id]);
@@ -1641,7 +1625,7 @@ app.get("/registry-card", async (req, res) => {
       success: true,
       head: headRes.rows[0],
       items: itemsRes.rows,
-      transfers: transfersRes.rows
+      transfers: []
     });
 
   } catch (e) {
@@ -1653,7 +1637,6 @@ app.get("/registry-card", async (req, res) => {
     });
   }
 });
-
 app.post("/registry-save", async (req, res) => {
   const client = await pool.connect();
 
