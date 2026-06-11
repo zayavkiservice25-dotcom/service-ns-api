@@ -1217,6 +1217,50 @@ async function canEditFtByLogin(poolOrClient, id_ft, login){
   );
   return r.rowCount > 0;
 }
+
+function getDivisionPayRule(login) {
+  const lg = String(login || "").trim().toLowerCase();
+
+  if (lg === "zh_elena") {
+    return {
+      mode: "only",
+      divisions: ["СК Жилой дом", "Smart Estate"]
+    };
+  }
+
+  if (lg === "s_zhasulan") {
+    return {
+      mode: "only",
+      divisions: ["Sapa asphalt"]
+    };
+  }
+
+  if (lg === "k_arailym") {
+    return {
+      mode: "except",
+      divisions: ["СК Жилой дом", "Smart Estate", "Sapa asphalt"]
+    };
+  }
+
+  return null;
+}
+
+function canSetPaid(login, roleFt) {
+  const lg = String(login || "").trim().toLowerCase();
+  const role = String(roleFt || "").trim().toLowerCase();
+
+  return (
+    lg === "b_erkin" ||
+    lg === "admin" ||
+    role === "admin" ||
+    role === "админ" ||
+    role === "администратор" ||
+    lg === "zh_elena" ||
+    lg === "s_zhasulan" ||
+    lg === "k_arailym"
+  );
+}
+
 async function canEditRowByLogin(poolOrClient, zvk_row_id, login) {
   const rid = Number(zvk_row_id);
   const lg  = normLogin(login);
@@ -1277,6 +1321,7 @@ app.post("/create-request", async (req, res) => {
         id_ft,
         id_zvk,
         object,
+        division,
         input_name,
         contractor,
         pay_purpose,
