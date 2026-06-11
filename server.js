@@ -1818,90 +1818,78 @@ app.post("/registry-save", async (req, res) => {
 app.get("/request-list", async (req, res) => {
   try {
     const login = String(req.query.login || "").trim().toLowerCase();
-    const roleFt = String(req.query.role_ft || "").trim().toLowerCase();
+    const roleFt = String(req.query.role_ft || req.query.role || "").trim().toLowerCase();
 
-    const canViewAll =
-      roleFt === "admin" ||
-      roleFt === "админ" ||
-      roleFt === "администратор" ||
-      roleFt === "supervisor" ||
-      roleFt === "супервайзер" ||
-      roleFt === "operator" ||
-      roleFt === "оператор";
-
-    const params = [];
-    let where = "";
-
-    if (!canViewAll) {
-      params.push(login);
-      where = `WHERE lower(trim(h.created_by)) = $1`;
+    if (!login) {
+      return res.status(400).json({
+        success: false,
+        error: "login required"
+      });
     }
 
-    const q = `
+    const isAdmin =
+      roleFt === "admin" ||
+      roleFt === "админ" ||
+      roleFt === "administrator" ||
+      login === "admin" ||
+      login === "b_erkin";
+
+    let whereSql = "";
+    const params = [];
+
+    if (!isAdmin) {
+      params.push(login);
+      whereSql = `WHERE lower(trim(created_by)) = $1`;
+    }
+
+    const r = await pool.query(`
       SELECT
-        h.id,
-        h.request_no,
-        h.request_date,
-        h.created_by,
-        h.total_amount,
-        h.items_count,
-        h.created_at,
+        id,
+        request_no,
+        request_date,
+        created_by,
+        total_amount,
+        items_count,
+        workflow_stage,
+        agree_status,
+        archive_flag,
+        pdf_url,
+        created_at,
 
-        COALESCE(h.acc_marat_name, 'Марат') AS acc_marat_name,
-        COALESCE(h.acc_marat_status, 'Ожидает') AS acc_marat_status,
-        h.acc_marat_time,
-        h.acc_marat_comment,
+        acc_shevchenko_status,
+        acc_shevchenko_time,
+        acc_shevchenko_comment,
 
-        COALESCE(h.acc_shevchenko_name, 'Шевченко') AS acc_shevchenko_name,
-        COALESCE(h.acc_shevchenko_status, 'Ожидает') AS acc_shevchenko_status,
-        h.acc_shevchenko_time,
-        h.acc_shevchenko_comment,
+        acc_marat_status,
+        acc_marat_time,
+        acc_marat_comment,
 
-        COALESCE(h.acc_ermek_name, 'Ермек') AS acc_ermek_name,
-        COALESCE(h.acc_ermek_status, 'Ожидает') AS acc_ermek_status,
-        h.acc_ermek_time,
-        h.acc_ermek_comment,
+        acc_ermek_status,
+        acc_ermek_time,
+        acc_ermek_comment,
 
-        CASE
-          WHEN COALESCE(h.acc_marat_status, '') = 'Согласовано'
-            OR COALESCE(h.acc_shevchenko_status, '') = 'Согласовано'
-            OR COALESCE(h.acc_ermek_status, '') = 'Согласовано'
-          THEN 'Да'
-          ELSE ''
-        END AS registry_flag,
+        approve_ermek_status,
+        approve_ermek_time,
+        approve_ermek_comment
 
-        CASE
-          WHEN COALESCE(paid.paid_rows, 0) > 0 THEN 'Да'
-          ELSE ''
-        END AS is_paid
+      FROM public.request_head
+      ${whereSql}
+      ORDER BY id DESC
+    `, params);
 
-      FROM public.request_head h
-
-      LEFT JOIN (
-        SELECT
-          i.request_id,
-          COUNT(*) FILTER (WHERE COALESCE(p.is_paid,'') = 'Да') AS paid_rows
-        FROM public.request_items i
-        LEFT JOIN public.zvk_pay p
-          ON p.zvk_row_id = i.zvk_row_id
-        GROUP BY i.request_id
-      ) paid ON paid.request_id = h.id
-
-      ${where}
-
-      ORDER BY h.request_date DESC, h.id DESC
-    `;
-
-    const { rows } = await pool.query(q, params);
-
-    return res.json({ success: true, rows });
+    return res.json({
+      success: true,
+      rows: r.rows
+    });
 
   } catch (e) {
-    console.error("request-list error:", e);
-    return res.status(500).json({ success: false, error: e.message });
+    console.error("REQUEST-LIST ERROR:", e);
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
   }
 });
-
 app.get("/request-card", async (req, res) => {
   try {
     const id = Number(req.query.id);
@@ -1920,6 +1908,29 @@ app.get("/request-card", async (req, res) => {
     if (!headRes.rows.length) {
       return res.status(404).json({ success:false, error:"request not found" });
     }
+
+const login = String(req.query.login || "").trim().toLowerCase();
+const roleFt = String(req.query.role_ft || req.query.role || "").trim().toLowerCase();
+
+const isAdmin =
+  roleFt === "admin" ||
+  roleFt === "админ" ||
+  roleFt === "administrator" ||
+  login === "admin" ||
+  login === "b_erkin";
+
+const head = headRes.rows[0];
+
+if (!isAdmin) {
+  const owner = String(head.created_by || "").trim().toLowerCase();
+
+  if (owner !== login) {
+    return res.status(403).json({
+      success: false,
+      error: "Нет доступа к чужой заявке"
+    });
+  }
+}
 
 const itemsRes = await pool.query(`
   SELECT
