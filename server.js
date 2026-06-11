@@ -1637,6 +1637,47 @@ app.get("/registry-card", async (req, res) => {
     });
   }
 });
+
+
+app.post("/request-created-bulk", async (req, res) => {
+  try {
+    const rowIds = Array.isArray(req.body.row_ids)
+      ? req.body.row_ids.map(Number).filter(Boolean)
+      : [];
+
+    const login = String(req.body.login || "").trim();
+    const value = String(req.body.value || "Да").trim();
+
+    if (!rowIds.length) {
+      return res.status(400).json({
+        success: false,
+        error: "row_ids required"
+      });
+    }
+
+    await pool.query(
+      `
+      UPDATE public.zvk_status
+      SET chief_approved = $1
+      WHERE zvk_row_id = ANY($2::bigint[])
+      `,
+      [value, rowIds]
+    );
+
+    return res.json({
+      success: true,
+      updated: rowIds.length
+    });
+
+  } catch (e) {
+    console.error("request-created-bulk error:", e);
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
+
 app.post("/registry-save", async (req, res) => {
   const client = await pool.connect();
 
