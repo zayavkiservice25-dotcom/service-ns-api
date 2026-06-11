@@ -1597,29 +1597,43 @@ app.get("/registry-card", async (req, res) => {
       });
     }
 
-    const itemsRes = await pool.query(`
-      SELECT
-        id,
-        registry_id,
-        zvk_row_id,
-        id_ft,
-        id_zvk,
-        object,
-        input_name,
-        contractor,
-        pay_purpose,
-        dds_article,
-        contract_no,
-        invoice_no,
-        invoice_date,
-        invoice_pdf,
-        src_d,
-        COALESCE(src_o, '') AS src_o,
-        to_pay
-      FROM public.registry_items
-      WHERE registry_id = $1
-      ORDER BY id
-    `, [id]);
+const itemsRes = await pool.query(`
+  SELECT
+    i.request_id,
+    i.zvk_row_id,
+    i.id_ft,
+    i.id_zvk,
+
+    COALESCE(cur.object, i.object) AS object,
+    COALESCE(cur.input_name, i.input_name) AS input_name,
+    COALESCE(cur.contractor, i.contractor) AS contractor,
+    COALESCE(cur.pay_purpose, i.pay_purpose) AS pay_purpose,
+    COALESCE(cur.dds_article, i.dds_article) AS dds_article,
+    COALESCE(cur.contract_no, i.contract_no) AS contract_no,
+    COALESCE(cur.invoice_no, i.invoice_no) AS invoice_no,
+    COALESCE(cur.invoice_date, i.invoice_date) AS invoice_date,
+    COALESCE(cur.invoice_pdf, i.invoice_pdf) AS invoice_pdf,
+    COALESCE(cur.src_d, i.src_d) AS src_d,
+    COALESCE(cur.src_o, i.src_o) AS src_o,
+    COALESCE(cur.to_pay, i.to_pay) AS to_pay,
+
+    COALESCE(cur.request_flag, '') AS request_flag,
+    COALESCE(cur.registry_flag, '') AS registry_flag,
+    COALESCE(cur.is_paid, '') AS is_paid
+
+  FROM public.request_items i
+
+  LEFT JOIN public.ft_zvk_current_v2 cur
+    ON cur.zvk_row_id = i.zvk_row_id
+
+  WHERE i.request_id = $1
+    AND NOT (
+      TRIM(COALESCE(cur.request_flag, '')) = 'Обнуление'
+      AND TRIM(COALESCE(cur.registry_flag, '')) = 'Обнуление'
+    )
+
+  ORDER BY i.id
+`, [id]);
 
     return res.json({
       success: true,
