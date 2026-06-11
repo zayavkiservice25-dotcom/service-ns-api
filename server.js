@@ -1250,11 +1250,6 @@ function canSetPaid(login, roleFt) {
   const role = String(roleFt || "").trim().toLowerCase();
 
   return (
-    lg === "b_erkin" ||
-    lg === "admin" ||
-    role === "admin" ||
-    role === "админ" ||
-    role === "администратор" ||
     lg === "zh_elena" ||
     lg === "s_zhasulan" ||
     lg === "k_arailym"
