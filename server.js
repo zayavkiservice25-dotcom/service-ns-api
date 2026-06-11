@@ -3625,6 +3625,11 @@ app.get("/svod-object", async (req, res) => {
         amount_in,
         to_pay,
         balance,
+
+        -- новые поля
+        ft_kasenov,
+        balance_kasenov,
+
         registry,
         balance_registry,
         ft_zayavka,
