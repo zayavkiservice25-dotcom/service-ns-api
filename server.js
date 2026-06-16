@@ -3886,14 +3886,14 @@ app.post("/approve-rows", async (req, res) => {
     }
 
     const agreeApprovers = {
-        s_zhasulan: {
+      s_zhasulan: {
         title: "Сулейменов Жасулан",
         nameCol: "acc_zhasulan_name",
         statusCol: "acc_zhasulan_status",
         timeCol: "acc_zhasulan_time",
         commentCol: "acc_zhasulan_comment"
       },
-     
+
       v_shevchenko: {
         title: "Шевченко Владимир",
         nameCol: "acc_shevchenko_name",
@@ -3901,6 +3901,7 @@ app.post("/approve-rows", async (req, res) => {
         timeCol: "acc_shevchenko_time",
         commentCol: "acc_shevchenko_comment"
       },
+
       k_marat: {
         title: "Койлибаев Марат",
         nameCol: "acc_marat_name",
@@ -3908,6 +3909,7 @@ app.post("/approve-rows", async (req, res) => {
         timeCol: "acc_marat_time",
         commentCol: "acc_marat_comment"
       },
+
       k_ermek: {
         title: "Касенов Ермек",
         nameCol: "acc_ermek_name",
@@ -3949,34 +3951,35 @@ app.post("/approve-rows", async (req, res) => {
 
     await client.query("BEGIN");
 
- const exists = await client.query(`
-  SELECT
-    id,
-    request_no,
-    total_amount,
-    acc_zhasulan_status
-  FROM public.request_head
-  WHERE id = $1
-  LIMIT 1
-`, [request_id]);
+    const exists = await client.query(`
+      SELECT
+        id,
+        request_no,
+        total_amount,
+        acc_zhasulan_status
+      FROM public.request_head
+      WHERE id = $1
+      LIMIT 1
+    `, [request_id]);
 
     if (!exists.rowCount) {
       throw new Error("Заявка не найдена");
     }
-const headRow = exists.rows[0];
 
-if (
-  loginNorm !== "s_zhasulan" &&
-  (
-    action === "agree" ||
-    action === "reject_agree" ||
-    action === "approve" ||
-    action === "reject_approve"
-  ) &&
-  String(headRow.acc_zhasulan_status || "").trim() !== "Согласовано"
-) {
-  throw new Error("Сначала должен согласовать Сулейменов Жасулан");
-}
+    const headRow = exists.rows[0];
+
+    if (
+      loginNorm !== "s_zhasulan" &&
+      (
+        action === "agree" ||
+        action === "reject_agree" ||
+        action === "approve" ||
+        action === "reject_approve"
+      ) &&
+      String(headRow.acc_zhasulan_status || "").trim() !== "Согласовано"
+    ) {
+      throw new Error("Сначала должен согласовать Сулейменов Жасулан");
+    }
 
     const isReject = action === "reject_agree" || action === "reject_approve";
     const statusText = isReject ? "Отклонено" : "Согласовано";
@@ -3997,19 +4000,6 @@ if (
     ]);
 
     await client.query(`
-      INSERT INTO public.request_approve_log
-if (
-  loginNorm === "s_zhasulan" &&
-  action === "agree"
-) {
-  const notifyUsersAfterZhasulan = [
-    "v_shevchenko",
-    "k_marat",
-    "k_ermek"
-  ];
-
-  for (const userLogin of notifyUsersAfterZhasulan) {
-       await client.query(`
       INSERT INTO public.request_approve_log
         (request_id, stage_name, approver_login, approver_name, action_type, comment_text)
       VALUES ($1, $2, $3, $4, $5, $6)
@@ -4056,13 +4046,13 @@ if (
       }
     }
 
-// Согласование или утверждение Ермека => авто Реестр = Да
-if (
-  action === "agree" ||
-  (action === "approve" && loginNorm === "k_ermek")
-) {
-  await setRequestRegistryYes(client, request_id);
-}
+    // Согласование или утверждение Ермека => авто Реестр = Да
+    if (
+      action === "agree" ||
+      (action === "approve" && loginNorm === "k_ermek")
+    ) {
+      await setRequestRegistryYes(client, request_id);
+    }
 
     await client.query("COMMIT");
 
@@ -4073,15 +4063,16 @@ if (
       action,
       status: statusText,
       registry_flag: (
-  action === "agree" ||
-  (action === "approve" && loginNorm === "k_ermek")
-) ? "Да" : ""
+        action === "agree" ||
+        (action === "approve" && loginNorm === "k_ermek")
+      ) ? "Да" : ""
     });
 
   } catch (e) {
     try { await client.query("ROLLBACK"); } catch (_) {}
 
     console.error("approve-rows error:", e);
+
     return res.status(500).json({
       success:false,
       error:e.message
