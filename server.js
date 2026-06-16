@@ -1416,10 +1416,7 @@ await client.query(`
 
 // ✅ Уведомление согласующим, когда заявка попала в "Отправленные заявки"
 const notifyUsers = [
-  "s_zhasulan",
-  "v_shevchenko",
-  "k_marat",
-  "k_ermek"
+  "s_zhasulan"
 ];
 
 for (const userLogin of notifyUsers) {
@@ -1826,8 +1823,132 @@ app.post("/registry-save", async (req, res) => {
   }
 });
 
+async function resetExpiredZhasulanRequests() {
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const expired = await client.query(`
+      SELECT
+        h.id AS request_id,
+        h.request_no,
+        ARRAY_AGG(i.zvk_row_id) AS row_ids
+      FROM public.request_head h
+      JOIN public.request_items i
+        ON i.request_id = h.id
+      WHERE COALESCE(h.acc_zhasulan_status, '') = 'Согласовано'
+        AND COALESCE(h.approve_ermek_status, '') NOT IN ('Согласовано', 'Утверждено', 'Да')
+        AND h.acc_zhasulan_time IS NOT NULL
+        AND (NOW() AT TIME ZONE 'Asia/Almaty') >=
+            (
+              ((h.acc_zhasulan_time AT TIME ZONE 'Asia/Almaty')::date + INTERVAL '2 days')
+              + TIME '18:00'
+            )
+      GROUP BY h.id, h.request_no
+    `);
+
+    for (const row of expired.rows) {
+      const requestId = Number(row.request_id);
+      const rowIds = (row.row_ids || []).map(Number).filter(Boolean);
+
+      if (!requestId || !rowIds.length) continue;
+
+      // Заявка = пусто
+      await client.query(`
+        UPDATE public.zvk
+        SET request_flag = NULL
+        WHERE id = ANY($1::bigint[])
+      `, [rowIds]);
+
+      // Реестр = пусто
+      await client.query(`
+        UPDATE public.zvk_pay
+        SET
+          registry_flag = NULL,
+          agree_time = NULL
+        WHERE zvk_row_id = ANY($1::bigint[])
+      `, [rowIds]);
+
+      // Источник Объект = пусто
+      await client.query(`
+        INSERT INTO public.zvk_status (zvk_row_id, status_time, src_o)
+        SELECT x, NOW(), ''
+        FROM unnest($1::bigint[]) AS x
+        ON CONFLICT (zvk_row_id)
+        DO UPDATE SET
+          src_o = '',
+          status_time = NOW()
+      `, [rowIds]);
+
+      // ЗаявкаСоздано = пусто, если колонка chief_approved есть
+      const hasChiefApproved = await client.query(`
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'zvk_status'
+          AND column_name = 'chief_approved'
+        LIMIT 1
+      `);
+
+      if (hasChiefApproved.rowCount) {
+        await client.query(`
+          UPDATE public.zvk_status
+          SET chief_approved = NULL
+          WHERE zvk_row_id = ANY($1::bigint[])
+        `, [rowIds]);
+      }
+
+      // Удаляем отправленную заявку, чтобы инициатор создал заново
+      await client.query(`
+        DELETE FROM public.request_approve_log
+        WHERE request_id = $1
+      `, [requestId]);
+
+      await client.query(`
+        DELETE FROM public.request_items
+        WHERE request_id = $1
+      `, [requestId]);
+
+      await client.query(`
+        DELETE FROM public.request_head
+        WHERE id = $1
+      `, [requestId]);
+
+      // Пересобираем хвост FT
+      for (const rid of rowIds) {
+        if (typeof rebuildFtTail === "function") {
+          await rebuildFtTail(client, rid);
+        }
+      }
+    }
+
+    await client.query("COMMIT");
+
+    return {
+      success: true,
+      reset_count: expired.rows.length
+    };
+
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+
+    console.error("resetExpiredZhasulanRequests error:", e);
+
+    return {
+      success: false,
+      error: e.message
+    };
+
+  } finally {
+    client.release();
+  }
+}
+
 app.get("/request-list", async (req, res) => {
   try {
+    await resetExpiredZhasulanRequests();
+
     const login = String(req.query.login || "").trim().toLowerCase();
     const roleFt = String(req.query.role_ft || req.query.role || "").trim().toLowerCase();
 
@@ -1848,9 +1969,25 @@ app.get("/request-list", async (req, res) => {
     let whereSql = "";
     const params = [];
 
-    if (!isAdmin) {
+    if (isAdmin) {
+      whereSql = "";
+    } else if (login === "s_zhasulan") {
+      whereSql = `
+        WHERE COALESCE(acc_zhasulan_status, '') NOT IN ('Согласовано', 'Отклонено')
+      `;
+    } else if (
+      login === "v_shevchenko" ||
+      login === "k_marat" ||
+      login === "k_ermek"
+    ) {
+      whereSql = `
+        WHERE COALESCE(acc_zhasulan_status, '') = 'Согласовано'
+      `;
+    } else {
       params.push(login);
-      whereSql = `WHERE lower(trim(created_by)) = $1`;
+      whereSql = `
+        WHERE lower(trim(created_by)) = $1
+      `;
     }
 
     const r = await pool.query(`
@@ -1900,82 +2037,7 @@ app.get("/request-list", async (req, res) => {
       error: e.message
     });
   }
-});app.get("/request-card", async (req, res) => {
-  try {
-    const id = Number(req.query.id);
-
-    if (!id) {
-      return res.status(400).json({ success:false, error:"id required" });
-    }
-
-    const headRes = await pool.query(`
-      SELECT *
-      FROM public.request_head
-      WHERE id = $1
-      LIMIT 1
-    `, [id]);
-
-    if (!headRes.rows.length) {
-      return res.status(404).json({ success:false, error:"request not found" });
-    }
-
-
-
-const itemsRes = await pool.query(`
-  SELECT
-    i.request_id,
-    i.zvk_row_id,
-    i.id_ft,
-    i.id_zvk,
-    i.object,
-    i.input_name,
-    i.contractor,
-    i.pay_purpose,
-    i.dds_article,
-    i.contract_no,
-    i.invoice_no,
-    i.invoice_date,
-    i.invoice_pdf,
-    i.src_d,
-    i.src_o,
-    i.to_pay,
-    COALESCE(p.registry_flag, '') AS registry_flag,
-    COALESCE(p.is_paid, '') AS is_paid
-  FROM public.request_items i
-  LEFT JOIN public.zvk_pay p
-    ON p.zvk_row_id = i.zvk_row_id
-  WHERE i.request_id = $1
-  ORDER BY i.id
-`, [id]);
-
-    const logRes = await pool.query(`
-      SELECT
-        id,
-        stage_name,
-        approver_login,
-        approver_name,
-        action_type,
-        comment_text,
-        created_at
-      FROM public.request_approve_log
-      WHERE request_id = $1
-      ORDER BY id
-    `, [id]);
-
-    res.json({
-      success:true,
-      head: headRes.rows[0],
-      items: itemsRes.rows,
-      log: logRes.rows
-    });
-
-  } catch (e) {
-    console.error("REQUEST-CARD ERROR:", e);
-    res.status(500).json({ success:false, error:e.message });
-  }
 });
-
-
 
 app.post("/zvk-save", async (req, res) => {
   try {
@@ -3887,16 +3949,34 @@ app.post("/approve-rows", async (req, res) => {
 
     await client.query("BEGIN");
 
-    const exists = await client.query(`
-      SELECT id
-      FROM public.request_head
-      WHERE id = $1
-      LIMIT 1
-    `, [request_id]);
+ const exists = await client.query(`
+  SELECT
+    id,
+    request_no,
+    total_amount,
+    acc_zhasulan_status
+  FROM public.request_head
+  WHERE id = $1
+  LIMIT 1
+`, [request_id]);
 
     if (!exists.rowCount) {
       throw new Error("Заявка не найдена");
     }
+const headRow = exists.rows[0];
+
+if (
+  loginNorm !== "s_zhasulan" &&
+  (
+    action === "agree" ||
+    action === "reject_agree" ||
+    action === "approve" ||
+    action === "reject_approve"
+  ) &&
+  String(headRow.acc_zhasulan_status || "").trim() !== "Согласовано"
+) {
+  throw new Error("Сначала должен согласовать Сулейменов Жасулан");
+}
 
     const isReject = action === "reject_agree" || action === "reject_approve";
     const statusText = isReject ? "Отклонено" : "Согласовано";
@@ -3918,6 +3998,39 @@ app.post("/approve-rows", async (req, res) => {
 
     await client.query(`
       INSERT INTO public.request_approve_log
+if (
+  loginNorm === "s_zhasulan" &&
+  action === "agree"
+) {
+  const notifyUsersAfterZhasulan = [
+    "v_shevchenko",
+    "k_marat",
+    "k_ermek"
+  ];
+
+  for (const userLogin of notifyUsersAfterZhasulan) {
+    await client.query(`
+      INSERT INTO public.notifications
+        (
+          user_login,
+          type,
+          title,
+          message,
+          entity_id,
+          entity_page,
+          is_read,
+          created_at
+        )
+      VALUES
+        ($1, 'request', $2, $3, $4, 'request_card', false, NOW())
+    `, [
+      userLogin,
+      `Заявка №${headRow.request_no} согласована Жасуланом`,
+      `Заявка доступна для согласования. Сумма: ${Number(headRow.total_amount || 0).toLocaleString("ru-RU")} ₸`,
+      request_id
+    ]);
+  }
+}
         (request_id, stage_name, approver_login, approver_name, action_type, comment_text)
       VALUES ($1, $2, $3, $4, $5, $6)
     `, [
