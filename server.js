@@ -3873,6 +3873,104 @@ async function setRequestRegistryYes(client, request_id) {
   }
 }
 
+app.get("/request-card", async (req, res) => {
+  try {
+    const id = Number(req.query.id);
+
+    if (!id) {
+      return res.status(400).json({
+        success: false,
+        error: "id required"
+      });
+    }
+
+    const headRes = await pool.query(`
+      SELECT
+        id,
+        request_no,
+        request_date,
+        created_by,
+        total_amount,
+        items_count,
+        created_at,
+
+        acc_zhasulan_status,
+        acc_zhasulan_time,
+        acc_zhasulan_comment,
+
+        acc_shevchenko_status,
+        acc_shevchenko_time,
+        acc_shevchenko_comment,
+
+        acc_marat_status,
+        acc_marat_time,
+        acc_marat_comment,
+
+        acc_ermek_status,
+        acc_ermek_time,
+        acc_ermek_comment,
+
+        approve_ermek_status,
+        approve_ermek_time,
+        approve_ermek_comment
+      FROM public.request_head
+      WHERE id = $1
+      LIMIT 1
+    `, [id]);
+
+    if (!headRes.rowCount) {
+      return res.status(404).json({
+        success: false,
+        error: "Заявка не найдена"
+      });
+    }
+
+    const itemsRes = await pool.query(`
+      SELECT
+        i.id,
+        i.request_id,
+        i.zvk_row_id,
+        i.id_ft,
+        i.id_zvk,
+        i.object,
+        i.division,
+        i.input_name,
+        i.contractor,
+        i.pay_purpose,
+        i.dds_article,
+        i.contract_no,
+        i.invoice_no,
+        i.invoice_date,
+        i.invoice_pdf,
+        i.src_d,
+        i.src_o,
+        i.to_pay,
+
+        COALESCE(cur.request_flag, '') AS request_flag,
+        COALESCE(cur.registry_flag, '') AS registry_flag,
+        COALESCE(cur.is_paid, '') AS is_paid
+      FROM public.request_items i
+      LEFT JOIN public.ft_zvk_current_v2 cur
+        ON cur.zvk_row_id = i.zvk_row_id
+      WHERE i.request_id = $1
+      ORDER BY i.id ASC
+    `, [id]);
+
+    return res.json({
+      success: true,
+      head: headRes.rows[0],
+      items: itemsRes.rows
+    });
+
+  } catch (e) {
+    console.error("REQUEST-CARD ERROR:", e);
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
+
 app.post("/approve-rows", async (req, res) => {
   const client = await pool.connect();
 
