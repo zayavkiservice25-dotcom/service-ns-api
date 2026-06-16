@@ -1983,12 +1983,17 @@ app.get("/request-list", async (req, res) => {
       whereSql = `
         WHERE COALESCE(acc_zhasulan_status, '') = 'Согласовано'
       `;
-    } else {
-      params.push(login);
-      whereSql = `
-        WHERE lower(trim(created_by)) = $1
-      `;
-    }
+} else {
+  params.push(login);
+  whereSql = `
+    WHERE lower(trim(created_by)) = $1
+       OR id IN (
+         SELECT request_id
+         FROM public.request_items
+         WHERE lower(trim(input_name)) = $1
+       )
+  `;
+}
 
     const r = await pool.query(`
       SELECT
