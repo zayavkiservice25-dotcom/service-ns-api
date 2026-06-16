@@ -1861,10 +1861,6 @@ app.get("/request-list", async (req, res) => {
         created_by,
         total_amount,
         items_count,
-        workflow_stage,
-        agree_status,
-        archive_flag,
-        pdf_url,
         created_at,
 
         acc_zhasulan_status,
@@ -1904,8 +1900,7 @@ app.get("/request-list", async (req, res) => {
       error: e.message
     });
   }
-});
-app.get("/request-card", async (req, res) => {
+});app.get("/request-card", async (req, res) => {
   try {
     const id = Number(req.query.id);
 
