@@ -1959,22 +1959,16 @@ app.get("/request-list", async (req, res) => {
       });
     }
 
-    const isAdmin =
-      roleFt === "admin" ||
-      roleFt === "админ" ||
-      roleFt === "administrator" ||
-      login === "admin" ||
-      login === "b_erkin";
-
     let whereSql = "";
     const params = [];
 
-    if (isAdmin) {
-      whereSql = "";
-    } else if (login === "s_zhasulan") {
+    // ✅ 1. Жасулан видит все заявки, где он еще НЕ согласовал и НЕ отклонил
+    if (login === "s_zhasulan") {
       whereSql = `
         WHERE COALESCE(acc_zhasulan_status, '') NOT IN ('Согласовано', 'Отклонено')
       `;
+
+    // ✅ 2. Эти трое НЕ видят, пока Жасулан не согласовал
     } else if (
       login === "v_shevchenko" ||
       login === "k_marat" ||
@@ -1983,17 +1977,29 @@ app.get("/request-list", async (req, res) => {
       whereSql = `
         WHERE COALESCE(acc_zhasulan_status, '') = 'Согласовано'
       `;
-} else {
-  params.push(login);
-  whereSql = `
-    WHERE lower(trim(created_by)) = $1
-       OR id IN (
-         SELECT request_id
-         FROM public.request_items
-         WHERE lower(trim(input_name)) = $1
-       )
-  `;
-}
+
+    // ✅ 3. Только настоящий админ видит все
+    } else if (
+      login === "admin" ||
+      login === "b_erkin" ||
+      roleFt === "admin" ||
+      roleFt === "админ" ||
+      roleFt === "administrator"
+    ) {
+      whereSql = "";
+
+    // ✅ 4. Инициатор видит только свои заявки
+    } else {
+      params.push(login);
+      whereSql = `
+        WHERE lower(trim(created_by)) = $1
+           OR id IN (
+             SELECT request_id
+             FROM public.request_items
+             WHERE lower(trim(input_name)) = $1
+           )
+      `;
+    }
 
     const r = await pool.query(`
       SELECT
@@ -2043,7 +2049,6 @@ app.get("/request-list", async (req, res) => {
     });
   }
 });
-
 app.post("/zvk-save", async (req, res) => {
   try {
     const {
