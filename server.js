@@ -4010,27 +4010,7 @@ if (
 
   for (const userLogin of notifyUsersAfterZhasulan) {
     await client.query(`
-      INSERT INTO public.notifications
-        (
-          user_login,
-          type,
-          title,
-          message,
-          entity_id,
-          entity_page,
-          is_read,
-          created_at
-        )
-      VALUES
-        ($1, 'request', $2, $3, $4, 'request_card', false, NOW())
-    `, [
-      userLogin,
-      `Заявка №${headRow.request_no} согласована Жасуланом`,
-      `Заявка доступна для согласования. Сумма: ${Number(headRow.total_amount || 0).toLocaleString("ru-RU")} ₸`,
-      request_id
-    ]);
-  }
-}
+      INSERT INTO public.request_approve_log
         (request_id, stage_name, approver_login, approver_name, action_type, comment_text)
       VALUES ($1, $2, $3, $4, $5, $6)
     `, [
@@ -4041,6 +4021,40 @@ if (
       action,
       comment
     ]);
+
+    if (
+      loginNorm === "s_zhasulan" &&
+      action === "agree"
+    ) {
+      const notifyUsersAfterZhasulan = [
+        "v_shevchenko",
+        "k_marat",
+        "k_ermek"
+      ];
+
+      for (const userLogin of notifyUsersAfterZhasulan) {
+        await client.query(`
+          INSERT INTO public.notifications
+            (
+              user_login,
+              type,
+              title,
+              message,
+              entity_id,
+              entity_page,
+              is_read,
+              created_at
+            )
+          VALUES
+            ($1, 'request', $2, $3, $4, 'request_card', false, NOW())
+        `, [
+          userLogin,
+          `Заявка №${headRow.request_no} согласована Жасуланом`,
+          `Заявка доступна для согласования. Сумма: ${Number(headRow.total_amount || 0).toLocaleString("ru-RU")} ₸`,
+          request_id
+        ]);
+      }
+    }
 
 // Согласование или утверждение Ермека => авто Реестр = Да
 if (
