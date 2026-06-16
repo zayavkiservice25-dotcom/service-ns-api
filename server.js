@@ -4009,7 +4009,7 @@ if (
   ];
 
   for (const userLogin of notifyUsersAfterZhasulan) {
-    await client.query(`
+       await client.query(`
       INSERT INTO public.request_approve_log
         (request_id, stage_name, approver_login, approver_name, action_type, comment_text)
       VALUES ($1, $2, $3, $4, $5, $6)
