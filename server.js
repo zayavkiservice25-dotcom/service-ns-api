@@ -416,6 +416,11 @@ await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_m
 await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_marat_time timestamptz;`);
 await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_marat_comment text;`);
 
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zhasulan_name text;`);
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zhasulan_status text;`);
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zhasulan_time timestamptz;`);
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zhasulan_comment text;`);
+
 await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_shevchenko_name text;`);
 await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_shevchenko_status text;`);
 await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_shevchenko_time timestamptz;`);
@@ -1370,6 +1375,11 @@ app.post("/create-request", async (req, res) => {
           total_amount = $1,
           items_count = $2,
 
+          acc_zhasulan_name = 'Сулейменов Жасулан',
+          acc_zhasulan_status = 'Ожидает',
+          acc_zhasulan_time = NULL,
+          acc_zhasulan_comment = NULL,
+
           acc_shevchenko_name = 'Шевченко Владимир',
           acc_shevchenko_status = 'Ожидает',
           acc_shevchenko_time = NULL,
@@ -1406,6 +1416,7 @@ await client.query(`
 
 // ✅ Уведомление согласующим, когда заявка попала в "Отправленные заявки"
 const notifyUsers = [
+  "s_zhasulan",
   "v_shevchenko",
   "k_marat",
   "k_ermek"
@@ -1856,6 +1867,10 @@ app.get("/request-list", async (req, res) => {
         pdf_url,
         created_at,
 
+        acc_zhasulan_status,
+        acc_zhasulan_time,
+        acc_zhasulan_comment,
+
         acc_shevchenko_status,
         acc_shevchenko_time,
         acc_shevchenko_comment,
@@ -1909,28 +1924,7 @@ app.get("/request-card", async (req, res) => {
       return res.status(404).json({ success:false, error:"request not found" });
     }
 
-const login = String(req.query.login || "").trim().toLowerCase();
-const roleFt = String(req.query.role_ft || req.query.role || "").trim().toLowerCase();
 
-const isAdmin =
-  roleFt === "admin" ||
-  roleFt === "админ" ||
-  roleFt === "administrator" ||
-  login === "admin" ||
-  login === "b_erkin";
-
-const head = headRes.rows[0];
-
-if (!isAdmin) {
-  const owner = String(head.created_by || "").trim().toLowerCase();
-
-  if (owner !== login) {
-    return res.status(403).json({
-      success: false,
-      error: "Нет доступа к чужой заявке"
-    });
-  }
-}
 
 const itemsRes = await pool.query(`
   SELECT
@@ -3835,6 +3829,14 @@ app.post("/approve-rows", async (req, res) => {
     }
 
     const agreeApprovers = {
+        s_zhasulan: {
+        title: "Сулейменов Жасулан",
+        nameCol: "acc_zhasulan_name",
+        statusCol: "acc_zhasulan_status",
+        timeCol: "acc_zhasulan_time",
+        commentCol: "acc_zhasulan_comment"
+      },
+     
       v_shevchenko: {
         title: "Шевченко Владимир",
         nameCol: "acc_shevchenko_name",
