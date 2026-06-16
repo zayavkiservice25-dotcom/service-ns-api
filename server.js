@@ -1963,17 +1963,15 @@ app.get("/request-list", async (req, res) => {
     const params = [];
 
     // ✅ 1. Жасулан видит все заявки, где он еще НЕ согласовал и НЕ отклонил
-    if (login === "s_zhasulan") {
-      whereSql = `
-        WHERE COALESCE(acc_zhasulan_status, '') NOT IN ('Согласовано', 'Отклонено')
-      `;
+if (login === "s_zhasulan") {
+  // Жасулан видит все заявки, даже после своего согласования
+  whereSql = "";
 
-    // ✅ 2. Эти трое НЕ видят, пока Жасулан не согласовал
-    } else if (
-      login === "v_shevchenko" ||
-      login === "k_marat" ||
-      login === "k_ermek"
-    ) {
+} else if (
+  login === "v_shevchenko" ||
+  login === "k_marat" ||
+  login === "k_ermek"
+) {
       whereSql = `
         WHERE COALESCE(acc_zhasulan_status, '') = 'Согласовано'
       `;
