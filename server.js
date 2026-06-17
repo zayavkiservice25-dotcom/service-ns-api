@@ -2859,18 +2859,20 @@ if (isAdmin || isAll) {
       COALESCE(v.is_paid, '') = 'Да'
       AND COALESCE(v.registry_flag, '') <> 'Обнуление'
     )`);
-  } else if (paidMode === "reset") {
-    // ✅ Обнуленные: любые Заявка, но Реестр = Обнуление
-    where.push(`(
-      COALESCE(v.registry_flag, '') = 'Обнуление'
-    )`);
-  } else {
-    // ✅ Обычная таблица: активные, без оплаченных и без обнуленных реестров
-    where.push(`(
-      COALESCE(v.is_paid, '') <> 'Да'
-      AND COALESCE(v.registry_flag, '') <> 'Обнуление'
-    )`);
-  }
+} else if (paidMode === "reset") {
+  // ✅ Обнуленные: если Заявка = Обнуление ИЛИ Реестр = Обнуление
+  where.push(`(
+    COALESCE(TRIM(v.request_flag), '') = 'Обнуление'
+    OR COALESCE(TRIM(v.registry_flag), '') = 'Обнуление'
+  )`);
+} else {
+  // ✅ Обычная таблица: активные, без оплаченных и без обнуленных заявок/реестров
+  where.push(`(
+    COALESCE(TRIM(v.is_paid), '') <> 'Да'
+    AND COALESCE(TRIM(v.request_flag), '') <> 'Обнуление'
+    AND COALESCE(TRIM(v.registry_flag), '') <> 'Обнуление'
+  )`);
+}
 }
 
 // ✅ Для инициатора/оператора НЕ фильтруем оплаченные вообще
