@@ -2860,16 +2860,20 @@ if (isAdmin || isAll) {
       AND COALESCE(v.registry_flag, '') <> 'Обнуление'
     )`);
 } else if (paidMode === "reset") {
-  // ✅ Обнуленные: если Заявка = Обнуление ИЛИ Реестр = Обнуление
-  where.push(`(
-    COALESCE(TRIM(v.request_flag), '') = 'Обнуление'
-    OR COALESCE(TRIM(v.registry_flag), '') = 'Обнуление'
-  )`);
+
+  // Обнуленные:
+  // показываем только строки, где Реестр = Обнуление
+  where.push(`
+    COALESCE(TRIM(v.registry_flag), '') = 'Обнуление'
+  `);
+
 } else {
-  // ✅ Обычная таблица: активные, без оплаченных и без обнуленных заявок/реестров
+
+  // Обычная таблица:
+  // показываем неоплаченные строки,
+  // где Реестр не равен Обнуление
   where.push(`(
     COALESCE(TRIM(v.is_paid), '') <> 'Да'
-    AND COALESCE(TRIM(v.request_flag), '') <> 'Обнуление'
     AND COALESCE(TRIM(v.registry_flag), '') <> 'Обнуление'
   )`);
 }
