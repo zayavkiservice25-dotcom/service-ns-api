@@ -1282,6 +1282,54 @@ async function canEditRowByLogin(poolOrClient, zvk_row_id, login) {
   return r.rowCount > 0;
 }
 
+const ISMAGULOV_LOGIN = "zhas";
+
+const ISMAGULOV_OBJECTS = new Set([
+  "05-М-Акм. Есиль",
+  "32-М-АлмО. Подкова Алматы",
+  "34-Д-Акм. Акколь",
+  "46-М-Жет. Алмалы 145+950км",
+  "47-М-Жет. Коктерек 2+708км",
+  "48-М-Жет. Тюгельбай 5+250км",
+  "49-М-Жет. Кабанбай 23+850км",
+  "50-М-Жет. Койлык 6+890км",
+  "51-М-Жет. Молалы 64+870км",
+  "52-М-Жет. Карабулак 54+411км",
+  "53-М-Жет. Тастобе 3+462км",
+  "55-М-Жет. Сарыозек Обход",
+  "57-Д-Акм. Макинск",
+  "58-Д-Аст. Улица 37",
+  "61-Д-Акм. Жалтырколь",
+  "63-Д-Аст. Оренбургская",
+  "64-Д-Жет. Хоргос",
+  "67-М-Акт. Жем",
+  "75-М-Крг. Шилы",
+  "76-М-Крг. Шат",
+  "77-М-Акт. Кауылжыр",
+  "78-Д-Аст. Уркер"
+]);
+
+function normalizeRequestObject(value) {
+  return String(value || "")
+    .replace(/\u00A0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function objectNeedsIsmagulov(value) {
+  return ISMAGULOV_OBJECTS.has(normalizeRequestObject(value));
+}
+
+async function requestNeedsIsmagulov(client, requestId) {
+  const result = await client.query(`
+    SELECT object
+    FROM public.request_items
+    WHERE request_id = $1
+  `, [Number(requestId)]);
+
+  return result.rows.some(row => objectNeedsIsmagulov(row.object));
+}
+
 app.post("/create-request", async (req, res) => {
   const client = await pool.connect();
 
@@ -1375,12 +1423,26 @@ app.post("/create-request", async (req, res) => {
           total_amount = $1,
           items_count = $2,
 
-          acc_zhasulan_name = 'Сулейменов Жасулан',
-          acc_zhasulan_status = 'Ожидает',
-          acc_zhasulan_time = NULL,
-          acc_zhasulan_comment = NULL,
+acc_zhasulan_name = 'Сулейменов Жасулан',
+acc_zhasulan_status = 'Ожидает',
+acc_zhasulan_time = NULL,
+acc_zhasulan_comment = NULL,
 
-          acc_shevchenko_name = 'Шевченко Владимир',
+acc_zhas_name = 'Исмагулов Жаслан',
+acc_zhas_status = CASE
+  WHEN EXISTS (
+    SELECT 1
+    FROM public.request_items ri
+    WHERE ri.request_id = $3
+      AND ri.object = ANY($4::text[])
+  )
+  THEN 'Ожидает'
+  ELSE 'Не требуется'
+END,
+acc_zhas_time = NULL,
+acc_zhas_comment = NULL,
+
+acc_shevchenko_name = 'Шевченко Владимир',
           acc_shevchenko_status = 'Ожидает',
           acc_shevchenko_time = NULL,
           acc_shevchenko_comment = NULL,
@@ -1400,7 +1462,12 @@ app.post("/create-request", async (req, res) => {
           approve_ermek_time = NULL,
           approve_ermek_comment = NULL
         WHERE id = $3
-      `, [total, count, request_id]);
+     `, [
+  total,
+  count,
+  request_id,
+  Array.from(ISMAGULOV_OBJECTS)
+]);
 
 await client.query(`
   INSERT INTO public.request_approve_log
@@ -1949,8 +2016,15 @@ app.get("/request-list", async (req, res) => {
   try {
     await resetExpiredZhasulanRequests();
 
-    const login = String(req.query.login || "").trim().toLowerCase();
-    const roleFt = String(req.query.role_ft || req.query.role || "").trim().toLowerCase();
+    const login = String(req.query.login || "")
+      .trim()
+      .toLowerCase();
+
+    const roleFt = String(
+      req.query.role_ft ||
+      req.query.role ||
+      ""
+    ).trim().toLowerCase();
 
     if (!login) {
       return res.status(400).json({
@@ -1962,21 +2036,52 @@ app.get("/request-list", async (req, res) => {
     let whereSql = "";
     const params = [];
 
-    // ✅ 1. Жасулан видит все заявки, где он еще НЕ согласовал и НЕ отклонил
-if (login === "s_zhasulan") {
-  // Жасулан видит все заявки, даже после своего согласования
-  whereSql = "";
+    if (login === "s_zhasulan") {
+      // Сулейменов видит все заявки.
+      whereSql = "";
 
-} else if (
-  login === "v_shevchenko" ||
-  login === "k_marat" ||
-  login === "k_ermek"
-) {
+    } else if (login === ISMAGULOV_LOGIN) {
+      // Исмагулов видит только свои объекты
+      // и только после согласования Сулейменова.
+      params.push(Array.from(ISMAGULOV_OBJECTS));
+
       whereSql = `
         WHERE COALESCE(acc_zhasulan_status, '') = 'Согласовано'
+          AND EXISTS (
+            SELECT 1
+            FROM public.request_items ri
+            WHERE ri.request_id = request_head.id
+              AND ri.object = ANY($1::text[])
+          )
       `;
 
-    // ✅ 3. Только настоящий админ видит все
+    } else if (
+      login === "v_shevchenko" ||
+      login === "k_marat" ||
+      login === "k_ermek"
+    ) {
+      /*
+       * Для объектов Исмагулова:
+       * сначала Сулейменов, потом Исмагулов.
+       *
+       * Для остальных объектов:
+       * достаточно согласования Сулейменова.
+       */
+      params.push(Array.from(ISMAGULOV_OBJECTS));
+
+      whereSql = `
+        WHERE COALESCE(acc_zhasulan_status, '') = 'Согласовано'
+          AND (
+            NOT EXISTS (
+              SELECT 1
+              FROM public.request_items ri
+              WHERE ri.request_id = request_head.id
+                AND ri.object = ANY($1::text[])
+            )
+            OR COALESCE(acc_zhas_status, '') = 'Согласовано'
+          )
+      `;
+
     } else if (
       login === "admin" ||
       login === "b_erkin" ||
@@ -1986,9 +2091,9 @@ if (login === "s_zhasulan") {
     ) {
       whereSql = "";
 
-    // ✅ 4. Инициатор видит только свои заявки
     } else {
       params.push(login);
+
       whereSql = `
         WHERE lower(trim(created_by)) = $1
            OR id IN (
@@ -1999,7 +2104,7 @@ if (login === "s_zhasulan") {
       `;
     }
 
-    const r = await pool.query(`
+    const result = await pool.query(`
       SELECT
         id,
         request_no,
@@ -2009,22 +2114,32 @@ if (login === "s_zhasulan") {
         items_count,
         created_at,
 
+        acc_zhasulan_name,
         acc_zhasulan_status,
         acc_zhasulan_time,
         acc_zhasulan_comment,
 
+        acc_zhas_name,
+        acc_zhas_status,
+        acc_zhas_time,
+        acc_zhas_comment,
+
+        acc_shevchenko_name,
         acc_shevchenko_status,
         acc_shevchenko_time,
         acc_shevchenko_comment,
 
+        acc_marat_name,
         acc_marat_status,
         acc_marat_time,
         acc_marat_comment,
 
+        acc_ermek_name,
         acc_ermek_status,
         acc_ermek_time,
         acc_ermek_comment,
 
+        approve_ermek_name,
         approve_ermek_status,
         approve_ermek_time,
         approve_ermek_comment
@@ -2036,17 +2151,20 @@ if (login === "s_zhasulan") {
 
     return res.json({
       success: true,
-      rows: r.rows
+      rows: result.rows
     });
 
   } catch (e) {
     console.error("REQUEST-LIST ERROR:", e);
+
     return res.status(500).json({
       success: false,
       error: e.message
     });
   }
 });
+
+
 app.post("/zvk-save", async (req, res) => {
   try {
     const {
@@ -3984,17 +4102,33 @@ app.post("/approve-rows", async (req, res) => {
   const client = await pool.connect();
 
   try {
-    const request_id = Number(req.body?.request_id || req.body?.id);
-    const loginNorm = String(req.body?.login || "").trim().toLowerCase();
-    const action = String(req.body?.action || "agree").trim().toLowerCase();
+    const requestId = Number(
+      req.body?.request_id ||
+      req.body?.id
+    );
+
+    const login = String(req.body?.login || "")
+      .trim()
+      .toLowerCase();
+
+    const action = String(req.body?.action || "agree")
+      .trim()
+      .toLowerCase();
+
     const comment = String(req.body?.comment || "").trim();
 
-    if (!request_id) {
-      return res.status(400).json({ success:false, error:"request_id required" });
+    if (!requestId) {
+      return res.status(400).json({
+        success: false,
+        error: "request_id required"
+      });
     }
 
-    if (!loginNorm) {
-      return res.status(400).json({ success:false, error:"login required" });
+    if (!login) {
+      return res.status(400).json({
+        success: false,
+        error: "login required"
+      });
     }
 
     const agreeApprovers = {
@@ -4004,6 +4138,14 @@ app.post("/approve-rows", async (req, res) => {
         statusCol: "acc_zhasulan_status",
         timeCol: "acc_zhasulan_time",
         commentCol: "acc_zhasulan_comment"
+      },
+
+      zhas: {
+        title: "Исмагулов Жаслан",
+        nameCol: "acc_zhas_name",
+        statusCol: "acc_zhas_status",
+        timeCol: "acc_zhas_time",
+        commentCol: "acc_zhas_comment"
       },
 
       v_shevchenko: {
@@ -4041,159 +4183,310 @@ app.post("/approve-rows", async (req, res) => {
       }
     };
 
-    let a = null;
+    let approver = null;
     let stageName = "";
 
-    if (action === "agree" || action === "reject_agree") {
-      a = agreeApprovers[loginNorm];
+    if (
+      action === "agree" ||
+      action === "reject_agree"
+    ) {
+      approver = agreeApprovers[login];
       stageName = "Согласование";
     }
 
-    if (action === "approve" || action === "reject_approve") {
-      a = approveApprovers[loginNorm];
+    if (
+      action === "approve" ||
+      action === "reject_approve"
+    ) {
+      approver = approveApprovers[login];
       stageName = "Утверждение";
     }
 
-    if (!a) {
+    if (!approver) {
       return res.status(403).json({
-        success:false,
-        error:"Нет прав на это действие"
+        success: false,
+        error: "Нет прав на это действие"
       });
     }
 
     await client.query("BEGIN");
 
-    const exists = await client.query(`
+    const headResult = await client.query(`
       SELECT
         id,
         request_no,
         total_amount,
-        acc_zhasulan_status
+
+        acc_zhasulan_status,
+        acc_zhas_status,
+
+        acc_shevchenko_status,
+        acc_marat_status,
+        acc_ermek_status,
+        approve_ermek_status
+
       FROM public.request_head
       WHERE id = $1
       LIMIT 1
-    `, [request_id]);
+      FOR UPDATE
+    `, [requestId]);
 
-    if (!exists.rowCount) {
+    if (!headResult.rowCount) {
       throw new Error("Заявка не найдена");
     }
 
-    const headRow = exists.rows[0];
+    const head = headResult.rows[0];
+    const needsIsmagulov = await requestNeedsIsmagulov(
+      client,
+      requestId
+    );
 
+    /*
+     * 1. Исмагулов может действовать только после Сулейменова.
+     */
     if (
-      loginNorm !== "s_zhasulan" &&
-      (
-        action === "agree" ||
-        action === "reject_agree" ||
-        action === "approve" ||
-        action === "reject_approve"
-      ) &&
-      String(headRow.acc_zhasulan_status || "").trim() !== "Согласовано"
+      login === ISMAGULOV_LOGIN &&
+      String(head.acc_zhasulan_status || "").trim() !== "Согласовано"
     ) {
-      throw new Error("Сначала должен согласовать Сулейменов Жасулан");
+      throw new Error(
+        "Сначала должен согласовать Сулейменов Жасулан"
+      );
     }
 
-    const isReject = action === "reject_agree" || action === "reject_approve";
-    const statusText = isReject ? "Отклонено" : "Согласовано";
+    /*
+     * 2. Исмагулов не может согласовывать чужие объекты.
+     */
+    if (
+      login === ISMAGULOV_LOGIN &&
+      !needsIsmagulov
+    ) {
+      throw new Error(
+        "Для этого объекта согласование Исмагулова не требуется"
+      );
+    }
+
+    /*
+     * 3. Шевченко, Койлибаев и Касенов ждут Сулейменова.
+     */
+    if (
+      (
+        login === "v_shevchenko" ||
+        login === "k_marat" ||
+        login === "k_ermek"
+      ) &&
+      String(head.acc_zhasulan_status || "").trim() !== "Согласовано"
+    ) {
+      throw new Error(
+        "Сначала должен согласовать Сулейменов Жасулан"
+      );
+    }
+
+    /*
+     * 4. Для специальных объектов они также ждут Исмагулова.
+     */
+    if (
+      needsIsmagulov &&
+      (
+        login === "v_shevchenko" ||
+        login === "k_marat" ||
+        login === "k_ermek"
+      ) &&
+      String(head.acc_zhas_status || "").trim() !== "Согласовано"
+    ) {
+      throw new Error(
+        "Сначала должен согласовать Исмагулов Жаслан"
+      );
+    }
+
+    const isReject =
+      action === "reject_agree" ||
+      action === "reject_approve";
+
+    const statusText = isReject
+      ? "Отклонено"
+      : "Согласовано";
 
     await client.query(`
       UPDATE public.request_head
       SET
-        ${a.nameCol} = $2,
-        ${a.statusCol} = $3,
-        ${a.timeCol} = NOW(),
-        ${a.commentCol} = $4
+        ${approver.nameCol} = $2,
+        ${approver.statusCol} = $3,
+        ${approver.timeCol} = NOW(),
+        ${approver.commentCol} = $4
       WHERE id = $1
     `, [
-      request_id,
-      a.title,
+      requestId,
+      approver.title,
       statusText,
       comment
     ]);
 
     await client.query(`
       INSERT INTO public.request_approve_log
-        (request_id, stage_name, approver_login, approver_name, action_type, comment_text)
+      (
+        request_id,
+        stage_name,
+        approver_login,
+        approver_name,
+        action_type,
+        comment_text
+      )
       VALUES ($1, $2, $3, $4, $5, $6)
     `, [
-      request_id,
+      requestId,
       stageName,
-      loginNorm,
-      a.title,
+      login,
+      approver.title,
       action,
       comment
     ]);
 
+    /*
+     * После Сулейменова:
+     * специальные объекты отправляются Исмагулову;
+     * остальные сразу Шевченко, Марату и Ермеку.
+     */
     if (
-      loginNorm === "s_zhasulan" &&
+      login === "s_zhasulan" &&
       action === "agree"
     ) {
-      const notifyUsersAfterZhasulan = [
-        "v_shevchenko",
-        "k_marat",
-        "k_ermek"
-      ];
+      const nextUsers = needsIsmagulov
+        ? [ISMAGULOV_LOGIN]
+        : ["v_shevchenko", "k_marat", "k_ermek"];
 
-      for (const userLogin of notifyUsersAfterZhasulan) {
+      for (const nextLogin of nextUsers) {
         await client.query(`
           INSERT INTO public.notifications
-            (
-              user_login,
-              type,
-              title,
-              message,
-              entity_id,
-              entity_page,
-              is_read,
-              created_at
-            )
+          (
+            user_login,
+            type,
+            title,
+            message,
+            entity_id,
+            entity_page,
+            is_read,
+            created_at
+          )
           VALUES
-            ($1, 'request', $2, $3, $4, 'request_card', false, NOW())
+          (
+            $1,
+            'request',
+            $2,
+            $3,
+            $4,
+            'request_card',
+            false,
+            NOW()
+          )
         `, [
-          userLogin,
-          `Заявка №${headRow.request_no} согласована Жасуланом`,
-          `Заявка доступна для согласования. Сумма: ${Number(headRow.total_amount || 0).toLocaleString("ru-RU")} ₸`,
-          request_id
+          nextLogin,
+          `Заявка №${head.request_no} ожидает согласования`,
+          `Сумма: ${Number(head.total_amount || 0).toLocaleString("ru-RU")} ₸`,
+          requestId
         ]);
       }
     }
 
-    // Согласование или утверждение Ермека => авто Реестр = Да
+    /*
+     * После Исмагулова заявка открывается троим.
+     */
     if (
-      action === "agree" ||
-      (action === "approve" && loginNorm === "k_ermek")
+      login === ISMAGULOV_LOGIN &&
+      action === "agree"
     ) {
-      await setRequestRegistryYes(client, request_id);
+      for (
+        const nextLogin of [
+          "v_shevchenko",
+          "k_marat",
+          "k_ermek"
+        ]
+      ) {
+        await client.query(`
+          INSERT INTO public.notifications
+          (
+            user_login,
+            type,
+            title,
+            message,
+            entity_id,
+            entity_page,
+            is_read,
+            created_at
+          )
+          VALUES
+          (
+            $1,
+            'request',
+            $2,
+            $3,
+            $4,
+            'request_card',
+            false,
+            NOW()
+          )
+        `, [
+          nextLogin,
+          `Заявка №${head.request_no} согласована Исмагуловым`,
+          `Заявка доступна для согласования. Сумма: ${Number(head.total_amount || 0).toLocaleString("ru-RU")} ₸`,
+          requestId
+        ]);
+      }
+    }
+
+    /*
+     * Реестр = Да только:
+     * Шевченко, Койлибаев, Касенов
+     * или финальное утверждение Касенова.
+     *
+     * Сулейменов и Исмагулов Реестр не меняют.
+     */
+    const shouldSetRegistryYes =
+      (
+        action === "agree" &&
+        (
+          login === "v_shevchenko" ||
+          login === "k_marat" ||
+          login === "k_ermek"
+        )
+      ) ||
+      (
+        action === "approve" &&
+        login === "k_ermek"
+      );
+
+    if (shouldSetRegistryYes) {
+      await setRequestRegistryYes(client, requestId);
     }
 
     await client.query("COMMIT");
 
     return res.json({
-      success:true,
-      request_id,
-      login: loginNorm,
+      success: true,
+      request_id: requestId,
+      login,
       action,
       status: statusText,
-      registry_flag: (
-        action === "agree" ||
-        (action === "approve" && loginNorm === "k_ermek")
-      ) ? "Да" : ""
+      needs_ismagulov: needsIsmagulov,
+      registry_flag: shouldSetRegistryYes ? "Да" : null
     });
 
   } catch (e) {
-    try { await client.query("ROLLBACK"); } catch (_) {}
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {}
 
-    console.error("approve-rows error:", e);
+    console.error("APPROVE-ROWS ERROR:", e);
 
     return res.status(500).json({
-      success:false,
-      error:e.message
+      success: false,
+      error: e.message
     });
 
   } finally {
     client.release();
   }
 });
+
 
 app.post("/request-items-paid-bulk", async (req, res) => {
   const client = await pool.connect();
