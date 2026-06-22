@@ -1112,64 +1112,70 @@ app.get("/ft", async (req, res) => {
 // =====================================================
 app.post("/ft-update-main", async (req, res) => {
   try {
-    const {
-      id_ft,
-      login,
-      division,
-      object,
-      contractor,
-      pay_purpose,
-      dds_article,
-      contract_no,
-      invoice_no,
-      sum_ft
-    } = req.body || {};
-
-    const actor = String(login || "").trim().toLowerCase();
-    const idFt = String(id_ft || "").trim();
+    const body = req.body || {};
+    const actor = String(body.login || "").trim().toLowerCase();
+    const idFt = String(body.id_ft || "").trim();
 
     if (!idFt) {
       return res.status(400).json({ success:false, error:"id_ft required" });
     }
 
-    // ✅ доступ только b_erkin
+    // Доступ только b_erkin.
     if (actor !== "b_erkin") {
       return res.status(403).json({ success:false, error:"NO_RIGHTS" });
     }
 
-    const sumNum = Number(
-      String(sum_ft || 0)
+    /*
+     * ЗАЩИТА ОТ ОЧИСТКИ СТРОКИ:
+     * массовое изменение Реестр/Оплачено не должно обновлять основные поля FT.
+     * Даже если старый клиент повторно отправит пустую карточку, пустые строки
+     * здесь НЕ заменят существующие значения в базе.
+     */
+    const textOrNull = (name) => {
+      if (!Object.prototype.hasOwnProperty.call(body, name)) return null;
+      const value = String(body[name] ?? "").trim();
+      return value === "" ? null : value;
+    };
+
+    let sumValue = null;
+    if (Object.prototype.hasOwnProperty.call(body, "sum_ft")) {
+      const raw = String(body.sum_ft ?? "")
         .replace(/\s/g, "")
         .replace(",", ".")
-    );
+        .trim();
 
-    if (!Number.isFinite(sumNum)) {
-      return res.status(400).json({ success:false, error:"sum_ft must be number" });
+      if (raw !== "") {
+        const parsed = Number(raw);
+        if (!Number.isFinite(parsed)) {
+          return res.status(400).json({ success:false, error:"sum_ft must be number" });
+        }
+        sumValue = parsed;
+      }
     }
 
     const r = await pool.query(`
       UPDATE public.ft
       SET
-        division = $2,
-        "object" = $3,
-        contractor = $4,
-        pay_purpose = $5,
-        dds_article = $6,
-        contract_no = $7,
-        invoice_no = $8,
-        sum_ft = $9
+        division    = COALESCE($2, division),
+        "object"    = COALESCE($3, "object"),
+        contractor  = COALESCE($4, contractor),
+        pay_purpose = COALESCE($5, pay_purpose),
+        dds_article = COALESCE($6, dds_article),
+        contract_no = COALESCE($7, contract_no),
+        invoice_no  = COALESCE($8, invoice_no),
+        sum_ft      = COALESCE($9, sum_ft)
       WHERE id_ft = $1
       RETURNING *
     `, [
       idFt,
-      String(division || "").trim(),
-      String(object || "").trim(),
-      String(contractor || "").trim(),
-      String(pay_purpose || "").trim(),
-      String(dds_article || "").trim(),
-      String(contract_no || "").trim(),
-      String(invoice_no || "").trim(),
-      sumNum
+      textOrNull("division"),
+      textOrNull("object"),
+      textOrNull("contractor"),
+      textOrNull("pay_purpose"),
+      textOrNull("dds_article"),
+      textOrNull("contract_no"),
+      textOrNull("invoice_no"),
+      sumValue
     ]);
 
     if (!r.rowCount) {
@@ -4826,7 +4832,7 @@ app.get("/matrix-sources", async (req, res) => {
 });
 
 
-// =====================================================
+// ==================================c===================
 // Start
 // =====================================================
 const PORT = process.env.PORT || 3000;
