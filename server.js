@@ -254,17 +254,7 @@ s.status_comment,
     WHERE rn = 1
   `);
 
-await pool.query(`
-  CREATE TABLE IF NOT EXISTS public.docs_from_1c (
-    doc_number TEXT PRIMARY KEY,
-    doc_date TIMESTAMPTZ,
-    organization_name TEXT,
-    counterparty_name TEXT,
-    total_amount NUMERIC(18,2),
-    items JSONB,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-  );
-`);
+
   
 await pool.query(`
   CREATE TABLE IF NOT EXISTS public.users (
@@ -281,6 +271,270 @@ await pool.query(`
   );
 `);
 
+// =====================================================
+// ИНТЕГРАЦИЯ С 1С
+// Таблицы заранее создаются при запуске сервера
+// =====================================================
+
+// 1. Шапка документа поступления
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS public.doc_receipts (
+    document_id text PRIMARY KEY,
+    base_id text,
+    document_number text,
+    document_posted boolean,
+    document_date timestamptz,
+
+    organization_bin text,
+    organization_name text,
+
+    warehouse_id text,
+    warehouse_name text,
+
+    counterparty_id text,
+    counterparty_bin text,
+    counterparty_name text,
+
+    contract_id text,
+    contract_name text,
+
+    currency_name text,
+    income_kpn text,
+    settlement_account text,
+    advance_account text,
+
+    vat_enable boolean,
+    vat_mode text,
+
+    document_sum numeric(18,2),
+    document_commentary text,
+    document_author_name text,
+    document_type text,
+
+    advance_withheld numeric(18,2),
+    guarantee_withheld numeric(18,2),
+    penalty_withheld numeric(18,2),
+    other_withheld numeric(18,2),
+
+    target_entity text,
+    action_required boolean,
+    is_executed boolean,
+    is_managerial boolean,
+
+    id_dov text,
+    deleted boolean DEFAULT false,
+
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now()
+  );
+`);
+
+// 2. Товары документа
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS public.doc_items (
+    document_id text NOT NULL,
+    item_id text NOT NULL,
+
+    item_name text,
+    quantity numeric(18,6),
+    price numeric(18,2),
+    amount numeric(18,2),
+
+    vat_percent numeric(10,4),
+    vat_amount numeric(18,2),
+    amount_with_vat numeric(18,2),
+
+    vat_account text,
+    turnover_type text,
+    receipt_type_name text,
+
+    cost_account_bu text,
+    cost_account_nu text,
+    in_group text,
+
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+
+    PRIMARY KEY (document_id, item_id),
+
+    CONSTRAINT doc_items_document_fk
+      FOREIGN KEY (document_id)
+      REFERENCES public.doc_receipts(document_id)
+      ON DELETE CASCADE
+  );
+`);
+
+// 3. Услуги документа
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS public.doc_services (
+    document_id text NOT NULL,
+    service_id text NOT NULL,
+
+    service_name text,
+    service_content text,
+
+    quantity numeric(18,6),
+    price numeric(18,2),
+    amount numeric(18,2),
+
+    vat_percent numeric(10,4),
+    vat_amount numeric(18,2),
+    amount_with_vat numeric(18,2),
+
+    vat_account text,
+    turnover_type text,
+    receipt_type_name text,
+
+    cost_account_bu text,
+    cost_account_nu text,
+
+    project_id text,
+    project_name text,
+
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+
+    PRIMARY KEY (document_id, service_id),
+
+    CONSTRAINT doc_services_document_fk
+      FOREIGN KEY (document_id)
+      REFERENCES public.doc_receipts(document_id)
+      ON DELETE CASCADE
+  );
+`);
+
+// 4. Контрагенты
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS public.ref_counterparties (
+    counterparty_id text PRIMARY KEY,
+    counterparty_name text,
+    individual_or_legal text,
+    group_name text,
+    counterparty_bin text,
+    counterparty_kbe text,
+    is_government_institution boolean,
+    is_small_retail_outlet boolean,
+    residence_country text,
+    vat_series text,
+    vat_number text,
+    vat_date date,
+    bank_account text,
+    bank_name text,
+    counterparty_comment text,
+    deleted boolean DEFAULT false,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now()
+  );
+`);
+
+// 5. Склады
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS public.ref_warehouses (
+    warehouse_id text PRIMARY KEY,
+    warehouse_name text,
+    warehouse_comment text,
+    deleted boolean DEFAULT false,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now()
+  );
+`);
+
+// 6. Товары и услуги
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS public.ref_products (
+    product_id text PRIMARY KEY,
+    product_code text,
+    product_name text,
+    is_group boolean,
+    is_service boolean,
+    article text,
+    unit text,
+    vat_percent numeric(10,4),
+    tnvd_code text,
+    kpvd_code text,
+    nkt_code text,
+    product_type text,
+    product_group text,
+    product_comment text,
+    deleted boolean DEFAULT false,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now()
+  );
+`);
+
+// 7. Договоры контрагентов
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS public.ref_counterparties_contracts (
+    contract_id text PRIMARY KEY,
+    contract_number text,
+    contract_date date,
+    contract_name text,
+    contract_type text,
+    organization_name text,
+    organization_bin text,
+    counterparty_id text,
+    counterparty_bin text,
+    counterparty_name text,
+    deleted boolean DEFAULT false,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now()
+  );
+`);
+
+// 8. Проекты
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS public.ref_project_groups (
+    project_id text PRIMARY KEY,
+    project_name text,
+    deleted boolean DEFAULT false,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now()
+  );
+`);
+
+// =====================================================
+// ДОПОЛНИТЕЛЬНЫЕ ИНДЕКСЫ ДЛЯ ПОИСКА
+// =====================================================
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS doc_receipts_document_date_idx
+  ON public.doc_receipts (document_date);
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS doc_receipts_counterparty_id_idx
+  ON public.doc_receipts (counterparty_id);
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS doc_receipts_warehouse_id_idx
+  ON public.doc_receipts (warehouse_id);
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS doc_receipts_contract_id_idx
+  ON public.doc_receipts (contract_id);
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS doc_items_item_id_idx
+  ON public.doc_items (item_id);
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS doc_services_service_id_idx
+  ON public.doc_services (service_id);
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS doc_services_project_id_idx
+  ON public.doc_services (project_id);
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS ref_contracts_counterparty_id_idx
+  ON public.ref_counterparties_contracts (counterparty_id);
+`);
 
 await pool.query(`
   ALTER TABLE public.users 
@@ -3702,108 +3956,6 @@ app.get("/division-svod", async (req, res) => {
     client.release();
   }
 });
-// =====================================================
-// ✅ НОВЫЕ ЭНДПОИНТЫ ДЛЯ 1С
-// =====================================================
-
-// Эндпоинт для приема любых JSON данных от 1С
-app.post("/from-1c", async (req, res) => {
-  try {
-    console.log("=== /from-1c ===");
-    console.log(req.body);
-
-    const docs = Array.isArray(req.body) ? req.body : [req.body];
-
-    if (!docs.length) {
-      return res.status(400).json({
-        success: false,
-        error: "EMPTY_JSON_BODY"
-      });
-    }
-
-    let insertedCount = 0;
-
-    for (const data of docs) {
-      if (!data || typeof data !== "object") continue;
-
-      if (!data.number) {
-        return res.status(400).json({
-          success: false,
-          error: "number required"
-        });
-      }
-
-      await pool.query(
-        `
-        INSERT INTO public.docs_from_1c (
-          doc_number,
-          doc_date,
-          organization_name,
-          counterparty_name,
-          total_amount,
-          items
-        )
-        VALUES ($1,$2,$3,$4,$5,$6)
-        ON CONFLICT (doc_number) DO UPDATE SET
-          doc_date = EXCLUDED.doc_date,
-          organization_name = EXCLUDED.organization_name,
-          counterparty_name = EXCLUDED.counterparty_name,
-          total_amount = EXCLUDED.total_amount,
-          items = EXCLUDED.items
-        `,
-        [
-          String(data.number).trim(),
-          data.date || null,
-          data.organization_name || null,
-          data.counterparty_name || null,
-          data.total_amount ?? 0,
-          JSON.stringify(data.items || [])
-        ]
-      );
-
-      insertedCount++;
-    }
-
-    res.json({
-      success: true,
-      inserted_count: insertedCount,
-      message: "Данные приняты"
-    });
-
-  } catch (error) {
-    console.error("❌ /from-1c error:", error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-// Эндпоинт для просмотра последних записей от 1С
-app.get("/last-data", async (req, res) => {
-  try {
-    const limit = Math.min(Number(req.query.limit || 10), 100);
-
-    const result = await pool.query(`
-      SELECT *
-      FROM public.docs_from_1c
-      ORDER BY created_at DESC
-      LIMIT $1
-    `, [limit]);
-
-    res.json({
-      success: true,
-      rows: result.rows
-    });
-
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
 
 // Эндпоинт для получения конкретной записи по ID
 app.get("/data/:number", async (req, res) => {
@@ -4832,7 +4984,845 @@ app.get("/matrix-sources", async (req, res) => {
 });
 
 
-// ==================================c===================
+// =====================================================
+// JSON API-ПРИЁМНИКИ ДЛЯ 1С
+// =====================================================
+
+function oneCArray(body) {
+  if (Array.isArray(body)) return body;
+  if (Array.isArray(body?.rows)) return body.rows;
+  if (Array.isArray(body?.data)) return body.data;
+  return body && typeof body === "object" ? [body] : [];
+}
+
+function oneCText(value) {
+  if (value === undefined || value === null) return null;
+
+  const result = String(value).trim();
+  return result === "" ? null : result;
+}
+
+function oneCNumber(value) {
+  if (value === undefined || value === null || value === "") return null;
+
+  const result = Number(
+    String(value)
+      .replace(/\s/g, "")
+      .replace(",", ".")
+  );
+
+  return Number.isFinite(result) ? result : null;
+}
+
+function oneCBoolean(value) {
+  if (value === undefined || value === null || value === "") return null;
+  if (typeof value === "boolean") return value;
+
+  const normalized = String(value).trim().toLowerCase();
+
+  if (["true", "1", "да", "yes"].includes(normalized)) return true;
+  if (["false", "0", "нет", "no"].includes(normalized)) return false;
+
+  return null;
+}
+
+// Необязательная защита API ключом.
+// В Render можно добавить переменную 1C_API_KEY.
+// 1С должна передавать заголовок: x-api-key
+function checkOneCApiKey(req, res, next) {
+  const expectedKey = String(process.env.ONE_C_API_KEY || "").trim();
+
+  // Пока ключ не задан в ENV, запросы пропускаются.
+  if (!expectedKey) return next();
+
+  const receivedKey = String(req.headers["x-api-key"] || "").trim();
+
+  if (receivedKey !== expectedKey) {
+    return res.status(401).json({
+      success: false,
+      error: "INVALID_API_KEY",
+      message: "Неверный API-ключ"
+    });
+  }
+
+  next();
+}
+
+// Проверка работы API
+app.get("/api/1c/health", (req, res) => {
+  return res.json({
+    success: true,
+    service: "1C integration API",
+    time: new Date().toISOString()
+  });
+});
+
+
+// =====================================================
+// 1. ПРИЁМ ДОКУМЕНТОВ doc_receipts
+// Внутри: doc_items и doc_services
+// =====================================================
+
+app.post(
+  "/api/1c/doc_receipts",
+  checkOneCApiKey,
+  async (req, res) => {
+    const client = await pool.connect();
+
+    try {
+      const documents = oneCArray(req.body);
+
+      if (!documents.length) {
+        return res.status(400).json({
+          success: false,
+          error: "EMPTY_BODY",
+          message: "JSON не содержит документов"
+        });
+      }
+
+      await client.query("BEGIN");
+
+      const results = [];
+
+      for (const doc of documents) {
+        const documentId = oneCText(doc.document_id);
+
+        if (!documentId) {
+          throw new Error("В одном из документов отсутствует document_id");
+        }
+
+        const oldDocument = await client.query(
+          `
+          SELECT document_id
+          FROM public.doc_receipts
+          WHERE document_id = $1
+          LIMIT 1
+          `,
+          [documentId]
+        );
+
+        const operation =
+          oldDocument.rowCount > 0 ? "updated" : "inserted";
+
+        await client.query(
+          `
+          INSERT INTO public.doc_receipts (
+            document_id,
+            base_id,
+            document_number,
+            document_posted,
+            document_date,
+            organization_bin,
+            organization_name,
+            warehouse_id,
+            warehouse_name,
+            counterparty_id,
+            counterparty_bin,
+            counterparty_name,
+            contract_id,
+            contract_name,
+            currency_name,
+            income_kpn,
+            settlement_account,
+            advance_account,
+            vat_enable,
+            vat_mode,
+            document_sum,
+            document_commentary,
+            document_author_name,
+            document_type,
+            advance_withheld,
+            guarantee_withheld,
+            penalty_withheld,
+            other_withheld,
+            target_entity,
+            action_required,
+            is_executed,
+            is_managerial,
+            id_dov,
+            deleted,
+            updated_at
+          )
+          VALUES (
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+            $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+            $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,
+            $31,$32,$33,$34,NOW()
+          )
+          ON CONFLICT (document_id)
+          DO UPDATE SET
+            base_id = EXCLUDED.base_id,
+            document_number = EXCLUDED.document_number,
+            document_posted = EXCLUDED.document_posted,
+            document_date = EXCLUDED.document_date,
+            organization_bin = EXCLUDED.organization_bin,
+            organization_name = EXCLUDED.organization_name,
+            warehouse_id = EXCLUDED.warehouse_id,
+            warehouse_name = EXCLUDED.warehouse_name,
+            counterparty_id = EXCLUDED.counterparty_id,
+            counterparty_bin = EXCLUDED.counterparty_bin,
+            counterparty_name = EXCLUDED.counterparty_name,
+            contract_id = EXCLUDED.contract_id,
+            contract_name = EXCLUDED.contract_name,
+            currency_name = EXCLUDED.currency_name,
+            income_kpn = EXCLUDED.income_kpn,
+            settlement_account = EXCLUDED.settlement_account,
+            advance_account = EXCLUDED.advance_account,
+            vat_enable = EXCLUDED.vat_enable,
+            vat_mode = EXCLUDED.vat_mode,
+            document_sum = EXCLUDED.document_sum,
+            document_commentary = EXCLUDED.document_commentary,
+            document_author_name = EXCLUDED.document_author_name,
+            document_type = EXCLUDED.document_type,
+            advance_withheld = EXCLUDED.advance_withheld,
+            guarantee_withheld = EXCLUDED.guarantee_withheld,
+            penalty_withheld = EXCLUDED.penalty_withheld,
+            other_withheld = EXCLUDED.other_withheld,
+            target_entity = EXCLUDED.target_entity,
+            action_required = EXCLUDED.action_required,
+            is_executed = EXCLUDED.is_executed,
+            is_managerial = EXCLUDED.is_managerial,
+            id_dov = EXCLUDED.id_dov,
+            deleted = EXCLUDED.deleted,
+            updated_at = NOW()
+          `,
+          [
+            documentId,
+            oneCText(doc.base_id),
+            oneCText(doc.document_number),
+            oneCBoolean(doc.document_posted),
+            oneCText(doc.document_date),
+
+            oneCText(doc.organization_bin),
+            oneCText(doc.organization_name),
+
+            oneCText(doc.warehouse_id),
+            oneCText(doc.warehouse_name),
+
+            oneCText(doc.counterparty_id),
+            oneCText(doc.counterparty_bin),
+            oneCText(doc.counterparty_name),
+
+            oneCText(doc.contract_id),
+            oneCText(doc.contract_name),
+
+            oneCText(doc.currency_name),
+            oneCText(doc.income_kpn),
+            oneCText(doc.settlement_account),
+            oneCText(doc.advance_account),
+
+            oneCBoolean(doc.vat_enable),
+            oneCText(doc.vat_mode),
+
+            oneCNumber(doc.document_sum),
+            oneCText(doc.document_commentary),
+            oneCText(doc.document_author_name),
+            oneCText(doc.document_type),
+
+            oneCNumber(doc.advance_withheld),
+            oneCNumber(doc.guarantee_withheld),
+            oneCNumber(doc.penalty_withheld),
+            oneCNumber(doc.other_withheld),
+
+            oneCText(doc.target_entity),
+            oneCBoolean(doc.action_required),
+            oneCBoolean(doc.is_executed),
+            oneCBoolean(doc.is_managerial),
+
+            oneCText(doc.id_dov),
+            oneCBoolean(doc.deleted) ?? false
+          ]
+        );
+
+        /*
+         * При повторной отправке документа очищаем старые массивы
+         * и записываем актуальные строки из 1С.
+         */
+        await client.query(
+          `DELETE FROM public.doc_items WHERE document_id = $1`,
+          [documentId]
+        );
+
+        await client.query(
+          `DELETE FROM public.doc_services WHERE document_id = $1`,
+          [documentId]
+        );
+
+        const docItems = Array.isArray(doc.doc_items)
+          ? doc.doc_items
+          : [];
+
+        for (const item of docItems) {
+          const itemId = oneCText(item.item_id);
+
+          if (!itemId) {
+            throw new Error(
+              `В doc_items документа ${documentId} отсутствует item_id`
+            );
+          }
+
+          await client.query(
+            `
+            INSERT INTO public.doc_items (
+              document_id,
+              item_id,
+              item_name,
+              quantity,
+              price,
+              amount,
+              vat_percent,
+              vat_amount,
+              amount_with_vat,
+              vat_account,
+              turnover_type,
+              receipt_type_name,
+              cost_account_bu,
+              cost_account_nu,
+              in_group,
+              updated_at
+            )
+            VALUES (
+              $1,$2,$3,$4,$5,$6,$7,$8,
+              $9,$10,$11,$12,$13,$14,$15,NOW()
+            )
+            `,
+            [
+              documentId,
+              itemId,
+              oneCText(item.item_name),
+              oneCNumber(item.quantity),
+              oneCNumber(item.price),
+              oneCNumber(item.amount),
+              oneCNumber(item.vat_percent),
+              oneCNumber(item.vat_amount),
+              oneCNumber(item.amount_with_vat),
+              oneCText(item.vat_account),
+              oneCText(item.turnover_type),
+              oneCText(item.receipt_type_name),
+              oneCText(item.cost_account_bu),
+              oneCText(item.cost_account_nu),
+              oneCText(item.in_group)
+            ]
+          );
+        }
+
+        const docServices = Array.isArray(doc.doc_services)
+          ? doc.doc_services
+          : [];
+
+        for (const service of docServices) {
+          const serviceId = oneCText(service.service_id);
+
+          if (!serviceId) {
+            throw new Error(
+              `В doc_services документа ${documentId} отсутствует service_id`
+            );
+          }
+
+          await client.query(
+            `
+            INSERT INTO public.doc_services (
+              document_id,
+              service_id,
+              service_name,
+              service_content,
+              quantity,
+              price,
+              amount,
+              vat_percent,
+              vat_amount,
+              amount_with_vat,
+              vat_account,
+              turnover_type,
+              receipt_type_name,
+              cost_account_bu,
+              cost_account_nu,
+              project_id,
+              project_name,
+              updated_at
+            )
+            VALUES (
+              $1,$2,$3,$4,$5,$6,$7,$8,$9,
+              $10,$11,$12,$13,$14,$15,$16,$17,NOW()
+            )
+            `,
+            [
+              documentId,
+              serviceId,
+              oneCText(service.service_name),
+              oneCText(service.service_content),
+              oneCNumber(service.quantity),
+              oneCNumber(service.price),
+              oneCNumber(service.amount),
+              oneCNumber(service.vat_percent),
+              oneCNumber(service.vat_amount),
+              oneCNumber(service.amount_with_vat),
+              oneCText(service.vat_account),
+              oneCText(service.turnover_type),
+              oneCText(service.receipt_type_name),
+              oneCText(service.cost_account_bu),
+              oneCText(service.cost_account_nu),
+              oneCText(service.project_id),
+              oneCText(service.project_name)
+            ]
+          );
+        }
+
+        results.push({
+          document_id: documentId,
+          operation,
+          doc_items_count: docItems.length,
+          doc_services_count: docServices.length
+        });
+      }
+
+      await client.query("COMMIT");
+
+      return res.json({
+        success: true,
+        received: documents.length,
+        results
+      });
+
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {}
+
+      console.error("1C DOC_RECEIPTS ERROR:", error);
+
+      return res.status(500).json({
+        success: false,
+        error: "DOC_RECEIPTS_ERROR",
+        message: error.message
+      });
+
+    } finally {
+      client.release();
+    }
+  }
+);
+
+
+// =====================================================
+// 2. КОНТРАГЕНТЫ
+// =====================================================
+
+app.post(
+  "/api/1c/ref_counterparties",
+  checkOneCApiKey,
+  async (req, res) => {
+    try {
+      const rows = oneCArray(req.body);
+      let saved = 0;
+
+      for (const row of rows) {
+        const id = oneCText(row.counterparty_id);
+
+        if (!id) {
+          return res.status(400).json({
+            success: false,
+            message: "counterparty_id обязателен"
+          });
+        }
+
+        await pool.query(
+          `
+          INSERT INTO public.ref_counterparties (
+            counterparty_id,
+            counterparty_name,
+            individual_or_legal,
+            group_name,
+            counterparty_bin,
+            counterparty_kbe,
+            is_government_institution,
+            is_small_retail_outlet,
+            residence_country,
+            vat_series,
+            vat_number,
+            vat_date,
+            bank_account,
+            bank_name,
+            counterparty_comment,
+            deleted,
+            updated_at
+          )
+          VALUES (
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,
+            $10,$11,$12,$13,$14,$15,$16,NOW()
+          )
+          ON CONFLICT (counterparty_id)
+          DO UPDATE SET
+            counterparty_name = EXCLUDED.counterparty_name,
+            individual_or_legal = EXCLUDED.individual_or_legal,
+            group_name = EXCLUDED.group_name,
+            counterparty_bin = EXCLUDED.counterparty_bin,
+            counterparty_kbe = EXCLUDED.counterparty_kbe,
+            is_government_institution =
+              EXCLUDED.is_government_institution,
+            is_small_retail_outlet =
+              EXCLUDED.is_small_retail_outlet,
+            residence_country = EXCLUDED.residence_country,
+            vat_series = EXCLUDED.vat_series,
+            vat_number = EXCLUDED.vat_number,
+            vat_date = EXCLUDED.vat_date,
+            bank_account = EXCLUDED.bank_account,
+            bank_name = EXCLUDED.bank_name,
+            counterparty_comment = EXCLUDED.counterparty_comment,
+            deleted = EXCLUDED.deleted,
+            updated_at = NOW()
+          `,
+          [
+            id,
+            oneCText(row.counterparty_name),
+            oneCText(row.individual_or_legal),
+            oneCText(row.group_name),
+            oneCText(row.counterparty_bin),
+            oneCText(row.counterparty_kbe),
+            oneCBoolean(row.is_government_institution),
+            oneCBoolean(row.is_small_retail_outlet),
+            oneCText(row.residence_country),
+            oneCText(row.vat_series),
+            oneCText(row.vat_number),
+            oneCText(row.vat_date),
+            oneCText(row.bank_account),
+            oneCText(row.bank_name),
+            oneCText(row.counterparty_comment),
+            oneCBoolean(row.deleted) ?? false
+          ]
+        );
+
+        saved++;
+      }
+
+      return res.json({ success: true, received: rows.length, saved });
+
+    } catch (error) {
+      console.error("1C COUNTERPARTIES ERROR:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: error.message
+      });
+    }
+  }
+);
+
+
+// =====================================================
+// 3. СКЛАДЫ
+// =====================================================
+
+app.post(
+  "/api/1c/ref_warehouses",
+  checkOneCApiKey,
+  async (req, res) => {
+    try {
+      const rows = oneCArray(req.body);
+      let saved = 0;
+
+      for (const row of rows) {
+        const id = oneCText(row.warehouse_id);
+
+        if (!id) {
+          return res.status(400).json({
+            success: false,
+            message: "warehouse_id обязателен"
+          });
+        }
+
+        await pool.query(
+          `
+          INSERT INTO public.ref_warehouses (
+            warehouse_id,
+            warehouse_name,
+            warehouse_comment,
+            deleted,
+            updated_at
+          )
+          VALUES ($1,$2,$3,$4,NOW())
+          ON CONFLICT (warehouse_id)
+          DO UPDATE SET
+            warehouse_name = EXCLUDED.warehouse_name,
+            warehouse_comment = EXCLUDED.warehouse_comment,
+            deleted = EXCLUDED.deleted,
+            updated_at = NOW()
+          `,
+          [
+            id,
+            oneCText(row.warehouse_name),
+            oneCText(row.warehouse_comment),
+            oneCBoolean(row.deleted) ?? false
+          ]
+        );
+
+        saved++;
+      }
+
+      return res.json({ success: true, received: rows.length, saved });
+
+    } catch (error) {
+      console.error("1C WAREHOUSES ERROR:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: error.message
+      });
+    }
+  }
+);
+
+
+// =====================================================
+// 4. ТОВАРЫ И УСЛУГИ
+// =====================================================
+
+app.post(
+  "/api/1c/ref_products",
+  checkOneCApiKey,
+  async (req, res) => {
+    try {
+      const rows = oneCArray(req.body);
+      let saved = 0;
+
+      for (const row of rows) {
+        const id = oneCText(row.product_id);
+
+        if (!id) {
+          return res.status(400).json({
+            success: false,
+            message: "product_id обязателен"
+          });
+        }
+
+        await pool.query(
+          `
+          INSERT INTO public.ref_products (
+            product_id,
+            product_code,
+            product_name,
+            is_group,
+            is_service,
+            article,
+            unit,
+            vat_percent,
+            tnvd_code,
+            kpvd_code,
+            nkt_code,
+            product_type,
+            product_group,
+            product_comment,
+            deleted,
+            updated_at
+          )
+          VALUES (
+            $1,$2,$3,$4,$5,$6,$7,$8,
+            $9,$10,$11,$12,$13,$14,$15,NOW()
+          )
+          ON CONFLICT (product_id)
+          DO UPDATE SET
+            product_code = EXCLUDED.product_code,
+            product_name = EXCLUDED.product_name,
+            is_group = EXCLUDED.is_group,
+            is_service = EXCLUDED.is_service,
+            article = EXCLUDED.article,
+            unit = EXCLUDED.unit,
+            vat_percent = EXCLUDED.vat_percent,
+            tnvd_code = EXCLUDED.tnvd_code,
+            kpvd_code = EXCLUDED.kpvd_code,
+            nkt_code = EXCLUDED.nkt_code,
+            product_type = EXCLUDED.product_type,
+            product_group = EXCLUDED.product_group,
+            product_comment = EXCLUDED.product_comment,
+            deleted = EXCLUDED.deleted,
+            updated_at = NOW()
+          `,
+          [
+            id,
+            oneCText(row.product_code),
+            oneCText(row.product_name),
+            oneCBoolean(row.is_group),
+            oneCBoolean(row.is_service),
+            oneCText(row.article),
+            oneCText(row.unit),
+            oneCNumber(row.vat_percent),
+            oneCText(row.tnvd_code),
+            oneCText(row.kpvd_code),
+            oneCText(row.nkt_code),
+            oneCText(row.product_type),
+            oneCText(row.product_group),
+            oneCText(row.product_comment),
+            oneCBoolean(row.deleted) ?? false
+          ]
+        );
+
+        saved++;
+      }
+
+      return res.json({ success: true, received: rows.length, saved });
+
+    } catch (error) {
+      console.error("1C PRODUCTS ERROR:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: error.message
+      });
+    }
+  }
+);
+
+
+// =====================================================
+// 5. ДОГОВОРЫ КОНТРАГЕНТОВ
+// =====================================================
+
+app.post(
+  "/api/1c/ref_counterparties_contracts",
+  checkOneCApiKey,
+  async (req, res) => {
+    try {
+      const rows = oneCArray(req.body);
+      let saved = 0;
+
+      for (const row of rows) {
+        const id = oneCText(row.contract_id);
+
+        if (!id) {
+          return res.status(400).json({
+            success: false,
+            message: "contract_id обязателен"
+          });
+        }
+
+        await pool.query(
+          `
+          INSERT INTO public.ref_counterparties_contracts (
+            contract_id,
+            contract_number,
+            contract_date,
+            contract_name,
+            contract_type,
+            organization_name,
+            organization_bin,
+            counterparty_id,
+            counterparty_bin,
+            counterparty_name,
+            deleted,
+            updated_at
+          )
+          VALUES (
+            $1,$2,$3,$4,$5,$6,
+            $7,$8,$9,$10,$11,NOW()
+          )
+          ON CONFLICT (contract_id)
+          DO UPDATE SET
+            contract_number = EXCLUDED.contract_number,
+            contract_date = EXCLUDED.contract_date,
+            contract_name = EXCLUDED.contract_name,
+            contract_type = EXCLUDED.contract_type,
+            organization_name = EXCLUDED.organization_name,
+            organization_bin = EXCLUDED.organization_bin,
+            counterparty_id = EXCLUDED.counterparty_id,
+            counterparty_bin = EXCLUDED.counterparty_bin,
+            counterparty_name = EXCLUDED.counterparty_name,
+            deleted = EXCLUDED.deleted,
+            updated_at = NOW()
+          `,
+          [
+            id,
+            oneCText(row.contract_number),
+            oneCText(row.contract_date),
+            oneCText(row.contract_name),
+            oneCText(row.contract_type),
+            oneCText(row.organization_name),
+            oneCText(row.organization_bin),
+            oneCText(row.counterparty_id),
+            oneCText(row.counterparty_bin),
+            oneCText(row.counterparty_name),
+            oneCBoolean(row.deleted) ?? false
+          ]
+        );
+
+        saved++;
+      }
+
+      return res.json({ success: true, received: rows.length, saved });
+
+    } catch (error) {
+      console.error("1C CONTRACTS ERROR:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: error.message
+      });
+    }
+  }
+);
+
+
+// =====================================================
+// 6. ПРОЕКТЫ
+// =====================================================
+
+app.post(
+  "/api/1c/ref_project_groups",
+  checkOneCApiKey,
+  async (req, res) => {
+    try {
+      const rows = oneCArray(req.body);
+      let saved = 0;
+
+      for (const row of rows) {
+        const id = oneCText(row.project_id);
+
+        if (!id) {
+          return res.status(400).json({
+            success: false,
+            message: "project_id обязателен"
+          });
+        }
+
+        await pool.query(
+          `
+          INSERT INTO public.ref_project_groups (
+            project_id,
+            project_name,
+            deleted,
+            updated_at
+          )
+          VALUES ($1,$2,$3,NOW())
+          ON CONFLICT (project_id)
+          DO UPDATE SET
+            project_name = EXCLUDED.project_name,
+            deleted = EXCLUDED.deleted,
+            updated_at = NOW()
+          `,
+          [
+            id,
+            oneCText(row.project_name),
+            oneCBoolean(row.deleted) ?? false
+          ]
+        );
+
+        saved++;
+      }
+
+      return res.json({ success: true, received: rows.length, saved });
+
+    } catch (error) {
+      console.error("1C PROJECT GROUPS ERROR:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: error.message
+      });
+    }
+  }
+);
+
+
+// =====================================================
 // Start
 // =====================================================
 const PORT = process.env.PORT || 3000;
