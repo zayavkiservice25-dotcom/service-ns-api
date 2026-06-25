@@ -317,9 +317,9 @@ await pool.query(`
     other_withheld numeric(18,2),
 
     target_entity text,
-    action_required boolean,
-    is_executed boolean,
-    is_managerial boolean,
+action_required text,
+is_executed text,
+is_managerial text,
 
     id_dov text,
     deleted boolean DEFAULT false,
@@ -5232,9 +5232,9 @@ app.post(
             oneCNumber(doc.other_withheld),
 
             oneCText(doc.target_entity),
-            oneCBoolean(doc.action_required),
-            oneCBoolean(doc.is_executed),
-            oneCBoolean(doc.is_managerial),
+oneCText(doc.action_required),
+oneCText(doc.is_executed),
+oneCText(doc.is_managerial),
 
             oneCText(doc.id_dov),
             oneCBoolean(doc.deleted) ?? false
@@ -6020,9 +6020,9 @@ app.post(
             oneCNumber(doc.other_withheld),
 
             oneCText(doc.target_entity),
-            oneCBoolean(doc.action_required),
-            oneCBoolean(doc.is_executed),
-            oneCBoolean(doc.is_managerial),
+oneCText(doc.action_required),
+oneCText(doc.is_executed),
+oneCText(doc.is_managerial),
 
             oneCText(doc.id_dov),
             oneCBoolean(doc.deleted) ?? false
