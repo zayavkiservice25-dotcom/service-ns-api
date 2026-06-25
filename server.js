@@ -331,7 +331,7 @@ await pool.query(`
 
 // 2. Товары документа
 await pool.query(`
-  CREATE TABLE IF NOT EXISTS public.doc_items (
+  CREATE TABLE IF NOT EXISTS public.doc_receipts_items (
     document_id text NOT NULL,
     item_id text NOT NULL,
 
@@ -348,9 +348,11 @@ await pool.query(`
     turnover_type text,
     receipt_type_name text,
 
-    cost_account_bu text,
-    cost_account_nu text,
-    in_group text,
+cost_account_bu text,
+cost_account_nu text,
+
+project_id text,
+project_name text,
 
     created_at timestamptz DEFAULT now(),
     updated_at timestamptz DEFAULT now(),
@@ -366,7 +368,7 @@ await pool.query(`
 
 // 3. Услуги документа
 await pool.query(`
-  CREATE TABLE IF NOT EXISTS public.doc_services (
+  CREATE TABLE IF NOT EXISTS public.doc_receipts_services (
     document_id text NOT NULL,
     service_id text NOT NULL,
 
@@ -517,18 +519,23 @@ await pool.query(`
 `);
 
 await pool.query(`
-  CREATE INDEX IF NOT EXISTS doc_items_item_id_idx
-  ON public.doc_items (item_id);
+  CREATE INDEX IF NOT EXISTS doc_receipts_items_item_id_idx
+  ON public.doc_receipts_items (item_id);
 `);
 
 await pool.query(`
-  CREATE INDEX IF NOT EXISTS doc_services_service_id_idx
-  ON public.doc_services (service_id);
+  CREATE INDEX IF NOT EXISTS doc_receipts_items_project_id_idx
+  ON public.doc_receipts_items (project_id);
 `);
 
 await pool.query(`
-  CREATE INDEX IF NOT EXISTS doc_services_project_id_idx
-  ON public.doc_services (project_id);
+  CREATE INDEX IF NOT EXISTS doc_receipts_services_service_id_idx
+  ON public.doc_receipts_services (service_id);
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS doc_receipts_services_project_id_idx
+  ON public.doc_receipts_services (project_id);
 `);
 
 await pool.query(`
@@ -5239,12 +5246,12 @@ app.post(
          * и записываем актуальные строки из 1С.
          */
         await client.query(
-          `DELETE FROM public.doc_items WHERE document_id = $1`,
+          `DELETE FROM public.doc_receipts_items WHERE document_id = $1`,
           [documentId]
         );
 
         await client.query(
-          `DELETE FROM public.doc_services WHERE document_id = $1`,
+          `DELETE FROM public.doc_receipts_services WHERE document_id = $1`,
           [documentId]
         );
 
@@ -5263,7 +5270,7 @@ app.post(
 
           await client.query(
             `
-            INSERT INTO public.doc_items (
+            INSERT INTO public.doc_receipts_items (
               document_id,
               item_id,
               item_name,
@@ -5284,7 +5291,7 @@ app.post(
             )
             VALUES (
               $1,$2,$3,$4,$5,$6,$7,$8,
-              $9,$10,$11,$12,$13,$14,$15,NOW()
+              $9,$10,$11,$12,$13,$14,$15,$16,NOW()
             )
             `,
             [
@@ -5298,11 +5305,12 @@ app.post(
               oneCNumber(item.vat_amount),
               oneCNumber(item.amount_with_vat),
               oneCText(item.vat_account),
-              oneCText(item.turnover_type),
+              oneCText(item.turnover_type ?? item.Turnover_type),
               oneCText(item.receipt_type_name),
               oneCText(item.cost_account_bu),
               oneCText(item.cost_account_nu),
-              oneCText(item.in_group)
+              oneCText(item.project_id),
+              oneCText(item.project_name)
             ]
           );
         }
@@ -5322,7 +5330,7 @@ app.post(
 
           await client.query(
             `
-            INSERT INTO public.doc_services (
+            INSERT INTO public.doc_receipts_services (
               document_id,
               service_id,
               service_name,
@@ -5359,7 +5367,7 @@ app.post(
               oneCNumber(service.vat_amount),
               oneCNumber(service.amount_with_vat),
               oneCText(service.vat_account),
-              oneCText(service.turnover_type),
+              oneCText(service.turnover_type ?? service.Turnover_type),
               oneCText(service.receipt_type_name),
               oneCText(service.cost_account_bu),
               oneCText(service.cost_account_nu),
