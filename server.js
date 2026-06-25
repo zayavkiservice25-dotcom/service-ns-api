@@ -6206,6 +6206,273 @@ oneCText(doc.is_managerial),
   }
 );
 
+// =====================================================
+// ПЛАТЕЖНОЕ ПОРУЧЕНИЕ ВХОДЯЩЕЕ
+// POST /api/1c/doc_incomingpaymentorder
+// Табличная часть: payment_transcript
+// =====================================================
+
+app.post(
+  "/api/1c/doc_incomingpaymentorder",
+  checkOneCApiKey,
+  async (req, res) => {
+    const client = await pool.connect();
+
+    try {
+      const documents = oneCArray(req.body);
+
+      if (!documents.length) {
+        return res.status(400).json({
+          success: false,
+          error: "EMPTY_BODY",
+          message: "JSON не содержит документов"
+        });
+      }
+
+      await client.query("BEGIN");
+
+      const results = [];
+
+      for (const doc of documents) {
+        const documentId = oneCText(doc.document_id);
+
+        if (!documentId) {
+          throw new Error(
+            "В одном из документов отсутствует document_id"
+          );
+        }
+
+        const oldDocument = await client.query(
+          `
+          SELECT document_id
+          FROM public.doc_incomingpaymentorder
+          WHERE document_id = $1
+          LIMIT 1
+          `,
+          [documentId]
+        );
+
+        const operation =
+          oldDocument.rowCount > 0 ? "updated" : "inserted";
+
+        await client.query(
+          `
+          INSERT INTO public.doc_incomingpaymentorder (
+            document_id,
+            document_number,
+            document_posted,
+            document_date,
+
+            organization_bin,
+            organization_name,
+
+            paid,
+            document_author_name,
+            responsible,
+            operation_type,
+            currency_name,
+            document_commentary,
+
+            statement_date,
+            document_sum,
+
+            cash_flow_item,
+            bank_account,
+            counterparty_account,
+            organization_account,
+            purpose_of_payment,
+
+            incoming_doc_date,
+            incoming_doc_number,
+
+            advance,
+
+            counterparty_id,
+            counterparty_bin,
+            counterparty_name,
+
+            deleted,
+            updated_at
+          )
+          VALUES (
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+            $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+            $21,$22,$23,$24,$25,$26,NOW()
+          )
+          ON CONFLICT (document_id)
+          DO UPDATE SET
+            document_number = EXCLUDED.document_number,
+            document_posted = EXCLUDED.document_posted,
+            document_date = EXCLUDED.document_date,
+
+            organization_bin = EXCLUDED.organization_bin,
+            organization_name = EXCLUDED.organization_name,
+
+            paid = EXCLUDED.paid,
+            document_author_name = EXCLUDED.document_author_name,
+            responsible = EXCLUDED.responsible,
+            operation_type = EXCLUDED.operation_type,
+            currency_name = EXCLUDED.currency_name,
+            document_commentary = EXCLUDED.document_commentary,
+
+            statement_date = EXCLUDED.statement_date,
+            document_sum = EXCLUDED.document_sum,
+
+            cash_flow_item = EXCLUDED.cash_flow_item,
+            bank_account = EXCLUDED.bank_account,
+            counterparty_account = EXCLUDED.counterparty_account,
+            organization_account = EXCLUDED.organization_account,
+            purpose_of_payment = EXCLUDED.purpose_of_payment,
+
+            incoming_doc_date = EXCLUDED.incoming_doc_date,
+            incoming_doc_number = EXCLUDED.incoming_doc_number,
+
+            advance = EXCLUDED.advance,
+
+            counterparty_id = EXCLUDED.counterparty_id,
+            counterparty_bin = EXCLUDED.counterparty_bin,
+            counterparty_name = EXCLUDED.counterparty_name,
+
+            deleted = EXCLUDED.deleted,
+            updated_at = NOW()
+          `,
+          [
+            documentId,
+            oneCText(doc.document_number),
+            oneCBoolean(doc.document_posted),
+            oneCText(doc.document_date),
+
+            oneCText(doc.organization_bin),
+            oneCText(doc.organization_name),
+
+            oneCBoolean(doc.paid),
+            oneCText(doc.document_author_name),
+            oneCText(doc.responsible),
+            oneCText(doc.operation_type),
+            oneCText(doc.currency_name),
+            oneCText(doc.document_commentary),
+
+            oneCText(doc.statement_date),
+            oneCNumber(doc.document_sum),
+
+            oneCText(doc.cash_flow_item),
+            oneCText(doc.bank_account),
+            oneCText(doc.counterparty_account),
+            oneCText(doc.organization_account),
+            oneCText(doc.purpose_of_payment),
+
+            oneCText(doc.incoming_doc_date),
+            oneCText(doc.incoming_doc_number),
+
+            oneCText(doc.advance),
+
+            oneCText(doc.counterparty_id),
+            oneCText(doc.counterparty_bin),
+            oneCText(doc.counterparty_name),
+
+            oneCBoolean(doc.deleted)
+          ]
+        );
+
+        // При обновлении документа старые строки расшифровки удаляются.
+        await client.query(
+          `
+          DELETE FROM public.doc_incomingpaymentorder_payment_transcript
+          WHERE document_id = $1
+          `,
+          [documentId]
+        );
+
+        const paymentTranscript = Array.isArray(doc.payment_transcript)
+          ? doc.payment_transcript
+          : [];
+
+        let insertedRows = 0;
+
+        for (let index = 0; index < paymentTranscript.length; index++) {
+          const row = paymentTranscript[index];
+          const lineNo = index + 1;
+
+          await client.query(
+            `
+            INSERT INTO public.doc_incomingpaymentorder_payment_transcript (
+              document_id,
+              line_no,
+
+              contract_id,
+              contract_name,
+              doc_deal,
+
+              settlement_rate,
+              payment_amount,
+              frequency_settlements,
+              settlement_amount,
+
+              vat_percent,
+              vat_amount,
+
+              cash_flow_item,
+              updated_at
+            )
+            VALUES (
+              $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW()
+            )
+            `,
+            [
+              documentId,
+              lineNo,
+
+              oneCText(row.contract_id),
+              oneCText(row.contract_name),
+              oneCText(row.doc_deal),
+
+              oneCNumber(row.settlement_rate),
+              oneCNumber(row.payment_amount),
+              oneCNumber(row.frequency_settlements),
+              oneCNumber(row.settlement_amount),
+
+              oneCNumber(row.vat_percent),
+              oneCNumber(row.vat_amount),
+
+              oneCText(row.cash_flow_item)
+            ]
+          );
+
+          insertedRows++;
+        }
+
+        results.push({
+          document_id: documentId,
+          operation,
+          payment_transcript_count: insertedRows
+        });
+      }
+
+      await client.query("COMMIT");
+
+      return res.json({
+        success: true,
+        count: results.length,
+        results
+      });
+
+    } catch (e) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {}
+
+      console.error("DOC-INCOMINGPAYMENTORDER ERROR:", e);
+
+      return res.status(500).json({
+        success: false,
+        error: e.message
+      });
+
+    } finally {
+      client.release();
+    }
+  }
+);
 
 // =====================================================
 // Start
