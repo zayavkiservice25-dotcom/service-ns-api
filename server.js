@@ -6079,8 +6079,6 @@ app.post(
               vat_amount,
               amount_with_vat,
               vat_account,
-              turnover_type,
-              receipt_type_name,
               cost_account_bu,
               cost_account_nu,
               project_id,
@@ -6089,7 +6087,7 @@ app.post(
             )
             VALUES (
               $1,$2,$3,$4,$5,$6,$7,$8,
-              $9,$10,$11,$12,$13,$14,$15,$16,NOW()
+              $9,$10,$11,$12,$13,$14,NOW()
             )
             `,
             [
@@ -6103,8 +6101,6 @@ app.post(
               oneCNumber(item.vat_amount),
               oneCNumber(item.amount_with_vat),
               oneCText(item.vat_account),
-              oneCText(item.turnover_type ?? item.Turnover_type),
-              oneCText(item.receipt_type_name),
               oneCText(item.cost_account_bu),
               oneCText(item.cost_account_nu),
               oneCText(item.project_id),
@@ -6144,8 +6140,6 @@ app.post(
               vat_amount,
               amount_with_vat,
               vat_account,
-              turnover_type,
-              receipt_type_name,
               cost_account_bu,
               cost_account_nu,
               project_id,
@@ -6154,7 +6148,7 @@ app.post(
             )
             VALUES (
               $1,$2,$3,$4,$5,$6,$7,$8,$9,
-              $10,$11,$12,$13,$14,$15,$16,$17,NOW()
+              $10,$11,$12,$13,$14,$15,NOW()
             )
             `,
             [
@@ -6169,10 +6163,6 @@ app.post(
               oneCNumber(service.vat_amount),
               oneCNumber(service.amount_with_vat),
               oneCText(service.vat_account),
-              oneCText(
-                service.turnover_type ?? service.Turnover_type
-              ),
-              oneCText(service.receipt_type_name),
               oneCText(service.cost_account_bu),
               oneCText(service.cost_account_nu),
               oneCText(service.project_id),
