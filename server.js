@@ -5278,7 +5278,8 @@ app.post(
               receipt_type_name,
               cost_account_bu,
               cost_account_nu,
-              in_group,
+              project_id,
+              project_name,
               updated_at
             )
             VALUES (
@@ -5817,6 +5818,392 @@ app.post(
         success: false,
         message: error.message
       });
+    }
+  }
+);
+
+// =====================================================
+// ПРИЁМ ДОКУМЕНТОВ ПРОДАЖИ doc_sales
+// Внутри JSON: doc_items и doc_services
+// =====================================================
+
+app.post(
+  "/api/1c/doc_sales",
+  checkOneCApiKey,
+  async (req, res) => {
+    const client = await pool.connect();
+
+    try {
+      const documents = oneCArray(req.body);
+
+      if (!documents.length) {
+        return res.status(400).json({
+          success: false,
+          error: "EMPTY_BODY",
+          message: "JSON не содержит документов продажи"
+        });
+      }
+
+      await client.query("BEGIN");
+
+      const results = [];
+
+      for (const doc of documents) {
+        const documentId = oneCText(doc.document_id);
+
+        if (!documentId) {
+          throw new Error(
+            "В одном из документов продажи отсутствует document_id"
+          );
+        }
+
+        const oldDocument = await client.query(
+          `
+          SELECT document_id
+          FROM public.doc_sales
+          WHERE document_id = $1
+          LIMIT 1
+          `,
+          [documentId]
+        );
+
+        const operation =
+          oldDocument.rowCount > 0 ? "updated" : "inserted";
+
+        // =================================================
+        // ШАПКА ДОКУМЕНТА ПРОДАЖИ
+        // =================================================
+
+        await client.query(
+          `
+          INSERT INTO public.doc_sales (
+            document_id,
+            document_number,
+            document_posted,
+            document_date,
+
+            organization_bin,
+            organization_name,
+
+            warehouse_id,
+            warehouse_name,
+
+            counterparty_id,
+            counterparty_bin,
+            counterparty_name,
+
+            contract_id,
+            contract_name,
+
+            currency_name,
+            income_kpn,
+            settlement_account,
+            advance_account,
+
+            vat_enable,
+            vat_mode,
+
+            document_sum,
+            document_commentary,
+            document_author_name,
+            document_type,
+
+            advance_withheld,
+            guarantee_withheld,
+            penalty_withheld,
+            other_withheld,
+
+            target_entity,
+            action_required,
+            is_executed,
+            is_managerial,
+
+            id_dov,
+            deleted,
+            updated_at
+          )
+          VALUES (
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+            $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+            $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,
+            $31,$32,$33,NOW()
+          )
+          ON CONFLICT (document_id)
+          DO UPDATE SET
+            document_number = EXCLUDED.document_number,
+            document_posted = EXCLUDED.document_posted,
+            document_date = EXCLUDED.document_date,
+
+            organization_bin = EXCLUDED.organization_bin,
+            organization_name = EXCLUDED.organization_name,
+
+            warehouse_id = EXCLUDED.warehouse_id,
+            warehouse_name = EXCLUDED.warehouse_name,
+
+            counterparty_id = EXCLUDED.counterparty_id,
+            counterparty_bin = EXCLUDED.counterparty_bin,
+            counterparty_name = EXCLUDED.counterparty_name,
+
+            contract_id = EXCLUDED.contract_id,
+            contract_name = EXCLUDED.contract_name,
+
+            currency_name = EXCLUDED.currency_name,
+            income_kpn = EXCLUDED.income_kpn,
+            settlement_account = EXCLUDED.settlement_account,
+            advance_account = EXCLUDED.advance_account,
+
+            vat_enable = EXCLUDED.vat_enable,
+            vat_mode = EXCLUDED.vat_mode,
+
+            document_sum = EXCLUDED.document_sum,
+            document_commentary = EXCLUDED.document_commentary,
+            document_author_name = EXCLUDED.document_author_name,
+            document_type = EXCLUDED.document_type,
+
+            advance_withheld = EXCLUDED.advance_withheld,
+            guarantee_withheld = EXCLUDED.guarantee_withheld,
+            penalty_withheld = EXCLUDED.penalty_withheld,
+            other_withheld = EXCLUDED.other_withheld,
+
+            target_entity = EXCLUDED.target_entity,
+            action_required = EXCLUDED.action_required,
+            is_executed = EXCLUDED.is_executed,
+            is_managerial = EXCLUDED.is_managerial,
+
+            id_dov = EXCLUDED.id_dov,
+            deleted = EXCLUDED.deleted,
+            updated_at = NOW()
+          `,
+          [
+            documentId,
+            oneCText(doc.document_number),
+            oneCBoolean(doc.document_posted),
+            oneCText(doc.document_date),
+
+            oneCText(doc.organization_bin),
+            oneCText(doc.organization_name),
+
+            oneCText(doc.warehouse_id),
+            oneCText(doc.warehouse_name),
+
+            oneCText(doc.counterparty_id),
+            oneCText(doc.counterparty_bin),
+            oneCText(doc.counterparty_name),
+
+            oneCText(doc.contract_id),
+            oneCText(doc.contract_name),
+
+            oneCText(doc.currency_name),
+            oneCText(doc.income_kpn),
+            oneCText(doc.settlement_account),
+            oneCText(doc.advance_account),
+
+            oneCBoolean(doc.vat_enable),
+            oneCText(doc.vat_mode),
+
+            oneCNumber(doc.document_sum),
+            oneCText(doc.document_commentary),
+            oneCText(doc.document_author_name),
+            oneCText(doc.document_type),
+
+            oneCNumber(doc.advance_withheld),
+            oneCNumber(doc.guarantee_withheld),
+            oneCNumber(doc.penalty_withheld),
+            oneCNumber(doc.other_withheld),
+
+            oneCText(doc.target_entity),
+            oneCBoolean(doc.action_required),
+            oneCBoolean(doc.is_executed),
+            oneCBoolean(doc.is_managerial),
+
+            oneCText(doc.id_dov),
+            oneCBoolean(doc.deleted) ?? false
+          ]
+        );
+
+        /*
+         * При повторной отправке документа продажи удаляем
+         * старые строки массивов и записываем новые из 1С.
+         */
+        await client.query(
+          `
+          DELETE FROM public.doc_sales_items
+          WHERE document_id = $1
+          `,
+          [documentId]
+        );
+
+        await client.query(
+          `
+          DELETE FROM public.doc_sales_services
+          WHERE document_id = $1
+          `,
+          [documentId]
+        );
+
+        // =================================================
+        // МАССИВ doc_items
+        // =================================================
+
+        const docItems = Array.isArray(doc.doc_items)
+          ? doc.doc_items
+          : [];
+
+        for (const item of docItems) {
+          const itemId = oneCText(item.item_id);
+
+          if (!itemId) {
+            throw new Error(
+              `В doc_items документа продажи ${documentId} отсутствует item_id`
+            );
+          }
+
+          await client.query(
+            `
+            INSERT INTO public.doc_sales_items (
+              document_id,
+              item_id,
+              item_name,
+              quantity,
+              price,
+              amount,
+              vat_percent,
+              vat_amount,
+              amount_with_vat,
+              vat_account,
+              turnover_type,
+              receipt_type_name,
+              cost_account_bu,
+              cost_account_nu,
+              project_id,
+              project_name,
+              updated_at
+            )
+            VALUES (
+              $1,$2,$3,$4,$5,$6,$7,$8,
+              $9,$10,$11,$12,$13,$14,$15,$16,NOW()
+            )
+            `,
+            [
+              documentId,
+              itemId,
+              oneCText(item.item_name),
+              oneCNumber(item.quantity),
+              oneCNumber(item.price),
+              oneCNumber(item.amount),
+              oneCNumber(item.vat_percent),
+              oneCNumber(item.vat_amount),
+              oneCNumber(item.amount_with_vat),
+              oneCText(item.vat_account),
+              oneCText(item.turnover_type ?? item.Turnover_type),
+              oneCText(item.receipt_type_name),
+              oneCText(item.cost_account_bu),
+              oneCText(item.cost_account_nu),
+              oneCText(item.project_id),
+              oneCText(item.project_name)
+            ]
+          );
+        }
+
+        // =================================================
+        // МАССИВ doc_services
+        // =================================================
+
+        const docServices = Array.isArray(doc.doc_services)
+          ? doc.doc_services
+          : [];
+
+        for (const service of docServices) {
+          const serviceId = oneCText(service.service_id);
+
+          if (!serviceId) {
+            throw new Error(
+              `В doc_services документа продажи ${documentId} отсутствует service_id`
+            );
+          }
+
+          await client.query(
+            `
+            INSERT INTO public.doc_sales_services (
+              document_id,
+              service_id,
+              service_name,
+              service_content,
+              quantity,
+              price,
+              amount,
+              vat_percent,
+              vat_amount,
+              amount_with_vat,
+              vat_account,
+              turnover_type,
+              receipt_type_name,
+              cost_account_bu,
+              cost_account_nu,
+              project_id,
+              project_name,
+              updated_at
+            )
+            VALUES (
+              $1,$2,$3,$4,$5,$6,$7,$8,$9,
+              $10,$11,$12,$13,$14,$15,$16,$17,NOW()
+            )
+            `,
+            [
+              documentId,
+              serviceId,
+              oneCText(service.service_name),
+              oneCText(service.service_content),
+              oneCNumber(service.quantity),
+              oneCNumber(service.price),
+              oneCNumber(service.amount),
+              oneCNumber(service.vat_percent),
+              oneCNumber(service.vat_amount),
+              oneCNumber(service.amount_with_vat),
+              oneCText(service.vat_account),
+              oneCText(
+                service.turnover_type ?? service.Turnover_type
+              ),
+              oneCText(service.receipt_type_name),
+              oneCText(service.cost_account_bu),
+              oneCText(service.cost_account_nu),
+              oneCText(service.project_id),
+              oneCText(service.project_name)
+            ]
+          );
+        }
+
+        results.push({
+          document_id: documentId,
+          operation,
+          doc_items_count: docItems.length,
+          doc_services_count: docServices.length
+        });
+      }
+
+      await client.query("COMMIT");
+
+      return res.json({
+        success: true,
+        received: documents.length,
+        results
+      });
+
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {}
+
+      console.error("1C DOC_SALES ERROR:", error);
+
+      return res.status(500).json({
+        success: false,
+        error: "DOC_SALES_ERROR",
+        message: error.message
+      });
+
+    } finally {
+      client.release();
     }
   }
 );
