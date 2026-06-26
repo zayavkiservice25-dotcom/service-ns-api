@@ -6412,10 +6412,12 @@ app.post(
               vat_amount,
 
               cash_flow_item,
+              project_id,
+              project_name,
               updated_at
             )
             VALUES (
-              $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW()
+              $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW()
             )
             `,
             [
@@ -6434,7 +6436,9 @@ app.post(
               oneCNumber(row.vat_percent),
               oneCNumber(row.vat_amount),
 
-              oneCText(row.cash_flow_item)
+              oneCText(row.cash_flow_item),
+              oneCText(row.project_id),
+              oneCText(row.project_name)
             ]
           );
 
