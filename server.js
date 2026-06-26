@@ -774,107 +774,289 @@ await pool.query(`
 `);
 
 // =====================================================
-// 1С: ПЛАТЕЖНОЕ ПОРУЧЕНИЕ ВХОДЯЩЕЕ — МАССИВЫ ВОЗВРАТОВ
+// 1С: ПЛАТЕЖНОЕ ПОРУЧЕНИЕ ИСХОДЯЩЕЕ
+// doc_outgoingpaymentorder + 10 табличных частей
 // =====================================================
 
 await pool.query(`
-  CREATE TABLE IF NOT EXISTS public.doc_incomingpaymentorder_payment_return_pension (
+  CREATE TABLE IF NOT EXISTS public.doc_outgoingpaymentorder (
+    document_id text PRIMARY KEY,
+    document_number text,
+    document_date timestamptz,
+    document_posted boolean,
+
+    bank_intermediary text,
+    bank_intermediary_account text,
+    tax_type text,
+    payment_type text,
+    include_bank_commission boolean,
+
+    value_date date,
+    statement_date date,
+    date_receipt_goods date,
+
+    code_bk text,
+    code_purpose_of_payment text,
+    document_commentary text,
+
+    rnn_payer text,
+    rnn_recipient text,
+    text_payer text,
+    text_recipient text,
+
+    percent_commission numeric(10,4),
+    amount_commission numeric(18,2),
+
+    fact_payer text,
+
+    organization_bin text,
+    organization_name text,
+
+    paid boolean,
+    document_author_name text,
+    responsible text,
+    operation_type text,
+    currency_name text,
+    document_sum numeric(18,2),
+
+    cash_flow_item text,
+    bank_account text,
+    counterparty_account text,
+    organization_account text,
+    purpose_of_payment text,
+
+    incoming_doc_date date,
+    incoming_doc_number text,
+
+    advance text,
+    target_entity text,
+    action_required text,
+    is_executed boolean,
+    ft_idzft text,
+
+    counterparty_id text,
+    counterparty_bin text,
+    counterparty_name text,
+
+    deleted boolean DEFAULT false,
+
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now()
+  );
+`);
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS public.doc_outgoingpaymentorder_payment_transcript (
     document_id text NOT NULL,
     line_no integer NOT NULL,
+
+    contract_id text,
+    contract_name text,
+    doc_deal text,
+    settlement_rate numeric(18,6),
+    payment_amount numeric(18,2),
+    frequency_settlements numeric(18,6),
+    settlement_amount numeric(18,2),
+    vat_percent numeric(10,4),
+    vat_amount numeric(18,2),
+    cash_flow_item text,
     project_id text,
     project_name text,
-    return_sum numeric(18,2),
-    doc_return text,
+
     created_at timestamptz DEFAULT now(),
     updated_at timestamptz DEFAULT now(),
 
     PRIMARY KEY (document_id, line_no),
-
-    CONSTRAINT incomingpaymentorder_return_pension_fk
+    CONSTRAINT outgoingpaymentorder_transcript_fk
       FOREIGN KEY (document_id)
-      REFERENCES public.doc_incomingpaymentorder(document_id)
+      REFERENCES public.doc_outgoingpaymentorder(document_id)
       ON DELETE CASCADE
   );
 `);
 
 await pool.query(`
-  CREATE TABLE IF NOT EXISTS public.doc_incomingpaymentorder_payment_return_social (
+  CREATE TABLE IF NOT EXISTS public.doc_outgoingpaymentorder_payment_transfer_salary (
     document_id text NOT NULL,
     line_no integer NOT NULL,
     project_id text,
     project_name text,
-    return_sum numeric(18,2),
-    doc_return text,
+    transfer_sum numeric(18,2),
+    doc_transfer text,
     created_at timestamptz DEFAULT now(),
     updated_at timestamptz DEFAULT now(),
-
     PRIMARY KEY (document_id, line_no),
-
-    CONSTRAINT incomingpaymentorder_return_social_fk
+    CONSTRAINT outgoingpaymentorder_salary_fk
       FOREIGN KEY (document_id)
-      REFERENCES public.doc_incomingpaymentorder(document_id)
+      REFERENCES public.doc_outgoingpaymentorder(document_id)
       ON DELETE CASCADE
   );
 `);
 
 await pool.query(`
-  CREATE TABLE IF NOT EXISTS public.doc_incomingpaymentorder_payment_return_salary (
+  CREATE TABLE IF NOT EXISTS public.doc_outgoingpaymentorder_payment_transfer_pension (
     document_id text NOT NULL,
     line_no integer NOT NULL,
     project_id text,
     project_name text,
-    return_sum numeric(18,2),
-    doc_return text,
+    transfer_sum numeric(18,2),
+    doc_transfer text,
     created_at timestamptz DEFAULT now(),
     updated_at timestamptz DEFAULT now(),
-
     PRIMARY KEY (document_id, line_no),
-
-    CONSTRAINT incomingpaymentorder_return_salary_fk
+    CONSTRAINT outgoingpaymentorder_pension_fk
       FOREIGN KEY (document_id)
-      REFERENCES public.doc_incomingpaymentorder(document_id)
+      REFERENCES public.doc_outgoingpaymentorder(document_id)
       ON DELETE CASCADE
   );
 `);
 
 await pool.query(`
-  CREATE TABLE IF NOT EXISTS public.doc_incomingpaymentorder_payment_return_single (
+  CREATE TABLE IF NOT EXISTS public.doc_outgoingpaymentorder_payment_transfer_social (
     document_id text NOT NULL,
     line_no integer NOT NULL,
     project_id text,
     project_name text,
-    return_sum numeric(18,2),
-    doc_return text,
+    transfer_sum numeric(18,2),
+    doc_transfer text,
     created_at timestamptz DEFAULT now(),
     updated_at timestamptz DEFAULT now(),
-
     PRIMARY KEY (document_id, line_no),
-
-    CONSTRAINT incomingpaymentorder_return_single_fk
+    CONSTRAINT outgoingpaymentorder_social_fk
       FOREIGN KEY (document_id)
-      REFERENCES public.doc_incomingpaymentorder(document_id)
+      REFERENCES public.doc_outgoingpaymentorder(document_id)
       ON DELETE CASCADE
   );
 `);
 
 await pool.query(`
-  CREATE INDEX IF NOT EXISTS incomingpaymentorder_return_pension_project_idx
-  ON public.doc_incomingpaymentorder_payment_return_pension(project_id);
+  CREATE TABLE IF NOT EXISTS public.doc_outgoingpaymentorder_payment_transfer_execution (
+    document_id text NOT NULL,
+    line_no integer NOT NULL,
+    project_id text,
+    project_name text,
+    transfer_sum numeric(18,2),
+    transfer_sum_payment numeric(18,2),
+    transfer_sum_fees numeric(18,2),
+    doc_transfer text,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+    PRIMARY KEY (document_id, line_no),
+    CONSTRAINT outgoingpaymentorder_execution_fk
+      FOREIGN KEY (document_id)
+      REFERENCES public.doc_outgoingpaymentorder(document_id)
+      ON DELETE CASCADE
+  );
 `);
 
 await pool.query(`
-  CREATE INDEX IF NOT EXISTS incomingpaymentorder_return_social_project_idx
-  ON public.doc_incomingpaymentorder_payment_return_social(project_id);
+  CREATE TABLE IF NOT EXISTS public.doc_outgoingpaymentorder_payment_transfer_vat (
+    document_id text NOT NULL,
+    line_no integer NOT NULL,
+    project_id text,
+    project_name text,
+    contract_id text,
+    contract_name text,
+    counterparty_id text,
+    counterparty_bin text,
+    counterparty_name text,
+    type_receipt_vat text,
+    type_turnover_vat text,
+    vat_percent numeric(10,4),
+    term_of_payment date,
+    sum_of_payment numeric(18,2),
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+    PRIMARY KEY (document_id, line_no),
+    CONSTRAINT outgoingpaymentorder_vat_fk
+      FOREIGN KEY (document_id)
+      REFERENCES public.doc_outgoingpaymentorder(document_id)
+      ON DELETE CASCADE
+  );
 `);
 
 await pool.query(`
-  CREATE INDEX IF NOT EXISTS incomingpaymentorder_return_salary_project_idx
-  ON public.doc_incomingpaymentorder_payment_return_salary(project_id);
+  CREATE TABLE IF NOT EXISTS public.doc_outgoingpaymentorder_payment_transfer_report (
+    document_id text NOT NULL,
+    line_no integer NOT NULL,
+    project_id text,
+    project_name text,
+    individual text,
+    number_card_account text,
+    type_of_debt text,
+    sum_of_payment numeric(18,2),
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+    PRIMARY KEY (document_id, line_no),
+    CONSTRAINT outgoingpaymentorder_report_fk
+      FOREIGN KEY (document_id)
+      REFERENCES public.doc_outgoingpaymentorder(document_id)
+      ON DELETE CASCADE
+  );
 `);
 
 await pool.query(`
-  CREATE INDEX IF NOT EXISTS incomingpaymentorder_return_single_project_idx
-  ON public.doc_incomingpaymentorder_payment_return_single(project_id);
+  CREATE TABLE IF NOT EXISTS public.doc_outgoingpaymentorder_payment_transfer_single (
+    document_id text NOT NULL,
+    line_no integer NOT NULL,
+    project_id text,
+    project_name text,
+    transfer_sum numeric(18,2),
+    doc_transfer text,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+    PRIMARY KEY (document_id, line_no),
+    CONSTRAINT outgoingpaymentorder_single_fk
+      FOREIGN KEY (document_id)
+      REFERENCES public.doc_outgoingpaymentorder(document_id)
+      ON DELETE CASCADE
+  );
+`);
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS public.doc_outgoingpaymentorder_payment_transfer_other (
+    document_id text NOT NULL,
+    line_no integer NOT NULL,
+    transfer_sum numeric(18,2),
+    doc_transfer text,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+    PRIMARY KEY (document_id, line_no),
+    CONSTRAINT outgoingpaymentorder_other_fk
+      FOREIGN KEY (document_id)
+      REFERENCES public.doc_outgoingpaymentorder(document_id)
+      ON DELETE CASCADE
+  );
+`);
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS public.doc_outgoingpaymentorder_payment_transfer_other_income (
+    document_id text NOT NULL,
+    line_no integer NOT NULL,
+    transfer_sum numeric(18,2),
+    doc_transfer text,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+    PRIMARY KEY (document_id, line_no),
+    CONSTRAINT outgoingpaymentorder_other_income_fk
+      FOREIGN KEY (document_id)
+      REFERENCES public.doc_outgoingpaymentorder(document_id)
+      ON DELETE CASCADE
+  );
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS outgoingpaymentorder_document_date_idx
+  ON public.doc_outgoingpaymentorder(document_date);
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS outgoingpaymentorder_counterparty_id_idx
+  ON public.doc_outgoingpaymentorder(counterparty_id);
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS outgoingpaymentorder_ft_idzft_idx
+  ON public.doc_outgoingpaymentorder(ft_idzft);
 `);
 
    console.log("DB init OK ✅");
@@ -6312,60 +6494,6 @@ oneCText(doc.is_managerial),
 );
 
 // =====================================================
-// Сохранение табличных частей возвратов входящего платежа
-// =====================================================
-
-async function saveIncomingPaymentReturnRows(
-  client,
-  tableName,
-  documentId,
-  rows
-) {
-  const safeTables = new Set([
-    "doc_incomingpaymentorder_payment_return_pension",
-    "doc_incomingpaymentorder_payment_return_social",
-    "doc_incomingpaymentorder_payment_return_salary",
-    "doc_incomingpaymentorder_payment_return_single"
-  ]);
-
-  if (!safeTables.has(tableName)) {
-    throw new Error("Недопустимое имя таблицы возврата");
-  }
-
-  const list = Array.isArray(rows) ? rows : [];
-
-  for (let index = 0; index < list.length; index++) {
-    const row = list[index] || {};
-    const lineNo = index + 1;
-
-    await client.query(
-      `
-      INSERT INTO public.${tableName} (
-        document_id,
-        line_no,
-        project_id,
-        project_name,
-        return_sum,
-        doc_return,
-        updated_at
-      )
-      VALUES ($1,$2,$3,$4,$5,$6,NOW())
-      `,
-      [
-        documentId,
-        lineNo,
-        oneCText(row.project_id),
-        oneCText(row.project_name),
-        oneCNumber(row.return_sum),
-        oneCText(row.doc_return)
-      ]
-    );
-  }
-
-  return list.length;
-}
-
-// =====================================================
 // ПЛАТЕЖНОЕ ПОРУЧЕНИЕ ВХОДЯЩЕЕ
 // POST /api/1c/doc_incomingpaymentorder
 // Табличная часть: payment_transcript
@@ -6542,38 +6670,6 @@ app.post(
           [documentId]
         );
 
-        await client.query(
-          `
-          DELETE FROM public.doc_incomingpaymentorder_payment_return_pension
-          WHERE document_id = $1
-          `,
-          [documentId]
-        );
-
-        await client.query(
-          `
-          DELETE FROM public.doc_incomingpaymentorder_payment_return_social
-          WHERE document_id = $1
-          `,
-          [documentId]
-        );
-
-        await client.query(
-          `
-          DELETE FROM public.doc_incomingpaymentorder_payment_return_salary
-          WHERE document_id = $1
-          `,
-          [documentId]
-        );
-
-        await client.query(
-          `
-          DELETE FROM public.doc_incomingpaymentorder_payment_return_single
-          WHERE document_id = $1
-          `,
-          [documentId]
-        );
-
         const paymentTranscript = Array.isArray(doc.payment_transcript)
           ? doc.payment_transcript
           : [];
@@ -6636,42 +6732,10 @@ app.post(
           insertedRows++;
         }
 
-        const pensionCount = await saveIncomingPaymentReturnRows(
-          client,
-          "doc_incomingpaymentorder_payment_return_pension",
-          documentId,
-          doc.payment_return_pension
-        );
-
-        const socialCount = await saveIncomingPaymentReturnRows(
-          client,
-          "doc_incomingpaymentorder_payment_return_social",
-          documentId,
-          doc.payment_return_social
-        );
-
-        const salaryCount = await saveIncomingPaymentReturnRows(
-          client,
-          "doc_incomingpaymentorder_payment_return_salary",
-          documentId,
-          doc.payment_return_salary
-        );
-
-        const singleCount = await saveIncomingPaymentReturnRows(
-          client,
-          "doc_incomingpaymentorder_payment_return_single",
-          documentId,
-          doc.payment_return_single
-        );
-
         results.push({
           document_id: documentId,
           operation,
-          payment_transcript_count: insertedRows,
-          payment_return_pension_count: pensionCount,
-          payment_return_social_count: socialCount,
-          payment_return_salary_count: salaryCount,
-          payment_return_single_count: singleCount
+          payment_transcript_count: insertedRows
         });
       }
 
@@ -6705,4 +6769,458 @@ app.post(
 // Start
 // =====================================================
 const PORT = process.env.PORT || 3000;
+
+// =====================================================
+// ПЛАТЕЖНОЕ ПОРУЧЕНИЕ ИСХОДЯЩЕЕ
+// POST /api/1c/doc_outgoingpaymentorder
+// Один API принимает шапку и 10 массивов
+// =====================================================
+
+const OUTGOING_PAYMENT_PARTS = {
+  payment_transcript: {
+    table: "doc_outgoingpaymentorder_payment_transcript",
+    fields: [
+      ["contract_id", oneCText],
+      ["contract_name", oneCText],
+      ["doc_deal", oneCText],
+      ["settlement_rate", oneCNumber],
+      ["payment_amount", oneCNumber],
+      ["frequency_settlements", oneCNumber],
+      ["settlement_amount", oneCNumber],
+      ["vat_percent", oneCNumber],
+      ["vat_amount", oneCNumber],
+      ["cash_flow_item", oneCText],
+      ["project_id", oneCText],
+      ["project_name", oneCText]
+    ]
+  },
+
+  payment_transfer_salary: {
+    table: "doc_outgoingpaymentorder_payment_transfer_salary",
+    fields: [
+      ["project_id", oneCText],
+      ["project_name", oneCText],
+      ["transfer_sum", oneCNumber],
+      ["doc_transfer", oneCText]
+    ]
+  },
+
+  payment_transfer_pension: {
+    table: "doc_outgoingpaymentorder_payment_transfer_pension",
+    fields: [
+      ["project_id", oneCText],
+      ["project_name", oneCText],
+      ["transfer_sum", oneCNumber],
+      ["doc_transfer", oneCText]
+    ]
+  },
+
+  payment_transfer_social: {
+    table: "doc_outgoingpaymentorder_payment_transfer_social",
+    fields: [
+      ["project_id", oneCText],
+      ["project_name", oneCText],
+      ["transfer_sum", oneCNumber],
+      ["doc_transfer", oneCText]
+    ]
+  },
+
+  payment_transfer_execution: {
+    table: "doc_outgoingpaymentorder_payment_transfer_execution",
+    fields: [
+      ["project_id", oneCText],
+      ["project_name", oneCText],
+      ["transfer_sum", oneCNumber],
+      ["transfer_sum_payment", oneCNumber],
+      ["transfer_sum_fees", oneCNumber],
+      ["doc_transfer", oneCText]
+    ]
+  },
+
+  payment_transfer_vat: {
+    table: "doc_outgoingpaymentorder_payment_transfer_vat",
+    fields: [
+      ["project_id", oneCText],
+      ["project_name", oneCText],
+      ["contract_id", oneCText],
+      ["contract_name", oneCText],
+      ["counterparty_id", oneCText],
+      ["counterparty_bin", oneCText],
+      ["counterparty_name", oneCText],
+      ["type_receipt_vat", oneCText],
+      ["type_turnover_vat", oneCText],
+      ["vat_percent", oneCNumber],
+      ["term_of_payment", oneCText],
+      ["sum_of_payment", oneCNumber]
+    ]
+  },
+
+  payment_transfer_report: {
+    table: "doc_outgoingpaymentorder_payment_transfer_report",
+    fields: [
+      ["project_id", oneCText],
+      ["project_name", oneCText],
+      ["individual", oneCText],
+      ["number_card_account", oneCText],
+      ["type_of_debt", oneCText],
+      ["sum_of_payment", oneCNumber]
+    ]
+  },
+
+  payment_transfer_single: {
+    table: "doc_outgoingpaymentorder_payment_transfer_single",
+    fields: [
+      ["project_id", oneCText],
+      ["project_name", oneCText],
+      ["transfer_sum", oneCNumber],
+      ["doc_transfer", oneCText]
+    ]
+  },
+
+  payment_transfer_other: {
+    table: "doc_outgoingpaymentorder_payment_transfer_other",
+    fields: [
+      ["transfer_sum", oneCNumber],
+      ["doc_transfer", oneCText]
+    ]
+  },
+
+  payment_transfer_other_income: {
+    table: "doc_outgoingpaymentorder_payment_transfer_other_income",
+    fields: [
+      ["transfer_sum", oneCNumber],
+      ["doc_transfer", oneCText]
+    ]
+  }
+};
+
+async function replaceOutgoingPaymentPart(
+  client,
+  documentId,
+  rows,
+  config
+) {
+  await client.query(
+    `DELETE FROM public.${config.table} WHERE document_id = $1`,
+    [documentId]
+  );
+
+  const list = Array.isArray(rows) ? rows : [];
+  const fieldNames = config.fields.map(([name]) => name);
+
+  for (let index = 0; index < list.length; index++) {
+    const row = list[index] || {};
+    const lineNo = index + 1;
+
+    const columns = ["document_id", "line_no", ...fieldNames, "updated_at"];
+    const placeholders = [
+      "$1",
+      "$2",
+      ...fieldNames.map((_, fieldIndex) => `$${fieldIndex + 3}`),
+      "NOW()"
+    ];
+
+    const values = [
+      documentId,
+      lineNo,
+      ...config.fields.map(([name, converter]) => converter(row[name]))
+    ];
+
+    await client.query(
+      `
+      INSERT INTO public.${config.table} (
+        ${columns.join(", ")}
+      )
+      VALUES (
+        ${placeholders.join(", ")}
+      )
+      `,
+      values
+    );
+  }
+
+  return list.length;
+}
+
+app.post(
+  "/api/1c/doc_outgoingpaymentorder",
+  checkOneCApiKey,
+  async (req, res) => {
+    const client = await pool.connect();
+
+    try {
+      const documents = oneCArray(req.body);
+
+      if (!documents.length) {
+        return res.status(400).json({
+          success: false,
+          error: "EMPTY_BODY",
+          message: "JSON не содержит документов"
+        });
+      }
+
+      await client.query("BEGIN");
+
+      const results = [];
+
+      for (const doc of documents) {
+        const documentId = oneCText(doc.document_id);
+
+        if (!documentId) {
+          throw new Error(
+            "В одном из документов отсутствует document_id"
+          );
+        }
+
+        const exists = await client.query(
+          `
+          SELECT document_id
+          FROM public.doc_outgoingpaymentorder
+          WHERE document_id = $1
+          LIMIT 1
+          `,
+          [documentId]
+        );
+
+        const operation = exists.rowCount ? "updated" : "inserted";
+
+        await client.query(
+          `
+          INSERT INTO public.doc_outgoingpaymentorder (
+            document_id,
+            document_number,
+            document_date,
+            document_posted,
+
+            bank_intermediary,
+            bank_intermediary_account,
+            tax_type,
+            payment_type,
+            include_bank_commission,
+
+            value_date,
+            statement_date,
+            date_receipt_goods,
+
+            code_bk,
+            code_purpose_of_payment,
+            document_commentary,
+
+            rnn_payer,
+            rnn_recipient,
+            text_payer,
+            text_recipient,
+
+            percent_commission,
+            amount_commission,
+            fact_payer,
+
+            organization_bin,
+            organization_name,
+
+            paid,
+            document_author_name,
+            responsible,
+            operation_type,
+            currency_name,
+            document_sum,
+
+            cash_flow_item,
+            bank_account,
+            counterparty_account,
+            organization_account,
+            purpose_of_payment,
+
+            incoming_doc_date,
+            incoming_doc_number,
+
+            advance,
+            target_entity,
+            action_required,
+            is_executed,
+            ft_idzft,
+
+            counterparty_id,
+            counterparty_bin,
+            counterparty_name,
+
+            deleted,
+            updated_at
+          )
+          VALUES (
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+            $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+            $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,
+            $31,$32,$33,$34,$35,$36,$37,$38,$39,$40,
+            $41,$42,$43,$44,$45,$46,NOW()
+          )
+          ON CONFLICT (document_id)
+          DO UPDATE SET
+            document_number = EXCLUDED.document_number,
+            document_date = EXCLUDED.document_date,
+            document_posted = EXCLUDED.document_posted,
+
+            bank_intermediary = EXCLUDED.bank_intermediary,
+            bank_intermediary_account = EXCLUDED.bank_intermediary_account,
+            tax_type = EXCLUDED.tax_type,
+            payment_type = EXCLUDED.payment_type,
+            include_bank_commission = EXCLUDED.include_bank_commission,
+
+            value_date = EXCLUDED.value_date,
+            statement_date = EXCLUDED.statement_date,
+            date_receipt_goods = EXCLUDED.date_receipt_goods,
+
+            code_bk = EXCLUDED.code_bk,
+            code_purpose_of_payment = EXCLUDED.code_purpose_of_payment,
+            document_commentary = EXCLUDED.document_commentary,
+
+            rnn_payer = EXCLUDED.rnn_payer,
+            rnn_recipient = EXCLUDED.rnn_recipient,
+            text_payer = EXCLUDED.text_payer,
+            text_recipient = EXCLUDED.text_recipient,
+
+            percent_commission = EXCLUDED.percent_commission,
+            amount_commission = EXCLUDED.amount_commission,
+            fact_payer = EXCLUDED.fact_payer,
+
+            organization_bin = EXCLUDED.organization_bin,
+            organization_name = EXCLUDED.organization_name,
+
+            paid = EXCLUDED.paid,
+            document_author_name = EXCLUDED.document_author_name,
+            responsible = EXCLUDED.responsible,
+            operation_type = EXCLUDED.operation_type,
+            currency_name = EXCLUDED.currency_name,
+            document_sum = EXCLUDED.document_sum,
+
+            cash_flow_item = EXCLUDED.cash_flow_item,
+            bank_account = EXCLUDED.bank_account,
+            counterparty_account = EXCLUDED.counterparty_account,
+            organization_account = EXCLUDED.organization_account,
+            purpose_of_payment = EXCLUDED.purpose_of_payment,
+
+            incoming_doc_date = EXCLUDED.incoming_doc_date,
+            incoming_doc_number = EXCLUDED.incoming_doc_number,
+
+            advance = EXCLUDED.advance,
+            target_entity = EXCLUDED.target_entity,
+            action_required = EXCLUDED.action_required,
+            is_executed = EXCLUDED.is_executed,
+            ft_idzft = EXCLUDED.ft_idzft,
+
+            counterparty_id = EXCLUDED.counterparty_id,
+            counterparty_bin = EXCLUDED.counterparty_bin,
+            counterparty_name = EXCLUDED.counterparty_name,
+
+            deleted = EXCLUDED.deleted,
+            updated_at = NOW()
+          `,
+          [
+            documentId,
+            oneCText(doc.document_number),
+            oneCText(doc.document_date),
+            oneCBoolean(doc.document_posted),
+
+            oneCText(doc.bank_intermediary),
+            oneCText(doc.bank_intermediary_account),
+            oneCText(doc.tax_type),
+            oneCText(doc.payment_type),
+            oneCBoolean(doc.include_bank_commission),
+
+            oneCText(doc.value_date),
+            oneCText(doc.statement_date),
+            oneCText(doc.date_receipt_goods),
+
+            oneCText(doc.code_bk),
+            oneCText(doc.code_purpose_of_payment),
+            oneCText(doc.document_commentary),
+
+            oneCText(doc.rnn_payer),
+            oneCText(doc.rnn_recipient),
+            oneCText(doc.text_payer),
+            oneCText(doc.text_recipient),
+
+            oneCNumber(doc.percent_commission),
+            oneCNumber(doc.amount_commission),
+            oneCText(doc.fact_payer),
+
+            oneCText(doc.organization_bin),
+            oneCText(doc.organization_name),
+
+            oneCBoolean(doc.paid),
+            oneCText(doc.document_author_name),
+            oneCText(doc.responsible),
+            oneCText(doc.operation_type),
+            oneCText(doc.currency_name),
+            oneCNumber(doc.document_sum),
+
+            oneCText(doc.cash_flow_item),
+            oneCText(doc.bank_account),
+            oneCText(doc.counterparty_account),
+            oneCText(doc.organization_account),
+            oneCText(doc.purpose_of_payment),
+
+            oneCText(doc.incoming_doc_date),
+            oneCText(doc.incoming_doc_number),
+
+            oneCText(doc.advance),
+            oneCText(doc.target_entity),
+            oneCText(doc.action_required),
+            oneCBoolean(doc.is_executed),
+            oneCText(doc.ft_idzft),
+
+            oneCText(doc.counterparty_id),
+            oneCText(doc.counterparty_bin),
+            oneCText(doc.counterparty_name),
+
+            oneCBoolean(doc.deleted)
+          ]
+        );
+
+        const counts = {};
+
+        for (const [jsonName, config] of Object.entries(OUTGOING_PAYMENT_PARTS)) {
+          counts[`${jsonName}_count`] = await replaceOutgoingPaymentPart(
+            client,
+            documentId,
+            doc[jsonName],
+            config
+          );
+        }
+
+        results.push({
+          document_id: documentId,
+          operation,
+          ...counts
+        });
+      }
+
+      await client.query("COMMIT");
+
+      return res.json({
+        success: true,
+        count: results.length,
+        results
+      });
+
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {}
+
+      console.error("DOC-OUTGOINGPAYMENTORDER ERROR:", error);
+
+      return res.status(500).json({
+        success: false,
+        error: "DOC_OUTGOINGPAYMENTORDER_ERROR",
+        message: error.message
+      });
+
+    } finally {
+      client.release();
+    }
+  }
+);
+
+
 app.listen(PORT, () => console.log("Server started on port " + PORT))
