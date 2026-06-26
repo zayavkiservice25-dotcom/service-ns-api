@@ -772,6 +772,111 @@ await pool.query(`
   CREATE INDEX IF NOT EXISTS user_role_history_login_idx
   ON public.user_role_history (lower(trim(login)));
 `);
+
+// =====================================================
+// 1С: ПЛАТЕЖНОЕ ПОРУЧЕНИЕ ВХОДЯЩЕЕ — МАССИВЫ ВОЗВРАТОВ
+// =====================================================
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS public.doc_incomingpaymentorder_payment_return_pension (
+    document_id text NOT NULL,
+    line_no integer NOT NULL,
+    project_id text,
+    project_name text,
+    return_sum numeric(18,2),
+    doc_return text,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+
+    PRIMARY KEY (document_id, line_no),
+
+    CONSTRAINT incomingpaymentorder_return_pension_fk
+      FOREIGN KEY (document_id)
+      REFERENCES public.doc_incomingpaymentorder(document_id)
+      ON DELETE CASCADE
+  );
+`);
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS public.doc_incomingpaymentorder_payment_return_social (
+    document_id text NOT NULL,
+    line_no integer NOT NULL,
+    project_id text,
+    project_name text,
+    return_sum numeric(18,2),
+    doc_return text,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+
+    PRIMARY KEY (document_id, line_no),
+
+    CONSTRAINT incomingpaymentorder_return_social_fk
+      FOREIGN KEY (document_id)
+      REFERENCES public.doc_incomingpaymentorder(document_id)
+      ON DELETE CASCADE
+  );
+`);
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS public.doc_incomingpaymentorder_payment_return_salary (
+    document_id text NOT NULL,
+    line_no integer NOT NULL,
+    project_id text,
+    project_name text,
+    return_sum numeric(18,2),
+    doc_return text,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+
+    PRIMARY KEY (document_id, line_no),
+
+    CONSTRAINT incomingpaymentorder_return_salary_fk
+      FOREIGN KEY (document_id)
+      REFERENCES public.doc_incomingpaymentorder(document_id)
+      ON DELETE CASCADE
+  );
+`);
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS public.doc_incomingpaymentorder_payment_return_single (
+    document_id text NOT NULL,
+    line_no integer NOT NULL,
+    project_id text,
+    project_name text,
+    return_sum numeric(18,2),
+    doc_return text,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+
+    PRIMARY KEY (document_id, line_no),
+
+    CONSTRAINT incomingpaymentorder_return_single_fk
+      FOREIGN KEY (document_id)
+      REFERENCES public.doc_incomingpaymentorder(document_id)
+      ON DELETE CASCADE
+  );
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS incomingpaymentorder_return_pension_project_idx
+  ON public.doc_incomingpaymentorder_payment_return_pension(project_id);
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS incomingpaymentorder_return_social_project_idx
+  ON public.doc_incomingpaymentorder_payment_return_social(project_id);
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS incomingpaymentorder_return_salary_project_idx
+  ON public.doc_incomingpaymentorder_payment_return_salary(project_id);
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS incomingpaymentorder_return_single_project_idx
+  ON public.doc_incomingpaymentorder_payment_return_single(project_id);
+`);
+
    console.log("DB init OK ✅");
 }
 
@@ -6207,6 +6312,60 @@ oneCText(doc.is_managerial),
 );
 
 // =====================================================
+// Сохранение табличных частей возвратов входящего платежа
+// =====================================================
+
+async function saveIncomingPaymentReturnRows(
+  client,
+  tableName,
+  documentId,
+  rows
+) {
+  const safeTables = new Set([
+    "doc_incomingpaymentorder_payment_return_pension",
+    "doc_incomingpaymentorder_payment_return_social",
+    "doc_incomingpaymentorder_payment_return_salary",
+    "doc_incomingpaymentorder_payment_return_single"
+  ]);
+
+  if (!safeTables.has(tableName)) {
+    throw new Error("Недопустимое имя таблицы возврата");
+  }
+
+  const list = Array.isArray(rows) ? rows : [];
+
+  for (let index = 0; index < list.length; index++) {
+    const row = list[index] || {};
+    const lineNo = index + 1;
+
+    await client.query(
+      `
+      INSERT INTO public.${tableName} (
+        document_id,
+        line_no,
+        project_id,
+        project_name,
+        return_sum,
+        doc_return,
+        updated_at
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,NOW())
+      `,
+      [
+        documentId,
+        lineNo,
+        oneCText(row.project_id),
+        oneCText(row.project_name),
+        oneCNumber(row.return_sum),
+        oneCText(row.doc_return)
+      ]
+    );
+  }
+
+  return list.length;
+}
+
+// =====================================================
 // ПЛАТЕЖНОЕ ПОРУЧЕНИЕ ВХОДЯЩЕЕ
 // POST /api/1c/doc_incomingpaymentorder
 // Табличная часть: payment_transcript
@@ -6383,6 +6542,38 @@ app.post(
           [documentId]
         );
 
+        await client.query(
+          `
+          DELETE FROM public.doc_incomingpaymentorder_payment_return_pension
+          WHERE document_id = $1
+          `,
+          [documentId]
+        );
+
+        await client.query(
+          `
+          DELETE FROM public.doc_incomingpaymentorder_payment_return_social
+          WHERE document_id = $1
+          `,
+          [documentId]
+        );
+
+        await client.query(
+          `
+          DELETE FROM public.doc_incomingpaymentorder_payment_return_salary
+          WHERE document_id = $1
+          `,
+          [documentId]
+        );
+
+        await client.query(
+          `
+          DELETE FROM public.doc_incomingpaymentorder_payment_return_single
+          WHERE document_id = $1
+          `,
+          [documentId]
+        );
+
         const paymentTranscript = Array.isArray(doc.payment_transcript)
           ? doc.payment_transcript
           : [];
@@ -6445,10 +6636,42 @@ app.post(
           insertedRows++;
         }
 
+        const pensionCount = await saveIncomingPaymentReturnRows(
+          client,
+          "doc_incomingpaymentorder_payment_return_pension",
+          documentId,
+          doc.payment_return_pension
+        );
+
+        const socialCount = await saveIncomingPaymentReturnRows(
+          client,
+          "doc_incomingpaymentorder_payment_return_social",
+          documentId,
+          doc.payment_return_social
+        );
+
+        const salaryCount = await saveIncomingPaymentReturnRows(
+          client,
+          "doc_incomingpaymentorder_payment_return_salary",
+          documentId,
+          doc.payment_return_salary
+        );
+
+        const singleCount = await saveIncomingPaymentReturnRows(
+          client,
+          "doc_incomingpaymentorder_payment_return_single",
+          documentId,
+          doc.payment_return_single
+        );
+
         results.push({
           document_id: documentId,
           operation,
-          payment_transcript_count: insertedRows
+          payment_transcript_count: insertedRows,
+          payment_return_pension_count: pensionCount,
+          payment_return_social_count: socialCount,
+          payment_return_salary_count: salaryCount,
+          payment_return_single_count: singleCount
         });
       }
 
