@@ -271,6 +271,10 @@ await pool.query(`
   );
 `);
 
+await pool.query(`
+  CREATE SCHEMA IF NOT EXISTS onec;
+`);
+
 // =====================================================
 // ИНТЕГРАЦИЯ С 1С
 // Таблицы заранее создаются при запуске сервера
@@ -278,7 +282,7 @@ await pool.query(`
 
 // 1. Шапка документа поступления
 await pool.query(`
-  CREATE TABLE IF NOT EXISTS public.doc_receipts (
+  CREATE TABLE IF NOT EXISTS onec.doc_receipts (
     document_id text PRIMARY KEY,
     base_id text,
     document_number text,
@@ -331,7 +335,7 @@ is_managerial text,
 
 // 2. Товары документа
 await pool.query(`
-  CREATE TABLE IF NOT EXISTS public.doc_receipts_items (
+  CREATE TABLE IF NOT EXISTS onec.doc_receipts_items (
     document_id text NOT NULL,
     item_id text NOT NULL,
 
@@ -361,14 +365,14 @@ project_name text,
 
     CONSTRAINT doc_items_document_fk
       FOREIGN KEY (document_id)
-      REFERENCES public.doc_receipts(document_id)
+      REFERENCES onec.doc_receipts(document_id)
       ON DELETE CASCADE
   );
 `);
 
 // 3. Услуги документа
 await pool.query(`
-  CREATE TABLE IF NOT EXISTS public.doc_receipts_services (
+  CREATE TABLE IF NOT EXISTS onec.doc_receipts_services (
     document_id text NOT NULL,
     service_id text NOT NULL,
 
@@ -400,14 +404,14 @@ await pool.query(`
 
     CONSTRAINT doc_services_document_fk
       FOREIGN KEY (document_id)
-      REFERENCES public.doc_receipts(document_id)
+      REFERENCES onec.doc_receipts(document_id)
       ON DELETE CASCADE
   );
 `);
 
 // 4. Контрагенты
 await pool.query(`
-  CREATE TABLE IF NOT EXISTS public.ref_counterparties (
+  CREATE TABLE IF NOT EXISTS onec.ref_counterparties (
     counterparty_id text PRIMARY KEY,
     counterparty_name text,
     individual_or_legal text,
@@ -431,7 +435,7 @@ await pool.query(`
 
 // 5. Склады
 await pool.query(`
-  CREATE TABLE IF NOT EXISTS public.ref_warehouses (
+  CREATE TABLE IF NOT EXISTS onec.ref_warehouses (
     warehouse_id text PRIMARY KEY,
     warehouse_name text,
     warehouse_comment text,
@@ -443,7 +447,7 @@ await pool.query(`
 
 // 6. Товары и услуги
 await pool.query(`
-  CREATE TABLE IF NOT EXISTS public.ref_products (
+  CREATE TABLE IF NOT EXISTS onec.ref_products (
     product_id text PRIMARY KEY,
     product_code text,
     product_name text,
@@ -466,7 +470,7 @@ await pool.query(`
 
 // 7. Договоры контрагентов
 await pool.query(`
-  CREATE TABLE IF NOT EXISTS public.ref_counterparties_contracts (
+  CREATE TABLE IF NOT EXISTS onec.ref_counterparties_contracts (
     contract_id text PRIMARY KEY,
     contract_number text,
     contract_date date,
@@ -485,7 +489,7 @@ await pool.query(`
 
 // 8. Проекты
 await pool.query(`
-  CREATE TABLE IF NOT EXISTS public.ref_project_groups (
+  CREATE TABLE IF NOT EXISTS onec.ref_project_groups (
     project_id text PRIMARY KEY,
     project_name text,
     deleted boolean DEFAULT false,
@@ -500,47 +504,47 @@ await pool.query(`
 
 await pool.query(`
   CREATE INDEX IF NOT EXISTS doc_receipts_document_date_idx
-  ON public.doc_receipts (document_date);
+  ON onec.doc_receipts (document_date);
 `);
 
 await pool.query(`
   CREATE INDEX IF NOT EXISTS doc_receipts_counterparty_id_idx
-  ON public.doc_receipts (counterparty_id);
+  ON onec.doc_receipts (counterparty_id);
 `);
 
 await pool.query(`
   CREATE INDEX IF NOT EXISTS doc_receipts_warehouse_id_idx
-  ON public.doc_receipts (warehouse_id);
+  ON onec.doc_receipts (warehouse_id);
 `);
 
 await pool.query(`
   CREATE INDEX IF NOT EXISTS doc_receipts_contract_id_idx
-  ON public.doc_receipts (contract_id);
+  ON onec.doc_receipts (contract_id);
 `);
 
 await pool.query(`
   CREATE INDEX IF NOT EXISTS doc_receipts_items_item_id_idx
-  ON public.doc_receipts_items (item_id);
+  ON onec.doc_receipts_items (item_id);
 `);
 
 await pool.query(`
   CREATE INDEX IF NOT EXISTS doc_receipts_items_project_id_idx
-  ON public.doc_receipts_items (project_id);
+  ON onec.doc_receipts_items (project_id);
 `);
 
 await pool.query(`
   CREATE INDEX IF NOT EXISTS doc_receipts_services_service_id_idx
-  ON public.doc_receipts_services (service_id);
+  ON onec.doc_receipts_services (service_id);
 `);
 
 await pool.query(`
   CREATE INDEX IF NOT EXISTS doc_receipts_services_project_id_idx
-  ON public.doc_receipts_services (project_id);
+  ON onec.doc_receipts_services (project_id);
 `);
 
 await pool.query(`
   CREATE INDEX IF NOT EXISTS ref_contracts_counterparty_id_idx
-  ON public.ref_counterparties_contracts (counterparty_id);
+  ON onec.ref_counterparties_contracts (counterparty_id);
 `);
 
 await pool.query(`
@@ -779,7 +783,7 @@ await pool.query(`
 // =====================================================
 
 await pool.query(`
-  CREATE TABLE IF NOT EXISTS public.doc_outgoingpaymentorder (
+  CREATE TABLE IF NOT EXISTS onec.doc_outgoingpaymentorder (
     document_id text PRIMARY KEY,
     document_number text,
     document_date timestamptz,
@@ -846,7 +850,7 @@ await pool.query(`
 `);
 
 await pool.query(`
-  CREATE TABLE IF NOT EXISTS public.doc_outgoingpaymentorder_payment_transcript (
+  CREATE TABLE IF NOT EXISTS onec.doc_outgoingpaymentorder_payment_transcript (
     document_id text NOT NULL,
     line_no integer NOT NULL,
 
@@ -869,13 +873,13 @@ await pool.query(`
     PRIMARY KEY (document_id, line_no),
     CONSTRAINT outgoingpaymentorder_transcript_fk
       FOREIGN KEY (document_id)
-      REFERENCES public.doc_outgoingpaymentorder(document_id)
+      REFERENCES onec.doc_outgoingpaymentorder(document_id)
       ON DELETE CASCADE
   );
 `);
 
 await pool.query(`
-  CREATE TABLE IF NOT EXISTS public.doc_outgoingpaymentorder_payment_transfer_salary (
+  CREATE TABLE IF NOT EXISTS onec.doc_outgoingpaymentorder_payment_transfer_salary (
     document_id text NOT NULL,
     line_no integer NOT NULL,
     project_id text,
@@ -887,13 +891,13 @@ await pool.query(`
     PRIMARY KEY (document_id, line_no),
     CONSTRAINT outgoingpaymentorder_salary_fk
       FOREIGN KEY (document_id)
-      REFERENCES public.doc_outgoingpaymentorder(document_id)
+      REFERENCES onec.doc_outgoingpaymentorder(document_id)
       ON DELETE CASCADE
   );
 `);
 
 await pool.query(`
-  CREATE TABLE IF NOT EXISTS public.doc_outgoingpaymentorder_payment_transfer_pension (
+  CREATE TABLE IF NOT EXISTS onec.doc_outgoingpaymentorder_payment_transfer_pension (
     document_id text NOT NULL,
     line_no integer NOT NULL,
     project_id text,
@@ -905,13 +909,13 @@ await pool.query(`
     PRIMARY KEY (document_id, line_no),
     CONSTRAINT outgoingpaymentorder_pension_fk
       FOREIGN KEY (document_id)
-      REFERENCES public.doc_outgoingpaymentorder(document_id)
+      REFERENCES onec.doc_outgoingpaymentorder(document_id)
       ON DELETE CASCADE
   );
 `);
 
 await pool.query(`
-  CREATE TABLE IF NOT EXISTS public.doc_outgoingpaymentorder_payment_transfer_social (
+  CREATE TABLE IF NOT EXISTS onec.doc_outgoingpaymentorder_payment_transfer_social (
     document_id text NOT NULL,
     line_no integer NOT NULL,
     project_id text,
@@ -923,13 +927,13 @@ await pool.query(`
     PRIMARY KEY (document_id, line_no),
     CONSTRAINT outgoingpaymentorder_social_fk
       FOREIGN KEY (document_id)
-      REFERENCES public.doc_outgoingpaymentorder(document_id)
+      REFERENCES onec.doc_outgoingpaymentorder(document_id)
       ON DELETE CASCADE
   );
 `);
 
 await pool.query(`
-  CREATE TABLE IF NOT EXISTS public.doc_outgoingpaymentorder_payment_transfer_execution (
+  CREATE TABLE IF NOT EXISTS onec.doc_outgoingpaymentorder_payment_transfer_execution (
     document_id text NOT NULL,
     line_no integer NOT NULL,
     project_id text,
@@ -943,13 +947,13 @@ await pool.query(`
     PRIMARY KEY (document_id, line_no),
     CONSTRAINT outgoingpaymentorder_execution_fk
       FOREIGN KEY (document_id)
-      REFERENCES public.doc_outgoingpaymentorder(document_id)
+      REFERENCES onec.doc_outgoingpaymentorder(document_id)
       ON DELETE CASCADE
   );
 `);
 
 await pool.query(`
-  CREATE TABLE IF NOT EXISTS public.doc_outgoingpaymentorder_payment_transfer_vat (
+  CREATE TABLE IF NOT EXISTS onec.doc_outgoingpaymentorder_payment_transfer_vat (
     document_id text NOT NULL,
     line_no integer NOT NULL,
     project_id text,
@@ -969,13 +973,13 @@ await pool.query(`
     PRIMARY KEY (document_id, line_no),
     CONSTRAINT outgoingpaymentorder_vat_fk
       FOREIGN KEY (document_id)
-      REFERENCES public.doc_outgoingpaymentorder(document_id)
+      REFERENCES onec.doc_outgoingpaymentorder(document_id)
       ON DELETE CASCADE
   );
 `);
 
 await pool.query(`
-  CREATE TABLE IF NOT EXISTS public.doc_outgoingpaymentorder_payment_transfer_report (
+  CREATE TABLE IF NOT EXISTS onec.doc_outgoingpaymentorder_payment_transfer_report (
     document_id text NOT NULL,
     line_no integer NOT NULL,
     project_id text,
@@ -989,13 +993,13 @@ await pool.query(`
     PRIMARY KEY (document_id, line_no),
     CONSTRAINT outgoingpaymentorder_report_fk
       FOREIGN KEY (document_id)
-      REFERENCES public.doc_outgoingpaymentorder(document_id)
+      REFERENCES onec.doc_outgoingpaymentorder(document_id)
       ON DELETE CASCADE
   );
 `);
 
 await pool.query(`
-  CREATE TABLE IF NOT EXISTS public.doc_outgoingpaymentorder_payment_transfer_single (
+  CREATE TABLE IF NOT EXISTS onec.doc_outgoingpaymentorder_payment_transfer_single (
     document_id text NOT NULL,
     line_no integer NOT NULL,
     project_id text,
@@ -1007,13 +1011,13 @@ await pool.query(`
     PRIMARY KEY (document_id, line_no),
     CONSTRAINT outgoingpaymentorder_single_fk
       FOREIGN KEY (document_id)
-      REFERENCES public.doc_outgoingpaymentorder(document_id)
+      REFERENCES onec.doc_outgoingpaymentorder(document_id)
       ON DELETE CASCADE
   );
 `);
 
 await pool.query(`
-  CREATE TABLE IF NOT EXISTS public.doc_outgoingpaymentorder_payment_transfer_other (
+  CREATE TABLE IF NOT EXISTS onec.doc_outgoingpaymentorder_payment_transfer_other (
     document_id text NOT NULL,
     line_no integer NOT NULL,
     transfer_sum numeric(18,2),
@@ -1023,13 +1027,13 @@ await pool.query(`
     PRIMARY KEY (document_id, line_no),
     CONSTRAINT outgoingpaymentorder_other_fk
       FOREIGN KEY (document_id)
-      REFERENCES public.doc_outgoingpaymentorder(document_id)
+      REFERENCES onec.doc_outgoingpaymentorder(document_id)
       ON DELETE CASCADE
   );
 `);
 
 await pool.query(`
-  CREATE TABLE IF NOT EXISTS public.doc_outgoingpaymentorder_payment_transfer_other_income (
+  CREATE TABLE IF NOT EXISTS onec.doc_outgoingpaymentorder_payment_transfer_other_income (
     document_id text NOT NULL,
     line_no integer NOT NULL,
     transfer_sum numeric(18,2),
@@ -1039,24 +1043,24 @@ await pool.query(`
     PRIMARY KEY (document_id, line_no),
     CONSTRAINT outgoingpaymentorder_other_income_fk
       FOREIGN KEY (document_id)
-      REFERENCES public.doc_outgoingpaymentorder(document_id)
+      REFERENCES onec.doc_outgoingpaymentorder(document_id)
       ON DELETE CASCADE
   );
 `);
 
 await pool.query(`
   CREATE INDEX IF NOT EXISTS outgoingpaymentorder_document_date_idx
-  ON public.doc_outgoingpaymentorder(document_date);
+  ON onec.doc_outgoingpaymentorder(document_date);
 `);
 
 await pool.query(`
   CREATE INDEX IF NOT EXISTS outgoingpaymentorder_counterparty_id_idx
-  ON public.doc_outgoingpaymentorder(counterparty_id);
+  ON onec.doc_outgoingpaymentorder(counterparty_id);
 `);
 
 await pool.query(`
   CREATE INDEX IF NOT EXISTS outgoingpaymentorder_ft_idzft_idx
-  ON public.doc_outgoingpaymentorder(ft_idzft);
+  ON onec.doc_outgoingpaymentorder(ft_idzft);
 `);
 
    console.log("DB init OK ✅");
@@ -5388,7 +5392,7 @@ app.post(
         const oldDocument = await client.query(
           `
           SELECT document_id
-          FROM public.doc_receipts
+          FROM onec.doc_receipts
           WHERE document_id = $1
           LIMIT 1
           `,
@@ -5400,7 +5404,7 @@ app.post(
 
         await client.query(
           `
-          INSERT INTO public.doc_receipts (
+          INSERT INTO onec.doc_receipts (
             document_id,
             base_id,
             document_number,
@@ -5533,12 +5537,12 @@ oneCText(doc.is_managerial),
          * и записываем актуальные строки из 1С.
          */
         await client.query(
-          `DELETE FROM public.doc_receipts_items WHERE document_id = $1`,
+          `DELETE FROM onec.doc_receipts_items WHERE document_id = $1`,
           [documentId]
         );
 
         await client.query(
-          `DELETE FROM public.doc_receipts_services WHERE document_id = $1`,
+          `DELETE FROM onec.doc_receipts_services WHERE document_id = $1`,
           [documentId]
         );
 
@@ -5557,7 +5561,7 @@ oneCText(doc.is_managerial),
 
           await client.query(
             `
-            INSERT INTO public.doc_receipts_items (
+            INSERT INTO onec.doc_receipts_items (
               document_id,
               item_id,
               item_name,
@@ -5617,7 +5621,7 @@ oneCText(doc.is_managerial),
 
           await client.query(
             `
-            INSERT INTO public.doc_receipts_services (
+            INSERT INTO onec.doc_receipts_services (
               document_id,
               service_id,
               service_name,
@@ -5724,7 +5728,7 @@ app.post(
 
         await pool.query(
           `
-          INSERT INTO public.ref_counterparties (
+          INSERT INTO onec.ref_counterparties (
             counterparty_id,
             counterparty_name,
             individual_or_legal,
@@ -5829,7 +5833,7 @@ app.post(
 
         await pool.query(
           `
-          INSERT INTO public.ref_warehouses (
+          INSERT INTO onec.ref_warehouses (
             warehouse_id,
             warehouse_name,
             warehouse_comment,
@@ -5893,7 +5897,7 @@ app.post(
 
         await pool.query(
           `
-          INSERT INTO public.ref_products (
+          INSERT INTO onec.ref_products (
             product_id,
             product_code,
             product_name,
@@ -5993,7 +5997,7 @@ app.post(
 
         await pool.query(
           `
-          INSERT INTO public.ref_counterparties_contracts (
+          INSERT INTO onec.ref_counterparties_contracts (
             contract_id,
             contract_number,
             contract_date,
@@ -6081,7 +6085,7 @@ app.post(
 
         await pool.query(
           `
-          INSERT INTO public.ref_project_groups (
+          INSERT INTO onec.ref_project_groups (
             project_id,
             project_name,
             deleted,
@@ -6155,7 +6159,7 @@ app.post(
         const oldDocument = await client.query(
           `
           SELECT document_id
-          FROM public.doc_sales
+          FROM onec.doc_sales
           WHERE document_id = $1
           LIMIT 1
           `,
@@ -6171,7 +6175,7 @@ app.post(
 
         await client.query(
           `
-          INSERT INTO public.doc_sales (
+          INSERT INTO onec.doc_sales (
             document_id,
             document_number,
             document_posted,
@@ -6322,7 +6326,7 @@ oneCText(doc.is_managerial),
          */
         await client.query(
           `
-          DELETE FROM public.doc_sales_items
+          DELETE FROM onec.doc_sales_items
           WHERE document_id = $1
           `,
           [documentId]
@@ -6330,7 +6334,7 @@ oneCText(doc.is_managerial),
 
         await client.query(
           `
-          DELETE FROM public.doc_sales_services
+          DELETE FROM onec.doc_sales_services
           WHERE document_id = $1
           `,
           [documentId]
@@ -6355,7 +6359,7 @@ oneCText(doc.is_managerial),
 
           await client.query(
             `
-            INSERT INTO public.doc_sales_items (
+            INSERT INTO onec.doc_sales_items (
               document_id,
               item_id,
               item_name,
@@ -6415,7 +6419,7 @@ oneCText(doc.is_managerial),
 
           await client.query(
             `
-            INSERT INTO public.doc_sales_services (
+            INSERT INTO onec.doc_sales_services (
               document_id,
               service_id,
               service_name,
@@ -6532,7 +6536,7 @@ app.post(
         const oldDocument = await client.query(
           `
           SELECT document_id
-          FROM public.doc_incomingpaymentorder
+          FROM onec.doc_incomingpaymentorder
           WHERE document_id = $1
           LIMIT 1
           `,
@@ -6544,7 +6548,7 @@ app.post(
 
         await client.query(
           `
-          INSERT INTO public.doc_incomingpaymentorder (
+          INSERT INTO onec.doc_incomingpaymentorder (
             document_id,
             document_number,
             document_posted,
@@ -6664,7 +6668,7 @@ app.post(
         // При обновлении документа старые строки расшифровки удаляются.
         await client.query(
           `
-          DELETE FROM public.doc_incomingpaymentorder_payment_transcript
+          DELETE FROM onec.doc_incomingpaymentorder_payment_transcript
           WHERE document_id = $1
           `,
           [documentId]
@@ -6682,7 +6686,7 @@ app.post(
 
           await client.query(
             `
-            INSERT INTO public.doc_incomingpaymentorder_payment_transcript (
+            INSERT INTO onec.doc_incomingpaymentorder_payment_transcript (
               document_id,
               line_no,
 
@@ -6901,7 +6905,7 @@ async function replaceOutgoingPaymentPart(
   config
 ) {
   await client.query(
-    `DELETE FROM public.${config.table} WHERE document_id = $1`,
+    `DELETE FROM onec.${config.table} WHERE document_id = $1`,
     [documentId]
   );
 
@@ -6928,7 +6932,7 @@ async function replaceOutgoingPaymentPart(
 
     await client.query(
       `
-      INSERT INTO public.${config.table} (
+      INSERT INTO onec.${config.table} (
         ${columns.join(", ")}
       )
       VALUES (
@@ -6975,7 +6979,7 @@ app.post(
         const exists = await client.query(
           `
           SELECT document_id
-          FROM public.doc_outgoingpaymentorder
+          FROM onec.doc_outgoingpaymentorder
           WHERE document_id = $1
           LIMIT 1
           `,
@@ -6986,7 +6990,7 @@ app.post(
 
         await client.query(
           `
-          INSERT INTO public.doc_outgoingpaymentorder (
+          INSERT INTO onec.doc_outgoingpaymentorder (
             document_id,
             document_number,
             document_date,
@@ -7222,5 +7226,171 @@ app.post(
   }
 );
 
+
+app.post("/api/doc_debt_adjustment", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const data = req.body || {};
+    const rows = Array.isArray(data.debt_amounts) ? data.debt_amounts : [];
+
+    if (!data.document_id) {
+      return res.status(400).json({
+        success: false,
+        error: "document_id required"
+      });
+    }
+
+    await client.query("BEGIN");
+
+    await client.query(`
+      INSERT INTO onec.doc_debt_adjustment (
+        document_id,
+        document_number,
+        document_date,
+        document_posted,
+        currency_name,
+        counterparty_id,
+        counterparty_bin,
+        counterparty_name,
+        document_commentary,
+        counterparty_id_debitor,
+        counterparty_bin_debitor,
+        counterparty_name_debitor,
+        counterparty_id_creditor,
+        counterparty_bin_creditor,
+        counterparty_name_creditor,
+        multiplicity,
+        rate_of_document,
+        organization_bin,
+        organization_name,
+        responsible,
+        consider_kpn,
+        management_act,
+        deleted,
+        updated_at
+      )
+      VALUES (
+        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+        $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+        $21,$22,$23,NOW()
+      )
+      ON CONFLICT (document_id)
+      DO UPDATE SET
+        document_number = EXCLUDED.document_number,
+        document_date = EXCLUDED.document_date,
+        document_posted = EXCLUDED.document_posted,
+        currency_name = EXCLUDED.currency_name,
+        counterparty_id = EXCLUDED.counterparty_id,
+        counterparty_bin = EXCLUDED.counterparty_bin,
+        counterparty_name = EXCLUDED.counterparty_name,
+        document_commentary = EXCLUDED.document_commentary,
+        counterparty_id_debitor = EXCLUDED.counterparty_id_debitor,
+        counterparty_bin_debitor = EXCLUDED.counterparty_bin_debitor,
+        counterparty_name_debitor = EXCLUDED.counterparty_name_debitor,
+        counterparty_id_creditor = EXCLUDED.counterparty_id_creditor,
+        counterparty_bin_creditor = EXCLUDED.counterparty_bin_creditor,
+        counterparty_name_creditor = EXCLUDED.counterparty_name_creditor,
+        multiplicity = EXCLUDED.multiplicity,
+        rate_of_document = EXCLUDED.rate_of_document,
+        organization_bin = EXCLUDED.organization_bin,
+        organization_name = EXCLUDED.organization_name,
+        responsible = EXCLUDED.responsible,
+        consider_kpn = EXCLUDED.consider_kpn,
+        management_act = EXCLUDED.management_act,
+        deleted = EXCLUDED.deleted,
+        updated_at = NOW()
+    `, [
+      data.document_id,
+      data.document_number || null,
+      data.document_date || null,
+      data.document_posted ?? null,
+      data.currency_name || null,
+      data.counterparty_id || null,
+      data.counterparty_bin || null,
+      data.counterparty_name || null,
+      data.document_commentary || null,
+      data.counterparty_id_debitor || null,
+      data.counterparty_bin_debitor || null,
+      data.counterparty_name_debitor || null,
+      data.counterparty_id_creditor || null,
+      data.counterparty_bin_creditor || null,
+      data.counterparty_name_creditor || null,
+      data.multiplicity ?? null,
+      data.rate_of_document ?? null,
+      data.organization_bin || null,
+      data.organization_name || null,
+      data.responsible || null,
+      data.consider_kpn ?? null,
+      data.management_act ?? null,
+      data.deleted ?? false
+    ]);
+
+    await client.query(`
+      DELETE FROM onec.doc_debt_adjustment_debt_amounts
+      WHERE document_id = $1
+    `, [data.document_id]);
+
+    let lineNo = 0;
+
+    for (const r of rows) {
+      lineNo++;
+
+      await client.query(`
+        INSERT INTO onec.doc_debt_adjustment_debt_amounts (
+          document_id,
+          line_no,
+          contract_id,
+          contract_name,
+          deal,
+          sum,
+          settlement_amount,
+          settlement_rate,
+          frequency_settlements,
+          type_of_debt,
+          sum_of_nu,
+          project_id,
+          project_name,
+          updated_at
+        )
+        VALUES (
+          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW()
+        )
+      `, [
+        data.document_id,
+        lineNo,
+        r.contract_id || null,
+        r.contract_name || null,
+        r.deal || null,
+        r.sum ?? null,
+        r.settlement_amount ?? null,
+        r.settlement_rate ?? null,
+        r.frequency_settlements ?? null,
+        r.type_of_debt || null,
+        r.sum_of_nu ?? null,
+        r.project_id || null,
+        r.project_name || null
+      ]);
+    }
+
+    await client.query("COMMIT");
+
+    res.json({
+      success: true,
+      document_id: data.document_id,
+      debt_amounts_count: rows.length
+    });
+
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("DOC_DEBT_ADJUSTMENT ERROR:", e);
+    res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  } finally {
+    client.release();
+  }
+});
 
 app.listen(PORT, () => console.log("Server started on port " + PORT))
