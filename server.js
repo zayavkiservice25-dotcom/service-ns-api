@@ -1063,6 +1063,299 @@ await pool.query(`
   ON onec.doc_outgoingpaymentorder(ft_idzft);
 `);
 
+
+
+// =====================================================
+// 1С: ДОП. МИГРАЦИИ ДЛЯ ВСЕХ ТАБЛИЧНЫХ ЧАСТЕЙ
+// Логика API: шапка ON CONFLICT, табличные части DELETE + INSERT
+// =====================================================
+
+// Если таблицы уже были созданы раньше со старым PRIMARY KEY только по service_id/item_id,
+// эти миграции переводят ключи на document_id + строка/ID, чтобы одинаковые service_id
+// в разных документах больше не конфликтовали.
+await pool.query(`
+DO $$
+BEGIN
+  IF to_regclass('onec.doc_receipts_items') IS NOT NULL THEN
+    ALTER TABLE onec.doc_receipts_items DROP CONSTRAINT IF EXISTS doc_items_pkey;
+    ALTER TABLE onec.doc_receipts_items DROP CONSTRAINT IF EXISTS doc_receipts_items_pkey;
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_constraint
+      WHERE conname = 'doc_receipts_items_pkey'
+        AND conrelid = 'onec.doc_receipts_items'::regclass
+    ) THEN
+      ALTER TABLE onec.doc_receipts_items
+      ADD CONSTRAINT doc_receipts_items_pkey PRIMARY KEY (document_id, item_id);
+    END IF;
+  END IF;
+
+  IF to_regclass('onec.doc_receipts_services') IS NOT NULL THEN
+    ALTER TABLE onec.doc_receipts_services DROP CONSTRAINT IF EXISTS doc_services_pkey;
+    ALTER TABLE onec.doc_receipts_services DROP CONSTRAINT IF EXISTS doc_receipts_services_pkey;
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_constraint
+      WHERE conname = 'doc_receipts_services_pkey'
+        AND conrelid = 'onec.doc_receipts_services'::regclass
+    ) THEN
+      ALTER TABLE onec.doc_receipts_services
+      ADD CONSTRAINT doc_receipts_services_pkey PRIMARY KEY (document_id, service_id);
+    END IF;
+  END IF;
+END $$;
+`);
+
+// =====================================================
+// 1С: РЕАЛИЗАЦИЯ doc_sales + doc_items/doc_services
+// =====================================================
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS onec.doc_sales (
+    document_id text PRIMARY KEY,
+    document_number text,
+    document_posted boolean,
+    document_date timestamptz,
+    organization_bin text,
+    organization_name text,
+    warehouse_id text,
+    warehouse_name text,
+    counterparty_id text,
+    counterparty_bin text,
+    counterparty_name text,
+    contract_id text,
+    contract_name text,
+    currency_name text,
+    income_kpn text,
+    settlement_account text,
+    advance_account text,
+    vat_enable boolean,
+    vat_mode text,
+    document_sum numeric(18,2),
+    document_commentary text,
+    document_author_name text,
+    document_type text,
+    advance_withheld numeric(18,2),
+    guarantee_withheld numeric(18,2),
+    penalty_withheld numeric(18,2),
+    other_withheld numeric(18,2),
+    target_entity text,
+    action_required text,
+    is_executed text,
+    is_managerial text,
+    id_dov text,
+    deleted boolean DEFAULT false,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now()
+  );
+`);
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS onec.doc_sales_items (
+    document_id text NOT NULL,
+    item_id text NOT NULL,
+    item_name text,
+    quantity numeric(18,6),
+    price numeric(18,2),
+    amount numeric(18,2),
+    vat_percent numeric(10,4),
+    vat_amount numeric(18,2),
+    amount_with_vat numeric(18,2),
+    vat_account text,
+    cost_account_bu text,
+    cost_account_nu text,
+    project_id text,
+    project_name text,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+    PRIMARY KEY (document_id, item_id),
+    CONSTRAINT doc_sales_items_document_fk
+      FOREIGN KEY (document_id)
+      REFERENCES onec.doc_sales(document_id)
+      ON DELETE CASCADE
+  );
+`);
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS onec.doc_sales_services (
+    document_id text NOT NULL,
+    service_id text NOT NULL,
+    service_name text,
+    service_content text,
+    quantity numeric(18,6),
+    price numeric(18,2),
+    amount numeric(18,2),
+    vat_percent numeric(10,4),
+    vat_amount numeric(18,2),
+    amount_with_vat numeric(18,2),
+    vat_account text,
+    cost_account_bu text,
+    cost_account_nu text,
+    project_id text,
+    project_name text,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+    PRIMARY KEY (document_id, service_id),
+    CONSTRAINT doc_sales_services_document_fk
+      FOREIGN KEY (document_id)
+      REFERENCES onec.doc_sales(document_id)
+      ON DELETE CASCADE
+  );
+`);
+
+await pool.query(`
+DO $$
+BEGIN
+  IF to_regclass('onec.doc_sales_items') IS NOT NULL THEN
+    ALTER TABLE onec.doc_sales_items DROP CONSTRAINT IF EXISTS doc_sales_items_pkey;
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_constraint
+      WHERE conname = 'doc_sales_items_pkey'
+        AND conrelid = 'onec.doc_sales_items'::regclass
+    ) THEN
+      ALTER TABLE onec.doc_sales_items
+      ADD CONSTRAINT doc_sales_items_pkey PRIMARY KEY (document_id, item_id);
+    END IF;
+  END IF;
+
+  IF to_regclass('onec.doc_sales_services') IS NOT NULL THEN
+    ALTER TABLE onec.doc_sales_services DROP CONSTRAINT IF EXISTS doc_sales_services_pkey;
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_constraint
+      WHERE conname = 'doc_sales_services_pkey'
+        AND conrelid = 'onec.doc_sales_services'::regclass
+    ) THEN
+      ALTER TABLE onec.doc_sales_services
+      ADD CONSTRAINT doc_sales_services_pkey PRIMARY KEY (document_id, service_id);
+    END IF;
+  END IF;
+END $$;
+`);
+
+// =====================================================
+// 1С: ПЛАТЕЖНОЕ ПОРУЧЕНИЕ ВХОДЯЩЕЕ + payment_transcript
+// =====================================================
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS onec.doc_incomingpaymentorder (
+    document_id text PRIMARY KEY,
+    document_number text,
+    document_posted boolean,
+    document_date timestamptz,
+    organization_bin text,
+    organization_name text,
+    paid boolean,
+    document_author_name text,
+    responsible text,
+    operation_type text,
+    currency_name text,
+    document_commentary text,
+    statement_date date,
+    document_sum numeric(18,2),
+    cash_flow_item text,
+    bank_account text,
+    counterparty_account text,
+    organization_account text,
+    purpose_of_payment text,
+    incoming_doc_date date,
+    incoming_doc_number text,
+    advance text,
+    counterparty_id text,
+    counterparty_bin text,
+    counterparty_name text,
+    deleted boolean DEFAULT false,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now()
+  );
+`);
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS onec.doc_incomingpaymentorder_payment_transcript (
+    document_id text NOT NULL,
+    line_no integer NOT NULL,
+    contract_id text,
+    contract_name text,
+    doc_deal text,
+    settlement_rate numeric(18,6),
+    payment_amount numeric(18,2),
+    frequency_settlements numeric(18,6),
+    settlement_amount numeric(18,2),
+    vat_percent numeric(10,4),
+    vat_amount numeric(18,2),
+    cash_flow_item text,
+    project_id text,
+    project_name text,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+    PRIMARY KEY (document_id, line_no),
+    CONSTRAINT incomingpaymentorder_transcript_fk
+      FOREIGN KEY (document_id)
+      REFERENCES onec.doc_incomingpaymentorder(document_id)
+      ON DELETE CASCADE
+  );
+`);
+
+// =====================================================
+// 1С: КОРРЕКТИРОВКА ДОЛГА doc_debt_adjustment + debt_amounts
+// =====================================================
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS onec.doc_debt_adjustment (
+    document_id text PRIMARY KEY,
+    document_number text,
+    document_date timestamptz,
+    document_posted boolean,
+    currency_name text,
+    counterparty_id text,
+    counterparty_bin text,
+    counterparty_name text,
+    document_commentary text,
+    counterparty_id_debitor text,
+    counterparty_bin_debitor text,
+    counterparty_name_debitor text,
+    counterparty_id_creditor text,
+    counterparty_bin_creditor text,
+    counterparty_name_creditor text,
+    multiplicity numeric(18,6),
+    rate_of_document numeric(18,6),
+    organization_bin text,
+    organization_name text,
+    responsible text,
+    consider_kpn boolean,
+    management_act text,
+    deleted boolean DEFAULT false,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now()
+  );
+`);
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS onec.doc_debt_adjustment_debt_amounts (
+    document_id text NOT NULL,
+    line_no integer NOT NULL,
+    contract_id text,
+    contract_name text,
+    deal text,
+    sum numeric(18,2),
+    settlement_amount numeric(18,2),
+    settlement_rate numeric(18,6),
+    frequency_settlements numeric(18,6),
+    type_of_debt text,
+    sum_of_nu numeric(18,2),
+    project_id text,
+    project_name text,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+    PRIMARY KEY (document_id, line_no),
+    CONSTRAINT debt_adjustment_amounts_fk
+      FOREIGN KEY (document_id)
+      REFERENCES onec.doc_debt_adjustment(document_id)
+      ON DELETE CASCADE
+  );
+`);
+
+// Индексы для новых таблиц и сортировки по новым данным сверху
+await pool.query(`CREATE INDEX IF NOT EXISTS doc_sales_created_at_idx ON onec.doc_sales (created_at DESC);`);
+await pool.query(`CREATE INDEX IF NOT EXISTS doc_incomingpaymentorder_created_at_idx ON onec.doc_incomingpaymentorder (created_at DESC);`);
+await pool.query(`CREATE INDEX IF NOT EXISTS doc_outgoingpaymentorder_created_at_idx ON onec.doc_outgoingpaymentorder (created_at DESC);`);
+await pool.query(`CREATE INDEX IF NOT EXISTS doc_debt_adjustment_created_at_idx ON onec.doc_debt_adjustment (created_at DESC);`);
+await pool.query(`CREATE INDEX IF NOT EXISTS doc_receipts_created_at_idx ON onec.doc_receipts (created_at DESC);`);
+
    console.log("DB init OK ✅");
 }
 
@@ -7227,7 +7520,7 @@ app.post(
 );
 
 
-app.post("/api/doc_debt_adjustment", async (req, res) => {
+app.post(["/api/doc_debt_adjustment", "/api/1c/doc_debt_adjustment"], async (req, res) => {
   const client = await pool.connect();
 
   try {
