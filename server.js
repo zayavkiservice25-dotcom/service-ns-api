@@ -337,7 +337,8 @@ is_managerial text,
 await pool.query(`
   CREATE TABLE IF NOT EXISTS onec.doc_receipts_items (
     document_id text NOT NULL,
-    item_id text NOT NULL,
+    line_no integer NOT NULL,
+    item_id text,
 
     item_name text,
     quantity numeric(18,6),
@@ -361,7 +362,7 @@ project_name text,
     created_at timestamptz DEFAULT now(),
     updated_at timestamptz DEFAULT now(),
 
-    PRIMARY KEY (document_id, item_id),
+    PRIMARY KEY (document_id, line_no),
 
     CONSTRAINT doc_items_document_fk
       FOREIGN KEY (document_id)
@@ -374,7 +375,8 @@ project_name text,
 await pool.query(`
   CREATE TABLE IF NOT EXISTS onec.doc_receipts_services (
     document_id text NOT NULL,
-    service_id text NOT NULL,
+    line_no integer NOT NULL,
+    service_id text,
 
     service_name text,
     service_content text,
@@ -400,7 +402,7 @@ await pool.query(`
     created_at timestamptz DEFAULT now(),
     updated_at timestamptz DEFAULT now(),
 
-    PRIMARY KEY (document_id, service_id),
+    PRIMARY KEY (document_id, line_no),
 
     CONSTRAINT doc_services_document_fk
       FOREIGN KEY (document_id)
@@ -1070,35 +1072,62 @@ await pool.query(`
 // Логика API: шапка ON CONFLICT, табличные части DELETE + INSERT
 // =====================================================
 
-// Если таблицы уже были созданы раньше со старым PRIMARY KEY только по service_id/item_id,
-// эти миграции переводят ключи на document_id + строка/ID, чтобы одинаковые service_id
-// в разных документах больше не конфликтовали.
+// ВАЖНО:
+// service_id/item_id могут повторяться в одном документе.
+// Поэтому первичный ключ табличных частей делаем по document_id + line_no.
+// При каждом новом JSON старые строки документа удаляются и вставляются заново.
 await pool.query(`
 DO $$
 BEGIN
   IF to_regclass('onec.doc_receipts_items') IS NOT NULL THEN
+    ALTER TABLE onec.doc_receipts_items ADD COLUMN IF NOT EXISTS line_no integer;
+    WITH x AS (
+      SELECT ctid, ROW_NUMBER() OVER (PARTITION BY document_id ORDER BY created_at, item_id, ctid) AS rn
+      FROM onec.doc_receipts_items
+      WHERE line_no IS NULL
+    )
+    UPDATE onec.doc_receipts_items t
+    SET line_no = x.rn
+    FROM x
+    WHERE t.ctid = x.ctid;
+
     ALTER TABLE onec.doc_receipts_items DROP CONSTRAINT IF EXISTS doc_items_pkey;
     ALTER TABLE onec.doc_receipts_items DROP CONSTRAINT IF EXISTS doc_receipts_items_pkey;
+    ALTER TABLE onec.doc_receipts_items ALTER COLUMN line_no SET NOT NULL;
+
     IF NOT EXISTS (
       SELECT 1 FROM pg_constraint
       WHERE conname = 'doc_receipts_items_pkey'
         AND conrelid = 'onec.doc_receipts_items'::regclass
     ) THEN
       ALTER TABLE onec.doc_receipts_items
-      ADD CONSTRAINT doc_receipts_items_pkey PRIMARY KEY (document_id, item_id);
+      ADD CONSTRAINT doc_receipts_items_pkey PRIMARY KEY (document_id, line_no);
     END IF;
   END IF;
 
   IF to_regclass('onec.doc_receipts_services') IS NOT NULL THEN
+    ALTER TABLE onec.doc_receipts_services ADD COLUMN IF NOT EXISTS line_no integer;
+    WITH x AS (
+      SELECT ctid, ROW_NUMBER() OVER (PARTITION BY document_id ORDER BY created_at, service_id, ctid) AS rn
+      FROM onec.doc_receipts_services
+      WHERE line_no IS NULL
+    )
+    UPDATE onec.doc_receipts_services t
+    SET line_no = x.rn
+    FROM x
+    WHERE t.ctid = x.ctid;
+
     ALTER TABLE onec.doc_receipts_services DROP CONSTRAINT IF EXISTS doc_services_pkey;
     ALTER TABLE onec.doc_receipts_services DROP CONSTRAINT IF EXISTS doc_receipts_services_pkey;
+    ALTER TABLE onec.doc_receipts_services ALTER COLUMN line_no SET NOT NULL;
+
     IF NOT EXISTS (
       SELECT 1 FROM pg_constraint
       WHERE conname = 'doc_receipts_services_pkey'
         AND conrelid = 'onec.doc_receipts_services'::regclass
     ) THEN
       ALTER TABLE onec.doc_receipts_services
-      ADD CONSTRAINT doc_receipts_services_pkey PRIMARY KEY (document_id, service_id);
+      ADD CONSTRAINT doc_receipts_services_pkey PRIMARY KEY (document_id, line_no);
     END IF;
   END IF;
 END $$;
@@ -1150,7 +1179,8 @@ await pool.query(`
 await pool.query(`
   CREATE TABLE IF NOT EXISTS onec.doc_sales_items (
     document_id text NOT NULL,
-    item_id text NOT NULL,
+    line_no integer NOT NULL,
+    item_id text,
     item_name text,
     quantity numeric(18,6),
     price numeric(18,2),
@@ -1165,7 +1195,7 @@ await pool.query(`
     project_name text,
     created_at timestamptz DEFAULT now(),
     updated_at timestamptz DEFAULT now(),
-    PRIMARY KEY (document_id, item_id),
+    PRIMARY KEY (document_id, line_no),
     CONSTRAINT doc_sales_items_document_fk
       FOREIGN KEY (document_id)
       REFERENCES onec.doc_sales(document_id)
@@ -1176,7 +1206,8 @@ await pool.query(`
 await pool.query(`
   CREATE TABLE IF NOT EXISTS onec.doc_sales_services (
     document_id text NOT NULL,
-    service_id text NOT NULL,
+    line_no integer NOT NULL,
+    service_id text,
     service_name text,
     service_content text,
     quantity numeric(18,6),
@@ -1192,7 +1223,7 @@ await pool.query(`
     project_name text,
     created_at timestamptz DEFAULT now(),
     updated_at timestamptz DEFAULT now(),
-    PRIMARY KEY (document_id, service_id),
+    PRIMARY KEY (document_id, line_no),
     CONSTRAINT doc_sales_services_document_fk
       FOREIGN KEY (document_id)
       REFERENCES onec.doc_sales(document_id)
@@ -1204,26 +1235,52 @@ await pool.query(`
 DO $$
 BEGIN
   IF to_regclass('onec.doc_sales_items') IS NOT NULL THEN
+    ALTER TABLE onec.doc_sales_items ADD COLUMN IF NOT EXISTS line_no integer;
+    WITH x AS (
+      SELECT ctid, ROW_NUMBER() OVER (PARTITION BY document_id ORDER BY created_at, item_id, ctid) AS rn
+      FROM onec.doc_sales_items
+      WHERE line_no IS NULL
+    )
+    UPDATE onec.doc_sales_items t
+    SET line_no = x.rn
+    FROM x
+    WHERE t.ctid = x.ctid;
+
     ALTER TABLE onec.doc_sales_items DROP CONSTRAINT IF EXISTS doc_sales_items_pkey;
+    ALTER TABLE onec.doc_sales_items ALTER COLUMN line_no SET NOT NULL;
+
     IF NOT EXISTS (
       SELECT 1 FROM pg_constraint
       WHERE conname = 'doc_sales_items_pkey'
         AND conrelid = 'onec.doc_sales_items'::regclass
     ) THEN
       ALTER TABLE onec.doc_sales_items
-      ADD CONSTRAINT doc_sales_items_pkey PRIMARY KEY (document_id, item_id);
+      ADD CONSTRAINT doc_sales_items_pkey PRIMARY KEY (document_id, line_no);
     END IF;
   END IF;
 
   IF to_regclass('onec.doc_sales_services') IS NOT NULL THEN
+    ALTER TABLE onec.doc_sales_services ADD COLUMN IF NOT EXISTS line_no integer;
+    WITH x AS (
+      SELECT ctid, ROW_NUMBER() OVER (PARTITION BY document_id ORDER BY created_at, service_id, ctid) AS rn
+      FROM onec.doc_sales_services
+      WHERE line_no IS NULL
+    )
+    UPDATE onec.doc_sales_services t
+    SET line_no = x.rn
+    FROM x
+    WHERE t.ctid = x.ctid;
+
     ALTER TABLE onec.doc_sales_services DROP CONSTRAINT IF EXISTS doc_sales_services_pkey;
+    ALTER TABLE onec.doc_sales_services ALTER COLUMN line_no SET NOT NULL;
+
     IF NOT EXISTS (
       SELECT 1 FROM pg_constraint
       WHERE conname = 'doc_sales_services_pkey'
         AND conrelid = 'onec.doc_sales_services'::regclass
     ) THEN
       ALTER TABLE onec.doc_sales_services
-      ADD CONSTRAINT doc_sales_services_pkey PRIMARY KEY (document_id, service_id);
+      ADD CONSTRAINT doc_sales_services_pkey PRIMARY KEY (document_id, line_no);
     END IF;
   END IF;
 END $$;
@@ -5843,7 +5900,9 @@ oneCText(doc.is_managerial),
           ? doc.doc_items
           : [];
 
-        for (const item of docItems) {
+        for (let index = 0; index < docItems.length; index++) {
+          const item = docItems[index];
+          const lineNo = index + 1;
           const itemId = oneCText(item.item_id);
 
           if (!itemId) {
@@ -5856,6 +5915,7 @@ oneCText(doc.is_managerial),
             `
             INSERT INTO onec.doc_receipts_items (
               document_id,
+              line_no,
               item_id,
               item_name,
               quantity,
@@ -5875,11 +5935,12 @@ oneCText(doc.is_managerial),
             )
             VALUES (
               $1,$2,$3,$4,$5,$6,$7,$8,
-              $9,$10,$11,$12,$13,$14,$15,$16,NOW()
+              $9,$10,$11,$12,$13,$14,$15,$16,$17,NOW()
             )
             `,
             [
               documentId,
+              lineNo,
               itemId,
               oneCText(item.item_name),
               oneCNumber(item.quantity),
@@ -5903,7 +5964,9 @@ oneCText(doc.is_managerial),
           ? doc.doc_services
           : [];
 
-        for (const service of docServices) {
+        for (let index = 0; index < docServices.length; index++) {
+          const service = docServices[index];
+          const lineNo = index + 1;
           const serviceId = oneCText(service.service_id);
 
           if (!serviceId) {
@@ -5916,6 +5979,7 @@ oneCText(doc.is_managerial),
             `
             INSERT INTO onec.doc_receipts_services (
               document_id,
+              line_no,
               service_id,
               service_name,
               service_content,
@@ -5936,11 +6000,12 @@ oneCText(doc.is_managerial),
             )
             VALUES (
               $1,$2,$3,$4,$5,$6,$7,$8,$9,
-              $10,$11,$12,$13,$14,$15,$16,$17,NOW()
+              $10,$11,$12,$13,$14,$15,$16,$17,$18,NOW()
             )
             `,
             [
               documentId,
+              lineNo,
               serviceId,
               oneCText(service.service_name),
               oneCText(service.service_content),
@@ -6641,7 +6706,9 @@ oneCText(doc.is_managerial),
           ? doc.doc_items
           : [];
 
-        for (const item of docItems) {
+        for (let index = 0; index < docItems.length; index++) {
+          const item = docItems[index];
+          const lineNo = index + 1;
           const itemId = oneCText(item.item_id);
 
           if (!itemId) {
@@ -6654,6 +6721,7 @@ oneCText(doc.is_managerial),
             `
             INSERT INTO onec.doc_sales_items (
               document_id,
+              line_no,
               item_id,
               item_name,
               quantity,
@@ -6671,11 +6739,12 @@ oneCText(doc.is_managerial),
             )
             VALUES (
               $1,$2,$3,$4,$5,$6,$7,$8,
-              $9,$10,$11,$12,$13,$14,NOW()
+              $9,$10,$11,$12,$13,$14,$15,NOW()
             )
             `,
             [
               documentId,
+              lineNo,
               itemId,
               oneCText(item.item_name),
               oneCNumber(item.quantity),
@@ -6701,7 +6770,9 @@ oneCText(doc.is_managerial),
           ? doc.doc_services
           : [];
 
-        for (const service of docServices) {
+        for (let index = 0; index < docServices.length; index++) {
+          const service = docServices[index];
+          const lineNo = index + 1;
           const serviceId = oneCText(service.service_id);
 
           if (!serviceId) {
@@ -6714,6 +6785,7 @@ oneCText(doc.is_managerial),
             `
             INSERT INTO onec.doc_sales_services (
               document_id,
+              line_no,
               service_id,
               service_name,
               service_content,
@@ -6732,11 +6804,12 @@ oneCText(doc.is_managerial),
             )
             VALUES (
               $1,$2,$3,$4,$5,$6,$7,$8,$9,
-              $10,$11,$12,$13,$14,$15,NOW()
+              $10,$11,$12,$13,$14,$15,$16,NOW()
             )
             `,
             [
               documentId,
+              lineNo,
               serviceId,
               oneCText(service.service_name),
               oneCText(service.service_content),
