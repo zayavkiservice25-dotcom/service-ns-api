@@ -2084,6 +2084,26 @@ app.post("/ft-update-main", async (req, res) => {
       return res.status(404).json({ success:false, error:"FT_NOT_FOUND" });
     }
 
+    // При изменении Дивизиона Источник Див синхронизируется автоматически.
+    await pool.query(
+      `
+      INSERT INTO public.zvk_status
+        (zvk_row_id, status_time, src_d)
+      SELECT
+        z.id,
+        NOW(),
+        f.division
+      FROM public.zvk z
+      JOIN public.ft f ON f.id_ft = z.id_ft
+      WHERE z.id_ft = $1
+      ON CONFLICT (zvk_row_id)
+      DO UPDATE SET
+        status_time = NOW(),
+        src_d = EXCLUDED.src_d
+      `,
+      [idFt]
+    );
+
     return res.json({ success:true, row:r.rows[0] });
 
   } catch (e) {
@@ -3378,7 +3398,7 @@ app.post("/zvk-bulk-request-flag", async (req, res) => {
 // =====================================================
 app.post("/zvk-status-row", async (req, res) => {
   try {
-    const { zvk_row_id, src_d, src_o, status_comment, login, is_admin, can_edit_all, is_all } = req.body;
+    const { zvk_row_id, src_o, status_comment, login, is_admin, can_edit_all, is_all } = req.body;
 
     const rid = Number(zvk_row_id);
     if (isNaN(rid)) {
@@ -3399,6 +3419,25 @@ app.post("/zvk-status-row", async (req, res) => {
 
     const hasStatusComment = Object.prototype.hasOwnProperty.call(req.body, "status_comment");
 
+    // src_d нельзя задавать с клиента.
+    // Всегда берём текущее значение division из основной строки FT.
+    const divisionResult = await pool.query(
+      `
+      SELECT f.division
+      FROM public.zvk z
+      JOIN public.ft f ON f.id_ft = z.id_ft
+      WHERE z.id = $1
+      LIMIT 1
+      `,
+      [rid]
+    );
+
+    if (!divisionResult.rowCount) {
+      return res.status(404).json({ success:false, error:"ZVK_ROW_NOT_FOUND" });
+    }
+
+    const autoSrcD = String(divisionResult.rows[0].division || "").trim() || null;
+
     const result = await pool.query(
       `
       INSERT INTO zvk_status (zvk_row_id, status_time, src_d, src_o, status_comment)
@@ -3406,10 +3445,7 @@ app.post("/zvk-status-row", async (req, res) => {
       ON CONFLICT (zvk_row_id)
       DO UPDATE SET
         status_time = NOW(),
-        src_d = CASE
-                  WHEN EXCLUDED.src_d IS NULL THEN NULL
-                  ELSE COALESCE(EXCLUDED.src_d, zvk_status.src_d)
-                END,
+        src_d = EXCLUDED.src_d,
         src_o = CASE
                   WHEN EXCLUDED.src_o IS NULL THEN NULL
                   ELSE COALESCE(EXCLUDED.src_o, zvk_status.src_o)
@@ -3420,7 +3456,7 @@ app.post("/zvk-status-row", async (req, res) => {
                          END
       RETURNING *
       `,
-      [rid, src_d ?? null, src_o ?? null, hasStatusComment ? String(status_comment || "") : null, hasStatusComment]
+      [rid, autoSrcD, src_o ?? null, hasStatusComment ? String(status_comment || "") : null, hasStatusComment]
     );
 
     res.json({ success: true, row: result.rows[0] });
@@ -4014,13 +4050,30 @@ app.post("/save-ft", async (req, res) => {
     const zftRow = await pool.query(`SELECT 'ZFT' || nextval('zvk_id_seq')::text AS id_zvk`);
     const id_zvk = zftRow.rows[0].id_zvk;
 
-    await pool.query(
+    const newZvk = await pool.query(
   `
   INSERT INTO zvk (id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag)
   VALUES ($1, $2, NOW(), 'СИСТЕМА', 0, 'Нет')
+  RETURNING id
   `,
   [id_zvk, id_ft]
 );
+
+    // Источник Див всегда равен выбранному Дивизиону.
+    // Пользователь не передаёт и не редактирует src_d вручную.
+    await pool.query(
+      `
+      INSERT INTO public.zvk_status
+        (zvk_row_id, status_time, src_d)
+      VALUES
+        ($1, NOW(), $2)
+      ON CONFLICT (zvk_row_id)
+      DO UPDATE SET
+        status_time = NOW(),
+        src_d = EXCLUDED.src_d
+      `,
+      [newZvk.rows[0].id, String(division).trim()]
+    );
 
     res.json({ success:true, id_ft: r.rows[0].id_ft, id_zvk });
   } catch (e) {
