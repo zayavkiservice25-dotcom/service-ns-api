@@ -8650,7 +8650,7 @@ app.post("/lzk/supply/save", async (req, res) => {
       )
       VALUES (
         $1,
-        COALESCE(NULLIF($2, ''), ''),
+        COALESCE($2, ''),
         $3,
         $4,
         $5,
@@ -8680,7 +8680,7 @@ app.post("/lzk/supply/save", async (req, res) => {
       RETURNING *
     `, [
       idzlzk,
-      idplxk,
+      idplxk || "",
       body.attention || null,
       body.responsible || null,
       body.payment || null,
@@ -8707,6 +8707,7 @@ app.post("/lzk/supply/save", async (req, res) => {
     });
   }
 });
+
 app.get("/lzk/trust-requests", async (req, res) => {
   try {
     const q = await pool.query(`
