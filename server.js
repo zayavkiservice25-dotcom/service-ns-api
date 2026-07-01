@@ -8401,6 +8401,7 @@ app.get("/lzk/supply", async (req, res) => {
         WHERE lower(trim(COALESCE(r.pto_status, ''))) IN
               ('согласован', 'согласовано')
       ),
+
       base_rows AS (
         SELECT
           a.idzlzk AS id,
@@ -8432,23 +8433,42 @@ app.get("/lzk/supply", async (req, res) => {
           s.trust_from AS trust_who,
           s.trust_invoice,
           s.trusted_person,
+
           EXISTS (
             SELECT 1
             FROM lzk.components c
-            WHERE c.object_name = a.object_name
-              AND c.recipe_name = a.material_name
+            WHERE lower(trim(c.object_name)) =
+                  lower(trim(a.object_name))
+              AND lower(trim(c.recipe_name)) =
+                  lower(trim(a.material_name))
           ) AS is_component_source
+
         FROM approved a
+
         LEFT JOIN lzk.supply s
           ON s.idzlzk = a.idzlzk
          AND COALESCE(trim(s.idplxk), '') = ''
       ),
+
       component_rows AS (
         SELECT
-          a.idzlzk || ':' || c.id::text AS id,
+          a.idzlzk || ':' ||
+          md5(
+            COALESCE(c.object_name, '') || '|' ||
+            COALESCE(c.recipe_name, '') || '|' ||
+            COALESCE(c.material_name, '')
+          ) AS id,
+
           a.idzlzk,
           a.idlzk,
-          'PLXK' || c.id::text AS idplxk,
+
+          'PLXK_' ||
+          md5(
+            COALESCE(c.object_name, '') || '|' ||
+            COALESCE(c.recipe_name, '') || '|' ||
+            COALESCE(c.material_name, '')
+          ) AS idplxk,
+
           'component'::text AS row_type,
           a.initiator,
           to_char(a.request_date, 'DD.MM.YYYY HH24:MI') AS request_date,
@@ -8457,7 +8477,10 @@ app.get("/lzk/supply", async (req, res) => {
           a.group_name,
           ''::text AS tmc_name,
           a.unit,
-          COALESCE(a.fact_qty, 0) * COALESCE(c.coefficient, 0) AS qty,
+
+          COALESCE(a.fact_qty, 0) *
+          COALESCE(c.coefficient, 0) AS qty,
+
           a.note,
           to_char(a.deadline, 'YYYY-MM-DD') AS deadline,
           a.documents_url AS pdf,
@@ -8475,18 +8498,38 @@ app.get("/lzk/supply", async (req, res) => {
           s.trust_invoice,
           s.trusted_person,
           true AS is_component_source
+
         FROM approved a
+
         JOIN lzk.components c
-          ON c.object_name = a.object_name
-         AND c.recipe_name = a.material_name
+          ON lower(trim(c.object_name)) =
+             lower(trim(a.object_name))
+         AND lower(trim(c.recipe_name)) =
+             lower(trim(a.material_name))
+
         LEFT JOIN lzk.supply s
           ON s.idzlzk = a.idzlzk
-         AND s.idplxk = 'PLXK' || c.id::text
+         AND s.idplxk =
+             'PLXK_' ||
+             md5(
+               COALESCE(c.object_name, '') || '|' ||
+               COALESCE(c.recipe_name, '') || '|' ||
+               COALESCE(c.material_name, '')
+             )
       )
-      SELECT * FROM base_rows
+
+      SELECT *
+      FROM base_rows
+
       UNION ALL
-      SELECT * FROM component_rows
-      ORDER BY idzlzk, row_type, idplxk
+
+      SELECT *
+      FROM component_rows
+
+      ORDER BY
+        regexp_replace(idzlzk, '\\D', '', 'g')::bigint,
+        row_type,
+        idplxk
     `);
 
     res.json({
@@ -8494,8 +8537,14 @@ app.get("/lzk/supply", async (req, res) => {
       role: lzkText(req.query.role),
       rows: q.rows
     });
+
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    console.error("LZK SUPPLY ERROR:", e);
+
+    res.status(500).json({
+      success: false,
+      error: e.message
+    });
   }
 });
 
