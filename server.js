@@ -8620,105 +8620,93 @@ app.get("/lzk/supply", async (req, res) => {
 app.post("/lzk/supply/save", async (req, res) => {
   try {
     const body = req.body || {};
-    const rawId = lzkText(body.idzlzk || body.id);
-    const idzlzk = rawId.includes(":") ? rawId.split(":")[0] : rawId;
-    let idplxk = lzkText(body.idplxk);
 
-    // В текущем HTML idplxk иногда не передаётся,
-    // а компонентная строка приходит как ZLZK12:35.
-    if (!idplxk && rawId.includes(":")) {
-      idplxk = "PLXK" + rawId.split(":").slice(1).join(":");
+    const idzlzk = lzkText(body.idzlzk || body.id);
+    const idplxk = lzkText(body.idplxk);
+
+    if (!idzlzk) {
+      return res.status(400).json({
+        success: false,
+        error: "IDZLZK не передан"
+      });
     }
 
-    if (!idzlzk) throw new Error("IDZLZK не передан");
-
-    // Работает и без уникального индекса: сначала UPDATE, затем INSERT.
-    const update = await pool.query(`
-      UPDATE lzk.supply
-      SET
-        component = COALESCE(NULLIF($3, ''), component),
-        recipe = COALESCE(NULLIF($4, ''), recipe),
-        attention = COALESCE($5, attention),
-        responsible = COALESCE(NULLIF($6, ''), responsible),
-        payment_status = COALESCE(NULLIF($7, ''), payment_status),
-        documents_status = COALESCE(NULLIF($8, ''), documents_status),
-        receive_status = COALESCE(NULLIF($9, ''), receive_status),
-        done_status = COALESCE(NULLIF($10, ''), done_status),
-        trust_qty = COALESCE($11, trust_qty),
-        trust_from = COALESCE(NULLIF($12, ''), trust_from),
-        trust_invoice = COALESCE(NULLIF($13, ''), trust_invoice),
-        trusted_person = COALESCE(NULLIF($14, ''), trusted_person),
-        updated_by = $15,
+    const q = await pool.query(`
+      INSERT INTO lzk.supply (
+        idzlzk,
+        idplxk,
+        attention,
+        responsible,
+        payment_status,
+        documents_status,
+        receive_status,
+        done_status,
+        trust_qty,
+        trust_from,
+        trust_invoice,
+        trusted_person,
+        created_at,
+        updated_at
+      )
+      VALUES (
+        $1,
+        COALESCE(NULLIF($2, ''), ''),
+        $3,
+        $4,
+        $5,
+        $6,
+        $7,
+        $8,
+        $9,
+        $10,
+        $11,
+        $12,
+        NOW(),
+        NOW()
+      )
+      ON CONFLICT (idzlzk, idplxk)
+      DO UPDATE SET
+        attention = EXCLUDED.attention,
+        responsible = EXCLUDED.responsible,
+        payment_status = EXCLUDED.payment_status,
+        documents_status = EXCLUDED.documents_status,
+        receive_status = EXCLUDED.receive_status,
+        done_status = EXCLUDED.done_status,
+        trust_qty = EXCLUDED.trust_qty,
+        trust_from = EXCLUDED.trust_from,
+        trust_invoice = EXCLUDED.trust_invoice,
+        trusted_person = EXCLUDED.trusted_person,
         updated_at = NOW()
-      WHERE idzlzk = $1
-        AND COALESCE(trim(idplxk), '') = COALESCE(trim($2), '')
+      RETURNING *
     `, [
       idzlzk,
       idplxk,
-      lzkText(body.component),
-      lzkText(body.recipe),
-      lzkNum(body.attention),
-      lzkText(body.responsible),
-      lzkText(body.payment),
-      lzkText(body.documents),
-      lzkText(body.receive_tmc),
-      lzkText(body.done),
-      lzkNum(body.trust_qty),
-      lzkText(body.trust_who),
-      lzkText(body.trust_invoice),
-      lzkText(body.trusted_person),
-      lzkText(body.login)
+      body.attention || null,
+      body.responsible || null,
+      body.payment || null,
+      body.documents || null,
+      body.receive_tmc || null,
+      body.done || null,
+      body.trust_qty || null,
+      body.trust_who || null,
+      body.trust_invoice || null,
+      body.trusted_person || null
     ]);
 
-    if (!update.rowCount) {
-      await pool.query(`
-        INSERT INTO lzk.supply (
-          idzlzk,
-          idplxk,
-          component,
-          recipe,
-          attention,
-          responsible,
-          payment_status,
-          documents_status,
-          receive_status,
-          done_status,
-          trust_qty,
-          trust_from,
-          trust_invoice,
-          trusted_person,
-          updated_by,
-          created_at,
-          updated_at
-        )
-        VALUES (
-          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,NOW(),NOW()
-        )
-      `, [
-        idzlzk,
-        idplxk || null,
-        lzkText(body.component),
-        lzkText(body.recipe),
-        lzkNum(body.attention),
-        lzkText(body.responsible),
-        lzkText(body.payment) || "Не оплачено",
-        lzkText(body.documents) || "В работе",
-        lzkText(body.receive_tmc),
-        lzkText(body.done),
-        lzkNum(body.trust_qty),
-        lzkText(body.trust_who),
-        lzkText(body.trust_invoice),
-        lzkText(body.trusted_person),
-        lzkText(body.login)
-      ]);
-    }
+    res.json({
+      success: true,
+      row: q.rows[0]
+    });
 
-    res.json({ success: true });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    console.error("LZK SUPPLY SAVE ERROR:", e);
+
+    res.status(500).json({
+      success: false,
+      error: e.message
+    });
   }
 });
-
 app.get("/lzk/trust-requests", async (req, res) => {
   try {
     const q = await pool.query(`
