@@ -8022,7 +8022,7 @@ app.get("/lzk/limits", async (req, res) => {
         l.constructive_name AS constructive,
         l.group_name,
         l.material_name AS tmc_name,
-        l.unit,
+        l.unit_name,
         COALESCE(l.plan_qty, 0) AS plan,
         COALESCE(l.price_without_vat, 0) AS column_l,
         COALESCE(l.amount, 0) AS amount_sum,
@@ -8054,7 +8054,7 @@ app.get("/lzk/limits", async (req, res) => {
         l.constructive_name,
         l.group_name,
         l.material_name,
-        l.unit,
+        l.unit_name,
         l.plan_qty,
         l.price_without_vat,
         l.amount
