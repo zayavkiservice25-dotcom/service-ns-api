@@ -8357,27 +8357,112 @@ app.post("/lzk/requests/status", async (req, res) => {
     });
   }
 
+  const client = await pool.connect();
+
   try {
-    const q = await pool.query(`
+    await client.query("BEGIN");
+
+    const updated = await client.query(`
       UPDATE lzk.requests
       SET
         pto_status = $2,
-        pto_date = NOW()
+        pto_date = NOW(),
+        updated_at = NOW()
       WHERE idzlzk = ANY($1::text[])
+      RETURNING idzlzk
     `, [ids, status]);
+
+    if (status === "Согласован") {
+      await client.query(`
+        INSERT INTO lzk.supply (
+          idzlzk,
+          idplxk,
+          component,
+          recipe,
+          payment_status,
+          documents_status,
+          created_at,
+          updated_at
+        )
+        SELECT
+          r.idzlzk,
+
+          'PLXK_' || md5(
+            lower(trim(COALESCE(r.object_name, ''))) || '|' ||
+            lower(trim(COALESCE(r.group_name, ''))) || '|' ||
+            lower(trim(COALESCE(r.material_name, ''))) || '|' ||
+            lower(trim(COALESCE(c.material_name, ''))) || '|' ||
+            COALESCE(c.coefficient::text, '')
+          ) AS idplxk,
+
+          c.material_name AS component,
+          c.coefficient::text AS recipe,
+          'Не оплачено',
+          'В работе',
+          NOW(),
+          NOW()
+
+        FROM lzk.requests r
+
+        JOIN lzk.components c
+          ON lower(trim(c.object_name)) =
+             lower(trim(r.object_name))
+
+         AND lower(trim(c.recipe_name)) =
+             lower(trim(r.material_name))
+
+         AND (
+           COALESCE(
+             trim(to_jsonb(c)->>'group_name'),
+             ''
+           ) = ''
+
+           OR lower(
+             trim(to_jsonb(c)->>'group_name')
+           ) = lower(
+             trim(r.group_name)
+           )
+         )
+
+        WHERE r.idzlzk = ANY($1::text[])
+
+          AND NOT EXISTS (
+            SELECT 1
+            FROM lzk.supply s
+            WHERE s.idzlzk = r.idzlzk
+              AND s.idplxk =
+                  'PLXK_' || md5(
+                    lower(trim(COALESCE(r.object_name, ''))) || '|' ||
+                    lower(trim(COALESCE(r.group_name, ''))) || '|' ||
+                    lower(trim(COALESCE(r.material_name, ''))) || '|' ||
+                    lower(trim(COALESCE(c.material_name, ''))) || '|' ||
+                    COALESCE(c.coefficient::text, '')
+                  )
+          )
+      `, [ids]);
+    }
+
+    await client.query("COMMIT");
 
     res.json({
       success: true,
-      updated: q.rowCount
+      updated: updated.rowCount
     });
 
   } catch (e) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {}
+
     console.error("LZK STATUS ERROR:", e);
 
     res.status(500).json({
       success: false,
       error: e.message
     });
+
+  } finally {
+    client.release();
   }
 });
 
@@ -8400,10 +8485,19 @@ app.get("/lzk/supply", async (req, res) => {
           r.deadline,
           r.documents_url,
           r.pto_status
+
         FROM lzk.requests r
-        WHERE lower(trim(COALESCE(r.pto_status, ''))) IN
-              ('согласован', 'согласовано')
+
+        WHERE lower(
+          trim(
+            COALESCE(r.pto_status, '')
+          )
+        ) IN (
+          'согласован',
+          'согласовано'
+        )
       ),
+
       base_rows AS (
         SELECT
           a.idzlzk AS id,
@@ -8411,85 +8505,223 @@ app.get("/lzk/supply", async (req, res) => {
           a.idlzk,
           ''::text AS idplxk,
           'base'::text AS row_type,
+
           a.initiator,
-          to_char(a.request_date, 'DD.MM.YYYY HH24:MI') AS request_date,
+
+          to_char(
+            a.request_date,
+            'DD.MM.YYYY HH24:MI'
+          ) AS request_date,
+
           a.object_name AS object,
           a.constructive_name AS constructive,
           a.group_name,
           a.material_name AS tmc_name,
           a.unit,
-          COALESCE(a.fact_qty, 0) AS qty,
+
+          COALESCE(
+            a.fact_qty,
+            0
+          ) AS qty,
+
           a.note,
-          to_char(a.deadline, 'YYYY-MM-DD') AS deadline,
+
+          to_char(
+            a.deadline,
+            'YYYY-MM-DD'
+          ) AS deadline,
+
           a.documents_url AS pdf,
           a.pto_status AS pto,
+
           ''::text AS component,
           ''::text AS recipe,
+
           s.attention,
           s.responsible,
           s.payment_status AS payment,
           s.documents_status AS documents,
           s.receive_status AS receive_tmc,
           s.done_status AS done,
+
           s.trust_qty,
           s.trust_from AS trust_who,
           s.trust_invoice,
           s.trusted_person,
+
           EXISTS (
             SELECT 1
             FROM lzk.components c
-            WHERE c.object_name = a.object_name
-              AND c.recipe_name = a.material_name
+
+            WHERE lower(trim(c.object_name)) =
+                  lower(trim(a.object_name))
+
+              AND lower(trim(c.recipe_name)) =
+                  lower(trim(a.material_name))
+
+              AND (
+                COALESCE(
+                  trim(to_jsonb(c)->>'group_name'),
+                  ''
+                ) = ''
+
+                OR lower(
+                  trim(to_jsonb(c)->>'group_name')
+                ) = lower(
+                  trim(a.group_name)
+                )
+              )
           ) AS is_component_source
+
         FROM approved a
+
         LEFT JOIN lzk.supply s
           ON s.idzlzk = a.idzlzk
-         AND COALESCE(trim(s.idplxk), '') = ''
+         AND COALESCE(
+               trim(s.idplxk),
+               ''
+             ) = ''
       ),
+
       component_rows AS (
         SELECT
-          a.idzlzk || ':' || c.id::text AS id,
+          a.idzlzk || ':' ||
+
+          (
+            'PLXK_' || md5(
+              lower(trim(COALESCE(a.object_name, ''))) || '|' ||
+              lower(trim(COALESCE(a.group_name, ''))) || '|' ||
+              lower(trim(COALESCE(a.material_name, ''))) || '|' ||
+              lower(trim(COALESCE(c.material_name, ''))) || '|' ||
+              COALESCE(c.coefficient::text, '')
+            )
+          ) AS id,
+
           a.idzlzk,
           a.idlzk,
-          'PLXK' || c.id::text AS idplxk,
+
+          'PLXK_' || md5(
+            lower(trim(COALESCE(a.object_name, ''))) || '|' ||
+            lower(trim(COALESCE(a.group_name, ''))) || '|' ||
+            lower(trim(COALESCE(a.material_name, ''))) || '|' ||
+            lower(trim(COALESCE(c.material_name, ''))) || '|' ||
+            COALESCE(c.coefficient::text, '')
+          ) AS idplxk,
+
           'component'::text AS row_type,
+
           a.initiator,
-          to_char(a.request_date, 'DD.MM.YYYY HH24:MI') AS request_date,
+
+          to_char(
+            a.request_date,
+            'DD.MM.YYYY HH24:MI'
+          ) AS request_date,
+
           a.object_name AS object,
           a.constructive_name AS constructive,
           a.group_name,
+
           ''::text AS tmc_name,
           a.unit,
-          COALESCE(a.fact_qty, 0) * COALESCE(c.coefficient, 0) AS qty,
+
+          COALESCE(
+            a.fact_qty,
+            0
+          ) * COALESCE(
+            c.coefficient,
+            0
+          ) AS qty,
+
           a.note,
-          to_char(a.deadline, 'YYYY-MM-DD') AS deadline,
+
+          to_char(
+            a.deadline,
+            'YYYY-MM-DD'
+          ) AS deadline,
+
           a.documents_url AS pdf,
           a.pto_status AS pto,
+
           c.material_name AS component,
           c.coefficient::text AS recipe,
+
           s.attention,
           s.responsible,
           s.payment_status AS payment,
           s.documents_status AS documents,
           s.receive_status AS receive_tmc,
           s.done_status AS done,
+
           s.trust_qty,
           s.trust_from AS trust_who,
           s.trust_invoice,
           s.trusted_person,
+
           true AS is_component_source
+
         FROM approved a
+
         JOIN lzk.components c
-          ON c.object_name = a.object_name
-         AND c.recipe_name = a.material_name
+          ON lower(trim(c.object_name)) =
+             lower(trim(a.object_name))
+
+         AND lower(trim(c.recipe_name)) =
+             lower(trim(a.material_name))
+
+         AND (
+           COALESCE(
+             trim(to_jsonb(c)->>'group_name'),
+             ''
+           ) = ''
+
+           OR lower(
+             trim(to_jsonb(c)->>'group_name')
+           ) = lower(
+             trim(a.group_name)
+           )
+         )
+
         LEFT JOIN lzk.supply s
           ON s.idzlzk = a.idzlzk
-         AND s.idplxk = 'PLXK' || c.id::text
+
+         AND s.idplxk =
+             'PLXK_' || md5(
+               lower(trim(COALESCE(a.object_name, ''))) || '|' ||
+               lower(trim(COALESCE(a.group_name, ''))) || '|' ||
+               lower(trim(COALESCE(a.material_name, ''))) || '|' ||
+               lower(trim(COALESCE(c.material_name, ''))) || '|' ||
+               COALESCE(c.coefficient::text, '')
+             )
       )
-      SELECT * FROM base_rows
-      UNION ALL
-      SELECT * FROM component_rows
-      ORDER BY idzlzk, row_type, idplxk
+
+      SELECT *
+      FROM (
+        SELECT *
+        FROM base_rows
+
+        UNION ALL
+
+        SELECT *
+        FROM component_rows
+      ) all_rows
+
+      ORDER BY
+        NULLIF(
+          regexp_replace(
+            all_rows.idzlzk,
+            '\\D',
+            '',
+            'g'
+          ),
+          ''
+        )::bigint,
+
+        CASE
+          WHEN all_rows.row_type = 'base' THEN 0
+          ELSE 1
+        END,
+
+        all_rows.idplxk
     `);
 
     res.json({
@@ -8497,8 +8729,14 @@ app.get("/lzk/supply", async (req, res) => {
       role: lzkText(req.query.role),
       rows: q.rows
     });
+
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    console.error("LZK SUPPLY ERROR:", e);
+
+    res.status(500).json({
+      success: false,
+      error: e.message
+    });
   }
 });
 
