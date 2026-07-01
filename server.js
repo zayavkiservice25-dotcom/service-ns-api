@@ -8977,4 +8977,27 @@ app.get("/lzk/suppliers", async (req, res) => {
   }
 });
 
+app.get("/lzk/trusted-persons", async (req, res) => {
+  try {
+    const q = await pool.query(`
+      SELECT trusted_person_name
+      FROM lzk.spr_trusted_person
+      WHERE COALESCE(trim(trusted_person_name), '') <> ''
+      ORDER BY trusted_person_name
+    `);
+
+    res.json({
+      success: true,
+      rows: q.rows
+    });
+  } catch (e) {
+    console.error("LZK TRUSTED PERSONS ERROR:", e);
+
+    res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
+
 app.listen(PORT, () => console.log("Server started on port " + PORT))
