@@ -1992,7 +1992,7 @@ app.get("/ft", async (req, res) => {
     const qUser = `
       SELECT f.*
       FROM ft f
-      WHERE f.input_name = $2
+      WHERE lower(trim(f.input_name)) = lower(trim($2))
       ORDER BY COALESCE(NULLIF(substring(f.id_ft from '\\d+'), ''), '0')::int DESC
       LIMIT $1
     `;
