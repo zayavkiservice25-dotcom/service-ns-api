@@ -8519,17 +8519,20 @@ app.get("/lzk/supply", async (req, res) => {
       )
 
       SELECT *
-      FROM base_rows
+      FROM (
+        SELECT *
+        FROM base_rows
 
-      UNION ALL
+        UNION ALL
 
-      SELECT *
-      FROM component_rows
+        SELECT *
+        FROM component_rows
+      ) all_rows
 
       ORDER BY
-        regexp_replace(idzlzk, '\\D', '', 'g')::bigint,
-        row_type,
-        idplxk
+        regexp_replace(all_rows.idzlzk, '\\D', '', 'g')::bigint,
+        all_rows.row_type,
+        all_rows.idplxk
     `);
 
     res.json({
