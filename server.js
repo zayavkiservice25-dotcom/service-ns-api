@@ -2681,30 +2681,23 @@ app.get("/registry-card", async (req, res) => {
   }
 });
 
-
 app.post("/request-created-bulk", async (req, res) => {
   try {
     const rowIds = Array.isArray(req.body.row_ids)
       ? req.body.row_ids.map(Number).filter(Boolean)
       : [];
 
-    const login = String(req.body.login || "").trim().toLowerCase();
+    const login = String(req.body.login || "")
+      .trim()
+      .toLowerCase();
 
-    // ВАЖНО: пустая строка означает очистить ЗаявкаСоздано.
-    // Нельзя использовать req.body.value || "Да", потому что "" тогда снова станет "Да".
-    const hasValue = Object.prototype.hasOwnProperty.call(req.body, "value");
-    const rawValue = hasValue ? req.body.value : "Да";
-    const valueText = rawValue === null || rawValue === undefined
-      ? ""
-      : String(rawValue).trim();
-    const value = valueText === "" ? null : valueText;
+    // Важно: пустое значение нельзя заменять на "Да"
+    const rawValue =
+      req.body.value === null || req.body.value === undefined
+        ? ""
+        : String(req.body.value).trim();
 
-    if (login !== "b_erkin") {
-      return res.status(403).json({
-        success: false,
-        error: "Нет доступа к изменению ЗаявкаСоздано"
-      });
-    }
+    const value = rawValue === "" ? null : rawValue;
 
     if (!rowIds.length) {
       return res.status(400).json({
@@ -2713,23 +2706,128 @@ app.post("/request-created-bulk", async (req, res) => {
       });
     }
 
-    const updateResult = await pool.query(
+    if (!login) {
+      return res.status(400).json({
+        success: false,
+        error: "login required"
+      });
+    }
+
+    if (value !== null && value !== "Да") {
+      return res.status(400).json({
+        success: false,
+        error: "Разрешены только пустое значение или Да"
+      });
+    }
+
+    const isBerkin = login === "b_erkin";
+
+    /*
+      Пустое значение вручную может устанавливать только b_erkin.
+
+      Значение "Да":
+      - b_erkin может ставить для любой строки;
+      - supervisor/admin/editor могут создавать заявку по доступной строке;
+      - инициатор может ставить только на своей строке.
+    */
+    if (value === null && !isBerkin) {
+      return res.status(403).json({
+        success: false,
+        error: "Нет доступа к очистке ЗаявкаСоздано"
+      });
+    }
+
+    const userResult = await pool.query(
       `
-      UPDATE public.zvk_status
-      SET chief_approved = $1
-      WHERE zvk_row_id = ANY($2::bigint[])
+      SELECT LOWER(TRIM(COALESCE(role_ft, ''))) AS role_ft
+      FROM public.users
+      WHERE LOWER(TRIM(login)) = $1
+      LIMIT 1
       `,
-      [value, rowIds]
+      [login]
+    );
+
+    const roleFt = String(
+      userResult.rows[0]?.role_ft || ""
+    ).trim().toLowerCase();
+
+    const canManageAll =
+      isBerkin ||
+      roleFt === "admin" ||
+      roleFt === "админ" ||
+      roleFt === "администратор" ||
+      roleFt === "supervisor" ||
+      roleFt === "супервайзер" ||
+      roleFt === "editor" ||
+      roleFt === "редактор";
+
+    let allowedRows;
+
+    if (canManageAll) {
+      allowedRows = await pool.query(
+        `
+        SELECT z.id
+        FROM public.zvk z
+        WHERE z.id = ANY($1::bigint[])
+        `,
+        [rowIds]
+      );
+    } else {
+      allowedRows = await pool.query(
+        `
+        SELECT z.id
+        FROM public.zvk z
+        JOIN public.ft f
+          ON f.id_ft = z.id_ft
+        WHERE z.id = ANY($1::bigint[])
+          AND LOWER(TRIM(COALESCE(f.input_name, ''))) = $2
+        `,
+        [rowIds, login]
+      );
+    }
+
+    const allowedIds = allowedRows.rows
+      .map(row => Number(row.id))
+      .filter(Boolean);
+
+    if (!allowedIds.length) {
+      return res.status(403).json({
+        success: false,
+        error: "Нет доступа к выбранным строкам"
+      });
+    }
+
+    // Создаём zvk_status, если строки там ещё нет
+    await pool.query(
+      `
+      INSERT INTO public.zvk_status
+      (
+        zvk_row_id,
+        status_time,
+        chief_approved
+      )
+      SELECT
+        row_id,
+        NOW(),
+        $1
+      FROM UNNEST($2::bigint[]) AS row_id
+      ON CONFLICT (zvk_row_id)
+      DO UPDATE SET
+        chief_approved = EXCLUDED.chief_approved,
+        status_time = NOW()
+      `,
+      [value, allowedIds]
     );
 
     return res.json({
       success: true,
-      updated: updateResult.rowCount,
+      updated: allowedIds.length,
       value: value
     });
 
   } catch (e) {
     console.error("request-created-bulk error:", e);
+
     return res.status(500).json({
       success: false,
       error: e.message
