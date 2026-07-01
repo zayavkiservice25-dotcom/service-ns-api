@@ -2688,8 +2688,23 @@ app.post("/request-created-bulk", async (req, res) => {
       ? req.body.row_ids.map(Number).filter(Boolean)
       : [];
 
-    const login = String(req.body.login || "").trim();
-    const value = String(req.body.value || "Да").trim();
+    const login = String(req.body.login || "").trim().toLowerCase();
+
+    // ВАЖНО: пустая строка означает очистить ЗаявкаСоздано.
+    // Нельзя использовать req.body.value || "Да", потому что "" тогда снова станет "Да".
+    const hasValue = Object.prototype.hasOwnProperty.call(req.body, "value");
+    const rawValue = hasValue ? req.body.value : "Да";
+    const valueText = rawValue === null || rawValue === undefined
+      ? ""
+      : String(rawValue).trim();
+    const value = valueText === "" ? null : valueText;
+
+    if (login !== "b_erkin") {
+      return res.status(403).json({
+        success: false,
+        error: "Нет доступа к изменению ЗаявкаСоздано"
+      });
+    }
 
     if (!rowIds.length) {
       return res.status(400).json({
@@ -2698,7 +2713,7 @@ app.post("/request-created-bulk", async (req, res) => {
       });
     }
 
-    await pool.query(
+    const updateResult = await pool.query(
       `
       UPDATE public.zvk_status
       SET chief_approved = $1
@@ -2709,7 +2724,8 @@ app.post("/request-created-bulk", async (req, res) => {
 
     return res.json({
       success: true,
-      updated: rowIds.length
+      updated: updateResult.rowCount,
+      value: value
     });
 
   } catch (e) {
