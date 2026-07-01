@@ -8342,7 +8342,6 @@ app.post("/lzk/requests/status", async (req, res) => {
     : [];
 
   const status = lzkText(req.body?.status);
-  const login = lzkText(req.body?.login);
 
   if (!ids.length) {
     return res.status(400).json({
@@ -8363,18 +8362,22 @@ app.post("/lzk/requests/status", async (req, res) => {
       UPDATE lzk.requests
       SET
         pto_status = $2,
-        pto_login = $3,
-        pto_date = NOW(),
-        updated_at = NOW()
+        pto_date = NOW()
       WHERE idzlzk = ANY($1::text[])
-    `, [ids, status, login]);
+    `, [ids, status]);
 
     res.json({
       success: true,
       updated: q.rowCount
     });
+
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    console.error("LZK STATUS ERROR:", e);
+
+    res.status(500).json({
+      success: false,
+      error: e.message
+    });
   }
 });
 
@@ -8401,7 +8404,6 @@ app.get("/lzk/supply", async (req, res) => {
         WHERE lower(trim(COALESCE(r.pto_status, ''))) IN
               ('согласован', 'согласовано')
       ),
-
       base_rows AS (
         SELECT
           a.idzlzk AS id,
@@ -8433,42 +8435,23 @@ app.get("/lzk/supply", async (req, res) => {
           s.trust_from AS trust_who,
           s.trust_invoice,
           s.trusted_person,
-
           EXISTS (
             SELECT 1
             FROM lzk.components c
-            WHERE lower(trim(c.object_name)) =
-                  lower(trim(a.object_name))
-              AND lower(trim(c.recipe_name)) =
-                  lower(trim(a.material_name))
+            WHERE c.object_name = a.object_name
+              AND c.recipe_name = a.material_name
           ) AS is_component_source
-
         FROM approved a
-
         LEFT JOIN lzk.supply s
           ON s.idzlzk = a.idzlzk
          AND COALESCE(trim(s.idplxk), '') = ''
       ),
-
       component_rows AS (
         SELECT
-          a.idzlzk || ':' ||
-          md5(
-            COALESCE(c.object_name, '') || '|' ||
-            COALESCE(c.recipe_name, '') || '|' ||
-            COALESCE(c.material_name, '')
-          ) AS id,
-
+          a.idzlzk || ':' || c.id::text AS id,
           a.idzlzk,
           a.idlzk,
-
-          'PLXK_' ||
-          md5(
-            COALESCE(c.object_name, '') || '|' ||
-            COALESCE(c.recipe_name, '') || '|' ||
-            COALESCE(c.material_name, '')
-          ) AS idplxk,
-
+          'PLXK' || c.id::text AS idplxk,
           'component'::text AS row_type,
           a.initiator,
           to_char(a.request_date, 'DD.MM.YYYY HH24:MI') AS request_date,
@@ -8477,10 +8460,7 @@ app.get("/lzk/supply", async (req, res) => {
           a.group_name,
           ''::text AS tmc_name,
           a.unit,
-
-          COALESCE(a.fact_qty, 0) *
-          COALESCE(c.coefficient, 0) AS qty,
-
+          COALESCE(a.fact_qty, 0) * COALESCE(c.coefficient, 0) AS qty,
           a.note,
           to_char(a.deadline, 'YYYY-MM-DD') AS deadline,
           a.documents_url AS pdf,
@@ -8498,41 +8478,18 @@ app.get("/lzk/supply", async (req, res) => {
           s.trust_invoice,
           s.trusted_person,
           true AS is_component_source
-
         FROM approved a
-
         JOIN lzk.components c
-          ON lower(trim(c.object_name)) =
-             lower(trim(a.object_name))
-         AND lower(trim(c.recipe_name)) =
-             lower(trim(a.material_name))
-
+          ON c.object_name = a.object_name
+         AND c.recipe_name = a.material_name
         LEFT JOIN lzk.supply s
           ON s.idzlzk = a.idzlzk
-         AND s.idplxk =
-             'PLXK_' ||
-             md5(
-               COALESCE(c.object_name, '') || '|' ||
-               COALESCE(c.recipe_name, '') || '|' ||
-               COALESCE(c.material_name, '')
-             )
+         AND s.idplxk = 'PLXK' || c.id::text
       )
-
-      SELECT *
-      FROM (
-        SELECT *
-        FROM base_rows
-
-        UNION ALL
-
-        SELECT *
-        FROM component_rows
-      ) all_rows
-
-      ORDER BY
-        regexp_replace(all_rows.idzlzk, '\\D', '', 'g')::bigint,
-        all_rows.row_type,
-        all_rows.idplxk
+      SELECT * FROM base_rows
+      UNION ALL
+      SELECT * FROM component_rows
+      ORDER BY idzlzk, row_type, idplxk
     `);
 
     res.json({
@@ -8540,14 +8497,8 @@ app.get("/lzk/supply", async (req, res) => {
       role: lzkText(req.query.role),
       rows: q.rows
     });
-
   } catch (e) {
-    console.error("LZK SUPPLY ERROR:", e);
-
-    res.status(500).json({
-      success: false,
-      error: e.message
-    });
+    res.status(500).json({ success: false, error: e.message });
   }
 });
 
