@@ -7812,4 +7812,934 @@ app.post(["/api/doc_debt_adjustment", "/api/1c/doc_debt_adjustment"], async (req
   }
 });
 
+// =====================================================
+// ЛЗК API — POSTGRESQL
+// Google Sheets в этих маршрутах не используется.
+// =====================================================
+
+function lzkText(v) {
+  return v === null || v === undefined ? "" : String(v).trim();
+}
+
+function lzkNum(v) {
+  if (v === null || v === undefined || lzkText(v) === "") return null;
+  const n = Number(String(v).replace(/\s/g, "").replace(",", "."));
+  return Number.isFinite(n) ? n : null;
+}
+
+function lzkYes(v) {
+  const s = lzkText(v).toLowerCase();
+  return s === "да" || s === "true" || s === "1";
+}
+
+function lzkDate(v) {
+  const s = lzkText(v);
+  if (!s) return null;
+
+  const direct = new Date(s);
+  if (!Number.isNaN(direct.getTime())) return direct;
+
+  const m = s.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/);
+  if (!m) return null;
+
+  return new Date(
+    Number(m[3]),
+    Number(m[2]) - 1,
+    Number(m[1]),
+    Number(m[4] || 0),
+    Number(m[5] || 0),
+    Number(m[6] || 0)
+  );
+}
+
+function lzkRoleCanSeeAll(role) {
+  const r = lzkText(role).toLowerCase();
+  return [
+    "admin", "админ", "администратор",
+    "editor", "редактор",
+    "pto", "пто",
+    "supervisor", "супервайзер",
+    "operator", "оператор",
+    "supplier", "снабженец"
+  ].includes(r);
+}
+
+async function nextLzkTextId(client, tableName, columnName, prefix) {
+  await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [
+    "lzk:" + tableName + ":" + columnName
+  ]);
+
+  const sql = `
+    SELECT COALESCE(
+      MAX(NULLIF(regexp_replace(${columnName}, '\\D', '', 'g'), '')::bigint),
+      0
+    ) + 1 AS next_no
+    FROM ${tableName}
+  `;
+
+  const result = await client.query(sql);
+  return prefix + String(result.rows[0].next_no);
+}
+
+app.get("/lzk/materials", async (req, res) => {
+  try {
+    const q = await pool.query(`
+      SELECT DISTINCT material_name AS value
+      FROM lzk.limits
+      WHERE COALESCE(trim(material_name), '') <> ''
+      ORDER BY material_name
+    `);
+
+    res.json({
+      success: true,
+      rows: q.rows.map(r => r.value)
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.get("/lzk/limits", async (req, res) => {
+  try {
+    const q = await pool.query(`
+      SELECT
+        l.idlzk,
+        l.object_name AS object,
+        l.constructive_name AS constructive,
+        l.group_name,
+        l.material_name AS tmc_name,
+        l.unit,
+        COALESCE(l.plan_qty, 0) AS plan,
+        COALESCE(l.price_without_vat, 0) AS column_l,
+        COALESCE(l.amount, 0) AS amount_sum,
+
+        COALESCE(SUM(
+          CASE
+            WHEN lower(trim(COALESCE(r.pto_status, ''))) IN ('согласован', 'согласовано')
+            THEN COALESCE(r.fact_qty, 0)
+            ELSE 0
+          END
+        ), 0) AS fact_approved,
+
+        COALESCE(SUM(
+          CASE
+            WHEN lower(trim(COALESCE(r.pto_status, ''))) NOT IN
+                 ('согласован', 'согласовано', 'отклонено')
+            THEN COALESCE(r.fact_qty, 0)
+            ELSE 0
+          END
+        ), 0) AS fact_not_approved
+
+      FROM lzk.limits l
+      LEFT JOIN lzk.requests r
+        ON r.idlzk = l.idlzk
+      WHERE COALESCE(l.is_active, true) = true
+      GROUP BY
+        l.idlzk,
+        l.object_name,
+        l.constructive_name,
+        l.group_name,
+        l.material_name,
+        l.unit,
+        l.plan_qty,
+        l.price_without_vat,
+        l.amount
+      ORDER BY
+        l.object_name,
+        l.constructive_name,
+        l.group_name,
+        l.material_name,
+        l.idlzk
+    `);
+
+    const rows = q.rows.map(row => {
+      const plan = Number(row.plan || 0);
+      const approved = Number(row.fact_approved || 0);
+      const pending = Number(row.fact_not_approved || 0);
+
+      return {
+        ...row,
+        difference: plan - approved,
+        difference2: plan - approved - pending
+      };
+    });
+
+    res.json({ success: true, rows });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.post("/lzk/requests", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const body = req.body || {};
+    const idlzk = lzkText(body.idlzk);
+    const initiator = lzkText(body.initiator || body.login);
+    const qty = lzkNum(body.qty ?? body.fact_qty);
+
+    if (!idlzk) throw new Error("IDLZK не передан");
+    if (!initiator) throw new Error("Инициатор не передан");
+    if (qty === null) throw new Error("Кол-во не заполнено");
+
+    await client.query("BEGIN");
+
+    const limitResult = await client.query(`
+      SELECT *
+      FROM lzk.limits
+      WHERE idlzk = $1
+      LIMIT 1
+    `, [idlzk]);
+
+    if (!limitResult.rows.length) {
+      throw new Error("IDLZK не найден в lzk.limits: " + idlzk);
+    }
+
+    const limit = limitResult.rows[0];
+    const idzlzk = await nextLzkTextId(
+      client,
+      "lzk.requests",
+      "idzlzk",
+      "ZLZK"
+    );
+
+    await client.query(`
+      INSERT INTO lzk.requests (
+        idzlzk,
+        idlzk,
+        initiator,
+        request_date,
+        object_name,
+        constructive_name,
+        group_name,
+        material_name,
+        unit,
+        fact_qty,
+        pto_status,
+        note,
+        deadline,
+        documents_url,
+        created_at,
+        updated_at
+      )
+      VALUES (
+        $1,$2,$3,COALESCE($4,NOW()),$5,$6,$7,$8,$9,$10,
+        'На рассмотрении',$11,$12,$13,NOW(),NOW()
+      )
+    `, [
+      idzlzk,
+      idlzk,
+      initiator,
+      lzkDate(body.request_date),
+      lzkText(body.object) || limit.object_name,
+      lzkText(body.constructive) || limit.constructive_name,
+      lzkText(body.group_name) || limit.group_name,
+      lzkText(body.tmc_name) || limit.material_name,
+      lzkText(body.unit) || limit.unit,
+      qty,
+      lzkText(body.note),
+      lzkDate(body.deadline),
+      lzkText(body.documents_url || body.pdf)
+    ]);
+
+    await client.query("COMMIT");
+
+    res.json({
+      success: true,
+      id: idzlzk,
+      idzlzk
+    });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    res.status(500).json({ success: false, error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+async function getLzkRequestRows(req, res, approvedOnly) {
+  try {
+    const idlzk = lzkText(req.query.idlzk);
+    const login = lzkText(req.query.login).toLowerCase();
+    const role = lzkText(req.query.role);
+    const canSeeAll = lzkRoleCanSeeAll(role);
+
+    const params = [idlzk];
+    let accessSql = "";
+
+    if (!canSeeAll && login) {
+      params.push(login);
+      accessSql = `AND lower(trim(r.initiator)) = $${params.length}`;
+    }
+
+    const statusSql = approvedOnly
+      ? `lower(trim(COALESCE(r.pto_status, ''))) IN ('согласован', 'согласовано')`
+      : `lower(trim(COALESCE(r.pto_status, ''))) NOT IN ('согласован', 'согласовано', 'отклонено')`;
+
+    const q = await pool.query(`
+      SELECT
+        r.idzlzk AS id,
+        r.idzlzk,
+        r.idlzk,
+        r.initiator,
+        to_char(r.request_date, 'DD.MM.YYYY HH24:MI') AS request_date,
+        r.object_name AS object,
+        r.constructive_name AS constructive,
+        r.group_name,
+        r.material_name AS tmc_name,
+        r.unit,
+        COALESCE(l.plan_qty, 0) AS plan,
+        COALESCE(r.fact_qty, 0) AS qty,
+        r.note,
+        to_char(r.deadline, 'YYYY-MM-DD') AS deadline,
+        r.documents_url AS pdf,
+        r.pto_status AS pto
+      FROM lzk.requests r
+      LEFT JOIN lzk.limits l
+        ON l.idlzk = r.idlzk
+      WHERE r.idlzk = $1
+        AND ${statusSql}
+        ${accessSql}
+      ORDER BY r.request_date, r.idzlzk
+    `, params);
+
+    const total = q.rows.reduce(
+      (sum, row) => sum + Number(row.qty || 0),
+      0
+    );
+
+    res.json({
+      success: true,
+      rows: q.rows,
+      total
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+}
+
+app.get("/lzk/requests/pending", (req, res) => {
+  return getLzkRequestRows(req, res, false);
+});
+
+app.get("/lzk/requests/approved", (req, res) => {
+  return getLzkRequestRows(req, res, true);
+});
+
+app.post("/lzk/requests/qty", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+    if (!rows.length) throw new Error("Строки не переданы");
+
+    await client.query("BEGIN");
+
+    let updated = 0;
+
+    for (const row of rows) {
+      const id = lzkText(row.idzlzk || row.id);
+      const qty = lzkNum(row.qty);
+
+      if (!id || qty === null) continue;
+
+      const q = await client.query(`
+        UPDATE lzk.requests
+        SET
+          fact_qty = $2,
+          updated_at = NOW()
+        WHERE idzlzk = $1
+          AND lower(trim(COALESCE(pto_status, ''))) NOT IN
+              ('согласован', 'согласовано', 'отклонено')
+      `, [id, qty]);
+
+      updated += q.rowCount;
+    }
+
+    await client.query("COMMIT");
+    res.json({ success: true, updated });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    res.status(500).json({ success: false, error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/lzk/requests/editor-update", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+    await client.query("BEGIN");
+
+    let updated = 0;
+
+    for (const row of rows) {
+      const id = lzkText(row.idzlzk || row.id);
+      if (!id) continue;
+
+      const q = await client.query(`
+        UPDATE lzk.requests
+        SET
+          fact_qty = COALESCE($2, fact_qty),
+          note = COALESCE(NULLIF($3, ''), note),
+          deadline = COALESCE($4, deadline),
+          updated_at = NOW()
+        WHERE idzlzk = $1
+      `, [
+        id,
+        lzkNum(row.qty),
+        lzkText(row.note),
+        lzkDate(row.deadline)
+      ]);
+
+      updated += q.rowCount;
+    }
+
+    await client.query("COMMIT");
+    res.json({ success: true, updated });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    res.status(500).json({ success: false, error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/lzk/requests/status", async (req, res) => {
+  const ids = Array.isArray(req.body?.ids)
+    ? req.body.ids.map(lzkText).filter(Boolean)
+    : [];
+
+  const status = lzkText(req.body?.status);
+  const login = lzkText(req.body?.login);
+
+  if (!ids.length) {
+    return res.status(400).json({
+      success: false,
+      error: "Не выбраны строки"
+    });
+  }
+
+  if (!["Согласован", "Отклонено"].includes(status)) {
+    return res.status(400).json({
+      success: false,
+      error: "Неверный статус"
+    });
+  }
+
+  try {
+    const q = await pool.query(`
+      UPDATE lzk.requests
+      SET
+        pto_status = $2,
+        pto_login = $3,
+        pto_date = NOW(),
+        updated_at = NOW()
+      WHERE idzlzk = ANY($1::text[])
+    `, [ids, status, login]);
+
+    res.json({
+      success: true,
+      updated: q.rowCount
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.get("/lzk/supply", async (req, res) => {
+  try {
+    const q = await pool.query(`
+      WITH approved AS (
+        SELECT
+          r.idzlzk,
+          r.idlzk,
+          r.initiator,
+          r.request_date,
+          r.object_name,
+          r.constructive_name,
+          r.group_name,
+          r.material_name,
+          r.unit,
+          r.fact_qty,
+          r.note,
+          r.deadline,
+          r.documents_url,
+          r.pto_status
+        FROM lzk.requests r
+        WHERE lower(trim(COALESCE(r.pto_status, ''))) IN
+              ('согласован', 'согласовано')
+      ),
+      base_rows AS (
+        SELECT
+          a.idzlzk AS id,
+          a.idzlzk,
+          a.idlzk,
+          ''::text AS idplxk,
+          'base'::text AS row_type,
+          a.initiator,
+          to_char(a.request_date, 'DD.MM.YYYY HH24:MI') AS request_date,
+          a.object_name AS object,
+          a.constructive_name AS constructive,
+          a.group_name,
+          a.material_name AS tmc_name,
+          a.unit,
+          COALESCE(a.fact_qty, 0) AS qty,
+          a.note,
+          to_char(a.deadline, 'YYYY-MM-DD') AS deadline,
+          a.documents_url AS pdf,
+          a.pto_status AS pto,
+          ''::text AS component,
+          ''::text AS recipe,
+          s.attention,
+          s.responsible,
+          s.payment_status AS payment,
+          s.documents_status AS documents,
+          s.receive_status AS receive_tmc,
+          s.done_status AS done,
+          s.trust_qty,
+          s.trust_from AS trust_who,
+          s.trust_invoice,
+          s.trusted_person,
+          EXISTS (
+            SELECT 1
+            FROM lzk.components c
+            WHERE c.object_name = a.object_name
+              AND c.recipe_name = a.material_name
+          ) AS is_component_source
+        FROM approved a
+        LEFT JOIN lzk.supply s
+          ON s.idzlzk = a.idzlzk
+         AND COALESCE(trim(s.idplxk), '') = ''
+      ),
+      component_rows AS (
+        SELECT
+          a.idzlzk || ':' || c.id::text AS id,
+          a.idzlzk,
+          a.idlzk,
+          'PLXK' || c.id::text AS idplxk,
+          'component'::text AS row_type,
+          a.initiator,
+          to_char(a.request_date, 'DD.MM.YYYY HH24:MI') AS request_date,
+          a.object_name AS object,
+          a.constructive_name AS constructive,
+          a.group_name,
+          ''::text AS tmc_name,
+          a.unit,
+          COALESCE(a.fact_qty, 0) * COALESCE(c.coefficient, 0) AS qty,
+          a.note,
+          to_char(a.deadline, 'YYYY-MM-DD') AS deadline,
+          a.documents_url AS pdf,
+          a.pto_status AS pto,
+          c.material_name AS component,
+          c.coefficient::text AS recipe,
+          s.attention,
+          s.responsible,
+          s.payment_status AS payment,
+          s.documents_status AS documents,
+          s.receive_status AS receive_tmc,
+          s.done_status AS done,
+          s.trust_qty,
+          s.trust_from AS trust_who,
+          s.trust_invoice,
+          s.trusted_person,
+          true AS is_component_source
+        FROM approved a
+        JOIN lzk.components c
+          ON c.object_name = a.object_name
+         AND c.recipe_name = a.material_name
+        LEFT JOIN lzk.supply s
+          ON s.idzlzk = a.idzlzk
+         AND s.idplxk = 'PLXK' || c.id::text
+      )
+      SELECT * FROM base_rows
+      UNION ALL
+      SELECT * FROM component_rows
+      ORDER BY idzlzk, row_type, idplxk
+    `);
+
+    res.json({
+      success: true,
+      role: lzkText(req.query.role),
+      rows: q.rows
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.post("/lzk/supply/save", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const rawId = lzkText(body.idzlzk || body.id);
+    const idzlzk = rawId.includes(":") ? rawId.split(":")[0] : rawId;
+    let idplxk = lzkText(body.idplxk);
+
+    // В текущем HTML idplxk иногда не передаётся,
+    // а компонентная строка приходит как ZLZK12:35.
+    if (!idplxk && rawId.includes(":")) {
+      idplxk = "PLXK" + rawId.split(":").slice(1).join(":");
+    }
+
+    if (!idzlzk) throw new Error("IDZLZK не передан");
+
+    // Работает и без уникального индекса: сначала UPDATE, затем INSERT.
+    const update = await pool.query(`
+      UPDATE lzk.supply
+      SET
+        component = COALESCE(NULLIF($3, ''), component),
+        recipe = COALESCE(NULLIF($4, ''), recipe),
+        attention = COALESCE($5, attention),
+        responsible = COALESCE(NULLIF($6, ''), responsible),
+        payment_status = COALESCE(NULLIF($7, ''), payment_status),
+        documents_status = COALESCE(NULLIF($8, ''), documents_status),
+        receive_status = COALESCE(NULLIF($9, ''), receive_status),
+        done_status = COALESCE(NULLIF($10, ''), done_status),
+        trust_qty = COALESCE($11, trust_qty),
+        trust_from = COALESCE(NULLIF($12, ''), trust_from),
+        trust_invoice = COALESCE(NULLIF($13, ''), trust_invoice),
+        trusted_person = COALESCE(NULLIF($14, ''), trusted_person),
+        updated_by = $15,
+        updated_at = NOW()
+      WHERE idzlzk = $1
+        AND COALESCE(trim(idplxk), '') = COALESCE(trim($2), '')
+    `, [
+      idzlzk,
+      idplxk,
+      lzkText(body.component),
+      lzkText(body.recipe),
+      lzkNum(body.attention),
+      lzkText(body.responsible),
+      lzkText(body.payment),
+      lzkText(body.documents),
+      lzkText(body.receive_tmc),
+      lzkText(body.done),
+      lzkNum(body.trust_qty),
+      lzkText(body.trust_who),
+      lzkText(body.trust_invoice),
+      lzkText(body.trusted_person),
+      lzkText(body.login)
+    ]);
+
+    if (!update.rowCount) {
+      await pool.query(`
+        INSERT INTO lzk.supply (
+          idzlzk,
+          idplxk,
+          component,
+          recipe,
+          attention,
+          responsible,
+          payment_status,
+          documents_status,
+          receive_status,
+          done_status,
+          trust_qty,
+          trust_from,
+          trust_invoice,
+          trusted_person,
+          updated_by,
+          created_at,
+          updated_at
+        )
+        VALUES (
+          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,NOW(),NOW()
+        )
+      `, [
+        idzlzk,
+        idplxk || null,
+        lzkText(body.component),
+        lzkText(body.recipe),
+        lzkNum(body.attention),
+        lzkText(body.responsible),
+        lzkText(body.payment) || "Не оплачено",
+        lzkText(body.documents) || "В работе",
+        lzkText(body.receive_tmc),
+        lzkText(body.done),
+        lzkNum(body.trust_qty),
+        lzkText(body.trust_who),
+        lzkText(body.trust_invoice),
+        lzkText(body.trusted_person),
+        lzkText(body.login)
+      ]);
+    }
+
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.get("/lzk/trust-requests", async (req, res) => {
+  try {
+    const q = await pool.query(`
+      SELECT
+        iddlzk,
+        idzlzk,
+        initiator,
+        object_name AS object,
+        to_char(request_date, 'DD.MM.YYYY HH24:MI') AS request_date,
+        constructive_name AS constructive,
+        group_name,
+        material_name AS tmc_name,
+        unit,
+        approved_qty AS qty,
+        applicant,
+        trusted_person AS mol,
+        supplier_name AS supplier_tmc,
+        receive_qty AS qty_receive,
+        invoice_pdf_url AS invoice_pdf,
+        to_char(submitted_at, 'DD.MM.YYYY HH24:MI') AS trust_request_datetime,
+        prepared_number,
+        to_char(prepared_date, 'DD.MM.YYYY HH24:MI') AS prepared_date,
+        deadline_days,
+        CASE WHEN received_status THEN 'Да' ELSE '' END AS received_status,
+        received_by AS received_name,
+        to_char(received_at, 'DD.MM.YYYY HH24:MI') AS received_date,
+        to_char(deadline_close_date, 'YYYY-MM-DD') AS deadline_close_date,
+        overdue_days,
+        closed_qty AS qty_closed,
+        CASE WHEN closed_status THEN 'Да' ELSE '' END AS closed_status,
+        to_char(closed_at, 'DD.MM.YYYY HH24:MI') AS closed_date
+      FROM lzk.trust_requests
+      ORDER BY submitted_at DESC NULLS LAST, iddlzk, idzlzk
+    `);
+
+    res.json({ success: true, rows: q.rows });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.post("/lzk/trust-requests/create", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const body = req.body || {};
+    const items = Array.isArray(body.items) ? body.items : [];
+
+    if (!items.length) throw new Error("Строки заявки не переданы");
+
+    await client.query("BEGIN");
+
+    const iddlzk = await nextLzkTextId(
+      client,
+      "lzk.trust_requests",
+      "iddlzk",
+      "DLZK"
+    );
+
+    for (const item of items) {
+      const idzlzk = lzkText(item.idzlzk || item.id);
+      if (!idzlzk) throw new Error("IDZLZK не передан");
+
+      await client.query(`
+        INSERT INTO lzk.trust_requests (
+          iddlzk,
+          idzlzk,
+          initiator,
+          object_name,
+          request_date,
+          constructive_name,
+          group_name,
+          material_name,
+          unit,
+          approved_qty,
+          applicant,
+          trusted_person,
+          supplier_name,
+          receive_qty,
+          invoice_pdf_url,
+          submitted_at,
+          created_at,
+          updated_at
+        )
+        VALUES (
+          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
+          COALESCE($16,NOW()),NOW(),NOW()
+        )
+      `, [
+        iddlzk,
+        idzlzk,
+        lzkText(item.initiator),
+        lzkText(item.object),
+        lzkDate(item.request_date),
+        lzkText(item.constructive),
+        lzkText(item.group_name),
+        lzkText(item.tmc_name),
+        lzkText(item.unit),
+        lzkNum(item.qty),
+        lzkText(body.applicant || body.login),
+        lzkText(item.mol),
+        lzkText(item.supplier_tmc),
+        lzkNum(item.qty_receive),
+        lzkText(item.invoice_pdf || body.invoice_pdf),
+        lzkDate(body.trust_request_datetime)
+      ]);
+    }
+
+    await client.query("COMMIT");
+    res.json({ success: true, iddlzk, created: items.length });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    res.status(500).json({ success: false, error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/lzk/trust-requests/manual", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const body = req.body || {};
+    const firstItem =
+      Array.isArray(body.items) && body.items.length
+        ? body.items[0]
+        : body;
+
+    await client.query("BEGIN");
+
+    const iddlzk = await nextLzkTextId(
+      client,
+      "lzk.trust_requests",
+      "iddlzk",
+      "DLZK"
+    );
+
+    await client.query(`
+      INSERT INTO lzk.trust_requests (
+        iddlzk,
+        idzlzk,
+        initiator,
+        object_name,
+        request_date,
+        constructive_name,
+        group_name,
+        material_name,
+        unit,
+        approved_qty,
+        applicant,
+        trusted_person,
+        supplier_name,
+        receive_qty,
+        invoice_pdf_url,
+        submitted_at,
+        created_at,
+        updated_at
+      )
+      VALUES (
+        $1,NULL,$2,$3,NULL,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,
+        COALESCE($14,NOW()),NOW(),NOW()
+      )
+    `, [
+      iddlzk,
+      lzkText(firstItem.initiator || body.initiator),
+      lzkText(firstItem.object || body.object),
+      lzkText(firstItem.constructive || body.constructive),
+      lzkText(firstItem.group_name || body.group_name),
+      lzkText(firstItem.tmc_name || body.tmc_name),
+      lzkText(firstItem.unit || body.unit),
+      lzkNum(firstItem.qty ?? body.qty),
+      lzkText(body.applicant || body.login),
+      lzkText(firstItem.mol || body.mol),
+      lzkText(firstItem.supplier_tmc || body.supplier_tmc),
+      lzkNum(firstItem.qty_receive ?? body.qty_receive),
+      lzkText(firstItem.invoice_pdf || body.invoice_pdf),
+      lzkDate(body.trust_request_datetime)
+    ]);
+
+    await client.query("COMMIT");
+    res.json({ success: true, iddlzk, created: 1 });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    res.status(500).json({ success: false, error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/lzk/trust-requests/update", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const iddlzk = lzkText(body.iddlzk);
+
+    if (!iddlzk) throw new Error("IDDlzk не передан");
+
+    const q = await pool.query(`
+      UPDATE lzk.trust_requests
+      SET
+        prepared_number = $2,
+        prepared_date = $3,
+        deadline_days = $4,
+        received_status = $5,
+        received_by = $6,
+        received_at = $7,
+        deadline_close_date = $8,
+        overdue_days = $9,
+        closed_qty = $10,
+        closed_status = $11,
+        closed_at = $12,
+        updated_at = NOW()
+      WHERE iddlzk = $1
+    `, [
+      iddlzk,
+      lzkText(body.prepared_number) || null,
+      lzkDate(body.prepared_date),
+      lzkNum(body.deadline_days),
+      lzkYes(body.received_status),
+      lzkText(body.received_name) || null,
+      lzkDate(body.received_date),
+      lzkDate(body.deadline_close_date),
+      lzkNum(body.overdue_days),
+      lzkNum(body.qty_closed),
+      lzkYes(body.closed_status),
+      lzkDate(body.closed_date)
+    ]);
+
+    res.json({ success: true, updated: q.rowCount });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.get("/lzk/trusted-persons", async (req, res) => {
+  try {
+    const q = await pool.query(`
+      SELECT DISTINCT trusted_person AS value
+      FROM lzk.trust_requests
+      WHERE COALESCE(trim(trusted_person), '') <> ''
+      ORDER BY trusted_person
+    `);
+
+    res.json({
+      success: true,
+      rows: q.rows.map(r => r.value)
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.get("/lzk/suppliers", async (req, res) => {
+  try {
+    const q = await pool.query(`
+      SELECT DISTINCT supplier_name AS value
+      FROM lzk.trust_requests
+      WHERE COALESCE(trim(supplier_name), '') <> ''
+      ORDER BY supplier_name
+    `);
+
+    res.json({
+      success: true,
+      rows: q.rows.map(r => r.value)
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 app.listen(PORT, () => console.log("Server started on port " + PORT))
