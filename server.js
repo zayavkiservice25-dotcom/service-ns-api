@@ -8022,32 +8022,40 @@ app.get("/lzk/limits", async (req, res) => {
         l.constructive_name AS constructive,
         l.group_name,
         l.material_name AS tmc_name,
-        l.unit_name,
+        l.unit_name AS unit,
         COALESCE(l.plan_qty, 0) AS plan,
         COALESCE(l.price_without_vat, 0) AS column_l,
         COALESCE(l.amount, 0) AS amount_sum,
 
-        COALESCE(SUM(
-          CASE
-            WHEN lower(trim(COALESCE(r.pto_status, ''))) IN ('согласован', 'согласовано')
-            THEN COALESCE(r.fact_qty, 0)
-            ELSE 0
-          END
-        ), 0) AS fact_approved,
+        COALESCE(
+          SUM(
+            CASE
+              WHEN lower(trim(COALESCE(r.pto_status, '')))
+                   IN ('согласован', 'согласовано')
+              THEN COALESCE(r.fact_qty, 0)
+              ELSE 0
+            END
+          ),
+          0
+        ) AS fact_approved,
 
-        COALESCE(SUM(
-          CASE
-            WHEN lower(trim(COALESCE(r.pto_status, ''))) NOT IN
-                 ('согласован', 'согласовано', 'отклонено')
-            THEN COALESCE(r.fact_qty, 0)
-            ELSE 0
-          END
-        ), 0) AS fact_not_approved
+        COALESCE(
+          SUM(
+            CASE
+              WHEN lower(trim(COALESCE(r.pto_status, '')))
+                   NOT IN ('согласован', 'согласовано', 'отклонено')
+              THEN COALESCE(r.fact_qty, 0)
+              ELSE 0
+            END
+          ),
+          0
+        ) AS fact_not_approved
 
       FROM lzk.limits l
+
       LEFT JOIN lzk.requests r
         ON r.idlzk = l.idlzk
-      WHERE COALESCE(l.is_active, true) = true
+
       GROUP BY
         l.idlzk,
         l.object_name,
@@ -8058,12 +8066,9 @@ app.get("/lzk/limits", async (req, res) => {
         l.plan_qty,
         l.price_without_vat,
         l.amount
+
       ORDER BY
-        l.object_name,
-        l.constructive_name,
-        l.group_name,
-        l.material_name,
-        l.idlzk
+        regexp_replace(l.idlzk, '\\D', '', 'g')::bigint ASC
     `);
 
     const rows = q.rows.map(row => {
@@ -8078,9 +8083,18 @@ app.get("/lzk/limits", async (req, res) => {
       };
     });
 
-    res.json({ success: true, rows });
+    res.json({
+      success: true,
+      rows
+    });
+
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    console.error("LZK LIMITS ERROR:", e);
+
+    res.status(500).json({
+      success: false,
+      error: e.message
+    });
   }
 });
 
@@ -8150,7 +8164,7 @@ app.post("/lzk/requests", async (req, res) => {
       lzkText(body.constructive) || limit.constructive_name,
       lzkText(body.group_name) || limit.group_name,
       lzkText(body.tmc_name) || limit.material_name,
-      lzkText(body.unit) || limit.unit,
+      lzkText(body.unit) || limit.unit_name,
       qty,
       lzkText(body.note),
       lzkDate(body.deadline),
