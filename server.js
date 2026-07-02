@@ -9322,22 +9322,12 @@ app.get("/bank/saldo", async (req, res) => {
   try {
     const dateFrom = bankDate_(req.query.dateFrom);
     const dateTo = bankDate_(req.query.dateTo);
-    const iban = String(req.query.iban || "").trim();
 
-    const values = [];
-    const where = [];
-
-    if (dateFrom) {
-      values.push(dateFrom);
-      where.push(`date_from >= $${values.length}`);
-    }
-    if (dateTo) {
-      values.push(dateTo);
-      where.push(`date_to <= $${values.length}`);
-    }
-    if (iban) {
-      values.push(iban);
-      where.push(`iban = $${values.length}`);
+    if (!dateFrom || !dateTo) {
+      return res.status(400).json({
+        success: false,
+        error: "dateFrom и dateTo обязательны в формате YYYY-MM-DD"
+      });
     }
 
     const q = await pool.query(`
@@ -9350,12 +9340,17 @@ app.get("/bank/saldo", async (req, res) => {
         balance_out_lcy, balance_out_lcy_currency,
         received_at
       FROM public.account_saldo
-      ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
-      ORDER BY date_to DESC, iban
-      LIMIT 2000
-    `, values);
+      WHERE date_from = $1::date
+        AND date_to = $2::date
+      ORDER BY iban
+    `, [dateFrom, dateTo]);
 
-    res.json({ success: true, rows: q.rows });
+    res.json({
+      success: true,
+      dateFrom,
+      dateTo,
+      rows: q.rows
+    });
   } catch (error) {
     console.error("BANK SALDO LIST ERROR:", error);
     res.status(500).json({ success: false, error: error.message });
