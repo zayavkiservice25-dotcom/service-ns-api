@@ -8555,6 +8555,16 @@ app.get("/lzk/supply", async (req, res) => {
         LEFT JOIN lzk.supply s
           ON s.idzlzk = a.idzlzk
          AND COALESCE(trim(s.idplxk), '') = ''
+
+        -- Если у заявки есть компоненты, исходная заявка после ПТО
+        -- не должна попадать в панель снабженца.
+        -- Она появится там только после заказа конкретного компонента.
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM lzk.supply component_source
+          WHERE component_source.idzlzk = a.idzlzk
+            AND COALESCE(trim(component_source.idplxk), '') <> ''
+        )
       ),
 
       component_rows AS (
