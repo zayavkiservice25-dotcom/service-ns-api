@@ -1421,6 +1421,12 @@ await pool.query(`
   CREATE SEQUENCE IF NOT EXISTS lzk.plxk_seq START 1;
 `);
 
+  await pool.query(`
+    ALTER TABLE lzk.supply
+    ADD COLUMN IF NOT EXISTS ordered_qty numeric(18,6) DEFAULT 0;
+  `);
+
+
 await pool.query(`
   ALTER TABLE lzk.requests
   ADD COLUMN IF NOT EXISTS pto_date timestamptz;
@@ -8562,11 +8568,10 @@ app.get("/lzk/supply", async (req, res) => {
           to_char(a.request_date, 'DD.MM.YYYY HH24:MI') AS request_date,
           a.object_name AS object,
           a.constructive_name AS constructive,
-          a.group_name,
-          ''::text AS tmc_name,
+          a.material_name AS group_name,
+          s.component AS tmc_name,
           a.unit,
-          COALESCE(a.fact_qty, 0) *
-          COALESCE(NULLIF(replace(s.recipe, ',', '.'), '')::numeric, 0) AS qty,
+          COALESCE(s.ordered_qty, 0) AS qty,
           a.note,
           to_char(a.deadline, 'YYYY-MM-DD') AS deadline,
           a.documents_url AS pdf,
@@ -8588,6 +8593,7 @@ app.get("/lzk/supply", async (req, res) => {
         JOIN lzk.supply s
           ON s.idzlzk = a.idzlzk
          AND COALESCE(trim(s.idplxk), '') <> ''
+         AND COALESCE(s.ordered_qty, 0) > 0
       )
 
       SELECT *
@@ -8998,6 +9004,84 @@ app.get("/lzk/trusted-persons", async (req, res) => {
       error: e.message
     });
   }
+});
+
+
+
+// =====================================================
+// ЛЗК: компоненты в разделе «Лимиты»
+// =====================================================
+app.get("/lzk/components", async (req, res) => {
+  try {
+    const login = lzkText(req.query.login).toLowerCase();
+    const role = lzkText(req.query.role).toLowerCase();
+    const showAll = ["pto", "пто", "editor", "редактор", "admin", "админ", "администратор"].includes(role);
+    const q = await pool.query(`
+      SELECT
+        r.idzlzk,
+        s.idplxk,
+        r.initiator,
+        r.object_name AS object,
+        r.material_name AS source_tmc,
+        r.material_name AS group_name,
+        s.component AS tmc_name,
+        r.unit,
+        COALESCE(r.fact_qty, 0) * COALESCE(NULLIF(replace(s.recipe, ',', '.'), '')::numeric, 0) AS plan_qty,
+        COALESCE(s.ordered_qty, 0) AS ordered_qty,
+        GREATEST(
+          COALESCE(r.fact_qty, 0) * COALESCE(NULLIF(replace(s.recipe, ',', '.'), '')::numeric, 0)
+          - COALESCE(s.ordered_qty, 0),
+          0
+        ) AS remaining_qty
+      FROM lzk.requests r
+      JOIN lzk.supply s
+        ON s.idzlzk = r.idzlzk
+       AND COALESCE(trim(s.idplxk), '') <> ''
+      WHERE lower(trim(COALESCE(r.pto_status, ''))) IN ('согласован', 'согласовано')
+        AND ($1::boolean OR lower(trim(COALESCE(r.initiator, ''))) = $2)
+      ORDER BY
+        NULLIF(regexp_replace(r.idzlzk, '\\D', '', 'g'), '')::bigint DESC,
+        NULLIF(regexp_replace(s.idplxk, '\\D', '', 'g'), '')::bigint
+    `, [showAll, login]);
+    res.json({ success: true, rows: q.rows });
+  } catch (e) {
+    console.error("LZK COMPONENTS ERROR:", e);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.post("/lzk/components/order", async (req, res) => {
+  const body = req.body || {};
+  const items = Array.isArray(body.items) ? body.items : [];
+  if (!items.length) return res.status(400).json({ success:false, error:"Не выбраны компоненты" });
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    for (const item of items) {
+      const idzlzk = lzkText(item.idzlzk);
+      const idplxk = lzkText(item.idplxk);
+      const qty = Number(String(item.qty || 0).replace(',', '.'));
+      if (!idzlzk || !idplxk || !Number.isFinite(qty) || qty <= 0) throw new Error("Неверное количество компонента");
+      const check = await client.query(`
+        SELECT
+          COALESCE(r.fact_qty,0) * COALESCE(NULLIF(replace(s.recipe, ',', '.'), '')::numeric,0) AS plan_qty,
+          COALESCE(s.ordered_qty,0) AS ordered_qty
+        FROM lzk.requests r JOIN lzk.supply s ON s.idzlzk=r.idzlzk
+        WHERE r.idzlzk=$1 AND s.idplxk=$2
+        FOR UPDATE OF s
+      `,[idzlzk,idplxk]);
+      if (!check.rowCount) throw new Error(`Компонент ${idplxk} не найден`);
+      const plan=Number(check.rows[0].plan_qty||0), ordered=Number(check.rows[0].ordered_qty||0);
+      if (ordered + qty > plan + 0.000001) throw new Error(`Количество по ${idplxk} превышает остаток`);
+      await client.query(`UPDATE lzk.supply SET ordered_qty=COALESCE(ordered_qty,0)+$3, updated_at=NOW() WHERE idzlzk=$1 AND idplxk=$2`,[idzlzk,idplxk,qty]);
+    }
+    await client.query("COMMIT");
+    res.json({success:true,updated:items.length});
+  } catch(e) {
+    try{await client.query("ROLLBACK");}catch(_){}
+    console.error("LZK COMPONENT ORDER ERROR:",e);
+    res.status(500).json({success:false,error:e.message});
+  } finally { client.release(); }
 });
 
 app.listen(PORT, () => console.log("Server started on port " + PORT))
