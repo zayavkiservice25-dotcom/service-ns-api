@@ -1466,6 +1466,44 @@ await pool.query(`
   );
 `);
 
+
+
+// =====================================================
+// ALATAU CITY BANK: САЛЬДО СЧЕТОВ
+// =====================================================
+await pool.query(`
+  CREATE SCHEMA IF NOT EXISTS bank;
+`);
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS bank.account_saldo (
+    id bigserial PRIMARY KEY,
+    company_id text NOT NULL,
+    iban text NOT NULL,
+    account_type text,
+    account_status text,
+    date_from date NOT NULL,
+    date_to date NOT NULL,
+    statement_date timestamptz,
+    balance_in numeric(24,2),
+    balance_in_currency text,
+    balance_out numeric(24,2),
+    balance_out_currency text,
+    balance_in_lcy numeric(24,2),
+    balance_in_lcy_currency text,
+    balance_out_lcy numeric(24,2),
+    balance_out_lcy_currency text,
+    received_at timestamptz NOT NULL DEFAULT now(),
+    raw_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+    UNIQUE (company_id, iban, date_from, date_to)
+  );
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS account_saldo_date_idx
+  ON bank.account_saldo (date_to DESC, iban);
+`);
+
    console.log("DB init OK ✅");
 }
 
@@ -9093,5 +9131,302 @@ app.post("/lzk/components/order", async (req, res) => {
     res.status(500).json({success:false,error:e.message});
   } finally { client.release(); }
 });
+
+
+
+// =====================================================
+// ALATAU CITY BANK BUSINESS API: САЛЬДО СЧЕТОВ
+// ENV: ALATAU_CLIENT_ID, ALATAU_CLIENT_SECRET
+// =====================================================
+const ALATAU_API_URL = String(
+  process.env.ALATAU_API_URL || "https://business.alataucitybank.kz/jbapi"
+).replace(/\/$/, "");
+
+let alatauTokenCache = {
+  accessToken: "",
+  companyId: "",
+  expiresAt: 0
+};
+
+function bankDate_(value) {
+  const text = String(value || "").trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : "";
+}
+
+function bankAmount_(money) {
+  const raw = money && typeof money === "object" ? money.amount : money;
+  if (raw === null || raw === undefined || raw === "") return null;
+  const n = Number(String(raw).replace(/\s/g, "").replace(",", "."));
+  return Number.isFinite(n) ? n : null;
+}
+
+function bankCurrency_(money) {
+  return String(money?.currency || "").trim() || null;
+}
+
+async function bankJsonRequest_(url, options = {}) {
+  const response = await fetch(url, options);
+  const text = await response.text();
+  let json = {};
+
+  try {
+    json = text ? JSON.parse(text) : {};
+  } catch (_) {
+    throw new Error(`Банк вернул не JSON. HTTP ${response.status}: ${text.slice(0, 300)}`);
+  }
+
+  if (!response.ok) {
+    const message =
+      json?.error?.description ||
+      json?.error?.message ||
+      json?.message ||
+      `HTTP ${response.status}`;
+    const error = new Error(message);
+    error.status = response.status;
+    error.bankResponse = json;
+    throw error;
+  }
+
+  return json;
+}
+
+async function getAlatauToken_() {
+  const now = Date.now();
+  if (
+    alatauTokenCache.accessToken &&
+    alatauTokenCache.companyId &&
+    now < alatauTokenCache.expiresAt - 60000
+  ) {
+    return alatauTokenCache;
+  }
+
+  const clientId = String(process.env.ALATAU_CLIENT_ID || "").trim();
+  const clientSecret = String(process.env.ALATAU_CLIENT_SECRET || "").trim();
+
+  if (!clientId || !clientSecret) {
+    const error = new Error("На Render не заполнены ALATAU_CLIENT_ID и ALATAU_CLIENT_SECRET");
+    error.status = 503;
+    throw error;
+  }
+
+  const json = await bankJsonRequest_(`${ALATAU_API_URL}/v1/oauth/token`, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ clientId, clientSecret })
+  });
+
+  if (!json.accessToken || !json.companyId) {
+    throw new Error("Банк не вернул accessToken или companyId");
+  }
+
+  alatauTokenCache = {
+    accessToken: String(json.accessToken),
+    companyId: String(json.companyId),
+    expiresAt: now + Number(json.expiresIn || 3600) * 1000
+  };
+
+  return alatauTokenCache;
+}
+
+async function alatauGet_(pathName, query = {}) {
+  let auth = await getAlatauToken_();
+  const url = new URL(`${ALATAU_API_URL}${pathName}`);
+  Object.entries(query).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== "") {
+      url.searchParams.set(key, String(value));
+    }
+  });
+
+  try {
+    return await bankJsonRequest_(url.toString(), {
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${auth.accessToken}`
+      }
+    });
+  } catch (error) {
+    if (error.status !== 401) throw error;
+
+    alatauTokenCache = { accessToken: "", companyId: "", expiresAt: 0 };
+    auth = await getAlatauToken_();
+
+    return bankJsonRequest_(url.toString(), {
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${auth.accessToken}`
+      }
+    });
+  }
+}
+
+function normalizeBankAccounts_(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (Array.isArray(payload?.accounts)) return payload.accounts;
+  if (payload?.iban) return [payload];
+  return [];
+}
+
+async function saveBankSaldo_(auth, account, saldo) {
+  const q = await pool.query(`
+    INSERT INTO bank.account_saldo (
+      company_id, iban, account_type, account_status,
+      date_from, date_to, statement_date,
+      balance_in, balance_in_currency,
+      balance_out, balance_out_currency,
+      balance_in_lcy, balance_in_lcy_currency,
+      balance_out_lcy, balance_out_lcy_currency,
+      received_at, raw_json
+    ) VALUES (
+      $1,$2,$3,$4,$5,$6,$7,
+      $8,$9,$10,$11,$12,$13,$14,$15,
+      now(),$16::jsonb
+    )
+    ON CONFLICT (company_id, iban, date_from, date_to)
+    DO UPDATE SET
+      account_type = EXCLUDED.account_type,
+      account_status = EXCLUDED.account_status,
+      statement_date = EXCLUDED.statement_date,
+      balance_in = EXCLUDED.balance_in,
+      balance_in_currency = EXCLUDED.balance_in_currency,
+      balance_out = EXCLUDED.balance_out,
+      balance_out_currency = EXCLUDED.balance_out_currency,
+      balance_in_lcy = EXCLUDED.balance_in_lcy,
+      balance_in_lcy_currency = EXCLUDED.balance_in_lcy_currency,
+      balance_out_lcy = EXCLUDED.balance_out_lcy,
+      balance_out_lcy_currency = EXCLUDED.balance_out_lcy_currency,
+      received_at = now(),
+      raw_json = EXCLUDED.raw_json
+    RETURNING *
+  `, [
+    auth.companyId,
+    String(saldo.iban || account.iban || "").trim(),
+    String(account.accountType || "").trim() || null,
+    String(account.status || "").trim() || null,
+    saldo.dateFrom,
+    saldo.dateTo,
+    saldo.statementDate || null,
+    bankAmount_(saldo.balanceIn),
+    bankCurrency_(saldo.balanceIn),
+    bankAmount_(saldo.balanceOut),
+    bankCurrency_(saldo.balanceOut),
+    bankAmount_(saldo.balanceInLCY),
+    bankCurrency_(saldo.balanceInLCY),
+    bankAmount_(saldo.balanceOutLCY),
+    bankCurrency_(saldo.balanceOutLCY),
+    JSON.stringify(saldo)
+  ]);
+
+  return q.rows[0];
+}
+
+app.get("/bank/saldo", async (req, res) => {
+  try {
+    const dateFrom = bankDate_(req.query.dateFrom);
+    const dateTo = bankDate_(req.query.dateTo);
+    const iban = String(req.query.iban || "").trim();
+
+    const values = [];
+    const where = [];
+
+    if (dateFrom) {
+      values.push(dateFrom);
+      where.push(`date_from >= $${values.length}`);
+    }
+    if (dateTo) {
+      values.push(dateTo);
+      where.push(`date_to <= $${values.length}`);
+    }
+    if (iban) {
+      values.push(iban);
+      where.push(`iban = $${values.length}`);
+    }
+
+    const q = await pool.query(`
+      SELECT
+        id, company_id, iban, account_type, account_status,
+        date_from, date_to, statement_date,
+        balance_in, balance_in_currency,
+        balance_out, balance_out_currency,
+        balance_in_lcy, balance_in_lcy_currency,
+        balance_out_lcy, balance_out_lcy_currency,
+        received_at
+      FROM bank.account_saldo
+      ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+      ORDER BY date_to DESC, iban
+      LIMIT 2000
+    `, values);
+
+    res.json({ success: true, rows: q.rows });
+  } catch (error) {
+    console.error("BANK SALDO LIST ERROR:", error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post("/bank/saldo/sync", async (req, res) => {
+  try {
+    const dateFrom = bankDate_(req.body?.dateFrom);
+    const dateTo = bankDate_(req.body?.dateTo);
+
+    if (!dateFrom || !dateTo) {
+      return res.status(400).json({
+        success: false,
+        error: "dateFrom и dateTo обязательны в формате YYYY-MM-DD"
+      });
+    }
+    if (dateFrom > dateTo) {
+      return res.status(400).json({ success: false, error: "Дата начала позже даты окончания" });
+    }
+
+    const auth = await getAlatauToken_();
+    const accountPayload = await alatauGet_(
+      `/v1/companies/${encodeURIComponent(auth.companyId)}/accounts`
+    );
+    const accounts = normalizeBankAccounts_(accountPayload)
+      .filter(a => String(a?.iban || "").trim())
+      .filter(a => !a.accountType || String(a.accountType).toUpperCase() === "ACCOUNT");
+
+    const result = [];
+    for (const account of accounts) {
+      const iban = String(account.iban).trim();
+      try {
+        const saldo = await alatauGet_(
+          `/v1/companies/${encodeURIComponent(auth.companyId)}/accounts/${encodeURIComponent(iban)}/saldo`,
+          { dateFrom, dateTo }
+        );
+        const saved = await saveBankSaldo_(auth, account, saldo);
+        result.push({ success: true, iban, row: saved });
+      } catch (error) {
+        result.push({
+          success: false,
+          iban,
+          error: error.message,
+          bankResponse: error.bankResponse || null
+        });
+      }
+    }
+
+    res.json({
+      success: true,
+      dateFrom,
+      dateTo,
+      accountsFound: accounts.length,
+      saved: result.filter(x => x.success).length,
+      failed: result.filter(x => !x.success).length,
+      result
+    });
+  } catch (error) {
+    console.error("BANK SALDO SYNC ERROR:", error);
+    res.status(error.status || 500).json({
+      success: false,
+      error: error.message,
+      bankResponse: error.bankResponse || null
+    });
+  }
+});
+
 
 app.listen(PORT, () => console.log("Server started on port " + PORT))
