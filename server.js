@@ -9357,6 +9357,102 @@ app.get("/bank/saldo", async (req, res) => {
   }
 });
 
+
+// =====================================================
+// ALATAU CITY BANK: дневной лимит синхронизации
+// 50 нажатий «Получить из банка» в сутки по времени Алматы
+// =====================================================
+const BANK_SALDO_DAILY_LIMIT = 50;
+
+async function ensureBankSaldoDailyLimitTable_() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.bank_saldo_daily_limit (
+      limit_date date PRIMARY KEY,
+      used_count integer NOT NULL DEFAULT 0,
+      updated_at timestamptz NOT NULL DEFAULT now(),
+      CHECK (used_count >= 0)
+    )
+  `);
+}
+
+async function getBankSaldoDailyLimitStatus_() {
+  await ensureBankSaldoDailyLimitTable_();
+
+  const q = await pool.query(`
+    SELECT COALESCE(
+      (
+        SELECT used_count
+        FROM public.bank_saldo_daily_limit
+        WHERE limit_date = (now() AT TIME ZONE 'Asia/Almaty')::date
+      ),
+      0
+    )::integer AS used
+  `);
+
+  const used = Number(q.rows[0]?.used || 0);
+
+  return {
+    success: true,
+    date: null,
+    used,
+    limit: BANK_SALDO_DAILY_LIMIT,
+    remaining: Math.max(0, BANK_SALDO_DAILY_LIMIT - used),
+    reached: used >= BANK_SALDO_DAILY_LIMIT
+  };
+}
+
+async function takeBankSaldoDailyLimit_() {
+  await ensureBankSaldoDailyLimitTable_();
+
+  const q = await pool.query(`
+    INSERT INTO public.bank_saldo_daily_limit
+      (limit_date, used_count, updated_at)
+    VALUES (
+      (now() AT TIME ZONE 'Asia/Almaty')::date,
+      1,
+      now()
+    )
+    ON CONFLICT (limit_date)
+    DO UPDATE SET
+      used_count = public.bank_saldo_daily_limit.used_count + 1,
+      updated_at = now()
+    WHERE public.bank_saldo_daily_limit.used_count < $1
+    RETURNING limit_date, used_count
+  `, [BANK_SALDO_DAILY_LIMIT]);
+
+  if (!q.rowCount) {
+    return {
+      allowed: false,
+      ...(await getBankSaldoDailyLimitStatus_())
+    };
+  }
+
+  const used = Number(q.rows[0].used_count || 0);
+
+  return {
+    allowed: true,
+    success: true,
+    date: q.rows[0].limit_date,
+    used,
+    limit: BANK_SALDO_DAILY_LIMIT,
+    remaining: Math.max(0, BANK_SALDO_DAILY_LIMIT - used),
+    reached: used >= BANK_SALDO_DAILY_LIMIT
+  };
+}
+
+app.get("/bank/saldo/limit", async (req, res) => {
+  try {
+    const status = await getBankSaldoDailyLimitStatus_();
+    res.json(status);
+  } catch (error) {
+    console.error("BANK SALDO LIMIT ERROR:", error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
 app.post("/bank/saldo/sync", async (req, res) => {
   try {
     const dateFrom = bankDate_(req.body?.dateFrom);
@@ -9370,6 +9466,16 @@ app.post("/bank/saldo/sync", async (req, res) => {
     }
     if (dateFrom > dateTo) {
       return res.status(400).json({ success: false, error: "Дата начала позже даты окончания" });
+    }
+
+    const limitStatus = await takeBankSaldoDailyLimit_();
+
+    if (!limitStatus.allowed) {
+      return res.status(429).json({
+        success: false,
+        error: "Дневной лимит исчерпан: 50 запросов в день",
+        limitStatus
+      });
     }
 
     const auth = await getAlatauToken_();
@@ -9407,14 +9513,22 @@ app.post("/bank/saldo/sync", async (req, res) => {
       accountsFound: accounts.length,
       saved: result.filter(x => x.success).length,
       failed: result.filter(x => !x.success).length,
+      limitStatus,
       result
     });
   } catch (error) {
     console.error("BANK SALDO SYNC ERROR:", error);
+
+    let limitStatus = null;
+    try {
+      limitStatus = await getBankSaldoDailyLimitStatus_();
+    } catch (_) {}
+
     res.status(error.status || 500).json({
       success: false,
       error: error.message,
-      bankResponse: error.bankResponse || null
+      bankResponse: error.bankResponse || null,
+      limitStatus
     });
   }
 });
