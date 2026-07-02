@@ -1472,11 +1472,7 @@ await pool.query(`
 // ALATAU CITY BANK: САЛЬДО СЧЕТОВ
 // =====================================================
 await pool.query(`
-  CREATE SCHEMA IF NOT EXISTS bank;
-`);
-
-await pool.query(`
-  CREATE TABLE IF NOT EXISTS bank.account_saldo (
+  CREATE TABLE IF NOT EXISTS public.account_saldo (
     id bigserial PRIMARY KEY,
     company_id text NOT NULL,
     iban text NOT NULL,
@@ -1501,7 +1497,7 @@ await pool.query(`
 
 await pool.query(`
   CREATE INDEX IF NOT EXISTS account_saldo_date_idx
-  ON bank.account_saldo (date_to DESC, iban);
+  ON public.account_saldo (date_to DESC, iban);
 `);
 
    console.log("DB init OK ✅");
@@ -9271,7 +9267,7 @@ function normalizeBankAccounts_(payload) {
 
 async function saveBankSaldo_(auth, account, saldo) {
   const q = await pool.query(`
-    INSERT INTO bank.account_saldo (
+    INSERT INTO public.account_saldo (
       company_id, iban, account_type, account_status,
       date_from, date_to, statement_date,
       balance_in, balance_in_currency,
@@ -9353,7 +9349,7 @@ app.get("/bank/saldo", async (req, res) => {
         balance_in_lcy, balance_in_lcy_currency,
         balance_out_lcy, balance_out_lcy_currency,
         received_at
-      FROM bank.account_saldo
+      FROM public.account_saldo
       ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
       ORDER BY date_to DESC, iban
       LIMIT 2000
