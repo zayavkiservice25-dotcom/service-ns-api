@@ -9540,17 +9540,48 @@ app.post("/bank/saldo/sync", async (req, res) => {
 // и ДО app.listen(...)
 // =====================================================
 
-app.get('/lzk/limit-create/refs', async (req, res) => {
+app.get("/lzk/limit-create/refs", async (req, res) => {
   try {
-    const [objects, constructives, groups, materials, units] = await Promise.all([
-      pool.query(`SELECT object_id, object_name FROM lzk.spr_objects ORDER BY object_name`),
-      pool.query(`SELECT constructive_id, constructive_name FROM lzk.spr_constructive ORDER BY constructive_name`),
-      pool.query(`SELECT group_id, group_name FROM lzk.spr_material_groups ORDER BY group_name`),
-      pool.query(`SELECT material_id, material_name, unit_id, unit_name FROM lzk.spr_materials ORDER BY material_name`),
-      pool.query(`SELECT unit_id, unit_name FROM lzk.spr_units ORDER BY unit_name`)
-    ]);
+    const [objects, constructives, groups, materials, units] =
+      await Promise.all([
+        pool.query(`
+          SELECT object_id, object_name
+          FROM lzk.spr_objects
+          ORDER BY object_name
+        `),
 
-    res.json({
+        pool.query(`
+          SELECT constructive_id, constructive_name
+          FROM lzk.spr_constructive
+          ORDER BY constructive_name
+        `),
+
+        pool.query(`
+          SELECT group_id, group_name
+          FROM lzk.spr_material_groups
+          ORDER BY group_name
+        `),
+
+        pool.query(`
+          SELECT
+            m.material_id,
+            m.material_name,
+            m.unit_id,
+            u.unit_name
+          FROM lzk.spr_materials m
+          LEFT JOIN lzk.spr_units u
+            ON u.unit_id = m.unit_id
+          ORDER BY m.material_name
+        `),
+
+        pool.query(`
+          SELECT unit_id, unit_name
+          FROM lzk.spr_units
+          ORDER BY unit_name
+        `)
+      ]);
+
+    return res.json({
       success: true,
       objects: objects.rows,
       constructives: constructives.rows,
@@ -9558,9 +9589,14 @@ app.get('/lzk/limit-create/refs', async (req, res) => {
       materials: materials.rows,
       units: units.rows
     });
+
   } catch (e) {
-    console.error('LZK LIMIT CREATE REFS ERROR:', e);
-    res.status(500).json({ success: false, error: e.message });
+    console.error("LZK LIMIT CREATE REFS ERROR:", e);
+
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
   }
 });
 
