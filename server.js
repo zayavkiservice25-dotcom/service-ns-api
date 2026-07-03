@@ -9534,4 +9534,214 @@ app.post("/bank/saldo/sync", async (req, res) => {
 });
 
 
+// =====================================================
+// ЛЗК — создание нового лимита из интерфейса
+// Вставить в server.js ПОСЛЕ функций lzkText/lzkNum/nextLzkTextId
+// и ДО app.listen(...)
+// =====================================================
+
+app.get('/lzk/limit-create/refs', async (req, res) => {
+  try {
+    const [objects, constructives, groups, materials, units] = await Promise.all([
+      pool.query(`SELECT object_id, object_name FROM lzk.spr_objects ORDER BY object_name`),
+      pool.query(`SELECT constructive_id, constructive_name FROM lzk.spr_constructive ORDER BY constructive_name`),
+      pool.query(`SELECT group_id, group_name FROM lzk.spr_material_groups ORDER BY group_name`),
+      pool.query(`SELECT material_id, material_name, unit_id, unit_name FROM lzk.spr_materials ORDER BY material_name`),
+      pool.query(`SELECT unit_id, unit_name FROM lzk.spr_units ORDER BY unit_name`)
+    ]);
+
+    res.json({
+      success: true,
+      objects: objects.rows,
+      constructives: constructives.rows,
+      groups: groups.rows,
+      materials: materials.rows,
+      units: units.rows
+    });
+  } catch (e) {
+    console.error('LZK LIMIT CREATE REFS ERROR:', e);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.post('/lzk/limit-create', async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const body = req.body || {};
+    const objectName = lzkText(body.object_name);
+    const constructiveName = lzkText(body.constructive_name);
+    const groupName = lzkText(body.group_name);
+    const materialName = lzkText(body.material_name);
+    const unitName = lzkText(body.unit_name);
+    const planQty = lzkNum(body.plan_qty);
+    const priceWithoutVat = lzkNum(body.price_without_vat);
+
+    if (!objectName) throw new Error('Объект не заполнен');
+    if (!constructiveName) throw new Error('Конструктив не заполнен');
+    if (!groupName) throw new Error('Группа не заполнена');
+    if (!materialName) throw new Error('ТМЦ по факту не заполнено');
+    if (!unitName) throw new Error('Ед.изм. не заполнена');
+    if (planQty === null || planQty < 0) throw new Error('Кол-во по плану заполнено неправильно');
+    if (priceWithoutVat === null || priceWithoutVat < 0) throw new Error('Цена без НДС заполнена неправильно');
+
+    await client.query('BEGIN');
+
+    // Защищает одновременную выдачу одинаковых ID.
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext('lzk_limit_create'))`);
+
+    async function findByName(table, idCol, nameCol, name) {
+      const q = await client.query(
+        `SELECT ${idCol} AS id, ${nameCol} AS name
+           FROM ${table}
+          WHERE lower(trim(${nameCol})) = lower(trim($1))
+          ORDER BY ${idCol}
+          LIMIT 1`,
+        [name]
+      );
+      return q.rows[0] || null;
+    }
+
+    let objectRow = await findByName('lzk.spr_objects', 'object_id', 'object_name', objectName);
+    if (!objectRow) {
+      const q = await client.query(`
+        SELECT COALESCE(MAX(NULLIF(regexp_replace(object_id::text, '\\D', '', 'g'), '')::bigint), 100000000) + 1 AS next_id
+        FROM lzk.spr_objects
+      `);
+      const objectId = String(q.rows[0].next_id);
+      await client.query(
+        `INSERT INTO lzk.spr_objects (object_id, object_name) VALUES ($1, $2)`,
+        [objectId, objectName]
+      );
+      objectRow = { id: objectId, name: objectName };
+    }
+
+    let constructiveRow = await findByName('lzk.spr_constructive', 'constructive_id', 'constructive_name', constructiveName);
+    if (!constructiveRow) {
+      const id = await nextLzkTextId(client, 'lzk.spr_constructive', 'constructive_id', 'kt');
+      await client.query(
+        `INSERT INTO lzk.spr_constructive (constructive_id, constructive_name) VALUES ($1, $2)`,
+        [id, constructiveName]
+      );
+      constructiveRow = { id, name: constructiveName };
+    }
+
+    let groupRow = await findByName('lzk.spr_material_groups', 'group_id', 'group_name', groupName);
+    if (!groupRow) {
+      const id = await nextLzkTextId(client, 'lzk.spr_material_groups', 'group_id', 'gr');
+      await client.query(
+        `INSERT INTO lzk.spr_material_groups (group_id, group_name) VALUES ($1, $2)`,
+        [id, groupName]
+      );
+      groupRow = { id, name: groupName };
+    }
+
+    let unitRow = await findByName('lzk.spr_units', 'unit_id', 'unit_name', unitName);
+    if (!unitRow) {
+      const id = await nextLzkTextId(client, 'lzk.spr_units', 'unit_id', 'ed');
+      await client.query(
+        `INSERT INTO lzk.spr_units (unit_id, unit_name) VALUES ($1, $2)`,
+        [id, unitName]
+      );
+      unitRow = { id, name: unitName };
+    }
+
+    let materialRow = await findByName('lzk.spr_materials', 'material_id', 'material_name', materialName);
+    if (!materialRow) {
+      const id = await nextLzkTextId(client, 'lzk.spr_materials', 'material_id', 'NTMC');
+      await client.query(
+        `INSERT INTO lzk.spr_materials (material_id, material_name, unit_id, unit_name)
+         VALUES ($1, $2, $3, $4)`,
+        [id, materialName, unitRow.id, unitName]
+      );
+      materialRow = { id, name: materialName };
+    }
+
+    const importNoResult = await client.query(`
+      SELECT COALESCE(MAX(import_no), 0) + 1 AS next_no
+      FROM lzk.limits_import
+    `);
+    const importNo = Number(importNoResult.rows[0].next_no);
+
+    await client.query(`
+      INSERT INTO lzk.limits_import (
+        import_no,
+        object_name,
+        constructive_name,
+        group_name,
+        material_name,
+        unit_name,
+        plan_qty_text,
+        price_text
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+    `, [
+      importNo,
+      objectName,
+      constructiveName,
+      groupName,
+      materialName,
+      unitName,
+      String(planQty),
+      String(priceWithoutVat)
+    ]);
+
+    const idlzk = await nextLzkTextId(client, 'lzk.limits', 'idlzk', 'LZK');
+    const amount = Number((planQty * priceWithoutVat).toFixed(2));
+
+    await client.query(`
+      INSERT INTO lzk.limits (
+        idlzk,
+        object_id,
+        object_name,
+        constructive_id,
+        constructive_name,
+        group_id,
+        group_name,
+        material_id,
+        material_name,
+        unit_id,
+        unit_name,
+        plan_qty,
+        price_without_vat,
+        amount
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+    `, [
+      idlzk,
+      objectRow.id,
+      objectName,
+      constructiveRow.id,
+      constructiveName,
+      groupRow.id,
+      groupName,
+      materialRow.id,
+      materialName,
+      unitRow.id,
+      unitName,
+      planQty,
+      priceWithoutVat,
+      amount
+    ]);
+
+    await client.query('COMMIT');
+
+    res.json({
+      success: true,
+      idlzk,
+      import_no: importNo,
+      object_id: objectRow.id,
+      constructive_id: constructiveRow.id,
+      group_id: groupRow.id,
+      material_id: materialRow.id,
+      unit_id: unitRow.id,
+      amount
+    });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('LZK LIMIT CREATE ERROR:', e);
+    res.status(500).json({ success: false, error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
 app.listen(PORT, () => console.log("Server started on port " + PORT))
