@@ -9686,9 +9686,9 @@ app.post('/lzk/limit-create', async (req, res) => {
     if (!materialRow) {
       const id = await nextLzkTextId(client, 'lzk.spr_materials', 'material_id', 'NTMC');
       await client.query(
-        `INSERT INTO lzk.spr_materials (material_id, material_name, unit_id, unit_name)
-         VALUES ($1, $2, $3, $4)`,
-        [id, materialName, unitRow.id, unitName]
+        `INSERT INTO lzk.spr_materials (material_id, material_name, unit_id)
+         VALUES ($1, $2, $3)`,
+        [id, materialName, unitRow.id]
       );
       materialRow = { id, name: materialName };
     }
