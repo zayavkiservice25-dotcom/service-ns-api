@@ -9323,32 +9323,60 @@ app.get("/bank/saldo", async (req, res) => {
     const dateFrom = bankDate_(req.query.dateFrom);
     const dateTo = bankDate_(req.query.dateTo);
 
-    if (!dateFrom || !dateTo) {
-      return res.status(400).json({
-        success: false,
-        error: "dateFrom и dateTo обязательны в формате YYYY-MM-DD"
+    let q;
+
+    // Если даты переданы — показываем именно этот период
+    if (dateFrom && dateTo) {
+      q = await pool.query(`
+        SELECT
+          id, company_id, iban, account_type, account_status,
+          date_from, date_to, statement_date,
+          balance_in, balance_in_currency,
+          balance_out, balance_out_currency,
+          balance_in_lcy, balance_in_lcy_currency,
+          balance_out_lcy, balance_out_lcy_currency,
+          received_at
+        FROM public.account_saldo
+        WHERE date_from = $1::date
+          AND date_to = $2::date
+        ORDER BY iban
+      `, [dateFrom, dateTo]);
+
+      return res.json({
+        success: true,
+        dateFrom,
+        dateTo,
+        rows: q.rows
       });
     }
 
-    const q = await pool.query(`
+    // Если даты не переданы — показываем последний сохраненный запрос
+    q = await pool.query(`
+      WITH last_period AS (
+        SELECT date_from, date_to
+        FROM public.account_saldo
+        ORDER BY received_at DESC
+        LIMIT 1
+      )
       SELECT
-        id, company_id, iban, account_type, account_status,
-        date_from, date_to, statement_date,
-        balance_in, balance_in_currency,
-        balance_out, balance_out_currency,
-        balance_in_lcy, balance_in_lcy_currency,
-        balance_out_lcy, balance_out_lcy_currency,
-        received_at
-      FROM public.account_saldo
-      WHERE date_from = $1::date
-        AND date_to = $2::date
-      ORDER BY iban
-    `, [dateFrom, dateTo]);
+        s.id, s.company_id, s.iban, s.account_type, s.account_status,
+        s.date_from, s.date_to, s.statement_date,
+        s.balance_in, s.balance_in_currency,
+        s.balance_out, s.balance_out_currency,
+        s.balance_in_lcy, s.balance_in_lcy_currency,
+        s.balance_out_lcy, s.balance_out_lcy_currency,
+        s.received_at
+      FROM public.account_saldo s
+      JOIN last_period lp
+        ON lp.date_from = s.date_from
+       AND lp.date_to = s.date_to
+      ORDER BY s.iban
+    `);
 
     res.json({
       success: true,
-      dateFrom,
-      dateTo,
+      dateFrom: q.rows[0]?.date_from || null,
+      dateTo: q.rows[0]?.date_to || null,
       rows: q.rows
     });
   } catch (error) {
@@ -9356,7 +9384,6 @@ app.get("/bank/saldo", async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
-
 
 // =====================================================
 // ALATAU CITY BANK: дневной лимит синхронизации
@@ -9464,8 +9491,12 @@ app.post("/bank/saldo/sync", async (req, res) => {
         error: "dateFrom и dateTo обязательны в формате YYYY-MM-DD"
       });
     }
+
     if (dateFrom > dateTo) {
-      return res.status(400).json({ success: false, error: "Дата начала позже даты окончания" });
+      return res.status(400).json({
+        success: false,
+        error: "Дата начала позже даты окончания"
+      });
     }
 
     const limitStatus = await takeBankSaldoDailyLimit_();
@@ -9479,23 +9510,34 @@ app.post("/bank/saldo/sync", async (req, res) => {
     }
 
     const auth = await getAlatauToken_();
+
     const accountPayload = await alatauGet_(
       `/v1/companies/${encodeURIComponent(auth.companyId)}/accounts`
     );
+
     const accounts = normalizeBankAccounts_(accountPayload)
       .filter(a => String(a?.iban || "").trim())
       .filter(a => !a.accountType || String(a.accountType).toUpperCase() === "ACCOUNT");
 
     const result = [];
+
     for (const account of accounts) {
       const iban = String(account.iban).trim();
+
       try {
         const saldo = await alatauGet_(
           `/v1/companies/${encodeURIComponent(auth.companyId)}/accounts/${encodeURIComponent(iban)}/saldo`,
           { dateFrom, dateTo }
         );
+
         const saved = await saveBankSaldo_(auth, account, saldo);
-        result.push({ success: true, iban, row: saved });
+
+        result.push({
+          success: true,
+          iban,
+          row: saved
+        });
+
       } catch (error) {
         result.push({
           success: false,
@@ -9506,6 +9548,22 @@ app.post("/bank/saldo/sync", async (req, res) => {
       }
     }
 
+    const savedRows = result
+      .filter(x => x.success && x.row)
+      .map(x => x.row);
+
+    if (savedRows.length) {
+      // Оставляем только последний успешно полученный период.
+      // Все старые периоды удаляются.
+      await pool.query(`
+        DELETE FROM public.account_saldo
+        WHERE NOT (
+          date_from = $1::date
+          AND date_to = $2::date
+        )
+      `, [dateFrom, dateTo]);
+    }
+
     res.json({
       success: true,
       dateFrom,
@@ -9514,12 +9572,15 @@ app.post("/bank/saldo/sync", async (req, res) => {
       saved: result.filter(x => x.success).length,
       failed: result.filter(x => !x.success).length,
       limitStatus,
+      rows: savedRows,
       result
     });
+
   } catch (error) {
     console.error("BANK SALDO SYNC ERROR:", error);
 
     let limitStatus = null;
+
     try {
       limitStatus = await getBankSaldoDailyLimitStatus_();
     } catch (_) {}
@@ -9532,7 +9593,6 @@ app.post("/bank/saldo/sync", async (req, res) => {
     });
   }
 });
-
 
 // =====================================================
 // ЛЗК — создание нового лимита из интерфейса
