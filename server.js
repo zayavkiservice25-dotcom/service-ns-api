@@ -8476,8 +8476,8 @@ app.post("/lzk/requests/status", async (req, res) => {
           'PLXK' || nextval('lzk.plxk_seq')::text,
           c.material_name,
           c.coefficient::text,
-          'Не оплачено',
-          'В работе',
+          ''::text,
+          ''::text,
           NOW(),
           NOW()
         FROM lzk.requests r
