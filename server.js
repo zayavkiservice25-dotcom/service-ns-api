@@ -5548,6 +5548,276 @@ app.post("/approve-rows", async (req, res) => {
 });
 
 
+
+// =====================================================
+// ОТМЕНА ОТКЛОНЁННЫХ СТРОК ПО ОДИНАКОВОМУ ID FT
+// Доступ: только s_zhasulan
+//
+// Для каждого ID FT:
+// 1) находим все строки, где финальное утверждение Касенова = Отклонено;
+// 2) самую раннюю созданную строку ZFT оставляем, но очищаем поля заявки;
+// 3) остальные отклонённые строки этого ID FT полностью удаляем;
+// 4) согласованные/утверждённые строки не затрагиваются.
+// =====================================================
+app.post("/cancel-rejected-ft-lines", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const login = String(req.body?.login || "").trim().toLowerCase();
+    const rowIds = Array.isArray(req.body?.row_ids)
+      ? [...new Set(req.body.row_ids.map(Number).filter(Boolean))]
+      : [];
+
+    if (login !== "s_zhasulan") {
+      return res.status(403).json({
+        success: false,
+        error: "Отменять отклонённые строки может только s_zhasulan"
+      });
+    }
+
+    if (!rowIds.length) {
+      return res.status(400).json({
+        success: false,
+        error: "row_ids required"
+      });
+    }
+
+    await client.query("BEGIN");
+
+    // Проверяем выбранные строки и получаем их ID FT.
+    const selectedResult = await client.query(`
+      SELECT
+        z.id,
+        z.id_ft
+      FROM public.zvk z
+      WHERE z.id = ANY($1::bigint[])
+        AND EXISTS (
+          SELECT 1
+          FROM public.request_items i
+          JOIN public.request_head h
+            ON h.id = i.request_id
+          WHERE i.zvk_row_id = z.id
+            AND LOWER(TRIM(COALESCE(h.approve_ermek_status, ''))) = 'отклонено'
+        )
+      FOR UPDATE OF z
+    `, [rowIds]);
+
+    const selectedValidIds = new Set(
+      selectedResult.rows.map(row => Number(row.id)).filter(Boolean)
+    );
+
+    if (selectedValidIds.size !== rowIds.length) {
+      throw new Error(
+        "Отменить можно только выбранные строки, где утверждение Касенова Ермека отклонено"
+      );
+    }
+
+    const ftIds = [...new Set(
+      selectedResult.rows
+        .map(row => String(row.id_ft || "").trim())
+        .filter(Boolean)
+    )];
+
+    if (!ftIds.length) {
+      throw new Error("Не найден ID FT");
+    }
+
+    let keptCount = 0;
+    let deletedCount = 0;
+    const details = [];
+    const affectedRequestIds = new Set();
+
+    for (const idFt of ftIds) {
+      // Только отклонённые строки. Подтверждённые строки с тем же ID FT сюда не попадут.
+      const rejectedResult = await client.query(`
+        SELECT
+          z.id AS zvk_row_id,
+          z.id_zvk,
+          z.zvk_date,
+          (
+            SELECT MIN(i.request_id)
+            FROM public.request_items i
+            JOIN public.request_head h
+              ON h.id = i.request_id
+            WHERE i.zvk_row_id = z.id
+              AND LOWER(TRIM(COALESCE(h.approve_ermek_status, ''))) = 'отклонено'
+          ) AS request_id
+        FROM public.zvk z
+        WHERE z.id_ft = $1
+          AND EXISTS (
+            SELECT 1
+            FROM public.request_items i
+            JOIN public.request_head h
+              ON h.id = i.request_id
+            WHERE i.zvk_row_id = z.id
+              AND LOWER(TRIM(COALESCE(h.approve_ermek_status, ''))) = 'отклонено'
+          )
+        ORDER BY z.zvk_date ASC NULLS LAST, z.id ASC
+        FOR UPDATE OF z
+      `, [idFt]);
+
+      const rejectedRows = rejectedResult.rows
+        .slice()
+        .sort((a, b) => {
+          const ad = a.zvk_date ? new Date(a.zvk_date).getTime() : Number.MAX_SAFE_INTEGER;
+          const bd = b.zvk_date ? new Date(b.zvk_date).getTime() : Number.MAX_SAFE_INTEGER;
+          return ad - bd || Number(a.zvk_row_id) - Number(b.zvk_row_id);
+        });
+
+      if (!rejectedRows.length) continue;
+
+      const keepRow = rejectedRows[0];
+      const keepId = Number(keepRow.zvk_row_id);
+      const deleteIds = rejectedRows
+        .slice(1)
+        .map(row => Number(row.zvk_row_id))
+        .filter(Boolean);
+      const allRejectedIds = rejectedRows
+        .map(row => Number(row.zvk_row_id))
+        .filter(Boolean);
+
+      rejectedRows.forEach(row => affectedRequestIds.add(Number(row.request_id)));
+
+      // Сохраняем первую созданную отклонённую ZFT, но делаем её свободной для новой заявки.
+      await client.query(`
+        UPDATE public.zvk
+        SET
+          to_pay = NULL,
+          request_flag = NULL
+        WHERE id = $1
+      `, [keepId]);
+
+      await client.query(`
+        INSERT INTO public.zvk_status
+        (
+          zvk_row_id,
+          status_time,
+          src_d,
+          src_o,
+          chief_approved
+        )
+        VALUES ($1, NOW(), NULL, NULL, NULL)
+        ON CONFLICT (zvk_row_id)
+        DO UPDATE SET
+          status_time = NOW(),
+          src_d = NULL,
+          src_o = NULL,
+          chief_approved = NULL
+      `, [keepId]);
+
+      await client.query(`
+        UPDATE public.zvk_pay
+        SET
+          registry_flag = NULL,
+          agree_time = NULL
+        WHERE zvk_row_id = $1
+      `, [keepId]);
+
+      // Все отклонённые строки убираем из «Отправленных заявок», включая оставляемую ZFT.
+      await client.query(`
+        DELETE FROM public.request_items
+        WHERE zvk_row_id = ANY($1::bigint[])
+      `, [allRejectedIds]);
+
+      if (deleteIds.length) {
+        await client.query(`
+          DELETE FROM public.zvk_pay
+          WHERE zvk_row_id = ANY($1::bigint[])
+        `, [deleteIds]);
+
+        await client.query(`
+          DELETE FROM public.zvk_status
+          WHERE zvk_row_id = ANY($1::bigint[])
+        `, [deleteIds]);
+
+        await client.query(`
+          DELETE FROM public.zvk
+          WHERE id = ANY($1::bigint[])
+        `, [deleteIds]);
+      }
+
+      keptCount += 1;
+      deletedCount += deleteIds.length;
+      details.push({
+        id_ft: idFt,
+        kept_zvk_row_id: keepId,
+        kept_id_zvk: keepRow.id_zvk || "",
+        deleted_zvk_row_ids: deleteIds
+      });
+    }
+
+    const requestIds = [...affectedRequestIds].filter(Boolean);
+
+    if (requestIds.length) {
+      // Обновляем непустые шапки.
+      await client.query(`
+        UPDATE public.request_head h
+        SET
+          items_count = x.items_count,
+          total_amount = x.total_amount
+        FROM (
+          SELECT
+            request_id,
+            COUNT(*)::integer AS items_count,
+            COALESCE(SUM(to_pay), 0)::numeric(18,2) AS total_amount
+          FROM public.request_items
+          WHERE request_id = ANY($1::bigint[])
+          GROUP BY request_id
+        ) x
+        WHERE h.id = x.request_id
+      `, [requestIds]);
+
+      // Удаляем журнал и шапки заявок, в которых больше не осталось строк.
+      const emptyRequests = await client.query(`
+        SELECT h.id
+        FROM public.request_head h
+        WHERE h.id = ANY($1::bigint[])
+          AND NOT EXISTS (
+            SELECT 1
+            FROM public.request_items i
+            WHERE i.request_id = h.id
+          )
+      `, [requestIds]);
+
+      const emptyIds = emptyRequests.rows.map(row => Number(row.id)).filter(Boolean);
+
+      if (emptyIds.length) {
+        await client.query(`
+          DELETE FROM public.request_approve_log
+          WHERE request_id = ANY($1::bigint[])
+        `, [emptyIds]);
+
+        await client.query(`
+          DELETE FROM public.request_head
+          WHERE id = ANY($1::bigint[])
+        `, [emptyIds]);
+      }
+    }
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success: true,
+      kept_count: keptCount,
+      deleted_count: deletedCount,
+      details
+    });
+
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+
+    console.error("cancel-rejected-ft-lines error:", e);
+
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+
+  } finally {
+    client.release();
+  }
+});
+
 app.post("/request-items-paid-bulk", async (req, res) => {
   const client = await pool.connect();
 
