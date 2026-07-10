@@ -3789,10 +3789,10 @@ if (hasReset.rowCount > 0) {
     const ins = await client.query(
       `
       INSERT INTO zvk (id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag)
-      VALUES ($1, $2, NOW(), 'СИСТЕМА', $3, 'Нет')
+      VALUES ($1, $2, NOW(), 'СИСТЕМА', 0, 'Нет')
       RETURNING id, id_zvk
       `,
-      [newIdZvk, ft, remaining]
+      [newIdZvk, ft]
     );
 
     const newRowId = Number(ins.rows[0].id);
