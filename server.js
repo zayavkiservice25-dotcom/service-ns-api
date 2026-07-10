@@ -3214,10 +3214,14 @@ app.get("/request-list", async (req, res) => {
     } else if (
       login === "admin" ||
       login === "b_erkin" ||
+      login === "k_arailym" ||
+      login === "zh_elena" ||
       roleFt === "admin" ||
       roleFt === "админ" ||
       roleFt === "administrator"
     ) {
+      // Операторы оплаты получают заявки.
+      // На клиенте список распределяется по дивизионам.
       whereSql = "";
 
     } else {
@@ -5852,6 +5856,66 @@ app.post("/request-items-paid-bulk", async (req, res) => {
     }
 
     await client.query("BEGIN");
+
+    // Проверяем, что выбранные строки принадлежат оператору по дивизиону.
+    const divisionCheck = await client.query(`
+      SELECT
+        i.zvk_row_id,
+        COALESCE(NULLIF(trim(f.division), ''), NULLIF(trim(s.src_d), ''), '') AS division
+      FROM public.request_items i
+      JOIN public.zvk z
+        ON z.id = i.zvk_row_id
+      JOIN public.ft f
+        ON f.id_ft = z.id_ft
+      LEFT JOIN public.zvk_status s
+        ON s.zvk_row_id = z.id
+      WHERE i.request_id = $1
+        AND i.zvk_row_id = ANY($2::bigint[])
+        AND i.zvk_row_id IS NOT NULL
+    `, [request_id, row_ids]);
+
+    if (divisionCheck.rowCount !== row_ids.length) {
+      throw new Error("Не все выбранные строки найдены в заявке");
+    }
+
+    const forbidden = divisionCheck.rows.filter(row => {
+      const division = String(row.division || "").replace(/\s+/g, " ").trim();
+
+      if (loginNorm === "s_zhasulan") {
+        return division !== "Sapa asphalt";
+      }
+
+      if (loginNorm === "zh_elena") {
+        return division !== "СК Жилой дом" &&
+               division !== "Smart Estate";
+      }
+
+      if (loginNorm === "k_arailym") {
+        const allowedDivisions = new Set([
+          "Дорога",
+          "Механизация",
+          "Мост",
+          "Офис",
+          "Сети",
+          "Import"
+        ]);
+
+        return !allowedDivisions.has(division);
+      }
+
+      return false; // admin и b_erkin без ограничения
+    });
+
+    if (forbidden.length) {
+      const divisions = [...new Set(
+        forbidden.map(row => String(row.division || "").trim() || "Без дивизиона")
+      )];
+
+      return res.status(403).json({
+        success: false,
+        error: "Нет прав менять Оплачено для дивизиона: " + divisions.join(", ")
+      });
+    }
 
     const head = await client.query(`
       SELECT approve_ermek_status
