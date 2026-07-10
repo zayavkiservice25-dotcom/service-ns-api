@@ -3398,12 +3398,15 @@ const toPayNum = isNoRequest
         `, [rid]);
       }
 
+      const rebuild = await rebuildFtTail(pool, rid);
+
       return res.json({
         success: true,
         updated: true,
         row: upd.rows[0],
         id_zvk: upd.rows[0].id_zvk,
-        zvk_row_id: upd.rows[0].id
+        zvk_row_id: upd.rows[0].id,
+        rebuild
       });
     }
 
@@ -3500,11 +3503,18 @@ const toPayNum = isNoRequest
       [id_zvk, ft, finalName, finalToPay, finalFlag]
     );
 
+    let rebuild = null;
+
+    if (finalFlag === "Да") {
+      rebuild = await rebuildFtTail(pool, Number(r.rows[0].id));
+    }
+
     return res.json({
       success: true,
       row: r.rows[0],
       id_zvk,
-      zvk_row_id: r.rows[0].id
+      zvk_row_id: r.rows[0].id,
+      rebuild
     });
 
   } catch (e) {
@@ -3576,12 +3586,19 @@ app.post("/zvk-bulk-request-flag", async (req, res) => {
         status_time = NOW()
     `, [ids, flag]);
 
+    const rebuild = [];
+
+    for (const rid of ids) {
+      rebuild.push(await rebuildFtTail(client, rid));
+    }
+
     await client.query("COMMIT");
 
     return res.json({
       success:true,
       updated: ids.length,
-      request_flag: flag
+      request_flag: flag,
+      rebuild
     });
 
   } catch (e) {
@@ -3669,7 +3686,7 @@ app.post("/zvk-status-row", async (req, res) => {
 // =====================================================
 // ✅ Оплата/Реестр — ПО СТРОКЕ истории (zvk_row_id)
 // POST /zvk-pay-row  { is_admin, zvk_row_id, registry_flag, is_paid }
-// ✅ + авто-создание следующего ZFT (СИСТЕМА)
+// Новая ZFT создаётся при Заявка = Да, а не при Реестр = Да
 // ✅ FIX: авто-строка СИСТЕМА создаётся с is_paid=NULL (пусто), а НЕ "Нет"
 // =====================================================
 
@@ -3725,14 +3742,13 @@ if (hasReset.rowCount > 0) {
 
   const ftSum = Number(ftRes.rows[0]?.sum_ft || 0);
 
-  // 2. сколько уже ушло в реестр по обычным строкам
+  // 2. сколько уже поставлено в Заявка = Да по обычным строкам
   const usedRes = await client.query(
     `
     SELECT COALESCE(SUM(COALESCE(z.to_pay,0)),0) AS used_sum
-    FROM zvk z
-    JOIN zvk_pay p ON p.zvk_row_id = z.id
+    FROM public.zvk z
     WHERE z.id_ft = $1
-      AND p.registry_flag = 'Да'
+      AND z.request_flag = 'Да'
       AND lower(trim(COALESCE(z.zvk_name,''))) <> 'система'
     `,
     [ft]
@@ -3891,41 +3907,16 @@ app.post("/zvk-pay-row", async (req, res) => {
     let rebuild = null;
     let deletedTail = null;
 
-    const ftRowRes = await client.query(
-      `
-      SELECT id_ft
-      FROM zvk
-      WHERE id = $1
-      LIMIT 1
-      `,
-      [Number(zvk_row_id)]
-    );
-
-    const id_ft = String(ftRowRes.rows[0]?.id_ft || "").trim();
-
-    if (id_ft) {
-      // если Реестр очистили -> удалить только последний авто-хвост
-      if (reg === null) {
-        deletedTail = await deleteLastAutoTailByFt(client, Number(zvk_row_id));
-      }
-
-    
-// ✅ если Реестр = Обнуление -> очистить Источник Объект
-if (reg === "Обнуление") {
-  await client.query(`
-    INSERT INTO public.zvk_status (zvk_row_id, src_o, status_time)
-    VALUES ($1, '', NOW())
-    ON CONFLICT (zvk_row_id)
-    DO UPDATE SET
-      src_o = '',
-      status_time = NOW()
-  `, [Number(zvk_row_id)]);
-}
-
-// если Реестр = Да -> пересобрать хвост
-if (reg === "Да") {
-  rebuild = await rebuildFtTail(client, Number(zvk_row_id));
-}
+    // Реестр больше не создаёт и не удаляет новую ZFT.
+    if (reg === "Обнуление") {
+      await client.query(`
+        INSERT INTO public.zvk_status (zvk_row_id, src_o, status_time)
+        VALUES ($1, '', NOW())
+        ON CONFLICT (zvk_row_id)
+        DO UPDATE SET
+          src_o = '',
+          status_time = NOW()
+      `, [Number(zvk_row_id)]);
     }
 
     await client.query("COMMIT");
@@ -5048,16 +5039,9 @@ async function setRequestRegistryYes(client, request_id) {
       agree_time = COALESCE(public.zvk_pay.agree_time, NOW())
   `, [request_id]);
 
-  const items = await client.query(`
-    SELECT zvk_row_id
-    FROM public.request_items
-    WHERE request_id = $1
-      AND zvk_row_id IS NOT NULL
-  `, [request_id]);
+  // Реестр = Да здесь только меняет статус.
+  // Новая ZFT с остатком создаётся при Заявка = Да.
 
-  for (const row of items.rows) {
-    await rebuildFtTail(client, Number(row.zvk_row_id));
-  }
 }
 
 app.get("/request-card", async (req, res) => {
