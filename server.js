@@ -646,8 +646,14 @@ await pool.query(`
       invoice_pdf text,
       src_d text,
       src_o text,
+      idlzk text,
       to_pay numeric(18,2) DEFAULT 0
     );
+  `);
+
+  await pool.query(`
+    ALTER TABLE public.request_items
+    ADD COLUMN IF NOT EXISTS idlzk text;
   `);
 
   await pool.query(`
@@ -2410,6 +2416,7 @@ app.post("/create-request", async (req, res) => {
           invoice_pdf,
           src_d,
           src_o,
+          idlzk,
           to_pay
         )
         SELECT
@@ -2429,6 +2436,7 @@ app.post("/create-request", async (req, res) => {
           v.invoice_pdf,
           v.src_d,
           v.src_o,
+          v.idlzk,
           v.to_pay
         FROM public.ft_zvk_current_v2 v
         WHERE v.zvk_row_id = $2
@@ -5140,6 +5148,7 @@ app.get("/request-card", async (req, res) => {
         i.invoice_pdf,
         i.src_d,
         i.src_o,
+        COALESCE(NULLIF(i.idlzk, ''), cur.idlzk, '') AS idlzk,
         i.to_pay,
 
         COALESCE(cur.request_flag, '') AS request_flag,
@@ -5311,19 +5320,7 @@ app.post("/approve-rows", async (req, res) => {
     );
 
     /*
-     * 1. Исмагулов может действовать только после Сулейменова.
-     */
-    if (
-      login === ISMAGULOV_LOGIN &&
-      String(head.acc_zhasulan_status || "").trim() !== "Согласовано"
-    ) {
-      throw new Error(
-        "Сначала должен согласовать Сулейменов Жасулан"
-      );
-    }
-
-    /*
-     * 2. Исмагулов не может согласовывать чужие объекты.
+     * 1. Исмагулов согласует первым, но только объекты из своей логики.
      */
     if (
       login === ISMAGULOV_LOGIN &&
@@ -5331,6 +5328,20 @@ app.post("/approve-rows", async (req, res) => {
     ) {
       throw new Error(
         "Для этого объекта согласование Исмагулова не требуется"
+      );
+    }
+
+    /*
+     * 2. Для специальных объектов Сулейменов ждёт Исмагулова.
+     * Для остальных объектов Сулейменов согласует сразу.
+     */
+    if (
+      login === "s_zhasulan" &&
+      needsIsmagulov &&
+      String(head.acc_zhas_status || "").trim() !== "Согласовано"
+    ) {
+      throw new Error(
+        "Сначала должен согласовать Исмагулов Жаслан"
       );
     }
 
@@ -5351,7 +5362,7 @@ app.post("/approve-rows", async (req, res) => {
     }
 
     /*
-     * 4. Для специальных объектов они также ждут Исмагулова.
+     * 4. Для специальных объектов основные согласующие также ждут Исмагулова.
      */
     if (
       needsIsmagulov &&
@@ -5411,17 +5422,120 @@ app.post("/approve-rows", async (req, res) => {
     ]);
 
     /*
-     * После Сулейменова:
-     * специальные объекты отправляются Исмагулову;
-     * остальные сразу Шевченко, Марату и Ермеку.
+     * Если Исмагулов или Сулейменов отклонил:
+     * - возвращаем строки в Финансовую таблицу;
+     * - Заявка = Нет;
+     * - К оплате, Источник Объект и IDLZK очищаем;
+     * - ЗаявкаСоздано и Реестр очищаем;
+     * - удаляем отправленную заявку.
+     */
+    if (
+      action === "reject_agree" &&
+      (login === ISMAGULOV_LOGIN || login === "s_zhasulan")
+    ) {
+      const itemRows = await client.query(`
+        SELECT zvk_row_id
+        FROM public.request_items
+        WHERE request_id = $1
+        ORDER BY id
+        FOR UPDATE
+      `, [requestId]);
+
+      const rowIds = itemRows.rows
+        .map(row => Number(row.zvk_row_id))
+        .filter(Boolean);
+
+      if (rowIds.length) {
+        await client.query(`
+          UPDATE public.zvk
+          SET
+            to_pay = NULL,
+            request_flag = 'Нет'
+          WHERE id = ANY($1::bigint[])
+        `, [rowIds]);
+
+        await client.query(`
+          INSERT INTO public.zvk_status
+          (
+            zvk_row_id,
+            status_time,
+            src_o,
+            idlzk,
+            chief_approved
+          )
+          SELECT
+            rid,
+            NOW(),
+            NULL,
+            NULL,
+            NULL
+          FROM unnest($1::bigint[]) AS rid
+          ON CONFLICT (zvk_row_id)
+          DO UPDATE SET
+            status_time = NOW(),
+            src_o = NULL,
+            idlzk = NULL,
+            chief_approved = NULL
+        `, [rowIds]);
+
+        await client.query(`
+          UPDATE public.zvk_pay
+          SET
+            registry_flag = NULL,
+            agree_time = NULL
+          WHERE zvk_row_id = ANY($1::bigint[])
+        `, [rowIds]);
+
+        await client.query(`
+          DELETE FROM public.notifications
+          WHERE entity_id = $1
+            AND type = 'request'
+        `, [requestId]);
+
+        await client.query(`
+          DELETE FROM public.request_items
+          WHERE request_id = $1
+        `, [requestId]);
+
+        await client.query(`
+          DELETE FROM public.request_approve_log
+          WHERE request_id = $1
+        `, [requestId]);
+
+        await client.query(`
+          DELETE FROM public.request_head
+          WHERE id = $1
+        `, [requestId]);
+
+        for (const rid of rowIds) {
+          if (typeof rebuildFtTail === "function") {
+            await rebuildFtTail(client, rid);
+          }
+        }
+      }
+
+      await client.query("COMMIT");
+
+      return res.json({
+        success: true,
+        request_id: requestId,
+        login,
+        action,
+        status: "Отклонено",
+        returned_to_ft: true,
+        cleared_rows: rowIds.length
+      });
+    }
+
+    /*
+     * После Сулейменова заявка открывается основным согласующим.
+     * Для специальных объектов к этому моменту Исмагулов уже согласовал.
      */
     if (
       login === "s_zhasulan" &&
       action === "agree"
     ) {
-      const nextUsers = needsIsmagulov
-        ? [ISMAGULOV_LOGIN]
-        : ["v_shevchenko", "k_marat", "k_ermek"];
+      const nextUsers = ["v_shevchenko", "k_marat", "k_ermek"];
 
       for (const nextLogin of nextUsers) {
         await client.query(`
@@ -5457,7 +5571,7 @@ app.post("/approve-rows", async (req, res) => {
     }
 
     /*
-     * После Исмагулова заявка открывается троим.
+     * После Исмагулова заявка передаётся Сулейменову.
      */
     if (
       login === ISMAGULOV_LOGIN &&
@@ -5465,9 +5579,7 @@ app.post("/approve-rows", async (req, res) => {
     ) {
       for (
         const nextLogin of [
-          "v_shevchenko",
-          "k_marat",
-          "k_ermek"
+          "s_zhasulan"
         ]
       ) {
         await client.query(`
@@ -5496,7 +5608,7 @@ app.post("/approve-rows", async (req, res) => {
         `, [
           nextLogin,
           `Заявка №${head.request_no} согласована Исмагуловым`,
-          `Заявка доступна для согласования. Сумма: ${Number(head.total_amount || 0).toLocaleString("ru-RU")} ₸`,
+          `Заявка передана Сулейменову Жасулану. Сумма: ${Number(head.total_amount || 0).toLocaleString("ru-RU")} ₸`,
           requestId
         ]);
       }
