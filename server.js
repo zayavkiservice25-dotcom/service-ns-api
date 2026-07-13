@@ -3346,24 +3346,18 @@ app.get("/request-list", async (req, res) => {
       login === "k_ermek"
     ) {
       /*
-       * Для объектов Исмагулова:
-       * сначала Сулейменов, потом Исмагулов.
+       * После Сулейменова заявка видна основным согласующим, если:
+       * - Исмагулов согласовал; или
+       * - Исмагулов для этой заявки не требуется.
        *
-       * Для остальных объектов:
-       * достаточно согласования Сулейменова.
+       * Маршрут уже определён при создании заявки и записан
+       * в request_head.acc_zhas_status.
        */
-      params.push(Array.from(ISMAGULOV_OBJECTS));
-
       whereSql = `
         WHERE COALESCE(acc_zhasulan_status, '') = 'Согласовано'
-          AND (
-            NOT EXISTS (
-              SELECT 1
-              FROM public.request_items ri
-              WHERE ri.request_id = request_head.id
-                AND ri.object = ANY($1::text[])
-            )
-            OR COALESCE(acc_zhas_status, '') = 'Согласовано'
+          AND COALESCE(acc_zhas_status, '') IN (
+            'Согласовано',
+            'Не требуется'
           )
       `;
 
