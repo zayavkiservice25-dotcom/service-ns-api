@@ -657,6 +657,21 @@ await pool.query(`
   `);
 
   await pool.query(`
+    ALTER TABLE public.request_items
+    ADD COLUMN IF NOT EXISTS printed_at timestamptz;
+  `);
+
+  await pool.query(`
+    ALTER TABLE public.request_items
+    ADD COLUMN IF NOT EXISTS printed_by text;
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS request_items_printed_at_idx
+    ON public.request_items (printed_at);
+  `);
+
+  await pool.query(`
     CREATE INDEX IF NOT EXISTS request_items_request_id_idx
     ON public.request_items (request_id);
   `);
@@ -5212,6 +5227,84 @@ async function setRequestRegistryYes(client, request_id) {
   // Новая ZFT с остатком создаётся при Заявка = Да.
 
 }
+
+// =====================================================
+// ПЕЧАТЬ НОВЫХ СТРОК, УТВЕРЖДЁННЫХ КАСЕНОВЫМ ЕРМЕКОМ
+// =====================================================
+app.get("/request-print-pending", async (req, res) => {
+  try {
+    const rows = await pool.query(`
+      SELECT
+        i.id AS request_item_id,
+        i.object,
+        COALESCE(NULLIF(trim(i.division), ''), NULLIF(trim(i.src_d), ''), '') AS division,
+        i.input_name,
+        i.id_zvk,
+        i.contractor,
+        i.pay_purpose,
+        i.dds_article,
+        i.contract_no,
+        i.invoice_no,
+        i.invoice_date,
+        i.src_o,
+        i.to_pay
+      FROM public.request_items i
+      JOIN public.request_head h
+        ON h.id = i.request_id
+      WHERE lower(trim(COALESCE(h.approve_ermek_status, ''))) IN
+            ('утверждено', 'согласовано', 'да')
+        AND i.printed_at IS NULL
+      ORDER BY h.approve_ermek_time ASC NULLS LAST, i.id ASC
+    `);
+
+    return res.json({
+      success: true,
+      count: rows.rowCount,
+      rows: rows.rows
+    });
+  } catch (e) {
+    console.error("REQUEST PRINT PENDING ERROR:", e);
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.post("/request-print-mark", async (req, res) => {
+  try {
+    const login = String(req.body?.login || "").trim();
+    const itemIds = Array.isArray(req.body?.item_ids)
+      ? [...new Set(req.body.item_ids.map(Number).filter(Boolean))]
+      : [];
+
+    if (!login) {
+      return res.status(400).json({ success: false, error: "login required" });
+    }
+    if (!itemIds.length) {
+      return res.status(400).json({ success: false, error: "item_ids required" });
+    }
+
+    const updated = await pool.query(`
+      UPDATE public.request_items i
+      SET printed_at = NOW(),
+          printed_by = $2
+      FROM public.request_head h
+      WHERE h.id = i.request_id
+        AND i.id = ANY($1::bigint[])
+        AND i.printed_at IS NULL
+        AND lower(trim(COALESCE(h.approve_ermek_status, ''))) IN
+            ('утверждено', 'согласовано', 'да')
+      RETURNING i.id, i.printed_at, i.printed_by
+    `, [itemIds, login]);
+
+    return res.json({
+      success: true,
+      updated_count: updated.rowCount,
+      rows: updated.rows
+    });
+  } catch (e) {
+    console.error("REQUEST PRINT MARK ERROR:", e);
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
 
 app.get("/request-card", async (req, res) => {
   try {
