@@ -146,6 +146,11 @@ await pool.query(`
   ADD COLUMN IF NOT EXISTS status_comment text;
 `);
 
+await pool.query(`
+  ALTER TABLE public.zvk_status
+  ADD COLUMN IF NOT EXISTS idlzk text;
+`);
+
 
 
   await pool.query(`
@@ -217,6 +222,7 @@ s.status_time,
 s.src_d,
 s.src_o,
 s.status_comment,
+s.idlzk,
 
       p.agree_time,
       p.registry_flag,
@@ -3620,7 +3626,7 @@ app.post("/zvk-bulk-request-flag", async (req, res) => {
 // =====================================================
 app.post("/zvk-status-row", async (req, res) => {
   try {
-    const { zvk_row_id, src_o, status_comment, login, is_admin, can_edit_all, is_all } = req.body;
+    const { zvk_row_id, src_o, idlzk, status_comment, login, is_admin, can_edit_all, is_all } = req.body;
 
     const rid = Number(zvk_row_id);
     if (isNaN(rid)) {
@@ -3640,6 +3646,7 @@ app.post("/zvk-status-row", async (req, res) => {
     }
 
     const hasStatusComment = Object.prototype.hasOwnProperty.call(req.body, "status_comment");
+    const hasIdlzk = Object.prototype.hasOwnProperty.call(req.body, "idlzk");
 
     // src_d нельзя задавать с клиента.
     // Всегда берём текущее значение division из основной строки FT.
@@ -3662,8 +3669,10 @@ app.post("/zvk-status-row", async (req, res) => {
 
     const result = await pool.query(
       `
-      INSERT INTO zvk_status (zvk_row_id, status_time, src_d, src_o, status_comment)
-      VALUES ($1, NOW(), $2, $3, $4)
+      INSERT INTO zvk_status
+        (zvk_row_id, status_time, src_d, src_o, status_comment, idlzk)
+      VALUES
+        ($1, NOW(), $2, $3, $4, $6)
       ON CONFLICT (zvk_row_id)
       DO UPDATE SET
         status_time = NOW(),
@@ -3675,10 +3684,22 @@ app.post("/zvk-status-row", async (req, res) => {
         status_comment = CASE
                            WHEN $5 THEN EXCLUDED.status_comment
                            ELSE zvk_status.status_comment
-                         END
+                         END,
+        idlzk = CASE
+                  WHEN $7 THEN EXCLUDED.idlzk
+                  ELSE zvk_status.idlzk
+                END
       RETURNING *
       `,
-      [rid, autoSrcD, src_o ?? null, hasStatusComment ? String(status_comment || "") : null, hasStatusComment]
+      [
+        rid,
+        autoSrcD,
+        src_o ?? null,
+        hasStatusComment ? String(status_comment || "") : null,
+        hasStatusComment,
+        hasIdlzk ? String(idlzk || "").trim() : null,
+        hasIdlzk
+      ]
     );
 
     res.json({ success: true, row: result.rows[0] });
