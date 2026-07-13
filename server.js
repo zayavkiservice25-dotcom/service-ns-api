@@ -2347,14 +2347,159 @@ function objectNeedsIsmagulov(value) {
   return ISMAGULOV_OBJECTS.has(normalizeRequestObject(value));
 }
 
+// Справочник Google Sheets:
+// лист «Статья ДДС»
+// столбец B = Статья ДДС
+// столбец G = «Да», если согласует Исмагулов
+const ISMAGULOV_DDS_SPREADSHEET_ID =
+  process.env.ISMAGULOV_DDS_SPREADSHEET_ID ||
+  "1nfp0EGfhEgLMJqR2GezKDApMuUTDSX6KCR5gmTmmaFg";
+
+const ISMAGULOV_DDS_SHEET_NAME =
+  process.env.ISMAGULOV_DDS_SHEET_NAME ||
+  "Статья ДДС";
+
+let ismagulovDdsCache = {
+  loadedAt: 0,
+  articles: new Set()
+};
+
+function normalizeRequestDds(value) {
+  return String(value || "")
+    .replace(/\u00A0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function parseSimpleCsv(text) {
+  const rows = [];
+  let row = [];
+  let cell = "";
+  let quoted = false;
+
+  const input = String(text || "");
+
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+
+    if (quoted) {
+      if (ch === '"') {
+        if (input[i + 1] === '"') {
+          cell += '"';
+          i++;
+        } else {
+          quoted = false;
+        }
+      } else {
+        cell += ch;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      quoted = true;
+    } else if (ch === ",") {
+      row.push(cell);
+      cell = "";
+    } else if (ch === "\n") {
+      row.push(cell.replace(/\r$/, ""));
+      rows.push(row);
+      row = [];
+      cell = "";
+    } else {
+      cell += ch;
+    }
+  }
+
+  row.push(cell.replace(/\r$/, ""));
+  if (row.some(v => String(v || "").trim() !== "")) {
+    rows.push(row);
+  }
+
+  return rows;
+}
+
+async function loadIsmagulovDdsArticles() {
+  const now = Date.now();
+
+  if (now - ismagulovDdsCache.loadedAt < 5 * 60 * 1000) {
+    return ismagulovDdsCache.articles;
+  }
+
+  const url =
+    "https://docs.google.com/spreadsheets/d/" +
+    ISMAGULOV_DDS_SPREADSHEET_ID +
+    "/gviz/tq?tqx=out:csv&sheet=" +
+    encodeURIComponent(ISMAGULOV_DDS_SHEET_NAME);
+
+  try {
+    const response = await fetch(url);
+
+    if (!response.ok) {
+      throw new Error("Google Sheets HTTP " + response.status);
+    }
+
+    const rows = parseSimpleCsv(await response.text());
+    const articles = new Set();
+
+    for (const row of rows) {
+      const article = normalizeRequestDds(row[1]); // B
+      const flag = String(row[6] || "").trim().toLowerCase(); // G
+
+      if (article && flag === "да") {
+        articles.add(article);
+      }
+    }
+
+    ismagulovDdsCache = {
+      loadedAt: now,
+      articles
+    };
+
+    return articles;
+  } catch (e) {
+    console.error("ISMAGULOV DDS ERROR:", e.message);
+
+    // Если лист недоступен, строка идёт Сулейменову.
+    ismagulovDdsCache = {
+      loadedAt: now,
+      articles: new Set()
+    };
+
+    return ismagulovDdsCache.articles;
+  }
+}
+
+async function rowNeedsIsmagulov(row) {
+  // Условие 1: объект должен подходить.
+  if (!objectNeedsIsmagulov(row?.object)) {
+    return false;
+  }
+
+  // Условие 2: Статья ДДС должна быть в B,
+  // и в этой строке в G должно стоять «Да».
+  const allowed = await loadIsmagulovDdsArticles();
+
+  return allowed.has(
+    normalizeRequestDds(row?.dds_article)
+  );
+}
+
 async function requestNeedsIsmagulov(client, requestId) {
   const result = await client.query(`
-    SELECT object
+    SELECT object, dds_article
     FROM public.request_items
     WHERE request_id = $1
   `, [Number(requestId)]);
 
-  return result.rows.some(row => objectNeedsIsmagulov(row.object));
+  for (const row of result.rows) {
+    if (await rowNeedsIsmagulov(row)) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 app.post("/create-request", async (req, res) => {
@@ -2445,6 +2590,8 @@ app.post("/create-request", async (req, res) => {
 
       const total = items.rows.reduce((s, r) => s + Number(r.to_pay || 0), 0);
       const count = items.rows.length;
+      const needsIsmagulovForNewRequest =
+        await requestNeedsIsmagulov(client, request_id);
 
       await client.query(`
         UPDATE public.request_head
@@ -2459,12 +2606,7 @@ acc_zhasulan_comment = NULL,
 
 acc_zhas_name = 'Исмагулов Жаслан',
 acc_zhas_status = CASE
-  WHEN EXISTS (
-    SELECT 1
-    FROM public.request_items ri
-    WHERE ri.request_id = $3
-      AND ri.object = ANY($4::text[])
-  )
+  WHEN $4::boolean = true
   THEN 'Ожидает'
   ELSE 'Не требуется'
 END,
@@ -2495,7 +2637,7 @@ acc_shevchenko_name = 'Шевченко Владимир',
   total,
   count,
   request_id,
-  Array.from(ISMAGULOV_OBJECTS)
+  needsIsmagulovForNewRequest
 ]);
 
 await client.query(`
@@ -2511,9 +2653,9 @@ await client.query(`
 ]);
 
 // ✅ Уведомление согласующим, когда заявка попала в "Отправленные заявки"
-const notifyUsers = [
-  "s_zhasulan"
-];
+const notifyUsers = needsIsmagulovForNewRequest
+  ? [ISMAGULOV_LOGIN]
+  : ["s_zhasulan"];
 
 for (const userLogin of notifyUsers) {
   await client.query(`
@@ -5161,10 +5303,19 @@ app.get("/request-card", async (req, res) => {
       ORDER BY i.id ASC
     `, [id]);
 
+    const itemsWithRoute = [];
+
+    for (const item of itemsRes.rows) {
+      itemsWithRoute.push({
+        ...item,
+        needs_ismagulov: await rowNeedsIsmagulov(item)
+      });
+    }
+
     return res.json({
       success: true,
       head: headRes.rows[0],
-      items: itemsRes.rows
+      items: itemsWithRoute
     });
 
   } catch (e) {
