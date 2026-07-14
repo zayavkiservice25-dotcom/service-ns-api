@@ -3341,17 +3341,18 @@ app.get("/request-list", async (req, res) => {
       whereSql = "";
 
     } else if (login === ISMAGULOV_LOGIN) {
-      // Исмагулов видит только свои объекты
-      // и только после согласования Сулейменова.
+      // Исмагулов согласует ПЕРВЫМ.
+      // Показываем заявки его маршрута сразу, не ожидая Сулейменова.
       params.push(Array.from(ISMAGULOV_OBJECTS));
 
       whereSql = `
-        WHERE COALESCE(acc_zhasulan_status, '') = 'Согласовано'
+        WHERE COALESCE(acc_zhas_status, '') <> 'Не требуется'
           AND EXISTS (
             SELECT 1
             FROM public.request_items ri
             WHERE ri.request_id = request_head.id
-              AND ri.object = ANY($1::text[])
+              AND trim(regexp_replace(COALESCE(ri.object, ''), '\s+', ' ', 'g'))
+                  = ANY($1::text[])
           )
       `;
 
@@ -5330,6 +5331,10 @@ app.get("/request-card", async (req, res) => {
         acc_zhasulan_status,
         acc_zhasulan_time,
         acc_zhasulan_comment,
+
+        acc_zhas_status,
+        acc_zhas_time,
+        acc_zhas_comment,
 
         acc_shevchenko_status,
         acc_shevchenko_time,
