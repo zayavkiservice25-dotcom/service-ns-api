@@ -2486,19 +2486,47 @@ async function loadIsmagulovDdsArticles() {
   }
 }
 
+function getRequestDdsCode(value) {
+  const normalized = normalizeRequestDds(value);
+
+  // Например:
+  // «84. Расчеты с бюджетом...» -> «84»
+  // Это защищает от небольших различий в тексте статьи.
+  const match = normalized.match(/^\s*(\d+(?:\.\d+)*)\s*[.\-–—)]?/);
+  return match ? match[1] : "";
+}
+
 async function rowNeedsIsmagulov(row) {
   // Условие 1: объект должен подходить.
   if (!objectNeedsIsmagulov(row?.object)) {
     return false;
   }
 
-  // Условие 2: Статья ДДС должна быть в B,
-  // и в этой строке в G должно стоять «Да».
+  // Условие 2: Статья ДДС должна быть в столбце B,
+  // а в столбце G напротив неё должно стоять «Да».
   const allowed = await loadIsmagulovDdsArticles();
+  const currentArticle = normalizeRequestDds(row?.dds_article);
 
-  return allowed.has(
-    normalizeRequestDds(row?.dds_article)
-  );
+  // Сначала проверяем полное совпадение.
+  if (allowed.has(currentArticle)) {
+    return true;
+  }
+
+  // Затем проверяем код статьи, например 84 или 135.
+  // Это нужно, если название статьи в FT и Google Sheets
+  // немного отличается пробелами или окончанием текста.
+  const currentCode = getRequestDdsCode(currentArticle);
+  if (!currentCode) {
+    return false;
+  }
+
+  for (const allowedArticle of allowed) {
+    if (getRequestDdsCode(allowedArticle) === currentCode) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 async function requestNeedsIsmagulov(client, requestId) {
@@ -3341,12 +3369,15 @@ app.get("/request-list", async (req, res) => {
       whereSql = "";
 
     } else if (login === ISMAGULOV_LOGIN) {
-      // Исмагулов видит только свои объекты
-      // и только после согласования Сулейменова.
+      /*
+       * Исмагулов согласует ПЕРВЫМ.
+       * Он видит заявки сразу, без ожидания Сулейменова,
+       * но только когда сервер определил, что его этап требуется.
+       */
       params.push(Array.from(ISMAGULOV_OBJECTS));
 
       whereSql = `
-        WHERE COALESCE(acc_zhasulan_status, '') = 'Согласовано'
+        WHERE COALESCE(acc_zhas_status, '') <> 'Не требуется'
           AND EXISTS (
             SELECT 1
             FROM public.request_items ri
