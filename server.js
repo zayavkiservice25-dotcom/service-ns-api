@@ -3341,18 +3341,17 @@ app.get("/request-list", async (req, res) => {
       whereSql = "";
 
     } else if (login === ISMAGULOV_LOGIN) {
-      // Исмагулов согласует ПЕРВЫМ.
-      // Показываем заявки его маршрута сразу, не ожидая Сулейменова.
+      // Исмагулов видит только свои объекты
+      // и только после согласования Сулейменова.
       params.push(Array.from(ISMAGULOV_OBJECTS));
 
       whereSql = `
-        WHERE COALESCE(acc_zhas_status, '') <> 'Не требуется'
+        WHERE COALESCE(acc_zhasulan_status, '') = 'Согласовано'
           AND EXISTS (
             SELECT 1
             FROM public.request_items ri
             WHERE ri.request_id = request_head.id
-              AND trim(regexp_replace(COALESCE(ri.object, ''), '\s+', ' ', 'g'))
-                  = ANY($1::text[])
+              AND ri.object = ANY($1::text[])
           )
       `;
 
@@ -5332,10 +5331,6 @@ app.get("/request-card", async (req, res) => {
         acc_zhasulan_time,
         acc_zhasulan_comment,
 
-        acc_zhas_status,
-        acc_zhas_time,
-        acc_zhas_comment,
-
         acc_shevchenko_status,
         acc_shevchenko_time,
         acc_shevchenko_comment,
@@ -5665,110 +5660,11 @@ app.post("/approve-rows", async (req, res) => {
     ]);
 
     /*
-     * Если Исмагулов или Сулейменов отклонил:
-     * - возвращаем строки в Финансовую таблицу;
-     * - Заявка = Нет;
-     * - К оплате, Источник Объект и IDLZK очищаем;
-     * - ЗаявкаСоздано и Реестр очищаем;
-     * - удаляем отправленную заявку.
+     * Отклонение Исмагулова или Сулейменова сохраняем в заявке.
+     * Строки request_head/request_items не удаляем и в FT не очищаем.
+     * Поэтому в «Отправленных заявках» остаётся статус «Отклонено»
+     * и комментарий с причиной отклонения.
      */
-    if (
-      action === "reject_agree" &&
-      (login === ISMAGULOV_LOGIN || login === "s_zhasulan")
-    ) {
-      const itemRows = await client.query(`
-        SELECT zvk_row_id
-        FROM public.request_items
-        WHERE request_id = $1
-        ORDER BY id
-        FOR UPDATE
-      `, [requestId]);
-
-      const rowIds = itemRows.rows
-        .map(row => Number(row.zvk_row_id))
-        .filter(Boolean);
-
-      if (rowIds.length) {
-        await client.query(`
-          UPDATE public.zvk
-          SET
-            to_pay = NULL,
-            request_flag = 'Нет'
-          WHERE id = ANY($1::bigint[])
-        `, [rowIds]);
-
-        await client.query(`
-          INSERT INTO public.zvk_status
-          (
-            zvk_row_id,
-            status_time,
-            src_o,
-            idlzk,
-            chief_approved
-          )
-          SELECT
-            rid,
-            NOW(),
-            NULL,
-            NULL,
-            NULL
-          FROM unnest($1::bigint[]) AS rid
-          ON CONFLICT (zvk_row_id)
-          DO UPDATE SET
-            status_time = NOW(),
-            src_o = NULL,
-            idlzk = NULL,
-            chief_approved = NULL
-        `, [rowIds]);
-
-        await client.query(`
-          UPDATE public.zvk_pay
-          SET
-            registry_flag = NULL,
-            agree_time = NULL
-          WHERE zvk_row_id = ANY($1::bigint[])
-        `, [rowIds]);
-
-        await client.query(`
-          DELETE FROM public.notifications
-          WHERE entity_id = $1
-            AND type = 'request'
-        `, [requestId]);
-
-        await client.query(`
-          DELETE FROM public.request_items
-          WHERE request_id = $1
-        `, [requestId]);
-
-        await client.query(`
-          DELETE FROM public.request_approve_log
-          WHERE request_id = $1
-        `, [requestId]);
-
-        await client.query(`
-          DELETE FROM public.request_head
-          WHERE id = $1
-        `, [requestId]);
-
-        for (const rid of rowIds) {
-          if (typeof rebuildFtTail === "function") {
-            await rebuildFtTail(client, rid);
-          }
-        }
-      }
-
-      await client.query("COMMIT");
-
-      return res.json({
-        success: true,
-        request_id: requestId,
-        login,
-        action,
-        status: "Отклонено",
-        returned_to_ft: true,
-        cleared_rows: rowIds.length
-      });
-    }
 
     /*
      * После Сулейменова заявка открывается основным согласующим.
