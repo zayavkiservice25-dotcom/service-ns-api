@@ -164,11 +164,18 @@ await pool.query(`
     CREATE TABLE IF NOT EXISTS zvk_pay (
       zvk_row_id bigint PRIMARY KEY,
       registry_flag text,
+      aray_paid text,
+      aray_pay_time timestamptz,
+      aray_paid_by text,
       is_paid text,
       agree_time timestamptz,
       pay_time timestamptz
     );
   `);
+
+  await pool.query(`ALTER TABLE public.zvk_pay ADD COLUMN IF NOT EXISTS aray_paid text;`);
+  await pool.query(`ALTER TABLE public.zvk_pay ADD COLUMN IF NOT EXISTS aray_pay_time timestamptz;`);
+  await pool.query(`ALTER TABLE public.zvk_pay ADD COLUMN IF NOT EXISTS aray_paid_by text;`);
 
   // (опционально) согласование по id_zvk
   await pool.query(`
@@ -226,6 +233,9 @@ s.idlzk,
 
       p.agree_time,
       p.registry_flag,
+      p.aray_paid,
+      p.aray_pay_time,
+      p.aray_paid_by,
       p.pay_time,
       p.is_paid
 
@@ -2938,6 +2948,7 @@ app.get("/registry-card", async (req, res) => {
 
         COALESCE(cur.request_flag, '') AS request_flag,
         COALESCE(cur.registry_flag, '') AS registry_flag,
+        COALESCE(cur.aray_paid, '') AS aray_paid,
         COALESCE(cur.is_paid, '') AS is_paid
 
       FROM public.registry_items i
@@ -5413,6 +5424,7 @@ app.get("/request-card", async (req, res) => {
 
         COALESCE(cur.request_flag, '') AS request_flag,
         COALESCE(cur.registry_flag, '') AS registry_flag,
+        COALESCE(cur.aray_paid, '') AS aray_paid,
         COALESCE(cur.is_paid, '') AS is_paid
       FROM public.request_items i
       LEFT JOIN public.ft_zvk_current_v2 cur
@@ -6114,64 +6126,33 @@ app.post("/request-items-paid-bulk", async (req, res) => {
 
   try {
     const request_id = Number(req.body?.request_id);
-
     const row_ids = Array.isArray(req.body?.row_ids)
       ? req.body.row_ids.map(Number).filter(Boolean)
       : [];
-
     const loginNorm = String(req.body?.login || "").trim().toLowerCase();
     const paidValue = String(req.body?.is_paid || "").trim();
 
-    if (!request_id) {
-      return res.status(400).json({
-        success: false,
-        error: "request_id required"
-      });
-    }
-
-    if (!row_ids.length) {
-      return res.status(400).json({
-        success: false,
-        error: "row_ids required"
-      });
-    }
-
+    if (!request_id) return res.status(400).json({ success:false, error:"request_id required" });
+    if (!row_ids.length) return res.status(400).json({ success:false, error:"row_ids required" });
     if (!["Да", "Нет"].includes(paidValue)) {
-      return res.status(400).json({
-        success: false,
-        error: "is_paid must be Да or Нет"
-      });
+      return res.status(400).json({ success:false, error:"is_paid must be Да or Нет" });
     }
 
-    // ✅ Оплату могут ставить только эти пользователи
-    const canPay =
-      loginNorm === "zh_elena" ||
-      loginNorm === "k_arailym" ||
-      loginNorm === "s_zhasulan" ||
-      loginNorm === "b_erkin" ||
-      loginNorm === "admin";
-
-    if (!canPay) {
-      return res.status(403).json({
-        success: false,
-        error: "Нет прав ставить Оплачено"
-      });
-    }
+    const canPay = ["zh_elena", "k_arailym", "s_zhasulan", "b_erkin", "admin"].includes(loginNorm);
+    if (!canPay) return res.status(403).json({ success:false, error:"Нет прав ставить Оплачено" });
 
     await client.query("BEGIN");
 
-    // Проверяем, что выбранные строки принадлежат оператору по дивизиону.
     const divisionCheck = await client.query(`
       SELECT
         i.zvk_row_id,
-        COALESCE(NULLIF(trim(f.division), ''), NULLIF(trim(s.src_d), ''), '') AS division
+        COALESCE(NULLIF(trim(i.division), ''), NULLIF(trim(f.division), ''), NULLIF(trim(s.src_d), ''), '') AS division,
+        COALESCE(p.aray_paid, '') AS aray_paid
       FROM public.request_items i
-      JOIN public.zvk z
-        ON z.id = i.zvk_row_id
-      JOIN public.ft f
-        ON f.id_ft = z.id_ft
-      LEFT JOIN public.zvk_status s
-        ON s.zvk_row_id = z.id
+      JOIN public.zvk z ON z.id = i.zvk_row_id
+      JOIN public.ft f ON f.id_ft = z.id_ft
+      LEFT JOIN public.zvk_status s ON s.zvk_row_id = z.id
+      LEFT JOIN public.zvk_pay p ON p.zvk_row_id = z.id
       WHERE i.request_id = $1
         AND i.zvk_row_id = ANY($2::bigint[])
         AND i.zvk_row_id IS NOT NULL
@@ -6181,42 +6162,23 @@ app.post("/request-items-paid-bulk", async (req, res) => {
       throw new Error("Не все выбранные строки найдены в заявке");
     }
 
+    const ELENA_DIVISIONS = new Set(["СК Жилой дом", "Smart Estate"]);
+    const ZHASULAN_DIVISIONS = new Set(["Sapa asphalt"]);
+    const DELEGATED_DIVISIONS = new Set([...ELENA_DIVISIONS, ...ZHASULAN_DIVISIONS]);
+
     const forbidden = divisionCheck.rows.filter(row => {
       const division = String(row.division || "").replace(/\s+/g, " ").trim();
-
-      if (loginNorm === "s_zhasulan") {
-        return division !== "Sapa asphalt";
-      }
-
-      if (loginNorm === "zh_elena") {
-        return division !== "СК Жилой дом" &&
-               division !== "Smart Estate";
-      }
-
-      if (loginNorm === "k_arailym") {
-        const allowedDivisions = new Set([
-          "Дорога",
-          "Механизация",
-          "Мост",
-          "Офис",
-          "Сети",
-          "Import"
-        ]);
-
-        return !allowedDivisions.has(division);
-      }
-
-      return false; // admin и b_erkin без ограничения
+      if (loginNorm === "s_zhasulan") return !ZHASULAN_DIVISIONS.has(division);
+      if (loginNorm === "zh_elena") return !ELENA_DIVISIONS.has(division);
+      if (loginNorm === "k_arailym") return false; // Арай видит и обрабатывает все дивизионы
+      return false;
     });
 
     if (forbidden.length) {
-      const divisions = [...new Set(
-        forbidden.map(row => String(row.division || "").trim() || "Без дивизиона")
-      )];
-
+      const divisions = [...new Set(forbidden.map(row => String(row.division || "").trim() || "Без дивизиона"))];
       return res.status(403).json({
-        success: false,
-        error: "Нет прав менять Оплачено для дивизиона: " + divisions.join(", ")
+        success:false,
+        error:"Нет прав менять Оплачено для дивизиона: " + divisions.join(", ")
       });
     }
 
@@ -6227,56 +6189,89 @@ app.post("/request-items-paid-bulk", async (req, res) => {
       LIMIT 1
     `, [request_id]);
 
-    if (!head.rowCount) {
-      throw new Error("Заявка не найдена");
-    }
-
+    if (!head.rowCount) throw new Error("Заявка не найдена");
     const approveStatus = String(head.rows[0].approve_ermek_status || "").trim();
-
     if (!["Согласовано", "Утверждено", "Да"].includes(approveStatus)) {
       throw new Error("Оплачено можно ставить только после утверждения Ермека");
     }
 
-    await client.query(`
-      INSERT INTO public.zvk_pay
-        (zvk_row_id, is_paid, pay_time)
-      SELECT
-        i.zvk_row_id,
-        CASE WHEN $3 = 'Да' THEN 'Да' ELSE NULL END,
-        CASE WHEN $3 = 'Да' THEN NOW() ELSE NULL END
-      FROM public.request_items i
-      WHERE i.request_id = $1
-        AND i.zvk_row_id = ANY($2::bigint[])
-        AND i.zvk_row_id IS NOT NULL
-      ON CONFLICT (zvk_row_id)
-      DO UPDATE SET
-        is_paid = EXCLUDED.is_paid,
-        pay_time = EXCLUDED.pay_time
-    `, [request_id, row_ids, paidValue]);
+    // Лена и Жасулан завершают оплату только после отметки Арай.
+    if (["zh_elena", "s_zhasulan"].includes(loginNorm)) {
+      const withoutAray = divisionCheck.rows.filter(row => String(row.aray_paid || "").trim() !== "Да");
+      if (withoutAray.length) {
+        return res.status(409).json({ success:false, error:"Сначала Арай должна поставить «Оплачено Арай = Да»" });
+      }
+    }
+
+    if (loginNorm === "k_arailym") {
+      const delegatedIds = divisionCheck.rows
+        .filter(row => DELEGATED_DIVISIONS.has(String(row.division || "").replace(/\s+/g, " ").trim()))
+        .map(row => Number(row.zvk_row_id));
+      const ownIds = divisionCheck.rows
+        .filter(row => !DELEGATED_DIVISIONS.has(String(row.division || "").replace(/\s+/g, " ").trim()))
+        .map(row => Number(row.zvk_row_id));
+
+      // Для дивизионов Лены/Жасулана Арай ставит только промежуточную отметку.
+      if (delegatedIds.length) {
+        await client.query(`
+          INSERT INTO public.zvk_pay (zvk_row_id, aray_paid, aray_pay_time, aray_paid_by)
+          SELECT x,
+                 CASE WHEN $2 = 'Да' THEN 'Да' ELSE NULL END,
+                 CASE WHEN $2 = 'Да' THEN NOW() ELSE NULL END,
+                 CASE WHEN $2 = 'Да' THEN $3 ELSE NULL END
+          FROM unnest($1::bigint[]) AS x
+          ON CONFLICT (zvk_row_id) DO UPDATE SET
+            aray_paid = EXCLUDED.aray_paid,
+            aray_pay_time = EXCLUDED.aray_pay_time,
+            aray_paid_by = EXCLUDED.aray_paid_by
+        `, [delegatedIds, paidValue, loginNorm]);
+      }
+
+      // Для остальных дивизионов одна кнопка Арай сразу закрывает оба столбца.
+      if (ownIds.length) {
+        await client.query(`
+          INSERT INTO public.zvk_pay
+            (zvk_row_id, aray_paid, aray_pay_time, aray_paid_by, is_paid, pay_time)
+          SELECT x,
+                 CASE WHEN $2 = 'Да' THEN 'Да' ELSE NULL END,
+                 CASE WHEN $2 = 'Да' THEN NOW() ELSE NULL END,
+                 CASE WHEN $2 = 'Да' THEN $3 ELSE NULL END,
+                 CASE WHEN $2 = 'Да' THEN 'Да' ELSE NULL END,
+                 CASE WHEN $2 = 'Да' THEN NOW() ELSE NULL END
+          FROM unnest($1::bigint[]) AS x
+          ON CONFLICT (zvk_row_id) DO UPDATE SET
+            aray_paid = EXCLUDED.aray_paid,
+            aray_pay_time = EXCLUDED.aray_pay_time,
+            aray_paid_by = EXCLUDED.aray_paid_by,
+            is_paid = EXCLUDED.is_paid,
+            pay_time = EXCLUDED.pay_time
+        `, [ownIds, paidValue, loginNorm]);
+      }
+    } else {
+      // Лена, Жасулан, админ и Беркин меняют финальный столбец «Оплачено».
+      await client.query(`
+        INSERT INTO public.zvk_pay (zvk_row_id, is_paid, pay_time)
+        SELECT x,
+               CASE WHEN $2 = 'Да' THEN 'Да' ELSE NULL END,
+               CASE WHEN $2 = 'Да' THEN NOW() ELSE NULL END
+        FROM unnest($1::bigint[]) AS x
+        ON CONFLICT (zvk_row_id) DO UPDATE SET
+          is_paid = EXCLUDED.is_paid,
+          pay_time = EXCLUDED.pay_time
+      `, [row_ids, paidValue]);
+    }
 
     await client.query("COMMIT");
-
-    return res.json({
-      success: true,
-      request_id,
-      paid: paidValue,
-      updated: row_ids.length
-    });
-
+    return res.json({ success:true, request_id, paid:paidValue, updated:row_ids.length });
   } catch (e) {
     try { await client.query("ROLLBACK"); } catch (_) {}
-
     console.error("request-items-paid-bulk error:", e);
-
-    return res.status(500).json({
-      success: false,
-      error: e.message
-    });
-
+    return res.status(500).json({ success:false, error:e.message });
   } finally {
     client.release();
   }
 });
+
 app.post("/update-row", async (req,res)=>{
   try{
     const {
@@ -10461,4 +10456,4 @@ app.post('/lzk/limit-create', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log("Server started on port " + PORT))
+app.listen(PORT, () => console.log("Server started on port " + PORT));
