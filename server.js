@@ -5279,7 +5279,7 @@ app.get("/request-print-pending", async (req, res) => {
       SELECT
         i.id AS request_item_id,
         i.object,
-        COALESCE(NULLIF(trim(i.division), ''), NULLIF(trim(i.src_d), ''), '') AS division,
+        COALESCE(NULLIF(trim(i.src_d), ''), '') AS division,
         i.input_name,
         i.id_zvk,
         i.contractor,
@@ -5373,6 +5373,10 @@ app.get("/request-card", async (req, res) => {
         acc_zhasulan_time,
         acc_zhasulan_comment,
 
+        acc_zhas_status,
+        acc_zhas_time,
+        acc_zhas_comment,
+
         acc_shevchenko_status,
         acc_shevchenko_time,
         acc_shevchenko_comment,
@@ -5408,7 +5412,7 @@ app.get("/request-card", async (req, res) => {
         i.id_ft,
         i.id_zvk,
         i.object,
-        i.division,
+        COALESCE(NULLIF(trim(cur.division), ''), NULLIF(trim(i.src_d), ''), '') AS division,
         i.input_name,
         i.contractor,
         i.pay_purpose,
@@ -6146,7 +6150,7 @@ app.post("/request-items-paid-bulk", async (req, res) => {
     const divisionCheck = await client.query(`
       SELECT
         i.zvk_row_id,
-        COALESCE(NULLIF(trim(i.division), ''), NULLIF(trim(f.division), ''), NULLIF(trim(s.src_d), ''), '') AS division,
+        COALESCE(NULLIF(trim(f.division), ''), NULLIF(trim(s.src_d), ''), '') AS division,
         COALESCE(p.aray_paid, '') AS aray_paid
       FROM public.request_items i
       JOIN public.zvk z ON z.id = i.zvk_row_id
