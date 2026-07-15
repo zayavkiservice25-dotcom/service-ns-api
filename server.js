@@ -234,10 +234,7 @@ s.idlzk,
       p.agree_time,
       p.registry_flag,
       p.pay_time,
-      p.is_paid,
-      p.aray_paid,
-      p.aray_pay_time,
-      p.aray_paid_by
+      p.is_paid
 
     FROM ft f
     LEFT JOIN zvk z ON z.id_ft = f.id_ft
@@ -675,6 +672,11 @@ await pool.query(`
     ALTER TABLE public.request_items
     ADD COLUMN IF NOT EXISTS printed_by text;
   `);
+
+  // Оплачено Арай хранится только в отправленной заявке, не в FT/zvk_pay.
+  await pool.query(`ALTER TABLE public.request_items ADD COLUMN IF NOT EXISTS aray_paid text;`);
+  await pool.query(`ALTER TABLE public.request_items ADD COLUMN IF NOT EXISTS aray_pay_time timestamptz;`);
+  await pool.query(`ALTER TABLE public.request_items ADD COLUMN IF NOT EXISTS aray_paid_by text;`);
 
   await pool.query(`
     CREATE INDEX IF NOT EXISTS request_items_printed_at_idx
@@ -2953,7 +2955,6 @@ app.get("/registry-card", async (req, res) => {
 
         COALESCE(cur.request_flag, '') AS request_flag,
         COALESCE(cur.registry_flag, '') AS registry_flag,
-        COALESCE(cur.aray_paid, '') AS aray_paid,
         COALESCE(cur.is_paid, '') AS is_paid
 
       FROM public.registry_items i
@@ -5433,7 +5434,7 @@ app.get("/request-card", async (req, res) => {
 
         COALESCE(cur.request_flag, '') AS request_flag,
         COALESCE(cur.registry_flag, '') AS registry_flag,
-        COALESCE(cur.aray_paid, '') AS aray_paid,
+        COALESCE(i.aray_paid, '') AS aray_paid,
         COALESCE(cur.is_paid, '') AS is_paid
       FROM public.request_items i
       LEFT JOIN public.ft_zvk_current_v2 cur
@@ -6154,14 +6155,14 @@ app.post("/request-items-paid-bulk", async (req, res) => {
 
     const divisionCheck = await client.query(`
       SELECT
+        i.id AS request_item_id,
         i.zvk_row_id,
         COALESCE(NULLIF(trim(f.division), ''), NULLIF(trim(s.src_d), ''), '') AS division,
-        COALESCE(p.aray_paid, '') AS aray_paid
+        COALESCE(i.aray_paid, '') AS aray_paid
       FROM public.request_items i
       JOIN public.zvk z ON z.id = i.zvk_row_id
       JOIN public.ft f ON f.id_ft = z.id_ft
       LEFT JOIN public.zvk_status s ON s.zvk_row_id = z.id
-      LEFT JOIN public.zvk_pay p ON p.zvk_row_id = z.id
       WHERE i.request_id = $1
         AND i.zvk_row_id = ANY($2::bigint[])
         AND i.zvk_row_id IS NOT NULL
@@ -6213,48 +6214,37 @@ app.post("/request-items-paid-bulk", async (req, res) => {
     }
 
     if (loginNorm === "k_arailym") {
-      const delegatedIds = divisionCheck.rows
-        .filter(row => DELEGATED_DIVISIONS.has(String(row.division || "").replace(/\s+/g, " ").trim()))
-        .map(row => Number(row.zvk_row_id));
-      const ownIds = divisionCheck.rows
-        .filter(row => !DELEGATED_DIVISIONS.has(String(row.division || "").replace(/\s+/g, " ").trim()))
-        .map(row => Number(row.zvk_row_id));
+      const delegatedRows = divisionCheck.rows.filter(row =>
+        DELEGATED_DIVISIONS.has(String(row.division || "").replace(/\s+/g, " ").trim())
+      );
+      const ownRows = divisionCheck.rows.filter(row =>
+        !DELEGATED_DIVISIONS.has(String(row.division || "").replace(/\s+/g, " ").trim())
+      );
 
-      // Для дивизионов Лены/Жасулана Арай ставит только промежуточную отметку.
-      if (delegatedIds.length) {
-        await client.query(`
-          INSERT INTO public.zvk_pay (zvk_row_id, aray_paid, aray_pay_time, aray_paid_by)
-          SELECT x,
-                 CASE WHEN $2 = 'Да' THEN 'Да' ELSE NULL END,
-                 CASE WHEN $2 = 'Да' THEN NOW() ELSE NULL END,
-                 CASE WHEN $2 = 'Да' THEN $3 ELSE NULL END
-          FROM unnest($1::bigint[]) AS x
-          ON CONFLICT (zvk_row_id) DO UPDATE SET
-            aray_paid = EXCLUDED.aray_paid,
-            aray_pay_time = EXCLUDED.aray_pay_time,
-            aray_paid_by = EXCLUDED.aray_paid_by
-        `, [delegatedIds, paidValue, loginNorm]);
-      }
+      // Отметка Арай сохраняется только в request_items — обычную FT не меняет.
+      await client.query(`
+        UPDATE public.request_items
+        SET aray_paid = CASE WHEN $3 = 'Да' THEN 'Да' ELSE NULL END,
+            aray_pay_time = CASE WHEN $3 = 'Да' THEN NOW() ELSE NULL END,
+            aray_paid_by = CASE WHEN $3 = 'Да' THEN $4 ELSE NULL END
+        WHERE request_id = $1
+          AND zvk_row_id = ANY($2::bigint[])
+      `, [request_id, row_ids, paidValue, loginNorm]);
 
-      // Для остальных дивизионов одна кнопка Арай сразу закрывает оба столбца.
+      // Для собственных дивизионов Арай дополнительно ставит окончательное
+      // старое Оплачено в zvk_pay. Только это поле влияет на обычную FT.
+      const ownIds = ownRows.map(row => Number(row.zvk_row_id));
       if (ownIds.length) {
         await client.query(`
-          INSERT INTO public.zvk_pay
-            (zvk_row_id, aray_paid, aray_pay_time, aray_paid_by, is_paid, pay_time)
+          INSERT INTO public.zvk_pay (zvk_row_id, is_paid, pay_time)
           SELECT x,
-                 CASE WHEN $2 = 'Да' THEN 'Да' ELSE NULL END,
-                 CASE WHEN $2 = 'Да' THEN NOW() ELSE NULL END,
-                 CASE WHEN $2 = 'Да' THEN $3 ELSE NULL END,
                  CASE WHEN $2 = 'Да' THEN 'Да' ELSE NULL END,
                  CASE WHEN $2 = 'Да' THEN NOW() ELSE NULL END
           FROM unnest($1::bigint[]) AS x
           ON CONFLICT (zvk_row_id) DO UPDATE SET
-            aray_paid = EXCLUDED.aray_paid,
-            aray_pay_time = EXCLUDED.aray_pay_time,
-            aray_paid_by = EXCLUDED.aray_paid_by,
             is_paid = EXCLUDED.is_paid,
             pay_time = EXCLUDED.pay_time
-        `, [ownIds, paidValue, loginNorm]);
+        `, [ownIds, paidValue]);
       }
     } else {
       // Лена, Жасулан, админ и Беркин меняют финальный столбец «Оплачено».
