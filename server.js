@@ -233,11 +233,11 @@ s.idlzk,
 
       p.agree_time,
       p.registry_flag,
+      p.pay_time,
+      p.is_paid,
       p.aray_paid,
       p.aray_pay_time,
-      p.aray_paid_by,
-      p.pay_time,
-      p.is_paid
+      p.aray_paid_by
 
     FROM ft f
     LEFT JOIN zvk z ON z.id_ft = f.id_ft
@@ -724,6 +724,11 @@ await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_z
 await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zhasulan_status text;`);
 await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zhasulan_time timestamptz;`);
 await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zhasulan_comment text;`);
+
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zhas_name text;`);
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zhas_status text;`);
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zhas_time timestamptz;`);
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zhas_comment text;`);
 
 await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_shevchenko_name text;`);
 await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_shevchenko_status text;`);
