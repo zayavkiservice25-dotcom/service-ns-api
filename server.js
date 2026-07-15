@@ -1392,6 +1392,22 @@ await pool.query(`
   );
 `);
 
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS onec.doc_incomingpaymentorder_payment_return_other (
+    document_id text NOT NULL,
+    line_no integer NOT NULL,
+    return_sum numeric(18,2),
+    doc_return text,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+    PRIMARY KEY (document_id, line_no),
+    CONSTRAINT incomingpaymentorder_return_other_fk
+      FOREIGN KEY (document_id)
+      REFERENCES onec.doc_incomingpaymentorder(document_id)
+      ON DELETE CASCADE
+  );
+`);
+
 // =====================================================
 // 1С: КОРРЕКТИРОВКА ДОЛГА doc_debt_adjustment + debt_amounts
 // =====================================================
@@ -7909,6 +7925,14 @@ app.post(
           [documentId]
         );
 
+        await client.query(
+          `
+          DELETE FROM onec.doc_incomingpaymentorder_payment_return_other
+          WHERE document_id = $1
+          `,
+          [documentId]
+        );
+
         const paymentTranscript = Array.isArray(doc.payment_transcript)
           ? doc.payment_transcript
           : [];
@@ -7971,10 +7995,43 @@ app.post(
           insertedRows++;
         }
 
+        const paymentReturnOther = Array.isArray(doc.payment_return_other)
+          ? doc.payment_return_other
+          : [];
+
+        let paymentReturnOtherRows = 0;
+
+        for (let index = 0; index < paymentReturnOther.length; index++) {
+          const row = paymentReturnOther[index] || {};
+          const lineNo = index + 1;
+
+          await client.query(
+            `
+            INSERT INTO onec.doc_incomingpaymentorder_payment_return_other (
+              document_id,
+              line_no,
+              return_sum,
+              doc_return,
+              updated_at
+            )
+            VALUES ($1,$2,$3,$4,NOW())
+            `,
+            [
+              documentId,
+              lineNo,
+              oneCNumber(row.return_sum),
+              oneCText(row.doc_return)
+            ]
+          );
+
+          paymentReturnOtherRows++;
+        }
+
         results.push({
           document_id: documentId,
           operation,
-          payment_transcript_count: insertedRows
+          payment_transcript_count: insertedRows,
+          payment_return_other_count: paymentReturnOtherRows
         });
       }
 
