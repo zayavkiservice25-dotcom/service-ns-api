@@ -9045,6 +9045,7 @@ async function getLzkRequestRows(req, res, approvedOnly) {
         r.idlzk,
         r.initiator,
         to_char(r.request_date, 'DD.MM.YYYY HH24:MI') AS request_date,
+        to_char(r.request_date, 'YYYY-MM-DD\"T\"HH24:MI') AS request_date_input,
         r.object_name AS object,
         r.constructive_name AS constructive,
         r.group_name,
@@ -9145,15 +9146,33 @@ app.post("/lzk/requests/editor-update", async (req, res) => {
         UPDATE lzk.requests
         SET
           fact_qty = COALESCE($2, fact_qty),
-          note = COALESCE(NULLIF($3, ''), note),
-          deadline = COALESCE($4, deadline),
+          initiator = COALESCE(NULLIF($3, ''), initiator),
+          request_date = COALESCE($4, request_date),
+          object_name = COALESCE(NULLIF($5, ''), object_name),
+          constructive_name = COALESCE(NULLIF($6, ''), constructive_name),
+          group_name = COALESCE(NULLIF($7, ''), group_name),
+          material_name = COALESCE(NULLIF($8, ''), material_name),
+          unit = COALESCE(NULLIF($9, ''), unit),
+          note = $10,
+          deadline = $11,
+          documents_url = $12,
           updated_at = NOW()
         WHERE idzlzk = $1
+          AND lower(trim(COALESCE(pto_status, ''))) NOT IN
+              ('согласован', 'согласовано', 'отклонено')
       `, [
         id,
         lzkNum(row.qty),
+        lzkText(row.initiator),
+        lzkDate(row.request_date),
+        lzkText(row.object),
+        lzkText(row.constructive),
+        lzkText(row.group_name),
+        lzkText(row.tmc_name),
+        lzkText(row.unit),
         lzkText(row.note),
-        lzkDate(row.deadline)
+        lzkDate(row.deadline),
+        lzkText(row.pdf)
       ]);
 
       updated += q.rowCount;
