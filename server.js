@@ -3314,7 +3314,7 @@ async function resetExpiredZhasulanRequests() {
           status_time = NOW()
       `, [rowIds]);
 
-      // ЗаявкаСоздано = пусто, если колонка chief_approved есть
+      // РеестрСоздано = пусто, если колонка chief_approved есть
       const hasChiefApproved = await client.query(`
         SELECT 1
         FROM information_schema.columns
@@ -3627,7 +3627,7 @@ const toPayNum = isNoRequest
       // ✅ если Заявка = Нет:
       // 1) НЕ пересоздаём ID ZFT;
       // 2) очищаем Источник Объект;
-      // 3) очищаем ЗаявкаСоздано.
+      // 3) очищаем РеестрСоздано.
       if (flag === "Нет") {
         await pool.query(`
           INSERT INTO public.zvk_status (zvk_row_id, src_o, chief_approved, status_time)
@@ -5368,7 +5368,7 @@ async function setRequestRegistryYes(client, request_id) {
       agree_time = COALESCE(public.zvk_pay.agree_time, NOW())
   `, [request_id]);
 
-  // Реестр = Да здесь только меняет статус.
+  // Реестр Согласовано = Да здесь только меняет статус.
   // Новая ZFT с остатком создаётся при Заявка = Да.
 
 }
@@ -5904,24 +5904,17 @@ app.post("/approve-rows", async (req, res) => {
     }
 
     /*
-     * Реестр = Да только:
-     * Шевченко, Койлибаев, Касенов
-     * или финальное утверждение Касенова.
+     * Реестр Согласовано = Да только когда согласует:
+     * - Шевченко Владимир
+     * - Койлибаев Марат
      *
-     * Сулейменов и Исмагулов Реестр не меняют.
+     * Исмагулов, Сулейменов и Касенов это поле не меняют.
      */
     const shouldSetRegistryYes =
+      action === "agree" &&
       (
-        action === "agree" &&
-        (
-          login === "v_shevchenko" ||
-          login === "k_marat" ||
-          login === "k_ermek"
-        )
-      ) ||
-      (
-        action === "approve" &&
-        login === "k_ermek"
+        login === "v_shevchenko" ||
+        login === "k_marat"
       );
 
     if (shouldSetRegistryYes) {
