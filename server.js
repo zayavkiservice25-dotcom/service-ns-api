@@ -151,6 +151,11 @@ await pool.query(`
   ADD COLUMN IF NOT EXISTS idlzk text;
 `);
 
+await pool.query(`
+  ALTER TABLE public.zvk_status
+  ADD COLUMN IF NOT EXISTS chief_approved text;
+`);
+
 
 
   await pool.query(`
@@ -3619,19 +3624,28 @@ const toPayNum = isNoRequest
         });
       }
 
-      // ✅ если Заявка = Нет, очищаем источник объект
+      // ✅ если Заявка = Нет:
+      // 1) НЕ пересоздаём ID ZFT;
+      // 2) очищаем Источник Объект;
+      // 3) очищаем ЗаявкаСоздано.
       if (flag === "Нет") {
         await pool.query(`
-          INSERT INTO public.zvk_status (zvk_row_id, src_o, status_time)
-          VALUES ($1, '', NOW())
+          INSERT INTO public.zvk_status (zvk_row_id, src_o, chief_approved, status_time)
+          VALUES ($1, '', NULL, NOW())
           ON CONFLICT (zvk_row_id)
           DO UPDATE SET
             src_o = '',
+            chief_approved = NULL,
             status_time = NOW()
         `, [rid]);
       }
 
-      const rebuild = await rebuildFtTail(pool, rid);
+      // ВАЖНО:
+      // rebuildFtTail удаляет открытые системные хвосты и создаёт новый ZFT.
+      // Поэтому при Заявка=Нет его запускать нельзя, иначе ZFT3200 станет ZFT3344.
+      const rebuild = flag === "Да"
+        ? await rebuildFtTail(pool, rid)
+        : null;
 
       return res.json({
         success: true,
@@ -3641,6 +3655,64 @@ const toPayNum = isNoRequest
         zvk_row_id: upd.rows[0].id,
         rebuild
       });
+    }
+
+    // ✅ если zvk_row_id не пришёл, но админ/система ставит Заявка=Нет,
+    // обновляем последнюю строку этого id_ft и НЕ создаём новый ZFT.
+    if (flag === "Нет") {
+      const lastExisting = await pool.query(
+        `
+        SELECT z.id
+        FROM public.zvk z
+        WHERE z.id_ft = $1
+        ORDER BY
+          z.zvk_date DESC NULLS LAST,
+          z.id DESC
+        LIMIT 1
+        `,
+        [ft]
+      );
+
+      const lastRid = Number(lastExisting.rows[0]?.id || 0);
+
+      if (lastRid) {
+        if (!adminOk) {
+          const ok = await canEditRowByLogin(pool, lastRid, actor);
+          if (!ok) {
+            return res.status(403).json({ success:false, error:"NO_RIGHTS_THIS_ROW" });
+          }
+        }
+
+        const updNoId = await pool.query(`
+          UPDATE public.zvk
+             SET request_flag = 'Нет',
+                 to_pay       = 0,
+                 zvk_name     = 'СИСТЕМА',
+                 zvk_date     = NOW()
+           WHERE id = $1
+           RETURNING id, id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag
+        `, [lastRid]);
+
+        await pool.query(`
+          INSERT INTO public.zvk_status (zvk_row_id, src_o, chief_approved, status_time)
+          VALUES ($1, '', NULL, NOW())
+          ON CONFLICT (zvk_row_id)
+          DO UPDATE SET
+            src_o = '',
+            chief_approved = NULL,
+            status_time = NOW()
+        `, [lastRid]);
+
+        return res.json({
+          success: true,
+          updated: true,
+          no_recreate: true,
+          row: updNoId.rows[0],
+          id_zvk: updNoId.rows[0].id_zvk,
+          zvk_row_id: updNoId.rows[0].id,
+          rebuild: null
+        });
+      }
     }
 
     // ✅ ниже старая логика создания новой строки, если zvk_row_id не пришёл
@@ -3809,20 +3881,29 @@ app.post("/zvk-bulk-request-flag", async (req, res) => {
     `, [ids, flag, actor]);
 
     await client.query(`
-      INSERT INTO public.zvk_status (zvk_row_id, src_o, status_time)
-      SELECT x, CASE WHEN $2 = 'Нет' THEN '' ELSE COALESCE(s.src_o, '') END, NOW()
+      INSERT INTO public.zvk_status (zvk_row_id, src_o, chief_approved, status_time)
+      SELECT
+        x,
+        CASE WHEN $2 = 'Нет' THEN '' ELSE COALESCE(s.src_o, '') END,
+        CASE WHEN $2 = 'Нет' THEN NULL ELSE s.chief_approved END,
+        NOW()
       FROM unnest($1::bigint[]) AS x
       LEFT JOIN public.zvk_status s ON s.zvk_row_id = x
       ON CONFLICT (zvk_row_id)
       DO UPDATE SET
         src_o = CASE WHEN $2 = 'Нет' THEN '' ELSE public.zvk_status.src_o END,
+        chief_approved = CASE WHEN $2 = 'Нет' THEN NULL ELSE public.zvk_status.chief_approved END,
         status_time = NOW()
     `, [ids, flag]);
 
     const rebuild = [];
 
-    for (const rid of ids) {
-      rebuild.push(await rebuildFtTail(client, rid));
+    // При Заявка=Нет НЕ запускаем rebuildFtTail,
+    // чтобы старый ZFT не удалялся и не создавался новый.
+    if (flag === "Да") {
+      for (const rid of ids) {
+        rebuild.push(await rebuildFtTail(client, rid));
+      }
     }
 
     await client.query("COMMIT");
