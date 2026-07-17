@@ -8,7 +8,7 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const path = require("path");
-const { Pool } = require("pg");
+const { Pool } = require("pg");a
 const app = express();
 const nodemailer = require("nodemailer");
 app.use(cors());
@@ -2161,7 +2161,7 @@ app.get("/ft", async (req, res) => {
 });
 
 // =====================================================
-// ✅ b_erkin может менять основные поля FT
+// ✅ b_erkin и s_zhasulan могут менять основные поля FT
 // POST /ft-update-main
 // =====================================================
 app.post("/ft-update-main", async (req, res) => {
@@ -2174,8 +2174,8 @@ app.post("/ft-update-main", async (req, res) => {
       return res.status(400).json({ success:false, error:"id_ft required" });
     }
 
-    // Доступ только b_erkin.
-    if (actor !== "b_erkin") {
+    // Доступ только b_erkin и s_zhasulan.
+    if (!["b_erkin", "s_zhasulan"].includes(actor)) {
       return res.status(403).json({ success:false, error:"NO_RIGHTS" });
     }
 
@@ -3044,17 +3044,17 @@ app.post("/request-created-bulk", async (req, res) => {
       });
     }
 
-    const isBerkin = login === "b_erkin";
+    const isBerkinOrZhasulan = ["b_erkin", "s_zhasulan"].includes(login);
 
     /*
-      Пустое значение вручную может устанавливать только b_erkin.
+      Пустое значение вручную могут устанавливать b_erkin и s_zhasulan.
 
       Значение "Да":
-      - b_erkin может ставить для любой строки;
+      - b_erkin и s_zhasulan могут ставить для любой строки;
       - supervisor/admin/editor могут создавать заявку по доступной строке;
       - инициатор может ставить только на своей строке.
     */
-    if (value === null && !isBerkin) {
+    if (value === null && !isBerkinOrZhasulan) {
       return res.status(403).json({
         success: false,
         error: "Нет доступа к очистке ЗаявкаСоздано"
@@ -3076,7 +3076,7 @@ app.post("/request-created-bulk", async (req, res) => {
     ).trim().toLowerCase();
 
     const canManageAll =
-      isBerkin ||
+      isBerkinOrZhasulan ||
       roleFt === "admin" ||
       roleFt === "админ" ||
       roleFt === "администратор" ||
@@ -3559,7 +3559,7 @@ app.post("/zvk-save", async (req, res) => {
       isTruthy(is_admin) ||
       isTruthy(is_all) ||
       isTruthy(can_edit_all) ||
-      actor.toLowerCase() === "b_erkin";
+      ["b_erkin", "s_zhasulan"].includes(actor.toLowerCase());
 
     const ft = String(id_ft).trim();
    let flag = String(request_flag || "Нет").trim();
@@ -3856,7 +3856,7 @@ app.post("/zvk-bulk-request-flag", async (req, res) => {
       isTruthy(is_admin) ||
       isTruthy(is_all) ||
       isTruthy(can_edit_all) ||
-      actor.toLowerCase() === "b_erkin";
+      ["b_erkin", "s_zhasulan"].includes(actor.toLowerCase());
 
     if (!adminOk) {
       return res.status(403).json({ success:false, error:"NO_RIGHTS" });
@@ -3943,7 +3943,7 @@ app.post("/zvk-status-row", async (req, res) => {
   isTruthy(is_admin) ||
   isTruthy(can_edit_all) ||
   String(is_all || "0") === "1" ||
-  actor.toLowerCase() === "b_erkin";
+  ["b_erkin", "s_zhasulan"].includes(actor.toLowerCase());
     if (!adminOk) {
       const ok = await canEditRowByLogin(pool, rid, actor);
       if (!ok) return res.status(403).json({ success: false, error: "NO_RIGHTS_THIS_ROW" });
@@ -4165,10 +4165,10 @@ app.post("/zvk-pay-row", async (req, res) => {
       is_admin === true || is_admin === 1 || is_admin === "1" ||
       String(is_admin).toLowerCase() === "true";
 
-    const payOk = adminOk || actor === "b_erkin";
+    const payOk = adminOk || ["b_erkin", "s_zhasulan"].includes(actor);
 
     if (!payOk) {
-      return res.status(403).json({ success:false, error:"only b_erkin/admin allowed" });
+      return res.status(403).json({ success:false, error:"only b_erkin/s_zhasulan/admin allowed" });
     }
 
     if (!zvk_row_id) {
@@ -4857,7 +4857,7 @@ app.put("/io-history/:id", async (req, res) => {
       role === "admin" ||
       role === "админ" ||
       role === "администратор" ||
-      actorLogin === "b_erkin";
+      ["b_erkin", "s_zhasulan"].includes(actorLogin);
 
     if (!canEdit) {
       return res.status(403).json({
