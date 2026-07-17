@@ -8,7 +8,7 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const path = require("path");
-const { Pool } = require("pg");a
+const { Pool } = require("pg");
 const app = express();
 const nodemailer = require("nodemailer");
 app.use(cors());
@@ -5904,18 +5904,13 @@ app.post("/approve-rows", async (req, res) => {
     }
 
     /*
-     * Реестр Согласовано = Да только когда согласует:
-     * - Шевченко Владимир
-     * - Койлибаев Марат
-     *
-     * Исмагулов, Сулейменов и Касенов это поле не меняют.
+     * Реестр Согласовано = Да ставится автоматически только тогда,
+     * когда Сулейменов Жасулан (s_zhasulan) нажимает «Согласовано».
+     * Остальные согласующие это поле автоматически не меняют.
      */
     const shouldSetRegistryYes =
       action === "agree" &&
-      (
-        login === "v_shevchenko" ||
-        login === "k_marat"
-      );
+      login === "s_zhasulan";
 
     if (shouldSetRegistryYes) {
       await setRequestRegistryYes(client, requestId);
