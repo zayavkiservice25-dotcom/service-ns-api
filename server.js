@@ -3411,7 +3411,8 @@ async function resetExpiredZhasulanRequests() {
 
 app.get("/request-list", async (req, res) => {
   try {
-    await resetExpiredZhasulanRequests();
+    // Автоматическое удаление/сброс строк Реестра отключено.
+    // resetExpiredZhasulanRequests() больше не вызывается автоматически.
 
     const login = String(req.query.login || "")
       .trim()
@@ -6104,10 +6105,10 @@ app.post("/approve-rows", async (req, res) => {
 
 // =====================================================
 // ОТМЕНА ОТКЛОНЁННЫХ СТРОК ПО ОДИНАКОВОМУ ID FT
-// Доступ: только s_zhasulan
+// Доступ: s_zhasulan и b_erkin
 //
 // Для каждого ID FT:
-// 1) находим все строки, где финальное утверждение Касенова = Отклонено;
+// 1) находим строки, отклонённые Исмагуловым, Сулейменовым или по утверждению Касенова;
 // 2) самую раннюю созданную строку ZFT оставляем, но очищаем поля заявки;
 // 3) остальные отклонённые строки этого ID FT полностью удаляем;
 // 4) согласованные/утверждённые строки не затрагиваются.
@@ -6121,10 +6122,10 @@ app.post("/cancel-rejected-ft-lines", async (req, res) => {
       ? [...new Set(req.body.row_ids.map(Number).filter(Boolean))]
       : [];
 
-    if (login !== "s_zhasulan") {
+    if (!["s_zhasulan", "b_erkin"].includes(login)) {
       return res.status(403).json({
         success: false,
-        error: "Отменять отклонённые строки может только s_zhasulan"
+        error: "Отменять отклонённые строки могут только s_zhasulan и b_erkin"
       });
     }
 
@@ -6150,7 +6151,11 @@ app.post("/cancel-rejected-ft-lines", async (req, res) => {
           JOIN public.request_head h
             ON h.id = i.request_id
           WHERE i.zvk_row_id = z.id
-            AND LOWER(TRIM(COALESCE(h.approve_ermek_status, ''))) = 'отклонено'
+            AND (
+              LOWER(TRIM(COALESCE(h.acc_zhas_status, ''))) = 'отклонено'
+              OR LOWER(TRIM(COALESCE(h.acc_zhasulan_status, ''))) = 'отклонено'
+              OR LOWER(TRIM(COALESCE(h.approve_ermek_status, ''))) = 'отклонено'
+            )
         )
       FOR UPDATE OF z
     `, [rowIds]);
@@ -6161,7 +6166,7 @@ app.post("/cancel-rejected-ft-lines", async (req, res) => {
 
     if (selectedValidIds.size !== rowIds.length) {
       throw new Error(
-        "Отменить можно только выбранные строки, где утверждение Касенова Ермека отклонено"
+        "Отменить можно только строки, где отклонено согласование Исмагулова, Сулейменова или утверждение Касенова Ермека"
       );
     }
 
@@ -6181,7 +6186,7 @@ app.post("/cancel-rejected-ft-lines", async (req, res) => {
     const affectedRequestIds = new Set();
 
     for (const idFt of ftIds) {
-      // Только отклонённые строки. Подтверждённые строки с тем же ID FT сюда не попадут.
+      // Только строки, отклонённые на одном из разрешённых этапов. Согласованные строки не затрагиваются.
       const rejectedResult = await client.query(`
         SELECT
           z.id AS zvk_row_id,
@@ -6193,7 +6198,11 @@ app.post("/cancel-rejected-ft-lines", async (req, res) => {
             JOIN public.request_head h
               ON h.id = i.request_id
             WHERE i.zvk_row_id = z.id
-              AND LOWER(TRIM(COALESCE(h.approve_ermek_status, ''))) = 'отклонено'
+              AND (
+              LOWER(TRIM(COALESCE(h.acc_zhas_status, ''))) = 'отклонено'
+              OR LOWER(TRIM(COALESCE(h.acc_zhasulan_status, ''))) = 'отклонено'
+              OR LOWER(TRIM(COALESCE(h.approve_ermek_status, ''))) = 'отклонено'
+            )
           ) AS request_id
         FROM public.zvk z
         WHERE z.id_ft = $1
@@ -6203,7 +6212,11 @@ app.post("/cancel-rejected-ft-lines", async (req, res) => {
             JOIN public.request_head h
               ON h.id = i.request_id
             WHERE i.zvk_row_id = z.id
-              AND LOWER(TRIM(COALESCE(h.approve_ermek_status, ''))) = 'отклонено'
+              AND (
+              LOWER(TRIM(COALESCE(h.acc_zhas_status, ''))) = 'отклонено'
+              OR LOWER(TRIM(COALESCE(h.acc_zhasulan_status, ''))) = 'отклонено'
+              OR LOWER(TRIM(COALESCE(h.approve_ermek_status, ''))) = 'отклонено'
+            )
           )
         ORDER BY z.zvk_date ASC NULLS LAST, z.id ASC
         FOR UPDATE OF z
