@@ -11,8 +11,26 @@ const path = require("path");
 const { Pool } = require("pg");
 const app = express();
 const nodemailer = require("nodemailer");
-app.use(cors());
-app.use(express.json({ limit: "20mb" }));
+
+// =====================================================
+// CORS: поддержка Google Apps Script, Safari и iPad
+// =====================================================
+const corsOptions = {
+  origin: true, // отражает Origin клиента, включая script.google.com/googleusercontent.com
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept"],
+  exposedHeaders: ["Content-Type"],
+  credentials: false,
+  optionsSuccessStatus: 204,
+  maxAge: 86400
+};
+
+app.use(cors(corsOptions));
+
+// Safari/iPad перед JSON POST может сначала отправлять OPTIONS.
+app.options(/.*/, cors(corsOptions));
+
+app.use(express.json({ limit: "20mb", type: ["application/json", "application/*+json"] }));
 app.use(express.urlencoded({ extended: true, limit: "20mb" }));
 app.use((err, req, res, next) => {
   if (err) {
@@ -22,9 +40,22 @@ app.use((err, req, res, next) => {
   next();
 });
 
-app.get("/ping", (req,res)=>res.json({ok:true, ts: Date.now()}));  // ✅ правильно
+app.get("/ping", (req, res) => {
+  res.set("Cache-Control", "no-store");
+  res.json({ ok: true, ts: Date.now(), service: "Service-NS API" });
+});
 
-app.options(/.*/, cors());
+// Проверка доступности API и CORS без обращения к базе данных.
+app.get("/api-health", (req, res) => {
+  res.set("Cache-Control", "no-store");
+  res.json({
+    ok: true,
+    origin: req.get("origin") || null,
+    userAgent: req.get("user-agent") || null,
+    ts: Date.now()
+  });
+});
+
 
 // 🔥 СТАТИКА (гарантированный путь)
 app.use("/public", express.static(process.cwd() + "/public"));
@@ -1709,7 +1740,7 @@ app.post("/login", async (req, res) => {
 
     const q = `
       SELECT *
-      FROM users
+      FROM public.users
       WHERE lower(trim(login)) = lower(trim($1))
         AND is_active = true
       LIMIT 1
