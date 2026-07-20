@@ -2324,13 +2324,44 @@ async function canEditFtByLogin(poolOrClient, id_ft, login){
   if (!ft || !lg) return false;
 
   const r = await poolOrClient.query(
-    `SELECT 1
-     FROM ft
-     WHERE id_ft = $1
-       AND lower(trim(input_name)) = $2
-     LIMIT 1`,
+    `
+    SELECT 1
+    FROM public.ft f
+    LEFT JOIN public.users u
+      ON lower(trim(u.login)) = $2
+    WHERE f.id_ft = $1
+      AND (
+        lower(trim(f.input_name)) = $2
+
+        OR lower(
+          regexp_replace(trim(f.input_name), '\\s+', ' ', 'g')
+        ) = lower(
+          regexp_replace(
+            trim(concat_ws(' ', u.last_name, u.first_name, u.middle_name)),
+            '\\s+',
+            ' ',
+            'g'
+          )
+        )
+
+        OR lower(
+          regexp_replace(trim(f.input_name), '\\s+', ' ', 'g')
+        ) = lower(
+          regexp_replace(
+            trim(concat_ws(' ', u.first_name, u.last_name, u.middle_name)),
+            '\\s+',
+            ' ',
+            'g'
+          )
+        )
+
+        OR lower(trim(f.input_name)) = lower(trim(COALESCE(u.email, '')))
+      )
+    LIMIT 1
+    `,
     [ft, lg]
   );
+
   return r.rowCount > 0;
 }
 
@@ -2374,17 +2405,46 @@ function canSetPaid(login, roleFt) {
 
 async function canEditRowByLogin(poolOrClient, zvk_row_id, login) {
   const rid = Number(zvk_row_id);
-  const lg  = normLogin(login);
+  const lg = normLogin(login);
 
   if (!rid || Number.isNaN(rid) || !lg) return false;
 
   const r = await poolOrClient.query(
     `
     SELECT 1
-    FROM zvk z
-    JOIN ft f ON f.id_ft = z.id_ft
+    FROM public.zvk z
+    JOIN public.ft f
+      ON f.id_ft = z.id_ft
+    LEFT JOIN public.users u
+      ON lower(trim(u.login)) = $2
     WHERE z.id = $1
-      AND lower(trim(f.input_name)) = $2
+      AND (
+        lower(trim(f.input_name)) = $2
+
+        OR lower(
+          regexp_replace(trim(f.input_name), '\\s+', ' ', 'g')
+        ) = lower(
+          regexp_replace(
+            trim(concat_ws(' ', u.last_name, u.first_name, u.middle_name)),
+            '\\s+',
+            ' ',
+            'g'
+          )
+        )
+
+        OR lower(
+          regexp_replace(trim(f.input_name), '\\s+', ' ', 'g')
+        ) = lower(
+          regexp_replace(
+            trim(concat_ws(' ', u.first_name, u.last_name, u.middle_name)),
+            '\\s+',
+            ' ',
+            'g'
+          )
+        )
+
+        OR lower(trim(f.input_name)) = lower(trim(COALESCE(u.email, '')))
+      )
     LIMIT 1
     `,
     [rid, lg]
