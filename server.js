@@ -3547,9 +3547,133 @@ app.get("/request-list", async (req, res) => {
       ORDER BY id DESC
     `, params);
 
+    const wantsFlat =
+      String(req.query.flat || "").trim() === "1";
+
+    if (!wantsFlat) {
+      return res.json({
+        success: true,
+        rows: result.rows
+      });
+    }
+
+    const requestIds = result.rows
+      .map(row => Number(row.id))
+      .filter(Boolean);
+
+    if (!requestIds.length) {
+      return res.json({
+        success: true,
+        rows: result.rows,
+        flat_rows: []
+      });
+    }
+
+    /*
+     * Быстрая загрузка реестра:
+     * все строки разрешённых пользователю заявок получаем одним SQL.
+     * Это заменяет десятки/сотни последовательных /request-card.
+     */
+    const flatResult = await pool.query(`
+      SELECT
+        i.id AS request_item_id,
+        i.id,
+        i.request_id,
+        i.zvk_row_id,
+        i.id_ft,
+        i.id_zvk,
+        i.object,
+
+        COALESCE(
+          NULLIF(trim(cur.division), ''),
+          NULLIF(trim(i.src_d), ''),
+          ''
+        ) AS division,
+
+        i.input_name,
+        i.contractor,
+        i.pay_purpose,
+        i.dds_article,
+        i.contract_no,
+        i.invoice_no,
+        i.invoice_date,
+        i.invoice_pdf,
+        i.src_d,
+        i.src_o,
+
+        COALESCE(
+          NULLIF(trim(i.idlzk), ''),
+          cur.idlzk,
+          ''
+        ) AS idlzk,
+
+        i.to_pay,
+
+        COALESCE(cur.request_flag, '') AS request_flag,
+        COALESCE(cur.registry_flag, '') AS registry_flag,
+        COALESCE(i.aray_paid, '') AS aray_paid,
+        COALESCE(cur.is_paid, '') AS is_paid,
+
+        h.request_no,
+        h.request_date,
+        h.created_by,
+        h.created_at,
+
+        COALESCE(h.acc_zhasulan_status, 'Ожидает')
+          AS acc_zhasulan_status,
+        COALESCE(h.acc_zhas_status, 'Ожидает')
+          AS acc_zhas_status,
+        COALESCE(h.acc_shevchenko_status, 'Ожидает')
+          AS acc_shevchenko_status,
+        COALESCE(h.acc_marat_status, 'Ожидает')
+          AS acc_marat_status,
+        COALESCE(h.acc_ermek_status, 'Ожидает')
+          AS acc_ermek_status,
+        COALESCE(h.approve_ermek_status, 'Ожидает')
+          AS approve_ermek_status,
+
+        h.acc_zhasulan_time,
+        h.acc_zhas_time,
+        h.acc_shevchenko_time,
+        h.acc_marat_time,
+        h.acc_ermek_time,
+        h.approve_ermek_time,
+
+        COALESCE(h.acc_zhasulan_comment, '')
+          AS acc_zhasulan_comment,
+        COALESCE(h.acc_zhas_comment, '')
+          AS acc_zhas_comment,
+        COALESCE(h.acc_shevchenko_comment, '')
+          AS acc_shevchenko_comment,
+        COALESCE(h.acc_marat_comment, '')
+          AS acc_marat_comment,
+        COALESCE(h.acc_ermek_comment, '')
+          AS acc_ermek_comment,
+        COALESCE(h.approve_ermek_comment, '')
+          AS approve_ermek_comment
+
+      FROM public.request_items i
+
+      JOIN public.request_head h
+        ON h.id = i.request_id
+
+      LEFT JOIN public.ft_zvk_current_v2 cur
+        ON cur.zvk_row_id = i.zvk_row_id
+
+      WHERE i.request_id = ANY($1::bigint[])
+        AND lower(
+          trim(
+            COALESCE(cur.registry_flag, '')
+          )
+        ) <> 'обнуление'
+
+      ORDER BY h.id DESC, i.id ASC
+    `, [requestIds]);
+
     return res.json({
       success: true,
-      rows: result.rows
+      rows: result.rows,
+      flat_rows: flatResult.rows
     });
 
   } catch (e) {
