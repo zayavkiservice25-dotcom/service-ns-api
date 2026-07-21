@@ -729,6 +729,229 @@ await pool.query(`
     ON public.request_items (zvk_row_id);
   `);
 
+
+  // =====================================================
+  // АВТОСИНХРОНИЗАЦИЯ ФТ -> РЕЕСТР
+  // request_items хранит данные заявки отдельной копией. Поэтому без этой
+  // синхронизации изменения в ft / zvk / zvk_status оставались только в ФТ.
+  // Синхронизируются все бизнес-поля, которые реально существуют в request_items.
+  // division в request_items не создаётся: он читается напрямую из FT/current view.
+  // Связь выполняется по стабильному ключу zvk_row_id.
+  // =====================================================
+  await pool.query(`
+    CREATE OR REPLACE FUNCTION public.sync_request_items_from_current(
+      p_zvk_row_id bigint DEFAULT NULL,
+      p_id_ft text DEFAULT NULL
+    )
+    RETURNS integer
+    LANGUAGE plpgsql
+    AS $$
+    DECLARE
+      v_request_ids bigint[] := ARRAY[]::bigint[];
+      v_updated_count integer := 0;
+    BEGIN
+      WITH changed AS (
+        UPDATE public.request_items i
+        SET
+          id_ft        = cur.id_ft,
+          id_zvk       = cur.id_zvk,
+          object       = cur.object,
+          input_name   = cur.input_name,
+          contractor   = cur.contractor,
+          pay_purpose  = cur.pay_purpose,
+          dds_article  = cur.dds_article,
+          contract_no  = cur.contract_no,
+          invoice_no   = cur.invoice_no,
+          invoice_date = cur.invoice_date,
+          invoice_pdf  = cur.invoice_pdf,
+          src_d        = cur.src_d,
+          src_o        = cur.src_o,
+          idlzk        = cur.idlzk,
+          to_pay       = cur.to_pay
+        FROM public.ft_zvk_current_v2 cur
+        WHERE i.zvk_row_id = cur.zvk_row_id
+          AND (p_zvk_row_id IS NULL OR cur.zvk_row_id = p_zvk_row_id)
+          AND (p_id_ft IS NULL OR cur.id_ft = p_id_ft)
+          AND ROW(
+            i.id_ft,
+            i.id_zvk,
+            i.object,
+            i.input_name,
+            i.contractor,
+            i.pay_purpose,
+            i.dds_article,
+            i.contract_no,
+            i.invoice_no,
+            i.invoice_date,
+            i.invoice_pdf,
+            i.src_d,
+            i.src_o,
+            i.idlzk,
+            i.to_pay
+          ) IS DISTINCT FROM ROW(
+            cur.id_ft,
+            cur.id_zvk,
+            cur.object,
+            cur.input_name,
+            cur.contractor,
+            cur.pay_purpose,
+            cur.dds_article,
+            cur.contract_no,
+            cur.invoice_no,
+            cur.invoice_date,
+            cur.invoice_pdf,
+            cur.src_d,
+            cur.src_o,
+            cur.idlzk,
+            cur.to_pay
+          )
+        RETURNING i.request_id
+      )
+      SELECT
+        COALESCE(array_agg(DISTINCT request_id), ARRAY[]::bigint[]),
+        COUNT(*)::integer
+      INTO v_request_ids, v_updated_count
+      FROM changed;
+
+      -- Если изменилось поле «К оплате», синхронизируем также итог шапки.
+      IF cardinality(v_request_ids) > 0 THEN
+        UPDATE public.request_head h
+        SET
+          total_amount = totals.total_amount,
+          items_count = totals.items_count
+        FROM (
+          SELECT
+            i.request_id,
+            COALESCE(SUM(i.to_pay), 0)::numeric(18,2) AS total_amount,
+            COUNT(*)::integer AS items_count
+          FROM public.request_items i
+          WHERE i.request_id = ANY(v_request_ids)
+          GROUP BY i.request_id
+        ) totals
+        WHERE h.id = totals.request_id;
+      END IF;
+
+      RETURN v_updated_count;
+    END;
+    $$;
+  `);
+
+  await pool.query(`
+    CREATE OR REPLACE FUNCTION public.trg_sync_request_items_by_ft()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+      PERFORM public.sync_request_items_from_current(NULL, NEW.id_ft);
+      RETURN NEW;
+    END;
+    $$;
+  `);
+
+  await pool.query(`
+    CREATE OR REPLACE FUNCTION public.trg_sync_request_items_by_zvk()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+      PERFORM public.sync_request_items_from_current(NEW.id, NULL);
+      RETURN NEW;
+    END;
+    $$;
+  `);
+
+  await pool.query(`
+    CREATE OR REPLACE FUNCTION public.trg_sync_request_items_by_status()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    DECLARE
+      v_zvk_row_id bigint;
+    BEGIN
+      IF TG_OP = 'DELETE' THEN
+        v_zvk_row_id := OLD.zvk_row_id;
+      ELSE
+        v_zvk_row_id := NEW.zvk_row_id;
+      END IF;
+
+      PERFORM public.sync_request_items_from_current(v_zvk_row_id, NULL);
+
+      IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+      END IF;
+
+      RETURN NEW;
+    END;
+    $$;
+  `);
+
+  await pool.query(`
+    DROP TRIGGER IF EXISTS ft_sync_request_items_trg ON public.ft;
+    CREATE TRIGGER ft_sync_request_items_trg
+    AFTER UPDATE OF
+      input_name,
+      division,
+      "object",
+      contractor,
+      pay_purpose,
+      dds_article,
+      contract_no,
+      invoice_no,
+      invoice_date,
+      invoice_pdf
+    ON public.ft
+    FOR EACH ROW
+    EXECUTE FUNCTION public.trg_sync_request_items_by_ft();
+  `);
+
+  await pool.query(`
+    DROP TRIGGER IF EXISTS zvk_sync_request_items_insert_trg ON public.zvk;
+    CREATE TRIGGER zvk_sync_request_items_insert_trg
+    AFTER INSERT ON public.zvk
+    FOR EACH ROW
+    EXECUTE FUNCTION public.trg_sync_request_items_by_zvk();
+  `);
+
+  await pool.query(`
+    DROP TRIGGER IF EXISTS zvk_sync_request_items_update_trg ON public.zvk;
+    CREATE TRIGGER zvk_sync_request_items_update_trg
+    AFTER UPDATE OF id_ft, id_zvk, to_pay
+    ON public.zvk
+    FOR EACH ROW
+    EXECUTE FUNCTION public.trg_sync_request_items_by_zvk();
+  `);
+
+  await pool.query(`
+    DROP TRIGGER IF EXISTS zvk_status_sync_request_items_insert_trg ON public.zvk_status;
+    CREATE TRIGGER zvk_status_sync_request_items_insert_trg
+    AFTER INSERT ON public.zvk_status
+    FOR EACH ROW
+    EXECUTE FUNCTION public.trg_sync_request_items_by_status();
+  `);
+
+  await pool.query(`
+    DROP TRIGGER IF EXISTS zvk_status_sync_request_items_update_trg ON public.zvk_status;
+    CREATE TRIGGER zvk_status_sync_request_items_update_trg
+    AFTER UPDATE OF src_d, src_o, idlzk
+    ON public.zvk_status
+    FOR EACH ROW
+    EXECUTE FUNCTION public.trg_sync_request_items_by_status();
+  `);
+
+  await pool.query(`
+    DROP TRIGGER IF EXISTS zvk_status_sync_request_items_delete_trg ON public.zvk_status;
+    CREATE TRIGGER zvk_status_sync_request_items_delete_trg
+    AFTER DELETE ON public.zvk_status
+    FOR EACH ROW
+    EXECUTE FUNCTION public.trg_sync_request_items_by_status();
+  `);
+
+  // Исправление уже созданных строк. Благодаря IS DISTINCT FROM
+  // повторные запуски сервера не переписывают строки без изменений.
+  await pool.query(`
+    SELECT public.sync_request_items_from_current(NULL, NULL);
+  `);
+
   // =========================
   // REQUEST APPROVE LOG
   // =========================
@@ -2722,7 +2945,6 @@ app.post("/create-request", async (req, res) => {
           id_ft,
           id_zvk,
           object,
-          division,
           input_name,
           contractor,
           pay_purpose,
@@ -2742,7 +2964,6 @@ app.post("/create-request", async (req, res) => {
           v.id_ft,
           v.id_zvk,
           v.object,
-          v.division,
           v.input_name,
           v.contractor,
           v.pay_purpose,
