@@ -2678,6 +2678,25 @@ async function canEditRowByLogin(poolOrClient, zvk_row_id, login) {
 
 const ISMAGULOV_LOGIN = "zhas";
 
+// Исмагулов участвует в согласовании только для этих дивизионов.
+// Проверка выполняется первой: Дивизион -> Объект -> Статья ДДС.
+const ISMAGULOV_DIVISIONS = new Set([
+  "Мост",
+  "Сети",
+  "Механизация"
+]);
+
+function normalizeRequestDivision(value) {
+  return String(value || "")
+    .replace(/\u00A0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function divisionNeedsIsmagulov(value) {
+  return ISMAGULOV_DIVISIONS.has(normalizeRequestDivision(value));
+}
+
 const ISMAGULOV_OBJECTS = new Set([
   "05-М-Акм. Есиль",
   "32-М-АлмО. Подкова Алматы",
@@ -2849,12 +2868,18 @@ function getRequestDdsCode(value) {
 }
 
 async function rowNeedsIsmagulov(row) {
-  // Условие 1: объект должен подходить.
+  // Условие 1: сначала должен подходить дивизион.
+  // Только: Мост, Сети или Механизация.
+  if (!divisionNeedsIsmagulov(row?.division)) {
+    return false;
+  }
+
+  // Условие 2: затем должен подходить объект.
   if (!objectNeedsIsmagulov(row?.object)) {
     return false;
   }
 
-  // Условие 2: Статья ДДС должна быть в столбце B,
+  // Условие 3: Статья ДДС должна быть в столбце B,
   // а в столбце G напротив неё должно стоять «Да».
   const allowed = await loadIsmagulovDdsArticles();
   const currentArticle = normalizeRequestDds(row?.dds_article);
@@ -2883,9 +2908,26 @@ async function rowNeedsIsmagulov(row) {
 
 async function requestNeedsIsmagulov(client, requestId) {
   const result = await client.query(`
-    SELECT object, dds_article
-    FROM public.request_items
-    WHERE request_id = $1
+    SELECT
+      COALESCE(
+        NULLIF(trim(cur.division), ''),
+        NULLIF(trim(i.src_d), ''),
+        ''
+      ) AS division,
+      COALESCE(
+        NULLIF(trim(cur.object), ''),
+        NULLIF(trim(i.object), ''),
+        ''
+      ) AS object,
+      COALESCE(
+        NULLIF(trim(cur.dds_article), ''),
+        NULLIF(trim(i.dds_article), ''),
+        ''
+      ) AS dds_article
+    FROM public.request_items i
+    LEFT JOIN public.ft_zvk_current_v2 cur
+      ON cur.zvk_row_id = i.zvk_row_id
+    WHERE i.request_id = $1
   `, [Number(requestId)]);
 
   for (const row of result.rows) {
@@ -3722,19 +3764,28 @@ app.get("/request-list", async (req, res) => {
     } else if (login === ISMAGULOV_LOGIN) {
       /*
        * Исмагулов согласует ПЕРВЫМ.
-       * Он видит заявки сразу, без ожидания Сулейменова,
-       * но только когда сервер определил, что его этап требуется.
+       * Предварительный SQL-фильтр:
+       * 1) дивизион = Мост / Сети / Механизация;
+       * 2) объект входит в список Исмагулова.
+       * Статья ДДС дополнительно проверяется ниже через rowNeedsIsmagulov().
        */
       params.push(Array.from(ISMAGULOV_OBJECTS));
+      params.push(Array.from(ISMAGULOV_DIVISIONS));
 
       whereSql = `
-        WHERE COALESCE(acc_zhas_status, '') <> 'Не требуется'
-          AND EXISTS (
-            SELECT 1
-            FROM public.request_items ri
-            WHERE ri.request_id = request_head.id
-              AND ri.object = ANY($1::text[])
-          )
+        WHERE EXISTS (
+          SELECT 1
+          FROM public.request_items ri
+          LEFT JOIN public.ft_zvk_current_v2 cur
+            ON cur.zvk_row_id = ri.zvk_row_id
+          WHERE ri.request_id = request_head.id
+            AND COALESCE(
+                  NULLIF(trim(cur.division), ''),
+                  NULLIF(trim(ri.src_d), ''),
+                  ''
+                ) = ANY($2::text[])
+            AND ri.object = ANY($1::text[])
+        )
       `;
 
     } else if (
@@ -3829,24 +3880,41 @@ app.get("/request-list", async (req, res) => {
       ORDER BY id DESC
     `, params);
 
+    let requestRows = result.rows;
+
+    // Финальная проверка для Исмагулова выполняется по всем трём условиям:
+    // Дивизион -> Объект -> Статья ДДС.
+    // Это также учитывает изменения ФТ после создания заявки.
+    if (login === ISMAGULOV_LOGIN) {
+      const filteredRows = [];
+
+      for (const headRow of requestRows) {
+        if (await requestNeedsIsmagulov(pool, headRow.id)) {
+          filteredRows.push(headRow);
+        }
+      }
+
+      requestRows = filteredRows;
+    }
+
     const wantsFlat =
       String(req.query.flat || "").trim() === "1";
 
     if (!wantsFlat) {
       return res.json({
         success: true,
-        rows: result.rows
+        rows: requestRows
       });
     }
 
-    const requestIds = result.rows
+    const requestIds = requestRows
       .map(row => Number(row.id))
       .filter(Boolean);
 
     if (!requestIds.length) {
       return res.json({
         success: true,
-        rows: result.rows,
+        rows: requestRows,
         flat_rows: []
       });
     }
@@ -3952,10 +4020,19 @@ app.get("/request-list", async (req, res) => {
       ORDER BY h.id DESC, i.id ASC
     `, [requestIds]);
 
+    const flatRowsWithRoute = [];
+
+    for (const item of flatResult.rows) {
+      flatRowsWithRoute.push({
+        ...item,
+        needs_ismagulov: await rowNeedsIsmagulov(item)
+      });
+    }
+
     return res.json({
       success: true,
-      rows: result.rows,
-      flat_rows: flatResult.rows
+      rows: requestRows,
+      flat_rows: flatRowsWithRoute
     });
 
   } catch (e) {
@@ -6145,20 +6222,21 @@ app.post("/approve-rows", async (req, res) => {
     );
 
     /*
-     * 1. Исмагулов согласует первым, но только объекты из своей логики.
+     * 1. Исмагулов согласует первым, только когда совпали:
+     * Дивизион -> Объект -> Статья ДДС.
      */
     if (
       login === ISMAGULOV_LOGIN &&
       !needsIsmagulov
     ) {
       throw new Error(
-        "Для этого объекта согласование Исмагулова не требуется"
+        "Для этого дивизиона, объекта или статьи ДДС согласование Исмагулова не требуется"
       );
     }
 
     /*
-     * 2. Для специальных объектов Сулейменов ждёт Исмагулова.
-     * Для остальных объектов Сулейменов согласует сразу.
+     * 2. Если совпали Дивизион + Объект + Статья ДДС,
+     * Сулейменов ждёт Исмагулова. В остальных случаях согласует сразу.
      */
     if (
       login === "s_zhasulan" &&
@@ -6187,7 +6265,8 @@ app.post("/approve-rows", async (req, res) => {
     }
 
     /*
-     * 4. Для специальных объектов основные согласующие также ждут Исмагулова.
+     * 4. При совпадении Дивизион + Объект + Статья ДДС
+     * основные согласующие также ждут Исмагулова.
      */
     if (
       needsIsmagulov &&
