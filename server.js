@@ -106,7 +106,8 @@ async function initDb()  {
       id_ft text PRIMARY KEY,
       input_date timestamptz,
       input_name text,
-      division text,
+      legal_entity text,
+mechanization text,
       "object" text,
       contractor text,
       invoice_no text,
@@ -239,7 +240,8 @@ await pool.query(`
       f.id_ft,
       f.input_date,
       f.input_name,
-      f.division,
+     f.legal_entity,
+f.mechanization,
       f."object" AS object,
       f.contractor,
 
@@ -888,10 +890,11 @@ await pool.query(`
   await pool.query(`
     DROP TRIGGER IF EXISTS ft_sync_request_items_trg ON public.ft;
     CREATE TRIGGER ft_sync_request_items_trg
-    AFTER UPDATE OF
-      input_name,
-      division,
-      "object",
+AFTER UPDATE OF
+  input_name,
+  legal_entity,
+  mechanization,
+  "object",
       contractor,
       pay_purpose,
       dds_article,
