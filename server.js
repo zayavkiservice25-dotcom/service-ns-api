@@ -737,7 +737,7 @@ await pool.query(`
   // request_items хранит данные заявки отдельной копией. Поэтому без этой
   // синхронизации изменения в ft / zvk / zvk_status оставались только в ФТ.
   // Синхронизируются все бизнес-поля, которые реально существуют в request_items.
-  // division в request_items не создаётся: он читается напрямую из FT/current view.
+  // legal_entity в request_items не создаётся: он читается напрямую из FT/current view.
   // Связь выполняется по стабильному ключу zvk_row_id.
   // =====================================================
   await pool.query(`
@@ -2467,7 +2467,7 @@ app.post("/ft-update-main", async (req, res) => {
     const r = await pool.query(`
       UPDATE public.ft
       SET
-        division    = COALESCE($2, division),
+        legal_entity    = COALESCE($2, legal_entity),
         "object"    = COALESCE($3, "object"),
         contractor  = COALESCE($4, contractor),
         pay_purpose = COALESCE($5, pay_purpose),
@@ -2479,7 +2479,7 @@ app.post("/ft-update-main", async (req, res) => {
       RETURNING *
     `, [
       idFt,
-      textOrNull("division"),
+      textOrNull("legal_entity"),
       textOrNull("object"),
       textOrNull("contractor"),
       textOrNull("pay_purpose"),
@@ -2501,7 +2501,7 @@ app.post("/ft-update-main", async (req, res) => {
       SELECT
         z.id,
         NOW(),
-        f.division
+        f.legal_entity
       FROM public.zvk z
       JOIN public.ft f ON f.id_ft = z.id_ft
       WHERE z.id_ft = $1
@@ -2873,7 +2873,7 @@ function getRequestDdsCode(value) {
 async function rowNeedsIsmagulov(row) {
   // Условие 1: сначала должен подходить дивизион.
   // Только: Мост, Сети или Механизация.
-  if (!divisionNeedsIsmagulov(row?.division)) {
+  if (!divisionNeedsIsmagulov(row?.legal_entity)) {
     return false;
   }
 
@@ -2913,10 +2913,10 @@ async function requestNeedsIsmagulov(client, requestId) {
   const result = await client.query(`
     SELECT
       COALESCE(
-        NULLIF(trim(cur.division), ''),
+        NULLIF(trim(cur.legal_entity), ''),
         NULLIF(trim(i.src_d), ''),
         ''
-      ) AS division,
+      ) AS legal_entity,
       COALESCE(
         NULLIF(trim(cur.object), ''),
         NULLIF(trim(i.object), ''),
@@ -3783,7 +3783,7 @@ app.get("/request-list", async (req, res) => {
             ON cur.zvk_row_id = ri.zvk_row_id
           WHERE ri.request_id = request_head.id
             AND COALESCE(
-                  NULLIF(trim(cur.division), ''),
+                  NULLIF(trim(cur.legal_entity), ''),
                   NULLIF(trim(ri.src_d), ''),
                   ''
                 ) = ANY($2::text[])
@@ -3938,10 +3938,10 @@ app.get("/request-list", async (req, res) => {
         i.object,
 
         COALESCE(
-          NULLIF(trim(cur.division), ''),
+          NULLIF(trim(cur.legal_entity), ''),
           NULLIF(trim(i.src_d), ''),
           ''
-        ) AS division,
+        ) AS legal_entity,
 
         i.input_name,
         i.contractor,
@@ -4470,10 +4470,10 @@ app.post("/zvk-status-row", async (req, res) => {
     const hasIdlzk = Object.prototype.hasOwnProperty.call(req.body, "idlzk");
 
     // src_d нельзя задавать с клиента.
-    // Всегда берём текущее значение division из основной строки FT.
+    // Всегда берём текущее значение legal_entity из основной строки FT.
     const divisionResult = await pool.query(
       `
-      SELECT f.division
+      SELECT f.legal_entity
       FROM public.zvk z
       JOIN public.ft f ON f.id_ft = z.id_ft
       WHERE z.id = $1
@@ -4486,7 +4486,7 @@ app.post("/zvk-status-row", async (req, res) => {
       return res.status(404).json({ success:false, error:"ZVK_ROW_NOT_FOUND" });
     }
 
-    const autoSrcD = String(divisionResult.rows[0].division || "").trim() || null;
+    const autoSrcD = String(divisionResult.rows[0].legal_entity || "").trim() || null;
 
     const result = await pool.query(
       `
@@ -5021,7 +5021,8 @@ app.post("/save-ft", async (req, res) => {
     const {
   input_date,
   input_name,
-  division,
+  legal_entity,
+  mechanization,
   object,
   contractor,
 
@@ -5037,7 +5038,7 @@ app.post("/save-ft", async (req, res) => {
 } = req.body;
 
     if (!input_name) return res.status(400).json({ success:false, error:"input_name is required" });
-    if (!division || !object) return res.status(400).json({ success:false, error:"division/object required" });
+    if (!legal_entity || !object) return res.status(400).json({ success:false, error:"legal_entity/object required" });
     if (!contractor) return res.status(400).json({ success:false, error:"contractor required" });
     if (!invoice_no) return res.status(400).json({ success:false, error:"invoice_no required" });
     if (!invoice_date) return res.status(400).json({ success:false, error:"invoice_date required" });
@@ -5056,20 +5057,21 @@ app.post("/save-ft", async (req, res) => {
   const r = await pool.query(
   `
   INSERT INTO public.ft
-    (id_ft, input_date, input_name, division, "object", contractor,
+    (id_ft, input_date, input_name, legal_entity, mechanization, "object", contractor,
      pay_purpose, dds_article, contract_no, contract_date,
      invoice_no, invoice_date, invoice_pdf, sum_ft)
   VALUES
-    ($1, $2, $3, $4, $5, $6,
-     $7, $8, $9, $10,
-     $11, $12, $13, $14)
+    ($1, $2, $3, $4, $5, $6, $7,
+     $8, $9, $10, $11,
+     $12, $13, $14, $15)
   RETURNING id_ft
   `,
   [
     id_ft,
     inputDateFormatted,
     String(input_name).trim(),
-    String(division).trim(),
+    String(legal_entity).trim(),
+    mechanization ? String(mechanization).trim() : null,
     String(object).trim(),
     String(contractor).trim(),
 
@@ -5110,7 +5112,7 @@ app.post("/save-ft", async (req, res) => {
         status_time = NOW(),
         src_d = EXCLUDED.src_d
       `,
-      [newZvk.rows[0].id, String(division).trim()]
+      [newZvk.rows[0].id, String(legal_entity).trim()]
     );
 
     res.json({ success:true, id_ft: r.rows[0].id_ft, id_zvk });
@@ -5899,7 +5901,7 @@ app.get("/request-print-pending", async (req, res) => {
       SELECT
         i.id AS request_item_id,
         i.object,
-        COALESCE(NULLIF(trim(i.src_d), ''), '') AS division,
+        COALESCE(NULLIF(trim(i.src_d), ''), '') AS legal_entity,
         i.input_name,
         i.id_zvk,
         i.contractor,
@@ -6032,7 +6034,7 @@ app.get("/request-card", async (req, res) => {
         i.id_ft,
         i.id_zvk,
         i.object,
-        COALESCE(NULLIF(trim(cur.division), ''), NULLIF(trim(i.src_d), ''), '') AS division,
+        COALESCE(NULLIF(trim(cur.legal_entity), ''), NULLIF(trim(i.src_d), ''), '') AS legal_entity,
         i.input_name,
         i.contractor,
         i.pay_purpose,
@@ -6773,7 +6775,7 @@ app.post("/request-items-paid-bulk", async (req, res) => {
       SELECT
         i.id AS request_item_id,
         i.zvk_row_id,
-        COALESCE(NULLIF(trim(f.division), ''), NULLIF(trim(s.src_d), ''), '') AS division,
+        COALESCE(NULLIF(trim(f.legal_entity), ''), NULLIF(trim(s.src_d), ''), '') AS legal_entity,
         COALESCE(i.aray_paid, '') AS aray_paid
       FROM public.request_items i
       JOIN public.zvk z ON z.id = i.zvk_row_id
@@ -6793,15 +6795,15 @@ app.post("/request-items-paid-bulk", async (req, res) => {
     const DELEGATED_DIVISIONS = new Set([...ELENA_DIVISIONS, ...ZHASULAN_DIVISIONS]);
 
     const forbidden = divisionCheck.rows.filter(row => {
-      const division = String(row.division || "").replace(/\s+/g, " ").trim();
-      if (loginNorm === "s_zhasulan") return !ZHASULAN_DIVISIONS.has(division);
-      if (loginNorm === "zh_elena") return !ELENA_DIVISIONS.has(division);
+      const legalEntity = String(row.legal_entity || "").replace(/\s+/g, " ").trim();
+      if (loginNorm === "s_zhasulan") return !ZHASULAN_DIVISIONS.has(legalEntity);
+      if (loginNorm === "zh_elena") return !ELENA_DIVISIONS.has(legalEntity);
       if (loginNorm === "k_arailym") return false; // Арай видит и обрабатывает все дивизионы
       return false;
     });
 
     if (forbidden.length) {
-      const divisions = [...new Set(forbidden.map(row => String(row.division || "").trim() || "Без дивизиона"))];
+      const divisions = [...new Set(forbidden.map(row => String(row.legal_entity || "").trim() || "Без дивизиона"))];
       return res.status(403).json({
         success:false,
         error:"Нет прав менять Оплачено для дивизиона: " + divisions.join(", ")
@@ -6831,10 +6833,10 @@ app.post("/request-items-paid-bulk", async (req, res) => {
 
     if (loginNorm === "k_arailym") {
       const delegatedRows = divisionCheck.rows.filter(row =>
-        DELEGATED_DIVISIONS.has(String(row.division || "").replace(/\s+/g, " ").trim())
+        DELEGATED_DIVISIONS.has(String(row.legal_entity || "").replace(/\s+/g, " ").trim())
       );
       const ownRows = divisionCheck.rows.filter(row =>
-        !DELEGATED_DIVISIONS.has(String(row.division || "").replace(/\s+/g, " ").trim())
+        !DELEGATED_DIVISIONS.has(String(row.legal_entity || "").replace(/\s+/g, " ").trim())
       );
 
       // Отметка Арай сохраняется только в request_items — обычную FT не меняет.
@@ -7080,7 +7082,7 @@ app.get("/matrix-sources", async (req, res) => {
         zvk_date,
         pay_time,
 
-        division,
+        legal_entity,
         object,
         contractor,
         pay_purpose,
