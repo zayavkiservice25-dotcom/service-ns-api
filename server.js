@@ -377,6 +377,7 @@ is_executed text,
 is_managerial text,
 
     id_dov text,
+    dov_name text,
     deleted boolean DEFAULT false,
 
     created_at timestamptz DEFAULT now(),
@@ -1476,6 +1477,7 @@ await pool.query(`
     is_executed text,
     is_managerial text,
     id_dov text,
+    dov_name text,
     deleted boolean DEFAULT false,
     created_at timestamptz DEFAULT now(),
     updated_at timestamptz DEFAULT now()
@@ -1729,6 +1731,9 @@ await pool.query(`
 `);
 
 // Индексы для новых таблиц и сортировки по новым данным сверху
+await pool.query(`ALTER TABLE onec.doc_receipts ADD COLUMN IF NOT EXISTS dov_name text;`);
+await pool.query(`ALTER TABLE onec.doc_sales ADD COLUMN IF NOT EXISTS dov_name text;`);
+
 await pool.query(`CREATE INDEX IF NOT EXISTS doc_sales_created_at_idx ON onec.doc_sales (created_at DESC);`);
 await pool.query(`CREATE INDEX IF NOT EXISTS doc_incomingpaymentorder_created_at_idx ON onec.doc_incomingpaymentorder (created_at DESC);`);
 await pool.query(`CREATE INDEX IF NOT EXISTS doc_outgoingpaymentorder_created_at_idx ON onec.doc_outgoingpaymentorder (created_at DESC);`);
@@ -7275,6 +7280,7 @@ app.post(
             is_executed,
             is_managerial,
             id_dov,
+            dov_name,
             deleted,
             updated_at
           )
@@ -7282,7 +7288,7 @@ app.post(
             $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
             $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
             $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,
-            $31,$32,$33,$34,NOW()
+            $31,$32,$33,$34,$35,NOW()
           )
           ON CONFLICT (document_id)
           DO UPDATE SET
@@ -7318,6 +7324,7 @@ app.post(
             is_executed = EXCLUDED.is_executed,
             is_managerial = EXCLUDED.is_managerial,
             id_dov = EXCLUDED.id_dov,
+            dov_name = EXCLUDED.dov_name,
             deleted = EXCLUDED.deleted,
             updated_at = NOW()
           `,
@@ -7365,6 +7372,7 @@ oneCText(doc.is_executed),
 oneCText(doc.is_managerial),
 
             oneCText(doc.id_dov),
+            oneCText(doc.dov_name),
             oneCBoolean(doc.deleted) ?? false
           ]
         );
@@ -8063,6 +8071,7 @@ app.post(
             is_managerial,
 
             id_dov,
+            dov_name,
             deleted,
             updated_at
           )
@@ -8070,7 +8079,7 @@ app.post(
             $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
             $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
             $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,
-            $31,$32,$33,NOW()
+            $31,$32,$33,$34,NOW()
           )
           ON CONFLICT (document_id)
           DO UPDATE SET
@@ -8115,6 +8124,7 @@ app.post(
             is_managerial = EXCLUDED.is_managerial,
 
             id_dov = EXCLUDED.id_dov,
+            dov_name = EXCLUDED.dov_name,
             deleted = EXCLUDED.deleted,
             updated_at = NOW()
           `,
@@ -8161,6 +8171,7 @@ oneCText(doc.is_executed),
 oneCText(doc.is_managerial),
 
             oneCText(doc.id_dov),
+            oneCText(doc.dov_name),
             oneCBoolean(doc.deleted) ?? false
           ]
         );
