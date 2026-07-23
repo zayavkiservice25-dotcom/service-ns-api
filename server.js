@@ -6233,6 +6233,63 @@ app.post("/approve-rows", async (req, res) => {
     );
 
     /*
+     * ФИНАЛЬНОЕ УТВЕРЖДЕНИЕ ЕРМЕКА:
+     * сумма «К оплате» по каждому Источник Объект не должна превышать
+     * «Остаток после оплаты» этого же объекта из public.svod_object_v1.
+     * Проверка выполняется на сервере, поэтому её нельзя обойти из браузера.
+     */
+    if (login === "k_ermek" && action === "approve") {
+      const balanceCheck = await client.query(`
+        WITH request_sources AS (
+          SELECT
+            NULLIF(trim(i.src_o), '') AS source_object,
+            COALESCE(SUM(i.to_pay), 0)::numeric AS request_to_pay
+          FROM public.request_items i
+          WHERE i.request_id = $1
+          GROUP BY NULLIF(trim(i.src_o), '')
+        ), object_balances AS (
+          SELECT
+            lower(trim(s.object_name)) AS object_key,
+            COALESCE(SUM(s.balance), 0)::numeric AS balance_after_pay
+          FROM public.svod_object_v1 s
+          GROUP BY lower(trim(s.object_name))
+        )
+        SELECT
+          rs.source_object,
+          rs.request_to_pay,
+          COALESCE(ob.balance_after_pay, 0)::numeric AS balance_after_pay
+        FROM request_sources rs
+        LEFT JOIN object_balances ob
+          ON ob.object_key = lower(trim(rs.source_object))
+        WHERE rs.source_object IS NULL
+           OR rs.request_to_pay > COALESCE(ob.balance_after_pay, 0) + 0.005
+        ORDER BY rs.source_object NULLS FIRST
+      `, [requestId]);
+
+      if (balanceCheck.rowCount) {
+        const money = value => Number(value || 0).toLocaleString("ru-RU", {
+          minimumFractionDigits: 2,
+          maximumFractionDigits: 2
+        });
+
+        const details = balanceCheck.rows.map(row => {
+          if (!row.source_object) {
+            return "не заполнен Источник Объект";
+          }
+
+          return `${row.source_object}: к оплате ${money(row.request_to_pay)} ₸, остаток ${money(row.balance_after_pay)} ₸`;
+        }).join("; ");
+
+        const err = new Error(
+          "Утверждение невозможно. Сумма «К оплате» превышает остаток после оплаты по Источник Объект: " + details
+        );
+        err.statusCode = 409;
+        err.errorCode = "SOURCE_OBJECT_BALANCE_EXCEEDED";
+        throw err;
+      }
+    }
+
+    /*
      * 1. Исмагулов согласует первым, только когда совпали:
      * Дивизион -> Объект -> Статья ДДС.
      */
@@ -6462,8 +6519,9 @@ app.post("/approve-rows", async (req, res) => {
 
     console.error("APPROVE-ROWS ERROR:", e);
 
-    return res.status(500).json({
+    return res.status(Number(e.statusCode || 500)).json({
       success: false,
+      code: e.errorCode || "APPROVE_ROWS_ERROR",
       error: e.message
     });
 
