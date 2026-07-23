@@ -2423,7 +2423,7 @@ app.get("/ft", async (req, res) => {
 });
 
 // =====================================================
-// ✅ b_erkin и s_zhasulan могут менять основные поля FT
+// ✅ b_erkin, s_zhasulan и a_zaitova могут менять основные поля FT
 // POST /ft-update-main
 // =====================================================
 app.post("/ft-update-main", async (req, res) => {
@@ -2436,8 +2436,8 @@ app.post("/ft-update-main", async (req, res) => {
       return res.status(400).json({ success:false, error:"id_ft required" });
     }
 
-    // Доступ только b_erkin и s_zhasulan.
-    if (!["b_erkin", "s_zhasulan"].includes(actor)) {
+    // Доступ только b_erkin, s_zhasulan и a_zaitova.
+    if (!["b_erkin", "s_zhasulan", "a_zaitova"].includes(actor)) {
       return res.status(403).json({ success:false, error:"NO_RIGHTS" });
     }
 
@@ -3406,13 +3406,13 @@ app.post("/request-created-bulk", async (req, res) => {
       });
     }
 
-    const isBerkinOrZhasulan = ["b_erkin", "s_zhasulan"].includes(login);
+    const isBerkinOrZhasulan = ["b_erkin", "s_zhasulan", "a_zaitova"].includes(login);
 
     /*
-      Пустое значение вручную могут устанавливать b_erkin и s_zhasulan.
+      Пустое значение вручную могут устанавливать b_erkin, s_zhasulan и a_zaitova.
 
       Значение "Да":
-      - b_erkin и s_zhasulan могут ставить для любой строки;
+      - b_erkin, s_zhasulan и a_zaitova могут ставить для любой строки;
       - supervisor/admin/editor могут создавать заявку по доступной строке;
       - инициатор может ставить только на своей строке.
     */
@@ -3820,6 +3820,7 @@ app.get("/request-list", async (req, res) => {
     } else if (
       login === "admin" ||
       login === "b_erkin" ||
+      login === "a_zaitova" ||
       login === "k_arailym" ||
       login === "zh_elena" ||
       roleFt === "admin" ||
@@ -4081,7 +4082,7 @@ app.post("/zvk-save", async (req, res) => {
       isTruthy(is_admin) ||
       isTruthy(is_all) ||
       isTruthy(can_edit_all) ||
-      ["b_erkin", "s_zhasulan"].includes(actor.toLowerCase());
+      ["b_erkin", "s_zhasulan", "a_zaitova"].includes(actor.toLowerCase());
 
     const ft = String(id_ft).trim();
    let flag = String(request_flag || "Нет").trim();
@@ -4378,7 +4379,7 @@ app.post("/zvk-bulk-request-flag", async (req, res) => {
       isTruthy(is_admin) ||
       isTruthy(is_all) ||
       isTruthy(can_edit_all) ||
-      ["b_erkin", "s_zhasulan"].includes(actor.toLowerCase());
+      ["b_erkin", "s_zhasulan", "a_zaitova"].includes(actor.toLowerCase());
 
     if (!adminOk) {
       return res.status(403).json({ success:false, error:"NO_RIGHTS" });
@@ -4465,7 +4466,7 @@ app.post("/zvk-status-row", async (req, res) => {
   isTruthy(is_admin) ||
   isTruthy(can_edit_all) ||
   String(is_all || "0") === "1" ||
-  ["b_erkin", "s_zhasulan"].includes(actor.toLowerCase());
+  ["b_erkin", "s_zhasulan", "a_zaitova"].includes(actor.toLowerCase());
     if (!adminOk) {
       const ok = await canEditRowByLogin(pool, rid, actor);
       if (!ok) return res.status(403).json({ success: false, error: "NO_RIGHTS_THIS_ROW" });
@@ -4687,10 +4688,10 @@ app.post("/zvk-pay-row", async (req, res) => {
       is_admin === true || is_admin === 1 || is_admin === "1" ||
       String(is_admin).toLowerCase() === "true";
 
-    const payOk = adminOk || ["b_erkin", "s_zhasulan"].includes(actor);
+    const payOk = adminOk || ["b_erkin", "s_zhasulan", "a_zaitova"].includes(actor);
 
     if (!payOk) {
-      return res.status(403).json({ success:false, error:"only b_erkin/s_zhasulan/admin allowed" });
+      return res.status(403).json({ success:false, error:"only b_erkin/s_zhasulan/a_zaitova/admin allowed" });
     }
 
     if (!zvk_row_id) {
@@ -6475,7 +6476,7 @@ app.post("/approve-rows", async (req, res) => {
 
 // =====================================================
 // ОТМЕНА ОТКЛОНЁННЫХ СТРОК ПО ОДИНАКОВОМУ ID FT
-// Доступ: s_zhasulan и b_erkin
+// Доступ: s_zhasulan, b_erkin и a_zaitova
 //
 // Для каждого ID FT:
 // 1) находим строки, отклонённые Исмагуловым, Сулейменовым или по утверждению Касенова;
@@ -6492,10 +6493,10 @@ app.post("/cancel-rejected-ft-lines", async (req, res) => {
       ? [...new Set(req.body.row_ids.map(Number).filter(Boolean))]
       : [];
 
-    if (!["s_zhasulan", "b_erkin"].includes(login)) {
+    if (!["s_zhasulan", "b_erkin", "a_zaitova"].includes(login)) {
       return res.status(403).json({
         success: false,
-        error: "Отменять отклонённые строки могут только s_zhasulan и b_erkin"
+        error: "Отменять отклонённые строки могут только s_zhasulan, b_erkin и a_zaitova"
       });
     }
 
@@ -6771,7 +6772,7 @@ app.post("/request-items-paid-bulk", async (req, res) => {
       return res.status(400).json({ success:false, error:"is_paid must be Да or Нет" });
     }
 
-    const canPay = ["zh_elena", "k_arailym", "s_zhasulan", "b_erkin", "admin"].includes(loginNorm);
+    const canPay = ["zh_elena", "k_arailym", "s_zhasulan", "b_erkin", "a_zaitova", "admin"].includes(loginNorm);
     if (!canPay) return res.status(403).json({ success:false, error:"Нет прав ставить Оплачено" });
 
     await client.query("BEGIN");
