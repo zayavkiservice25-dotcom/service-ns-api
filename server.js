@@ -5152,9 +5152,10 @@ app.post("/io-save", async (req, res) => {
       const inputDate = String(row?.input_date || "").trim();
       const objectName = String(row?.object || "").trim();
       const divIn = String(row?.div_in || "").trim();
-      const ddsIn = String(row?.dds_in || "").trim();
+      const dds = String(row?.dds || row?.dds_in || row?.dds_out || "").trim();
       const divOut = String(row?.div_out || "").trim();
-      const ddsOut = String(row?.dds_out || "").trim();
+      const ddsIn = dds;
+      const ddsOut = dds;
 
       const sumValue = Number(
         String(row?.sum || "")
@@ -5174,17 +5175,14 @@ app.post("/io-save", async (req, res) => {
         throw new Error("Дивизион Вх не указан");
       }
 
-      if (!ddsIn) {
-        throw new Error("ДДСвх не указан");
+      if (!dds) {
+        throw new Error("ДДС не указан");
       }
 
       if (!divOut) {
         throw new Error("Дивизион Исх не указан");
       }
 
-      if (!ddsOut) {
-        throw new Error("ДДСисх не указан");
-      }
 
       // 1. Сначала создаём историю
       const historyResult = await client.query(
@@ -5747,24 +5745,14 @@ app.get("/svod-object", async (req, res) => {
       SELECT
         object_name,
         amount,
-
         to_pay_paid,
-        to_pay_paid AS to_pay,
-
         balance,
-
         to_pay_registry,
-        to_pay_registry AS registry,
-
         balance_after_registry,
-        balance_after_registry AS balance_registry,
-
         ft_zayavka,
         balance_zayavka,
-
         ft_kasenov,
         balance_kasenov
-
       FROM public.svod_object_v1
       ORDER BY object_name
     `);
@@ -5781,10 +5769,13 @@ app.get("/svod-object", async (req, res) => {
       ok: false,
       error: String(e.message || e)
     });
+
   } finally {
     client.release();
   }
 });
+
+
 
 
 
