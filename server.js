@@ -5739,7 +5739,6 @@ app.get("/data/:number", async (req, res) => {
 });
 
 
-
 app.get("/svod-object", async (req, res) => {
   const client = await pool.connect();
 
@@ -5747,32 +5746,36 @@ app.get("/svod-object", async (req, res) => {
     const r = await client.query(`
       SELECT
         object_name,
-        amount_in,
-        to_pay,
+        amount,
+        to_pay_paid,
         balance,
-
-        -- новые поля
-        ft_kasenov,
-        balance_kasenov,
-
-        registry,
-        balance_registry,
+        to_pay_registry,
+        balance_after_registry,
         ft_zayavka,
-        balance_zayavka
+        balance_zayavka,
+        ft_kasenov,
+        balance_kasenov
       FROM public.svod_object_v1
       ORDER BY object_name
     `);
 
-    res.json({ ok: true, rows: r.rows });
+    res.json({
+      ok: true,
+      rows: r.rows
+    });
 
   } catch (e) {
     console.error("SVOD-OBJECT ERROR:", e);
-    res.status(500).json({ ok: false, error: String(e.message || e) });
+
+    res.status(500).json({
+      ok: false,
+      error: String(e.message || e)
+    });
+
   } finally {
     client.release();
   }
 });
-
 
 
 
