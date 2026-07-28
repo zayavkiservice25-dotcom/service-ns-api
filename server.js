@@ -5742,19 +5742,37 @@ app.get("/svod-object", async (req, res) => {
 
   try {
     const r = await client.query(`
+      WITH registry_by_object AS (
+        SELECT
+          lower(trim(cur.src_o)) AS object_key,
+          COALESCE(SUM(cur.to_pay), 0)::numeric AS to_pay_registry
+        FROM public.ft_zvk_current_v2 cur
+        WHERE NULLIF(trim(cur.src_o), '') IS NOT NULL
+          AND trim(COALESCE(cur.registry_flag, '')) = 'Да'
+          AND trim(COALESCE(cur.is_paid, '')) <> 'Да'
+        GROUP BY lower(trim(cur.src_o))
+      )
       SELECT
-        object_name,
-        amount,
-        to_pay_paid,
-        balance,
-        to_pay_registry,
-        balance_after_registry,
-        ft_zayavka,
-        balance_zayavka,
-        ft_kasenov,
-        balance_kasenov
-      FROM public.svod_object_v1
-      ORDER BY object_name
+        s.object_name,
+        s.amount,
+        s.to_pay_paid,
+        s.balance,
+
+        COALESCE(r.to_pay_registry, 0)::numeric AS to_pay_registry,
+
+        (
+          COALESCE(s.balance, 0)::numeric
+          - COALESCE(r.to_pay_registry, 0)::numeric
+        ) AS balance_after_registry,
+
+        s.ft_zayavka,
+        s.balance_zayavka,
+        s.ft_kasenov,
+        s.balance_kasenov
+      FROM public.svod_object_v1 s
+      LEFT JOIN registry_by_object r
+        ON r.object_key = lower(trim(s.object_name))
+      ORDER BY s.object_name
     `);
 
     res.json({
