@@ -5747,14 +5747,24 @@ app.get("/svod-object", async (req, res) => {
       SELECT
         object_name,
         amount,
+
         to_pay_paid,
+        to_pay_paid AS to_pay,
+
         balance,
+
         to_pay_registry,
+        to_pay_registry AS registry,
+
         balance_after_registry,
+        balance_after_registry AS balance_registry,
+
         ft_zayavka,
         balance_zayavka,
+
         ft_kasenov,
         balance_kasenov
+
       FROM public.svod_object_v1
       ORDER BY object_name
     `);
@@ -5771,13 +5781,10 @@ app.get("/svod-object", async (req, res) => {
       ok: false,
       error: String(e.message || e)
     });
-
   } finally {
     client.release();
   }
 });
-
-
 
 
 
