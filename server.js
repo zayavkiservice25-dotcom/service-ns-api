@@ -5163,7 +5163,7 @@ app.post("/io-save", async (req, res) => {
           .replace(",", ".")
       );
 
-      if (!Number.isFinite(sumValue) || sumValue <= 0) {
+      if (!Number.isFinite(sumValue) || sumValue === 0) {
         throw new Error("Введите правильную сумму");
       }
 
@@ -5402,7 +5402,7 @@ app.put("/io-history/:id", async (req, res) => {
         .replace(",", ".")
     );
 
-    if (!Number.isFinite(sumValue) || sumValue <= 0) {
+    if (!Number.isFinite(sumValue) || sumValue === 0) {
       return res.status(400).json({
         success: false,
         error: "Введите правильную сумму"
