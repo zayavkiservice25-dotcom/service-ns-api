@@ -5754,16 +5754,18 @@ app.get("/svod-object", async (req, res) => {
       )
       SELECT
         s.object_name,
-        s.amount,
-        s.to_pay_paid,
+
+        -- Названия полей должны совпадать с FtObjects.html
+        s.amount AS amount_in,
+        s.to_pay_paid AS to_pay,
         s.balance,
 
-        COALESCE(r.to_pay_registry, 0)::numeric AS to_pay_registry,
+        COALESCE(r.to_pay_registry, 0)::numeric AS registry,
 
         (
           COALESCE(s.balance, 0)::numeric
           - COALESCE(r.to_pay_registry, 0)::numeric
-        ) AS balance_after_registry,
+        ) AS balance_registry,
 
         s.ft_zayavka,
         s.balance_zayavka,
