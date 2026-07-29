@@ -5702,6 +5702,66 @@ app.get("/division-svod", async (req, res) => {
   }
 });
 
+// =====================================================
+// САЛЬДО ПО ИСТОЧНИКАМ ЗА ВЫБРАННЫЙ ПЕРИОД
+// =====================================================
+app.get("/division-saldo-period", async (req, res) => {
+  try {
+    const dateFrom = String(req.query.dateFrom || "").trim();
+    const dateTo = String(req.query.dateTo || "").trim();
+
+    if (
+      !/^\d{4}-\d{2}-\d{2}$/.test(dateFrom) ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(dateTo)
+    ) {
+      return res.status(400).json({
+        success: false,
+        error: "dateFrom и dateTo обязательны в формате YYYY-MM-DD"
+      });
+    }
+
+    if (dateFrom > dateTo) {
+      return res.status(400).json({
+        success: false,
+        error: "Дата начала не может быть позже даты окончания"
+      });
+    }
+
+    const result = await pool.query(
+      `
+      SELECT
+        division_dds,
+        opening_balance,
+        period_amount_in,
+        period_amount_out,
+        period_to_pay_paid,
+        period_result
+      FROM public.get_division_saldo(
+        $1::date,
+        $2::date
+      )
+      `,
+      [dateFrom, dateTo]
+    );
+
+    return res.json({
+      success: true,
+      dateFrom,
+      dateTo,
+      rows: result.rows
+    });
+
+  } catch (error) {
+    console.error("DIVISION SALDO PERIOD ERROR:", error);
+
+    return res.status(500).json({
+      success: false,
+      error: error.message || String(error)
+    });
+  }
+});
+
+
 // Эндпоинт для получения конкретной записи по ID
 app.get("/data/:number", async (req, res) => {
   try {
