@@ -5735,11 +5735,13 @@ app.get("/division-saldo-period", async (req, res) => {
         period_amount_in,
         period_amount_out,
         period_to_pay_paid,
-        period_result
+        period_result,
+        closing_balance
       FROM public.get_division_saldo(
         $1::date,
         $2::date
       )
+      ORDER BY division_dds
       `,
       [dateFrom, dateTo]
     );
@@ -5760,7 +5762,6 @@ app.get("/division-saldo-period", async (req, res) => {
     });
   }
 });
-
 
 // Эндпоинт для получения конкретной записи по ID
 app.get("/data/:number", async (req, res) => {
