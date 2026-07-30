@@ -10001,7 +10001,8 @@ app.get("/lzk/supply", async (req, res) => {
           r.note,
           r.deadline,
           r.documents_url,
-          r.pto_status
+          r.pto_status,
+          r.pto_date
         FROM lzk.requests r
         WHERE lower(trim(COALESCE(r.pto_status, '')))
               IN ('согласован', 'согласовано')
@@ -10026,6 +10027,7 @@ app.get("/lzk/supply", async (req, res) => {
           to_char(a.deadline, 'YYYY-MM-DD') AS deadline,
           a.documents_url AS pdf,
           a.pto_status AS pto,
+          a.pto_date AS approved_at,
           ''::text AS component,
           ''::text AS recipe,
           s.attention,
@@ -10079,6 +10081,7 @@ app.get("/lzk/supply", async (req, res) => {
           to_char(a.deadline, 'YYYY-MM-DD') AS deadline,
           a.documents_url AS pdf,
           a.pto_status AS pto,
+          a.pto_date AS approved_at,
           s.component,
           s.recipe,
           s.attention,
@@ -10106,9 +10109,10 @@ app.get("/lzk/supply", async (req, res) => {
         SELECT * FROM component_rows
       ) all_rows
       ORDER BY
-        NULLIF(regexp_replace(all_rows.idzlzk, '\\D', '', 'g'), '')::bigint,
+        all_rows.approved_at ASC NULLS FIRST,
+        NULLIF(regexp_replace(all_rows.idzlzk, '\\D', '', 'g'), '')::bigint ASC,
         CASE WHEN all_rows.row_type = 'base' THEN 0 ELSE 1 END,
-        NULLIF(regexp_replace(all_rows.idplxk, '\\D', '', 'g'), '')::bigint
+        NULLIF(regexp_replace(all_rows.idplxk, '\\D', '', 'g'), '')::bigint ASC NULLS FIRST
     `);
 
     res.json({
