@@ -3817,6 +3817,20 @@ app.get("/request-list", async (req, res) => {
           )
       `;
 
+} else if (login === "o_bakytzhan") {
+  // Бакытжан видит только реестры,
+  // где ВводИмя = r_gulnur.
+  params.push("r_gulnur");
+
+  whereSql = `
+    WHERE id IN (
+      SELECT DISTINCT request_id
+      FROM public.request_items
+      WHERE lower(trim(input_name)) = $1
+    )
+  `;
+
+
     } else if (
       login === "admin" ||
       login === "b_erkin" ||
