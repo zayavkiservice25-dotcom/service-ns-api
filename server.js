@@ -3830,11 +3830,16 @@ app.get("/request-list", async (req, res) => {
         )
       `;
 
-    } else if (login === "s_zhasulan") {
-      // Сулейменов не участвует в маршруте Сервис НС.
-      params.push("Сервис НС");
-      whereSql = `
-        WHERE NOT EXISTS (
+} else if (login === "s_zhasulan") {
+  params.push("Сервис НС");
+  params.push("s_zhasulan");
+
+  whereSql = `
+    WHERE
+      (
+        /* Обычная логика Сулейменова:
+           показываем всё, кроме Сервис НС */
+        NOT EXISTS (
           SELECT 1
           FROM public.request_items ri
           LEFT JOIN public.ft_zvk_current_v2 cur
@@ -3848,7 +3853,22 @@ app.get("/request-list", async (req, res) => {
               )
             )) = lower($1)
         )
-      `;
+      )
+
+      OR
+
+      (
+        /* Но свои заявки он видит всегда как инициатор */
+        lower(trim(COALESCE(request_head.created_by, ''))) = lower($2)
+
+        OR EXISTS (
+          SELECT 1
+          FROM public.request_items ri
+          WHERE ri.request_id = request_head.id
+            AND lower(trim(COALESCE(ri.input_name, ''))) = lower($2)
+        )
+      )
+  `;
 
     } else if (login === ISMAGULOV_LOGIN) {
       /*
