@@ -990,6 +990,11 @@ await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_z
 await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zhasulan_time timestamptz;`);
 await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zhasulan_comment text;`);
 
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zaitova_name text;`);
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zaitova_status text;`);
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zaitova_time timestamptz;`);
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zaitova_comment text;`);
+
 await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zhas_name text;`);
 await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zhas_status text;`);
 await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zhas_time timestamptz;`);
@@ -2947,6 +2952,28 @@ async function requestNeedsIsmagulov(client, requestId) {
   return false;
 }
 
+async function requestIsServiceNs(client, requestId) {
+  const result = await client.query(`
+    SELECT EXISTS (
+      SELECT 1
+      FROM public.request_items i
+      LEFT JOIN public.ft_zvk_current_v2 cur
+        ON cur.zvk_row_id = i.zvk_row_id
+      WHERE i.request_id = $1
+        AND lower(trim(
+          COALESCE(
+            NULLIF(cur.legal_entity, ''),
+            NULLIF(i.src_d, ''),
+            ''
+          )
+        )) = lower('Сервис НС')
+    ) AS is_service_ns
+  `, [Number(requestId)]);
+
+  return result.rows[0]?.is_service_ns === true;
+}
+
+
 app.post("/create-request", async (req, res) => {
   const client = await pool.connect();
 
@@ -3035,6 +3062,8 @@ app.post("/create-request", async (req, res) => {
       const count = items.rows.length;
       const needsIsmagulovForNewRequest =
         await requestNeedsIsmagulov(client, request_id);
+      const isServiceNsForNewRequest =
+        await requestIsServiceNs(client, request_id);
 
       await client.query(`
         UPDATE public.request_head
@@ -3043,18 +3072,29 @@ app.post("/create-request", async (req, res) => {
           items_count = $2,
 
 acc_zhasulan_name = 'Сулейменов Жасулан',
-acc_zhasulan_status = 'Ожидает',
+acc_zhasulan_status = CASE
+  WHEN $5::boolean = true THEN 'Не требуется'
+  ELSE 'Ожидает'
+END,
 acc_zhasulan_time = NULL,
 acc_zhasulan_comment = NULL,
 
 acc_zhas_name = 'Исмагулов Жаслан',
 acc_zhas_status = CASE
-  WHEN $4::boolean = true
-  THEN 'Ожидает'
+  WHEN $5::boolean = true THEN 'Не требуется'
+  WHEN $4::boolean = true THEN 'Ожидает'
   ELSE 'Не требуется'
 END,
 acc_zhas_time = NULL,
 acc_zhas_comment = NULL,
+
+acc_zaitova_name = 'Заитова Алия',
+acc_zaitova_status = CASE
+  WHEN $5::boolean = true THEN 'Ожидает'
+  ELSE 'Не требуется'
+END,
+acc_zaitova_time = NULL,
+acc_zaitova_comment = NULL,
 
 acc_shevchenko_name = 'Шевченко Владимир',
           acc_shevchenko_status = 'Ожидает',
@@ -3080,7 +3120,8 @@ acc_shevchenko_name = 'Шевченко Владимир',
   total,
   count,
   request_id,
-  needsIsmagulovForNewRequest
+  needsIsmagulovForNewRequest,
+  isServiceNsForNewRequest
 ]);
 
 await client.query(`
@@ -3096,9 +3137,13 @@ await client.query(`
 ]);
 
 // ✅ Уведомление согласующим, когда заявка попала в "Отправленные заявки"
-const notifyUsers = needsIsmagulovForNewRequest
-  ? [ISMAGULOV_LOGIN]
-  : ["s_zhasulan"];
+const notifyUsers = isServiceNsForNewRequest
+  ? ["a_zaitova"]
+  : (
+      needsIsmagulovForNewRequest
+        ? [ISMAGULOV_LOGIN]
+        : ["s_zhasulan"]
+    );
 
 for (const userLogin of notifyUsers) {
   await client.query(`
@@ -3765,9 +3810,45 @@ app.get("/request-list", async (req, res) => {
     let whereSql = "";
     const params = [];
 
-    if (login === "s_zhasulan") {
-      // Сулейменов видит все заявки.
-      whereSql = "";
+    if (login === "a_zaitova") {
+      // Заитова Алия видит только заявки ЮрЛицо = Сервис НС.
+      params.push("Сервис НС");
+      whereSql = `
+        WHERE EXISTS (
+          SELECT 1
+          FROM public.request_items ri
+          LEFT JOIN public.ft_zvk_current_v2 cur
+            ON cur.zvk_row_id = ri.zvk_row_id
+          WHERE ri.request_id = request_head.id
+            AND lower(trim(
+              COALESCE(
+                NULLIF(cur.legal_entity, ''),
+                NULLIF(ri.src_d, ''),
+                ''
+              )
+            )) = lower($1)
+        )
+      `;
+
+    } else if (login === "s_zhasulan") {
+      // Сулейменов не участвует в маршруте Сервис НС.
+      params.push("Сервис НС");
+      whereSql = `
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM public.request_items ri
+          LEFT JOIN public.ft_zvk_current_v2 cur
+            ON cur.zvk_row_id = ri.zvk_row_id
+          WHERE ri.request_id = request_head.id
+            AND lower(trim(
+              COALESCE(
+                NULLIF(cur.legal_entity, ''),
+                NULLIF(ri.src_d, ''),
+                ''
+              )
+            )) = lower($1)
+        )
+      `;
 
     } else if (login === ISMAGULOV_LOGIN) {
       /*
@@ -3810,10 +3891,20 @@ app.get("/request-list", async (req, res) => {
        * в request_head.acc_zhas_status.
        */
       whereSql = `
-        WHERE COALESCE(acc_zhasulan_status, '') = 'Согласовано'
-          AND COALESCE(acc_zhas_status, '') IN (
-            'Согласовано',
-            'Не требуется'
+        WHERE
+          (
+            COALESCE(acc_zaitova_status, '') = 'Согласовано'
+            AND COALESCE(acc_zhasulan_status, '') = 'Не требуется'
+            AND COALESCE(acc_zhas_status, '') = 'Не требуется'
+          )
+          OR
+          (
+            COALESCE(acc_zaitova_status, '') = 'Не требуется'
+            AND COALESCE(acc_zhasulan_status, '') = 'Согласовано'
+            AND COALESCE(acc_zhas_status, '') IN (
+              'Согласовано',
+              'Не требуется'
+            )
           )
       `;
 
@@ -3834,7 +3925,6 @@ app.get("/request-list", async (req, res) => {
     } else if (
       login === "admin" ||
       login === "b_erkin" ||
-      login === "a_zaitova" ||
       login === "k_arailym" ||
       login === "zh_elena" ||
       roleFt === "admin" ||
@@ -3872,6 +3962,11 @@ app.get("/request-list", async (req, res) => {
         acc_zhasulan_status,
         acc_zhasulan_time,
         acc_zhasulan_comment,
+
+        acc_zaitova_name,
+        acc_zaitova_status,
+        acc_zaitova_time,
+        acc_zaitova_comment,
 
         acc_zhas_name,
         acc_zhas_status,
@@ -3994,6 +4089,8 @@ app.get("/request-list", async (req, res) => {
 
         COALESCE(h.acc_zhasulan_status, 'Ожидает')
           AS acc_zhasulan_status,
+        COALESCE(h.acc_zaitova_status, 'Ожидает')
+          AS acc_zaitova_status,
         COALESCE(h.acc_zhas_status, 'Ожидает')
           AS acc_zhas_status,
         COALESCE(h.acc_shevchenko_status, 'Ожидает')
@@ -4006,6 +4103,7 @@ app.get("/request-list", async (req, res) => {
           AS approve_ermek_status,
 
         h.acc_zhasulan_time,
+        h.acc_zaitova_time,
         h.acc_zhas_time,
         h.acc_shevchenko_time,
         h.acc_marat_time,
@@ -4014,6 +4112,8 @@ app.get("/request-list", async (req, res) => {
 
         COALESCE(h.acc_zhasulan_comment, '')
           AS acc_zhasulan_comment,
+        COALESCE(h.acc_zaitova_comment, '')
+          AS acc_zaitova_comment,
         COALESCE(h.acc_zhas_comment, '')
           AS acc_zhas_comment,
         COALESCE(h.acc_shevchenko_comment, '')
@@ -6097,6 +6197,10 @@ app.get("/request-card", async (req, res) => {
         acc_zhasulan_time,
         acc_zhasulan_comment,
 
+        acc_zaitova_status,
+        acc_zaitova_time,
+        acc_zaitova_comment,
+
         acc_zhas_status,
         acc_zhas_time,
         acc_zhas_comment,
@@ -6235,6 +6339,14 @@ app.post("/approve-rows", async (req, res) => {
         commentCol: "acc_zhas_comment"
       },
 
+      a_zaitova: {
+        title: "Заитова Алия",
+        nameCol: "acc_zaitova_name",
+        statusCol: "acc_zaitova_status",
+        timeCol: "acc_zaitova_time",
+        commentCol: "acc_zaitova_comment"
+      },
+
       v_shevchenko: {
         title: "Шевченко Владимир",
         nameCol: "acc_shevchenko_name",
@@ -6306,6 +6418,7 @@ app.post("/approve-rows", async (req, res) => {
 
         acc_zhasulan_status,
         acc_zhas_status,
+        acc_zaitova_status,
 
         acc_shevchenko_status,
         acc_marat_status,
@@ -6324,6 +6437,10 @@ app.post("/approve-rows", async (req, res) => {
 
     const head = headResult.rows[0];
     const needsIsmagulov = await requestNeedsIsmagulov(
+      client,
+      requestId
+    );
+    const isServiceNs = await requestIsServiceNs(
       client,
       requestId
     );
@@ -6385,6 +6502,22 @@ app.post("/approve-rows", async (req, res) => {
       }
     }
 
+    // Сервис НС: Исмагулов и Сулейменов не участвуют, согласует Заитова Алия.
+    if (
+      isServiceNs &&
+      (login === ISMAGULOV_LOGIN || login === "s_zhasulan")
+    ) {
+      throw new Error(
+        "Для ЮрЛицо «Сервис НС» согласование Исмагулова и Сулейменова не требуется"
+      );
+    }
+
+    if (login === "a_zaitova" && !isServiceNs) {
+      throw new Error(
+        "Заитова Алия согласует только заявки ЮрЛицо «Сервис НС»"
+      );
+    }
+
     /*
      * 1. Исмагулов согласует первым, только когда совпали:
      * Дивизион -> Объект -> Статья ДДС.
@@ -6403,6 +6536,7 @@ app.post("/approve-rows", async (req, res) => {
      * Сулейменов ждёт Исмагулова. В остальных случаях согласует сразу.
      */
     if (
+      !isServiceNs &&
       login === "s_zhasulan" &&
       needsIsmagulov &&
       String(head.acc_zhas_status || "").trim() !== "Согласовано"
@@ -6413,37 +6547,37 @@ app.post("/approve-rows", async (req, res) => {
     }
 
     /*
-     * 3. Шевченко, Койлибаев и Касенов ждут Сулейменова.
+     * 3. Основные согласующие ждут нужный первый этап:
+     * - Сервис НС -> Заитова Алия;
+     * - остальные -> Сулейменов (и Исмагулов, если требуется).
      */
-    if (
-      (
-        login === "v_shevchenko" ||
-        login === "k_marat" ||
-        login === "k_ermek"
-      ) &&
-      String(head.acc_zhasulan_status || "").trim() !== "Согласовано"
-    ) {
-      throw new Error(
-        "Сначала должен согласовать Сулейменов Жасулан"
-      );
-    }
+    const isMainApprover =
+      login === "v_shevchenko" ||
+      login === "k_marat" ||
+      login === "k_ermek";
 
-    /*
-     * 4. При совпадении Дивизион + Объект + Статья ДДС
-     * основные согласующие также ждут Исмагулова.
-     */
-    if (
-      needsIsmagulov &&
-      (
-        login === "v_shevchenko" ||
-        login === "k_marat" ||
-        login === "k_ermek"
-      ) &&
-      String(head.acc_zhas_status || "").trim() !== "Согласовано"
-    ) {
-      throw new Error(
-        "Сначала должен согласовать Исмагулов Жаслан"
-      );
+    if (isMainApprover) {
+      if (
+        isServiceNs &&
+        String(head.acc_zaitova_status || "").trim() !== "Согласовано"
+      ) {
+        throw new Error("Сначала должна согласовать Заитова Алия");
+      }
+
+      if (
+        !isServiceNs &&
+        String(head.acc_zhasulan_status || "").trim() !== "Согласовано"
+      ) {
+        throw new Error("Сначала должен согласовать Сулейменов Жасулан");
+      }
+
+      if (
+        !isServiceNs &&
+        needsIsmagulov &&
+        String(head.acc_zhas_status || "").trim() !== "Согласовано"
+      ) {
+        throw new Error("Сначала должен согласовать Исмагулов Жаслан");
+      }
     }
 
     const isReject =
@@ -6501,8 +6635,11 @@ app.post("/approve-rows", async (req, res) => {
      * Для специальных объектов к этому моменту Исмагулов уже согласовал.
      */
     if (
-      login === "s_zhasulan" &&
-      action === "agree"
+      action === "agree" &&
+      (
+        (!isServiceNs && login === "s_zhasulan") ||
+        (isServiceNs && login === "a_zaitova")
+      )
     ) {
       const nextUsers = ["v_shevchenko", "k_marat", "k_ermek"];
 
@@ -6543,6 +6680,7 @@ app.post("/approve-rows", async (req, res) => {
      * После Исмагулова заявка передаётся Сулейменову.
      */
     if (
+      !isServiceNs &&
       login === ISMAGULOV_LOGIN &&
       action === "agree"
     ) {
@@ -6590,7 +6728,10 @@ app.post("/approve-rows", async (req, res) => {
      */
     const shouldSetRegistryYes =
       action === "agree" &&
-      login === "s_zhasulan";
+      (
+        (!isServiceNs && login === "s_zhasulan") ||
+        (isServiceNs && login === "a_zaitova")
+      );
 
     if (shouldSetRegistryYes) {
       await setRequestRegistryYes(client, requestId);
