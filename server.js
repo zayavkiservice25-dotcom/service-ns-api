@@ -11222,6 +11222,230 @@ app.post("/bank/saldo/sync", async (req, res) => {
   }
 });
 
+
+
+// =====================================================
+// FORTE BANK BUSINESS API: ТЕКУЩИЙ БАЛАНС СЧЕТОВ
+// ENV:
+// FORTE_CLIENT_ID
+// FORTE_CLIENT_SECRET
+// FORTE_GRAVITEE_API_KEY
+// FORTE_API_URL=https://gravitee-api-gateway.forte.kz
+// FORTE_ACCOUNTS=KZ...,KZ...   (можно оставить пустым до добавления IBAN)
+// =====================================================
+const FORTE_API_URL = String(
+  process.env.FORTE_API_URL || "https://gravitee-api-gateway.forte.kz"
+).replace(/\/$/, "");
+
+let forteTokenCache = {
+  token: "",
+  expiresAt: 0
+};
+
+function forteConfiguredAccounts_() {
+  return String(process.env.FORTE_ACCOUNTS || "")
+    .split(/[;,\n]/)
+    .map(v => v.trim().replace(/\s+/g, "").toUpperCase())
+    .filter(Boolean);
+}
+
+async function forteJsonRequest_(url, options = {}) {
+  const response = await fetch(url, options);
+  const text = await response.text();
+  let json = {};
+
+  try {
+    json = text ? JSON.parse(text) : {};
+  } catch (_) {
+    const error = new Error(`Forte вернул не JSON. HTTP ${response.status}: ${text.slice(0, 300)}`);
+    error.status = response.status;
+    throw error;
+  }
+
+  if (!response.ok) {
+    const message = json?.message || json?.error?.message || json?.error || `HTTP ${response.status}`;
+    const error = new Error(typeof message === "string" ? message : JSON.stringify(message));
+    error.status = response.status;
+    error.bankResponse = json;
+    throw error;
+  }
+
+  return json;
+}
+
+async function getForteToken_(force = false) {
+  const now = Date.now();
+  if (!force && forteTokenCache.token && now < forteTokenCache.expiresAt - 30000) {
+    return forteTokenCache.token;
+  }
+
+  const clientId = String(process.env.FORTE_CLIENT_ID || "").trim();
+  const clientSecret = String(process.env.FORTE_CLIENT_SECRET || "").trim();
+  const apiKey = String(process.env.FORTE_GRAVITEE_API_KEY || "").trim();
+
+  if (!clientId || !clientSecret || !apiKey) {
+    const error = new Error("На Render не заполнены FORTE_CLIENT_ID, FORTE_CLIENT_SECRET и FORTE_GRAVITEE_API_KEY");
+    error.status = 503;
+    throw error;
+  }
+
+  const json = await forteJsonRequest_(`${FORTE_API_URL}/fincore/auth/login`, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      "x-gravitee-api-key": apiKey
+    },
+    body: JSON.stringify({ clientId, clientSecret })
+  });
+
+  const token = String(json?.token || "").trim();
+  if (!token) throw new Error("Forte Bank не вернул token");
+
+  // По документации Forte токен живет 10 минут.
+  forteTokenCache = {
+    token,
+    expiresAt: now + 10 * 60 * 1000
+  };
+
+  return token;
+}
+
+async function forteGet_(pathName, query = {}) {
+  const apiKey = String(process.env.FORTE_GRAVITEE_API_KEY || "").trim();
+  let token = await getForteToken_();
+  const url = new URL(`${FORTE_API_URL}${pathName}`);
+
+  Object.entries(query).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== "") {
+      url.searchParams.set(key, String(value));
+    }
+  });
+
+  const doRequest = currentToken => forteJsonRequest_(url.toString(), {
+    headers: {
+      Accept: "application/json",
+      Authorization: `Bearer ${currentToken}`,
+      "x-gravitee-api-key": apiKey
+    }
+  });
+
+  try {
+    return await doRequest(token);
+  } catch (error) {
+    if (error.status !== 401) throw error;
+    forteTokenCache = { token: "", expiresAt: 0 };
+    token = await getForteToken_(true);
+    return doRequest(token);
+  }
+}
+
+async function ensureForteBalanceTable_() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.forte_account_balance (
+      id bigserial PRIMARY KEY,
+      iban text NOT NULL,
+      balance numeric(20,2),
+      currency text DEFAULT 'KZT',
+      received_at timestamptz NOT NULL DEFAULT now(),
+      raw_json jsonb,
+      UNIQUE (iban)
+    )
+  `);
+}
+
+async function saveForteBalance_(payload, fallbackIban) {
+  await ensureForteBalanceTable_();
+
+  const iban = String(payload?.accountNumber || fallbackIban || "")
+    .trim().replace(/\s+/g, "").toUpperCase();
+  const balance = bankAmount_(payload?.balance);
+
+  const q = await pool.query(`
+    INSERT INTO public.forte_account_balance (iban, balance, currency, received_at, raw_json)
+    VALUES ($1,$2,'KZT',now(),$3::jsonb)
+    ON CONFLICT (iban)
+    DO UPDATE SET
+      balance = EXCLUDED.balance,
+      currency = EXCLUDED.currency,
+      received_at = now(),
+      raw_json = EXCLUDED.raw_json
+    RETURNING *
+  `, [iban, balance, JSON.stringify(payload || {})]);
+
+  return q.rows[0];
+}
+
+app.get("/forte/balance", async (req, res) => {
+  try {
+    await ensureForteBalanceTable_();
+    const q = await pool.query(`
+      SELECT id, iban, balance, currency, received_at
+      FROM public.forte_account_balance
+      ORDER BY iban
+    `);
+
+    res.json({ success: true, rows: q.rows });
+  } catch (error) {
+    console.error("FORTE BALANCE LIST ERROR:", error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post("/forte/balance/sync", async (req, res) => {
+  try {
+    const accounts = forteConfiguredAccounts_();
+
+    // Пока IBAN Forte не добавлены — это нормальное состояние.
+    if (!accounts.length) {
+      return res.json({
+        success: true,
+        configured: false,
+        accountsFound: 0,
+        saved: 0,
+        failed: 0,
+        rows: [],
+        message: "Счета Forte пока не добавлены"
+      });
+    }
+
+    const result = [];
+
+    for (const iban of accounts) {
+      try {
+        const payload = await forteGet_("/fincore/account-balance", { accountNumber: iban });
+        const row = await saveForteBalance_(payload, iban);
+        result.push({ success: true, iban, row });
+      } catch (error) {
+        result.push({
+          success: false,
+          iban,
+          error: error.message,
+          bankResponse: error.bankResponse || null
+        });
+      }
+    }
+
+    const rows = result.filter(x => x.success && x.row).map(x => x.row);
+    res.json({
+      success: true,
+      configured: true,
+      accountsFound: accounts.length,
+      saved: rows.length,
+      failed: result.filter(x => !x.success).length,
+      rows,
+      result
+    });
+  } catch (error) {
+    console.error("FORTE BALANCE SYNC ERROR:", error);
+    res.status(error.status || 500).json({
+      success: false,
+      error: error.message,
+      bankResponse: error.bankResponse || null
+    });
+  }
+});
+
 // =====================================================
 // ЛЗК — создание нового лимита из интерфейса
 // Вставить в server.js ПОСЛЕ функций lzkText/lzkNum/nextLzkTextId
