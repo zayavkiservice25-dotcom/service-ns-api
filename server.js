@@ -11279,11 +11279,11 @@ async function getForteToken_(force = false) {
     return forteTokenCache.token;
   }
 
-  const clientId = String(process.env.FORTE_CLIENT_ID || "").trim();
+  const clientIdRaw = String(process.env.FORTE_CLIENT_ID || "").trim();
   const clientSecret = String(process.env.FORTE_CLIENT_SECRET || "").trim();
   const apiKey = String(process.env.FORTE_GRAVITEE_API_KEY || "").trim();
 
-  if (!clientId || !clientSecret || !apiKey) {
+  if (!clientIdRaw || !clientSecret || !apiKey) {
     const error = new Error("На Render не заполнены FORTE_CLIENT_ID, FORTE_CLIENT_SECRET и FORTE_GRAVITEE_API_KEY");
     error.status = 503;
     throw error;
@@ -11296,11 +11296,29 @@ async function getForteToken_(force = false) {
       "Content-Type": "application/json",
       "x-gravitee-api-key": apiKey
     },
-    body: JSON.stringify({ clientId, clientSecret })
+    // В Postman Forte clientId передается без кавычек.
+    // Поэтому цифровой id (например 623) отправляем как number.
+    body: JSON.stringify({
+      clientId: /^\d+$/.test(clientIdRaw) ? Number(clientIdRaw) : clientIdRaw,
+      clientSecret
+    })
   });
 
-  const token = String(json?.token || "").trim();
-  if (!token) throw new Error("Forte Bank не вернул token");
+  // В разных версиях документации ответ может быть token
+  // либо token внутри data. Поддерживаем оба варианта.
+  const token = String(
+    json?.token ||
+    json?.accessToken ||
+    json?.data?.token ||
+    json?.data?.accessToken ||
+    ""
+  ).trim();
+
+  if (!token) {
+    const error = new Error("Forte Bank авторизация успешна, но token не найден в ответе");
+    error.bankResponse = json;
+    throw error;
+  }
 
   // По документации Forte токен живет 10 минут.
   forteTokenCache = {
@@ -11427,12 +11445,30 @@ app.post("/forte/balance/sync", async (req, res) => {
     }
 
     const rows = result.filter(x => x.success && x.row).map(x => x.row);
+    const failedRows = result.filter(x => !x.success);
+
+    // Раньше даже если ВСЕ счета Forte завершались ошибкой,
+    // endpoint возвращал success:true. Из-за этого интерфейс молча
+    // показывал только Alatau. Теперь реальная ошибка будет видна.
+    if (!rows.length && failedRows.length) {
+      return res.status(502).json({
+        success: false,
+        configured: true,
+        accountsFound: accounts.length,
+        saved: 0,
+        failed: failedRows.length,
+        error: failedRows[0]?.error || "Forte: не удалось получить баланс ни по одному счету",
+        firstBankResponse: failedRows[0]?.bankResponse || null,
+        result
+      });
+    }
+
     res.json({
       success: true,
       configured: true,
       accountsFound: accounts.length,
       saved: rows.length,
-      failed: result.filter(x => !x.success).length,
+      failed: failedRows.length,
       rows,
       result
     });
