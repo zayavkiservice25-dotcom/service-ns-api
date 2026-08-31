@@ -6495,6 +6495,10 @@ app.post("/approve-rows", async (req, res) => {
         LEFT JOIN object_balances ob
           ON ob.object_key = lower(trim(rs.source_object))
         WHERE rs.source_object IS NULL
+           OR (
+                rs.request_to_pay > 0
+                AND COALESCE(ob.balance_after_pay, 0) <= 0
+              )
            OR rs.request_to_pay > COALESCE(ob.balance_after_pay, 0) + 0.005
         ORDER BY rs.source_object NULLS FIRST
       `, [requestId]);
