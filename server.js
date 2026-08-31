@@ -11899,7 +11899,7 @@ app.post("/do-ft/recognize", async (req, res) => {
       body: JSON.stringify({
         model,
         store:false,
-        reasoning:{ effort:"none" },
+        reasoning:{ effort:"minimal" },
         max_output_tokens:500,
         input:[{
           role:"user",
