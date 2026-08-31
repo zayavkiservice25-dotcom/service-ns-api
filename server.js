@@ -11830,19 +11830,49 @@ function doFtParseFilenameBackend_(fileName, legalRows, objects, dds) {
 function doFtMatchContractorBackend_(rawName, contractors) {
   const source = doFtUniqueStrings_(contractors);
   const rawKey = doFtNorm_(rawName);
-  if (!rawKey) return { contractor: "", matched: false, method: "empty" };
 
-  const exact = source.filter(x => doFtNorm_(x) === rawKey);
-  if (exact.length === 1) return { contractor: exact[0], matched: true, method: "exact" };
+  if (!rawKey) {
+    return {
+      contractor: "",
+      matched: false,
+      method: "empty"
+    };
+  }
 
-  // Консервативный fallback: уникальное вхождение одного нормализованного названия в другое.
-  const contain = source.filter(x => {
-    const k = doFtNorm_(x);
-    return k.length >= 5 && rawKey.length >= 5 && (k.includes(rawKey) || rawKey.includes(k));
+  // 1. Сначала точное совпадение после очистки названия.
+  const exact = source.find(x => doFtNorm_(x) === rawKey);
+
+  if (exact) {
+    return {
+      contractor: exact,   // возвращаем ТОЧНО как написано в Google Sheet
+      matched: true,
+      method: "exact"
+    };
+  }
+
+  // 2. Если AI добавил "ТОО", "Поставщик" и т.п. —
+  // ищем название из справочника внутри распознанной строки.
+  const contain = source.find(x => {
+    const key = doFtNorm_(x);
+
+    if (!key || key.length < 5) return false;
+
+    return rawKey.includes(key) || key.includes(rawKey);
   });
-  if (contain.length === 1) return { contractor: contain[0], matched: true, method: "contain" };
 
-  return { contractor: "", matched: false, method: exact.length > 1 || contain.length > 1 ? "ambiguous" : "not_found" };
+  if (contain) {
+    return {
+      contractor: contain, // ТОЧНО значение из Google Sheet
+      matched: true,
+      method: "contain"
+    };
+  }
+
+  return {
+    contractor: "",
+    matched: false,
+    method: "not_found"
+  };
 }
 
 app.post("/do-ft/recognize", async (req, res) => {
