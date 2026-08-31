@@ -11756,15 +11756,18 @@ function doFtExtractOutputText_(json) {
 function doFtNorm_(v) {
   return String(v || "")
     .toLowerCase()
-    .replace(/[«»„“”"'`]/g, "")
-    .replace(/\bпоставщик\b/giu, " ")
-    .replace(/\bтоварищество\s+с\s+ограниченной\s+ответственностью\b/giu, " ")
-    .replace(/\b(тоо|too|llp|ао|ao|ип|ip)\b/giu, " ")
+    .replace(/[«»„“”"'`]/g, " ")
+    // Не используем \b для русских слов: в JavaScript это ASCII-boundary.
+    .replace(/поставщик/giu, " ")
+    .replace(/товарищество\s+с\s+ограниченной\s+ответственностью/giu, " ")
+    .replace(/(?:^|[^a-zа-яё0-9])(тоо|too|llp|ао|ao|ип|ip)(?=$|[^a-zа-яё0-9])/giu, " ")
+    .replace(/бин\s*\/?\s*иин/giu, " ")
+    .replace(/(?:бин|иин)/giu, " ")
+    .replace(/\d{12}/g, " ")
     .replace(/[^a-zа-яё0-9]+/giu, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
-
 function doFtUniqueStrings_(arr) {
   const seen = new Set();
   const out = [];
@@ -11829,52 +11832,42 @@ function doFtParseFilenameBackend_(fileName, legalRows, objects, dds) {
 
 function doFtMatchContractorBackend_(rawName, contractors) {
   const source = doFtUniqueStrings_(contractors);
-  const rawKey = doFtNorm_(rawName);
+  const raw = String(rawName || "").replace(/\s+/g, " ").trim();
 
-  if (!rawKey) {
-    return {
-      contractor: "",
-      matched: false,
-      method: "empty"
-    };
+  if (!raw) {
+    return { contractor:"", matched:false, method:"empty" };
   }
 
-  // 1. Сначала точное совпадение после очистки названия.
-  const exact = source.find(x => doFtNorm_(x) === rawKey);
+  // Если название есть в кавычках, используем его как основной ключ.
+  const quoted = raw.match(/[«"“”]([^«»"“”]+)[»"“”]/);
+  const companyName = quoted && quoted[1] ? quoted[1].trim() : raw;
 
-  if (exact) {
-    return {
-      contractor: exact,   // возвращаем ТОЧНО как написано в Google Sheet
-      matched: true,
-      method: "exact"
-    };
+  const companyKey = doFtNorm_(companyName);
+  const rawKey = doFtNorm_(raw);
+
+  const prepared = source
+    .map(original => ({ original, key: doFtNorm_(original) }))
+    .filter(x => x.key);
+
+  // Точное совпадение возвращает ИМЕННО строку из листа «Контрагент».
+  let found = prepared.find(x => x.key === companyKey);
+  if (found) {
+    return { contractor:found.original, matched:true, method:"exact_sheet" };
   }
 
-  // 2. Если AI добавил "ТОО", "Поставщик" и т.п. —
-  // ищем название из справочника внутри распознанной строки.
-  const contain = source.find(x => {
-    const key = doFtNorm_(x);
+  const candidates = prepared
+    .filter(x =>
+      (companyKey && (x.key.includes(companyKey) || companyKey.includes(x.key))) ||
+      (rawKey && (x.key.includes(rawKey) || rawKey.includes(x.key)))
+    )
+    .sort((a, b) => b.key.length - a.key.length);
 
-    if (!key || key.length < 5) return false;
-
-    return rawKey.includes(key) || key.includes(rawKey);
-  });
-
-  if (contain) {
-    return {
-      contractor: contain, // ТОЧНО значение из Google Sheet
-      matched: true,
-      method: "contain"
-    };
+  if (candidates.length) {
+    return { contractor:candidates[0].original, matched:true, method:"contain_sheet" };
   }
 
-  return {
-    contractor: "",
-    matched: false,
-    method: "not_found"
-  };
+  return { contractor:"", matched:false, method:"not_found" };
 }
-
 app.post("/do-ft/recognize", async (req, res) => {
   try {
     const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
