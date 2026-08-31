@@ -11757,6 +11757,8 @@ function doFtNorm_(v) {
   return String(v || "")
     .toLowerCase()
     .replace(/[«»„“”"'`]/g, "")
+    .replace(/\bпоставщик\b/giu, " ")
+    .replace(/\bтоварищество\s+с\s+ограниченной\s+ответственностью\b/giu, " ")
     .replace(/\b(тоо|too|llp|ао|ao|ип|ip)\b/giu, " ")
     .replace(/[^a-zа-яё0-9]+/giu, " ")
     .replace(/\s+/g, " ")
