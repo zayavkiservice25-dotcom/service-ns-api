@@ -241,7 +241,6 @@ await pool.query(`
       f.input_date,
       f.input_name,
      f.legal_entity,
-f.mechanization,
       f."object" AS object,
       f.contractor,
 
@@ -272,7 +271,8 @@ s.idlzk,
       p.agree_time,
       p.registry_flag,
       p.pay_time,
-      p.is_paid
+      p.is_paid,
+      f.mechanization
 
     FROM ft f
     LEFT JOIN zvk z ON z.id_ft = f.id_ft
