@@ -11788,20 +11788,33 @@ function doFtParseFilenameBackend_(fileName, legalRows, objects, dds) {
     .trim();
 
   const p = base.split("-").map(x => String(x || "").trim());
-  const legalCode = p[0] || "";
-  const objectCode = p[1] || "";
-  const ddsCode = p[2] || "";
-  const mechCode = p[3] || "";
 
-  // 1-я цифра: лист «ЮрЛицо» — A=код, B=название.
+  function leadingDigits(v) {
+    const m = String(v || "").match(/^\s*(\d+)/);
+    return m ? m[1] : "";
+  }
+
+  // Текст после цифрового кода НЕ участвует в логике.
+  // 1-57-130(счет 167 от 01.09.26).pdf == 1-57-130.pdf
+  const legalCode  = leadingDigits(p[0]);
+  const objectCode = leadingDigits(p[1]);
+  const ddsCode    = leadingDigits(p[2]);
+  const mechCode   = leadingDigits(p[3]);
+
   const legalEntity = (Array.isArray(legalRows) ? legalRows : [])
-    .map(x => ({ code:String(x?.code || "").trim(), name:String(x?.name || "").trim() }))
-    .find(x => x.code && x.name && String(Number(x.code)) === String(Number(legalCode)))?.name || "";
+    .map(x => ({
+      code: String(x?.code || "").trim(),
+      name: String(x?.name || "").trim()
+    }))
+    .find(x =>
+      x.code &&
+      x.name &&
+      legalCode &&
+      String(Number(x.code)) === String(Number(legalCode))
+    )?.name || "";
 
-  // 2-я цифра: лист «Объект», колонка A.
-  // Например 03-М-Акм... -> код 03.
   let object = "";
-  if (objectCode && /^\d+$/.test(objectCode)) {
+  if (objectCode) {
     const n = String(Number(objectCode));
     object = (Array.isArray(objects) ? objects : []).find(v => {
       const m = String(v || "").trim().match(/^(\d+)/);
@@ -11809,10 +11822,8 @@ function doFtParseFilenameBackend_(fileName, legalRows, objects, dds) {
     }) || "";
   }
 
-  // 3-я цифра: лист «Статья ДДС», колонка B.
-  // Например 4. Выплаты... -> код 4.
   let ddsArticle = "";
-  if (ddsCode && /^\d+$/.test(ddsCode)) {
+  if (ddsCode) {
     const n = String(Number(ddsCode));
     ddsArticle = (Array.isArray(dds) ? dds : []).find(v => {
       const m = String(v || "").trim().match(/^(\d+)\s*\./);
@@ -11822,11 +11833,11 @@ function doFtParseFilenameBackend_(fileName, legalRows, objects, dds) {
 
   return {
     legal_entity: legalEntity,
+    mechanization: mechCode === "1" ? "Да" : "",
     object_code: objectCode,
-    object,
+    object: object,
     dds_code: ddsCode,
-    dds_article: ddsArticle,
-    mechanization: mechCode === "1" ? "Да" : ""
+    dds_article: ddsArticle
   };
 }
 
@@ -11887,10 +11898,20 @@ function doFtExtractContractPartsBackend_(v) {
 
   let number = "";
 
-  let m = text.match(/(?:№|no\.?|номер)\s*([A-Za-zА-Яа-я0-9]+(?:[-/][A-Za-zА-Яа-я0-9]+)*)/iu);
+  // Номер после № / No / Номер.
+  // Поддерживает:
+  // SNS26-MAT-P-20
+  // 160426/002
+  // 26-0001
+  // 020-08
+  let m = text.match(
+    /(?:№|no\.?|номер)\s*([A-Za-zА-Яа-я0-9]+(?:[-/][A-Za-zА-Яа-я0-9]+)*)/iu
+  );
 
   if (!m) {
-    m = text.match(/\b([A-Za-zА-Яа-я0-9]+(?:[-/][A-Za-zА-Яа-я0-9]+)+)\b/u);
+    m = text.match(
+      /\b([A-Za-zА-Яа-я0-9]+(?:[-/][A-Za-zА-Яа-я0-9]+)+)\b/u
+    );
   }
 
   if (m && m[1]) {
@@ -12035,26 +12056,30 @@ app.post("/do-ft/recognize", async (req, res) => {
 
     // Короткий промпт: не передаем справочники в модель — это экономит входные токены.
     const instruction = [
-      "Прочитай счет/инвойс и верни данные из самого документа.",
-      "contractor_raw: верни поставщика из строки 'Поставщик:'; если ее нет — самого Бенефициара. Не возвращай банк бенефициара, БИК, банк или покупателя.",
-      "Если поле невозможно прочитать — верни пустую строку. Не пиши 'Not specified clearly'.",
-      "contract_no: верни ТОЛЬКО номер договора и дату из PDF, без описания договора.",
-      "Не исправляй дату по справочнику — contract_no должен отражать именно PDF.",
+      "Прочитай ТОЛЬКО содержимое PDF. Имя файла полностью игнорируй: оно может содержать служебные коды, номер счета, дату и любой произвольный текст.",
+      "contractor_raw: верни поставщика из строки 'Поставщик:'; если такой строки нет — самого Бенефициара. Не возвращай банк бенефициара, БИК, банк или покупателя.",
+      "contract_no: найди номер договора и дату по смыслу, даже если рядом НЕТ слова 'Договор'.",
+      "Ищи варианты с маркерами 'Договор', 'Основание', 'No', '№', 'N', а также строки, где сразу указан номер вида букв/цифр с дефисами или слешами и рядом есть дата.",
+      "Верни ТОЛЬКО номер договора и дату из PDF, без описания услуги/товара.",
+      "Поддерживай номера с буквами, цифрами, дефисами и слешами: SNS26-MAT-P-20, 160426/002, 26-0001, 020-08.",
       "Пример: 'No 160426/002 от 16.04.2026 Хостинг' -> contract_no='160426/002 от 16.04.2026г.'.",
       "Пример: 'Договор поставки товара No 26-0001 от 09.01.2026г.' -> contract_no='26-0001 от 09.01.2026г.'.",
       "Пример: 'Договор №020-08 техническое обслуживание и ремонта автомобилей от 20.08.25 г.' -> contract_no='020-08 от 20.08.25 г.'.",
-      "Назначение платежа сформулируй кратко по товарам/услугам.",
-      "invoice_no: верни ТОЛЬКО номер счета, без слов 'Счет', 'Счет на оплату', '№', 'No' и без даты.",
-      "Дату счета верни YYYY-MM-DD.",
-      "Сумма — итог к оплате числом.",
-      "Ничего не выдумывай."
+      "Пример: 'Договор SNS26-MAT-P-20 от 13.05.2026' -> contract_no='SNS26-MAT-P-20 от 13.05.2026г.'.",
+      "Если строка выглядит просто как 'SNS26-MAT-P-20 от 13.05.2026' без слова Договор — тоже верни 'SNS26-MAT-P-20 от 13.05.2026г.'.",
+      "invoice_no: найди номер счета по смыслу, даже если нет точной фразы 'Счет на оплату'. Ищи 'Счет', 'Invoice', '№', 'No' рядом с номером документа.",
+      "Верни только номер счета, без слов Счет/Invoice/№/No и без даты.",
+      "invoice_date: верни дату счета YYYY-MM-DD.",
+      "sum_ft: бери ТОЛЬКО итоговую сумму к оплате из 'Итого', 'Всего', 'Всего к оплате', 'Total'. Не бери НДС, цену позиции или сумму одной строки.",
+      "pay_purpose: кратко опиши товары/услуги из строк таблицы.",
+      "Если поле реально невозможно прочитать — верни пустую строку. Не пиши 'Not specified clearly' и не придумывай значения."
     ].join("\n");
 
     const imageDetailRaw = String(process.env.OPENAI_IMAGE_DETAIL || "low").trim().toLowerCase();
     const imageDetail = ["low","high","auto"].includes(imageDetailRaw) ? imageDetailRaw : "low";
 
     const filePart = mimeType === "application/pdf"
-      ? { type:"input_file", filename:fileName, file_data:`data:${mimeType};base64,${base64}` }
+      ? { type:"input_file", filename:"document.pdf", file_data:`data:${mimeType};base64,${base64}` }
       : { type:"input_image", image_url:`data:${mimeType};base64,${base64}`, detail:imageDetail };
 
     const model = String(process.env.OPENAI_MODEL || "gpt-5-nano").trim();
