@@ -11836,6 +11836,8 @@ function doFtMatchContractorBackend_(rawName, contractors) {
 
   if (!raw) return { contractor:"", matched:false, method:"empty" };
 
+  // Берём название из кавычек, если есть:
+  // Индивидуальный предприниматель "JSJ MART" -> JSJ MART
   const quoted = raw.match(/[«"“”]([^«»"“”]+)[»"“”]/);
   const core = quoted && quoted[1] ? quoted[1].trim() : raw;
 
@@ -11863,19 +11865,6 @@ function doFtMatchContractorBackend_(rawName, contractors) {
   return { contractor:"", matched:false, method:"not_found" };
 }
 
-function doFtNormContract_(v) {
-  return String(v || "")
-    .toLowerCase()
-    .replace(/[№#]/g, " no ")
-    .replace(/\bномер\b/giu, " no ")
-    .replace(/\bno\.?\b/giu, " no ")
-    .replace(/\bот\b/giu, " от ")
-    .replace(/г\.?/giu, " ")
-    .replace(/[^a-zа-яё0-9]+/giu, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
 function doFtExtractContractPartsBackend_(v) {
   const text = String(v || "")
     .replace(/\u00A0/g, " ")
@@ -11883,20 +11872,24 @@ function doFtExtractContractPartsBackend_(v) {
     .trim();
 
   let number = "";
-  let m = text.match(/(?:№|no\.?|n\s*o?|номер)\s*([A-Za-zА-Яа-я0-9]+(?:[-/][A-Za-zА-Яа-я0-9]+)*)/iu);
+  let m = text.match(/(?:№|no\.?|номер)\s*([A-Za-zА-Яа-я0-9]+(?:[-/][A-Za-zА-Яа-я0-9]+)*)/iu);
+
   if (!m) {
     m = text.match(/\b([A-Za-zА-Яа-я0-9]+(?:[-/][A-Za-zА-Яа-я0-9]+)+)\b/u);
   }
+
   if (m && m[1]) number = String(m[1]).trim().toLowerCase();
 
   let date = "";
   const dm = text.match(/(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{2,4})/u);
+
   if (dm) {
     let yyyy = String(dm[3]);
     if (yyyy.length === 2) {
       const yy = Number(yyyy);
       yyyy = String(yy >= 70 ? 1900 + yy : 2000 + yy);
     }
+
     date =
       String(dm[1]).padStart(2, "0") + "." +
       String(dm[2]).padStart(2, "0") + "." +
@@ -11906,65 +11899,45 @@ function doFtExtractContractPartsBackend_(v) {
   return { number, date };
 }
 
-function doFtMatchContractBackend_(contractor, rawContract, contractRows) {
+function doFtFindContractRowByRaw_(rawContract, contractRows, contractor) {
+  const raw = String(rawContract || "").trim();
   const rows = Array.isArray(contractRows) ? contractRows : [];
-  const list = rows
-    .filter(x => String(x?.contractor || "").trim() === String(contractor || "").trim())
-    .map(x => String(x?.contract_no || "").trim())
-    .filter(Boolean);
+  if (!raw || !rows.length) return null;
 
-  if (!contractor || !rawContract || !list.length) {
-    return { contract_no:"", matched:false, method:"empty_or_no_contracts" };
-  }
+  const parts = doFtExtractContractPartsBackend_(raw);
+  if (!parts.number) return null;
 
-  const rawKey = doFtNormContract_(rawContract);
+  let candidates = rows.filter(x => {
+    const c = String(x?.contractor || "").trim();
+    const no = String(x?.contract_no || "").trim();
+    if (!c || !no) return false;
 
-  let found = list.find(x => doFtNormContract_(x) === rawKey);
-  if (found) {
-    return { contract_no:found, matched:true, method:"exact_sheet" };
-  }
+    if (contractor && doFtNorm_(c) !== doFtNorm_(contractor)) return false;
 
-  // Основное сравнение: номер + дата.
-  // Например:
-  // GPT: "№20-08 техническое обслуживание ... от 20.08.25 г."
-  // Sheet: "20-08 от 20.08.2025"
-  const rawParts = doFtExtractContractPartsBackend_(rawContract);
+    const p = doFtExtractContractPartsBackend_(no);
+    if (!p.number || p.number !== parts.number) return false;
 
-  if (rawParts.number) {
-    const candidates = list.filter(x => {
-      const p = doFtExtractContractPartsBackend_(x);
-      if (!p.number || p.number !== rawParts.number) return false;
-      if (rawParts.date && p.date) return p.date === rawParts.date;
+    if (parts.date && p.date) return p.date === parts.date;
+    return true;
+  });
+
+  if (candidates.length === 1) return candidates[0];
+
+  // Если с ограничением по контрагенту не нашли — ищем глобально по номеру+дате.
+  if (contractor && candidates.length === 0) {
+    candidates = rows.filter(x => {
+      const no = String(x?.contract_no || "").trim();
+      const p = doFtExtractContractPartsBackend_(no);
+      if (!p.number || p.number !== parts.number) return false;
+      if (parts.date && p.date) return p.date === parts.date;
       return true;
     });
 
-    if (candidates.length === 1) {
-      return { contract_no:candidates[0], matched:true, method:"number_date_sheet" };
-    }
-
-    if (rawParts.date && candidates.length > 1) {
-      const exactDate = candidates.find(
-        x => doFtExtractContractPartsBackend_(x).date === rawParts.date
-      );
-      if (exactDate) {
-        return { contract_no:exactDate, matched:true, method:"number_date_sheet" };
-      }
-    }
+    if (candidates.length === 1) return candidates[0];
   }
 
-  // Резерв по вхождению.
-  found = list.find(x => {
-    const k = doFtNormContract_(x);
-    return k && rawKey && (k.includes(rawKey) || rawKey.includes(k));
-  });
-
-  if (found) {
-    return { contract_no:found, matched:true, method:"contain_sheet" };
-  }
-
-  return { contract_no:"", matched:false, method:"not_found" };
+  return null;
 }
-
 app.post("/do-ft/recognize", async (req, res) => {
   try {
     const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
@@ -11994,22 +11967,17 @@ app.post("/do-ft/recognize", async (req, res) => {
 
     // Короткий промпт: не передаем справочники в модель — это экономит входные токены.
     const instruction = [
-      "Извлеки данные из счета/инвойса.",
-      "КРИТИЧНО для contractor_raw: поставщик — это организация/ИП из строки 'Поставщик:' или сам 'Бенефициар', которому принадлежит ИИК.",
-      "НИКОГДА не считай банком-поставщиком организацию из строк 'Банк бенефициара', 'Банк', 'БИК'.",
-      "Если есть одновременно 'Бенефициар: Changan Nurly Zhol' и 'Банк бенефициара: ForteBank', contractor_raw должен быть Changan Nurly Zhol, а НЕ ForteBank.",
-      "Покупателя также не возвращай как contractor_raw.",
-      "Если название поставщика указано в кавычках, сохрани название из кавычек вместе с юридической формой, если она явно есть.",
-      "Ничего не выдумывай.",
-      "Назначение платежа сформулируй кратко по товару/услуге из счета.",
+      "Прочитай счет/инвойс и верни данные из самого документа.",
+      "contractor_raw: верни ТЕКСТ поставщика из строки 'Поставщик:'; если строка Поставщик не видна — верни название самого Бенефициара.",
+      "Не возвращай банк бенефициара, БИК, банк или покупателя как contractor_raw.",
+      "Не пиши фразы 'Not specified clearly', 'не указано ясно' и подобные. Если поле действительно невозможно прочитать — верни пустую строку.",
+      "contract_no: верни текст после метки 'Договор:' с номером и датой. Можно сохранить описание между номером и датой.",
+      "Пример: 'Договор №20-08 техническое обслуживание и ремонта автомобилей от 20.08.25 г.' -> contract_no='№20-08 техническое обслуживание и ремонта автомобилей от 20.08.25 г.'.",
+      "Назначение платежа сформулируй кратко по товарам/услугам.",
       "Дату счета верни YYYY-MM-DD.",
       "Сумма — итог к оплате числом.",
-      "Поле contract_no: если в документе есть строка Договор/Основание, верни номер ВМЕСТЕ с датой.",
-      "Для contract_no сохрани сырой смысл строки договора: номер и дату; текст между номером и датой можно оставить.",
-      "Пример: 'Договор №20-08 техническое обслуживание и ремонта автомобилей от 20.08.25 г.' -> contract_no='№20-08 техническое обслуживание и ремонта автомобилей от 20.08.25 г.'.",
-      "Если договора действительно нет, contract_no пустая строка.",
-      "Если документ не читается, status=error; если есть сомнения в ключевых данных, status=needs_clarification."
-    ].join("\n");
+      "Ничего не выдумывай."
+    ].join("\\n");
 
     const imageDetailRaw = String(process.env.OPENAI_IMAGE_DETAIL || "low").trim().toLowerCase();
     const imageDetail = ["low","high","auto"].includes(imageDetailRaw) ? imageDetailRaw : "low";
@@ -12084,33 +12052,66 @@ app.post("/do-ft/recognize", async (req, res) => {
       return res.status(502).json({ success:false, error:"OPENAI_BAD_JSON", raw:outputText.slice(0,1000) });
     }
 
-    // Сопоставление контрагента — на backend, без дополнительных токенов.
-    const contractorMatch = doFtMatchContractorBackend_(extracted.contractor_raw, contractors);
-    const contractMatch = doFtMatchContractBackend_(contractorMatch.contractor, extracted.contract_no, contractRows);
+    // 1) Сначала пробуем контрагента по сырому ответу GPT.
+    let contractorMatch = doFtMatchContractorBackend_(extracted.contractor_raw, contractors);
+
+    // 2) Договор ищем по номеру + дате.
+    // Если договор однозначно найден в листе «Договоры»,
+    // его строка также является надежным источником контрагента.
+    let contractRow = doFtFindContractRowByRaw_(
+      extracted.contract_no,
+      contractRows,
+      contractorMatch.contractor
+    );
+
+    // 3) ВАЖНО: если GPT ошибся в контрагенте (например, вернул ForteBank
+    // или "Not specified clearly"), но договор однозначно найден,
+    // берем контрагента И договор ИЗ ОДНОЙ СТРОКИ листа «Договоры».
+    if (contractRow) {
+      contractorMatch = {
+        contractor: String(contractRow.contractor || "").trim(),
+        matched: true,
+        method: "contract_row_sheet"
+      };
+    }
+
+    // 4) После восстановления контрагента еще раз ищем договор только
+    // среди договоров этого контрагента.
+    if (!contractRow && contractorMatch.matched) {
+      contractRow = doFtFindContractRowByRaw_(
+        extracted.contract_no,
+        contractRows,
+        contractorMatch.contractor
+      );
+    }
 
     const data = {
       ...filenameInfo,
-      status: String(extracted.status || "needs_clarification"),
+      status: String(extracted.status || "ok"),
       contractor_raw: String(extracted.contractor_raw || "").trim(),
-      contractor: contractorMatch.contractor,
-      contractor_matched: contractorMatch.matched,
-      contractor_match_method: contractorMatch.method,
+      contractor: contractorMatch.contractor || "",
+      contractor_matched: !!contractorMatch.matched,
+      contractor_match_method: contractorMatch.method || "",
       pay_purpose: String(extracted.pay_purpose || "").trim(),
+
+      // raw = ровно то, что прочитал GPT
       contract_no_raw: String(extracted.contract_no || "").trim(),
-      contract_no: contractMatch.contract_no,
-      contract_matched: contractMatch.matched,
-      contract_match_method: contractMatch.method,
+
+      // contract_no = ТОЛЬКО точное значение из листа «Договоры»
+      contract_no: contractRow ? String(contractRow.contract_no || "").trim() : "",
+      contract_matched: !!contractRow,
+      contract_match_method: contractRow ? "number_date_sheet" : "not_found",
+
       invoice_no: String(extracted.invoice_no || "").trim(),
       invoice_date: String(extracted.invoice_date || "").trim(),
       sum_ft: extracted.sum_ft == null ? null : Number(extracted.sum_ft),
       reason: String(extracted.reason || "").trim()
     };
 
-    if (!contractorMatch.matched && data.status === "ok") {
+    if (!data.contractor) {
       data.status = "needs_clarification";
-      data.reason = [data.reason, "Контрагент не найден однозначно в справочнике"].filter(Boolean).join("; ");
+      data.reason = [data.reason, "Контрагент не найден в листе Договоры"].filter(Boolean).join("; ");
     }
-
     return res.json({ success:true, model, image_detail:imageDetail, data });
   } catch (e) {
     console.error("/do-ft/recognize:", e);
