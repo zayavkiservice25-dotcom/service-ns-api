@@ -11865,6 +11865,20 @@ function doFtMatchContractorBackend_(rawName, contractors) {
   return { contractor:"", matched:false, method:"not_found" };
 }
 
+function doFtNormalizeContractNumberToken_(v) {
+  const raw = String(v || "").trim().toLowerCase();
+  if (!raw) return "";
+
+  return raw
+    .split(/([-/])/)
+    .map(part => {
+      if (part === "-" || part === "/") return part;
+      if (/^\d+$/.test(part)) return String(Number(part));
+      return part;
+    })
+    .join("");
+}
+
 function doFtExtractContractPartsBackend_(v) {
   const text = String(v || "")
     .replace(/\u00A0/g, " ")
@@ -11872,19 +11886,23 @@ function doFtExtractContractPartsBackend_(v) {
     .trim();
 
   let number = "";
+
   let m = text.match(/(?:№|no\.?|номер)\s*([A-Za-zА-Яа-я0-9]+(?:[-/][A-Za-zА-Яа-я0-9]+)*)/iu);
 
   if (!m) {
     m = text.match(/\b([A-Za-zА-Яа-я0-9]+(?:[-/][A-Za-zА-Яа-я0-9]+)+)\b/u);
   }
 
-  if (m && m[1]) number = String(m[1]).trim().toLowerCase();
+  if (m && m[1]) {
+    number = doFtNormalizeContractNumberToken_(m[1]);
+  }
 
   let date = "";
   const dm = text.match(/(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{2,4})/u);
 
   if (dm) {
     let yyyy = String(dm[3]);
+
     if (yyyy.length === 2) {
       const yy = Number(yyyy);
       yyyy = String(yy >= 70 ? 1900 + yy : 2000 + yy);
@@ -11898,47 +11916,68 @@ function doFtExtractContractPartsBackend_(v) {
 
   return { number, date };
 }
-
 function doFtFindContractRowByRaw_(rawContract, contractRows, contractor) {
   const raw = String(rawContract || "").trim();
   const rows = Array.isArray(contractRows) ? contractRows : [];
   if (!raw || !rows.length) return null;
 
-  const parts = doFtExtractContractPartsBackend_(raw);
-  if (!parts.number) return null;
+  const rawParts = doFtExtractContractPartsBackend_(raw);
+  if (!rawParts.number) return null;
 
-  let candidates = rows.filter(x => {
+  const contractorKey = doFtNorm_(contractor || "");
+
+  // Сначала только зависимый список найденного контрагента.
+  let scoped = rows.filter(x => {
     const c = String(x?.contractor || "").trim();
     const no = String(x?.contract_no || "").trim();
     if (!c || !no) return false;
-
-    if (contractor && doFtNorm_(c) !== doFtNorm_(contractor)) return false;
-
-    const p = doFtExtractContractPartsBackend_(no);
-    if (!p.number || p.number !== parts.number) return false;
-
-    if (parts.date && p.date) return p.date === parts.date;
+    if (contractorKey && doFtNorm_(c) !== contractorKey) return false;
     return true;
   });
 
-  if (candidates.length === 1) return candidates[0];
+  // Главное правило — номер договора.
+  // Дата нужна только если у одного контрагента есть несколько строк
+  // с одинаковым номером договора.
+  let sameNumber = scoped.filter(x => {
+    const p = doFtExtractContractPartsBackend_(x.contract_no);
+    return p.number && p.number === rawParts.number;
+  });
 
-  // Если с ограничением по контрагенту не нашли — ищем глобально по номеру+дате.
-  if (contractor && candidates.length === 0) {
-    candidates = rows.filter(x => {
-      const no = String(x?.contract_no || "").trim();
-      const p = doFtExtractContractPartsBackend_(no);
-      if (!p.number || p.number !== parts.number) return false;
-      if (parts.date && p.date) return p.date === parts.date;
-      return true;
+  if (sameNumber.length === 1) {
+    return sameNumber[0];
+  }
+
+  if (sameNumber.length > 1 && rawParts.date) {
+    const sameDate = sameNumber.filter(x => {
+      const p = doFtExtractContractPartsBackend_(x.contract_no);
+      return p.date && p.date === rawParts.date;
     });
 
-    if (candidates.length === 1) return candidates[0];
+    if (sameDate.length === 1) return sameDate[0];
+  }
+
+  // Резерв: если GPT не определил контрагента, но по всему листу
+  // номер договора встречается ровно один раз — можно восстановить
+  // и договор, и контрагента из этой строки.
+  if (!contractorKey) {
+    sameNumber = rows.filter(x => {
+      const p = doFtExtractContractPartsBackend_(x?.contract_no);
+      return p.number && p.number === rawParts.number;
+    });
+
+    if (sameNumber.length === 1) return sameNumber[0];
+
+    if (sameNumber.length > 1 && rawParts.date) {
+      const sameDate = sameNumber.filter(x => {
+        const p = doFtExtractContractPartsBackend_(x?.contract_no);
+        return p.date && p.date === rawParts.date;
+      });
+      if (sameDate.length === 1) return sameDate[0];
+    }
   }
 
   return null;
 }
-
 function doFtExtractInvoiceNo_(v) {
   const text = String(v || "")
     .replace(/\u00A0/g, " ")
@@ -11997,18 +12036,19 @@ app.post("/do-ft/recognize", async (req, res) => {
     // Короткий промпт: не передаем справочники в модель — это экономит входные токены.
     const instruction = [
       "Прочитай счет/инвойс и верни данные из самого документа.",
-      "contractor_raw: верни ТЕКСТ поставщика из строки 'Поставщик:'; если строка Поставщик не видна — верни название самого Бенефициара.",
-      "Не возвращай банк бенефициара, БИК, банк или покупателя как contractor_raw.",
-      "Не пиши фразы 'Not specified clearly', 'не указано ясно' и подобные. Если поле действительно невозможно прочитать — верни пустую строку.",
-      "contract_no: верни текст после метки 'Договор:' с номером и датой. Можно сохранить описание между номером и датой.",
-      "Пример: 'Договор №20-08 техническое обслуживание и ремонта автомобилей от 20.08.25 г.' -> contract_no='№20-08 техническое обслуживание и ремонта автомобилей от 20.08.25 г.'.",
+      "contractor_raw: верни поставщика из строки 'Поставщик:'; если ее нет — самого Бенефициара. Не возвращай банк бенефициара, БИК, банк или покупателя.",
+      "Если поле невозможно прочитать — верни пустую строку. Не пиши 'Not specified clearly'.",
+      "contract_no: верни ТОЛЬКО номер договора и дату из PDF, без описания договора.",
+      "Не исправляй дату по справочнику — contract_no должен отражать именно PDF.",
+      "Пример: 'No 160426/002 от 16.04.2026 Хостинг' -> contract_no='160426/002 от 16.04.2026г.'.",
+      "Пример: 'Договор поставки товара No 26-0001 от 09.01.2026г.' -> contract_no='26-0001 от 09.01.2026г.'.",
+      "Пример: 'Договор №020-08 техническое обслуживание и ремонта автомобилей от 20.08.25 г.' -> contract_no='020-08 от 20.08.25 г.'.",
       "Назначение платежа сформулируй кратко по товарам/услугам.",
       "invoice_no: верни ТОЛЬКО номер счета, без слов 'Счет', 'Счет на оплату', '№', 'No' и без даты.",
-      "Пример: 'Счет на оплату № 00000001830 от 31 августа 2026 г.' -> invoice_no='00000001830'.",
       "Дату счета верни YYYY-MM-DD.",
       "Сумма — итог к оплате числом.",
       "Ничего не выдумывай."
-    ].join("\\n");
+    ].join("\n");
 
     const imageDetailRaw = String(process.env.OPENAI_IMAGE_DETAIL || "low").trim().toLowerCase();
     const imageDetail = ["low","high","auto"].includes(imageDetailRaw) ? imageDetailRaw : "low";
