@@ -11756,15 +11756,18 @@ function doFtExtractOutputText_(json) {
 function doFtNorm_(v) {
   return String(v || "")
     .toLowerCase()
-    .replace(/[«»„“”"'`]/g, "")
-    .replace(/\bпоставщик\b/giu, " ")
-    .replace(/\bтоварищество\s+с\s+ограниченной\s+ответственностью\b/giu, " ")
-    .replace(/\b(тоо|too|llp|ао|ao|ип|ip)\b/giu, " ")
+    .replace(/[«»„“”"'`]/g, " ")
+    .replace(/поставщик/giu, " ")
+    .replace(/товарищество\s+с\s+ограниченной\s+ответственностью/giu, " ")
+    .replace(/индивидуальн(?:ый|ого)\s+предпринимател(?:ь|я)/giu, " ")
+    .replace(/(?:^|[^a-zа-яё0-9])(тоо|too|llp|ао|ao|ип|ip)(?=$|[^a-zа-яё0-9])/giu, " ")
+    .replace(/бин\s*\/?\s*иин/giu, " ")
+    .replace(/(?:бин|иин)/giu, " ")
+    .replace(/\d{12}/g, " ")
     .replace(/[^a-zа-яё0-9]+/giu, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
-
 function doFtUniqueStrings_(arr) {
   const seen = new Set();
   const out = [];
@@ -11829,52 +11832,88 @@ function doFtParseFilenameBackend_(fileName, legalRows, objects, dds) {
 
 function doFtMatchContractorBackend_(rawName, contractors) {
   const source = doFtUniqueStrings_(contractors);
-  const rawKey = doFtNorm_(rawName);
+  const raw = String(rawName || "").replace(/\s+/g, " ").trim();
 
-  if (!rawKey) {
-    return {
-      contractor: "",
-      matched: false,
-      method: "empty"
-    };
+  if (!raw) return { contractor:"", matched:false, method:"empty" };
+
+  const quoted = raw.match(/[«"“”]([^«»"“”]+)[»"“”]/);
+  const core = quoted && quoted[1] ? quoted[1].trim() : raw;
+
+  const coreKey = doFtNorm_(core);
+  const rawKey = doFtNorm_(raw);
+
+  const prepared = source
+    .map(original => ({ original, key: doFtNorm_(original) }))
+    .filter(x => x.key);
+
+  let found = prepared.find(x => x.key === coreKey || x.key === rawKey);
+  if (found) return { contractor:found.original, matched:true, method:"exact_sheet" };
+
+  const candidates = prepared
+    .filter(x =>
+      (coreKey && (x.key.includes(coreKey) || coreKey.includes(x.key))) ||
+      (rawKey && (x.key.includes(rawKey) || rawKey.includes(x.key)))
+    )
+    .sort((a,b) => b.key.length - a.key.length);
+
+  if (candidates.length) {
+    return { contractor:candidates[0].original, matched:true, method:"contain_sheet" };
   }
 
-  // 1. Сначала точное совпадение после очистки названия.
-  const exact = source.find(x => doFtNorm_(x) === rawKey);
-
-  if (exact) {
-    return {
-      contractor: exact,   // возвращаем ТОЧНО как написано в Google Sheet
-      matched: true,
-      method: "exact"
-    };
-  }
-
-  // 2. Если AI добавил "ТОО", "Поставщик" и т.п. —
-  // ищем название из справочника внутри распознанной строки.
-  const contain = source.find(x => {
-    const key = doFtNorm_(x);
-
-    if (!key || key.length < 5) return false;
-
-    return rawKey.includes(key) || key.includes(rawKey);
-  });
-
-  if (contain) {
-    return {
-      contractor: contain, // ТОЧНО значение из Google Sheet
-      matched: true,
-      method: "contain"
-    };
-  }
-
-  return {
-    contractor: "",
-    matched: false,
-    method: "not_found"
-  };
+  return { contractor:"", matched:false, method:"not_found" };
 }
 
+function doFtNormContract_(v) {
+  return String(v || "")
+    .toLowerCase()
+    .replace(/[№#]/g, " no ")
+    .replace(/\bномер\b/giu, " no ")
+    .replace(/\bno\.?\b/giu, " no ")
+    .replace(/\bот\b/giu, " от ")
+    .replace(/г\.?/giu, " ")
+    .replace(/[^a-zа-яё0-9]+/giu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function doFtMatchContractBackend_(contractor, rawContract, contractRows) {
+  const rows = Array.isArray(contractRows) ? contractRows : [];
+  const list = rows
+    .filter(x => String(x?.contractor || "").trim() === String(contractor || "").trim())
+    .map(x => String(x?.contract_no || "").trim())
+    .filter(Boolean);
+
+  if (!contractor || !rawContract || !list.length) {
+    return { contract_no:"", matched:false, method:"empty_or_no_contracts" };
+  }
+
+  const rawKey = doFtNormContract_(rawContract);
+
+  let found = list.find(x => doFtNormContract_(x) === rawKey);
+  if (found) return { contract_no:found, matched:true, method:"exact_sheet" };
+
+  found = list.find(x => {
+    const k = doFtNormContract_(x);
+    return k && rawKey && (k.includes(rawKey) || rawKey.includes(k));
+  });
+  if (found) return { contract_no:found, matched:true, method:"contain_sheet" };
+
+  const noMatch = String(rawContract).match(/(?:№|no\.?|номер)?\s*([A-Za-zА-Яа-я0-9]+(?:[-/][A-Za-zА-Яа-я0-9]+)+)/iu);
+  const dateMatch = String(rawContract).match(/(\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4})/u);
+  const noToken = noMatch ? doFtNormContract_(noMatch[1]) : "";
+  const dateToken = dateMatch ? doFtNormContract_(dateMatch[1]) : "";
+
+  const candidates = list.filter(x => {
+    const k = doFtNormContract_(x);
+    return (!noToken || k.includes(noToken)) && (!dateToken || k.includes(dateToken));
+  });
+
+  if (candidates.length === 1) {
+    return { contract_no:candidates[0], matched:true, method:"number_date_sheet" };
+  }
+
+  return { contract_no:"", matched:false, method:candidates.length > 1 ? "ambiguous" : "not_found" };
+}
 app.post("/do-ft/recognize", async (req, res) => {
   try {
     const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
@@ -11886,6 +11925,7 @@ app.post("/do-ft/recognize", async (req, res) => {
     const mimeType = String(req.body?.mime_type || "application/pdf").trim().toLowerCase();
     const base64 = String(req.body?.base64 || "").trim();
     const contractors = doFtUniqueStrings_(req.body?.contractors);
+    const contractRows = Array.isArray(req.body?.contract_rows) ? req.body.contract_rows : [];
     const filenameDicts = req.body?.filename_dicts || {};
     const legalRows = Array.isArray(filenameDicts.legal) ? filenameDicts.legal : [];
     const objects = doFtUniqueStrings_(filenameDicts.objects);
@@ -11992,6 +12032,7 @@ app.post("/do-ft/recognize", async (req, res) => {
 
     // Сопоставление контрагента — на backend, без дополнительных токенов.
     const contractorMatch = doFtMatchContractorBackend_(extracted.contractor_raw, contractors);
+    const contractMatch = doFtMatchContractBackend_(contractorMatch.contractor, extracted.contract_no, contractRows);
 
     const data = {
       ...filenameInfo,
@@ -12001,7 +12042,10 @@ app.post("/do-ft/recognize", async (req, res) => {
       contractor_matched: contractorMatch.matched,
       contractor_match_method: contractorMatch.method,
       pay_purpose: String(extracted.pay_purpose || "").trim(),
-      contract_no: String(extracted.contract_no || "").trim(),
+      contract_no_raw: String(extracted.contract_no || "").trim(),
+      contract_no: contractMatch.contract_no,
+      contract_matched: contractMatch.matched,
+      contract_match_method: contractMatch.method,
       invoice_no: String(extracted.invoice_no || "").trim(),
       invoice_date: String(extracted.invoice_date || "").trim(),
       sum_ft: extracted.sum_ft == null ? null : Number(extracted.sum_ft),
