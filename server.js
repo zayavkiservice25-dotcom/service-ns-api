@@ -6809,6 +6809,7 @@ app.post("/cancel-rejected-ft-lines", async (req, res) => {
             AND (
               LOWER(TRIM(COALESCE(h.acc_zhas_status, ''))) = 'отклонено'
               OR LOWER(TRIM(COALESCE(h.acc_zhasulan_status, ''))) = 'отклонено'
+              OR LOWER(TRIM(COALESCE(h.acc_zaitova_status, ''))) = 'отклонено'
               OR LOWER(TRIM(COALESCE(h.approve_ermek_status, ''))) = 'отклонено'
             )
         )
@@ -6856,6 +6857,7 @@ app.post("/cancel-rejected-ft-lines", async (req, res) => {
               AND (
               LOWER(TRIM(COALESCE(h.acc_zhas_status, ''))) = 'отклонено'
               OR LOWER(TRIM(COALESCE(h.acc_zhasulan_status, ''))) = 'отклонено'
+              OR LOWER(TRIM(COALESCE(h.acc_zaitova_status, ''))) = 'отклонено'
               OR LOWER(TRIM(COALESCE(h.approve_ermek_status, ''))) = 'отклонено'
             )
           ) AS request_id
@@ -6870,6 +6872,7 @@ app.post("/cancel-rejected-ft-lines", async (req, res) => {
               AND (
               LOWER(TRIM(COALESCE(h.acc_zhas_status, ''))) = 'отклонено'
               OR LOWER(TRIM(COALESCE(h.acc_zhasulan_status, ''))) = 'отклонено'
+              OR LOWER(TRIM(COALESCE(h.acc_zaitova_status, ''))) = 'отклонено'
               OR LOWER(TRIM(COALESCE(h.approve_ermek_status, ''))) = 'отклонено'
             )
           )
