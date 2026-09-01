@@ -11876,6 +11876,36 @@ function doFtNormContract_(v) {
     .trim();
 }
 
+function doFtExtractContractPartsBackend_(v) {
+  const text = String(v || "")
+    .replace(/\u00A0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  let number = "";
+  let m = text.match(/(?:№|no\.?|n\s*o?|номер)\s*([A-Za-zА-Яа-я0-9]+(?:[-/][A-Za-zА-Яа-я0-9]+)*)/iu);
+  if (!m) {
+    m = text.match(/\b([A-Za-zА-Яа-я0-9]+(?:[-/][A-Za-zА-Яа-я0-9]+)+)\b/u);
+  }
+  if (m && m[1]) number = String(m[1]).trim().toLowerCase();
+
+  let date = "";
+  const dm = text.match(/(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{2,4})/u);
+  if (dm) {
+    let yyyy = String(dm[3]);
+    if (yyyy.length === 2) {
+      const yy = Number(yyyy);
+      yyyy = String(yy >= 70 ? 1900 + yy : 2000 + yy);
+    }
+    date =
+      String(dm[1]).padStart(2, "0") + "." +
+      String(dm[2]).padStart(2, "0") + "." +
+      yyyy;
+  }
+
+  return { number, date };
+}
+
 function doFtMatchContractBackend_(contractor, rawContract, contractRows) {
   const rows = Array.isArray(contractRows) ? contractRows : [];
   const list = rows
@@ -11890,30 +11920,51 @@ function doFtMatchContractBackend_(contractor, rawContract, contractRows) {
   const rawKey = doFtNormContract_(rawContract);
 
   let found = list.find(x => doFtNormContract_(x) === rawKey);
-  if (found) return { contract_no:found, matched:true, method:"exact_sheet" };
+  if (found) {
+    return { contract_no:found, matched:true, method:"exact_sheet" };
+  }
 
+  // Основное сравнение: номер + дата.
+  // Например:
+  // GPT: "№20-08 техническое обслуживание ... от 20.08.25 г."
+  // Sheet: "20-08 от 20.08.2025"
+  const rawParts = doFtExtractContractPartsBackend_(rawContract);
+
+  if (rawParts.number) {
+    const candidates = list.filter(x => {
+      const p = doFtExtractContractPartsBackend_(x);
+      if (!p.number || p.number !== rawParts.number) return false;
+      if (rawParts.date && p.date) return p.date === rawParts.date;
+      return true;
+    });
+
+    if (candidates.length === 1) {
+      return { contract_no:candidates[0], matched:true, method:"number_date_sheet" };
+    }
+
+    if (rawParts.date && candidates.length > 1) {
+      const exactDate = candidates.find(
+        x => doFtExtractContractPartsBackend_(x).date === rawParts.date
+      );
+      if (exactDate) {
+        return { contract_no:exactDate, matched:true, method:"number_date_sheet" };
+      }
+    }
+  }
+
+  // Резерв по вхождению.
   found = list.find(x => {
     const k = doFtNormContract_(x);
     return k && rawKey && (k.includes(rawKey) || rawKey.includes(k));
   });
-  if (found) return { contract_no:found, matched:true, method:"contain_sheet" };
 
-  const noMatch = String(rawContract).match(/(?:№|no\.?|номер)?\s*([A-Za-zА-Яа-я0-9]+(?:[-/][A-Za-zА-Яа-я0-9]+)+)/iu);
-  const dateMatch = String(rawContract).match(/(\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4})/u);
-  const noToken = noMatch ? doFtNormContract_(noMatch[1]) : "";
-  const dateToken = dateMatch ? doFtNormContract_(dateMatch[1]) : "";
-
-  const candidates = list.filter(x => {
-    const k = doFtNormContract_(x);
-    return (!noToken || k.includes(noToken)) && (!dateToken || k.includes(dateToken));
-  });
-
-  if (candidates.length === 1) {
-    return { contract_no:candidates[0], matched:true, method:"number_date_sheet" };
+  if (found) {
+    return { contract_no:found, matched:true, method:"contain_sheet" };
   }
 
-  return { contract_no:"", matched:false, method:candidates.length > 1 ? "ambiguous" : "not_found" };
+  return { contract_no:"", matched:false, method:"not_found" };
 }
+
 app.post("/do-ft/recognize", async (req, res) => {
   try {
     const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
