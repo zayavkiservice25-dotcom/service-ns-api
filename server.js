@@ -3831,45 +3831,10 @@ app.get("/request-list", async (req, res) => {
       `;
 
 } else if (login === "s_zhasulan") {
-  params.push("Сервис НС");
-  params.push("s_zhasulan");
-
-  whereSql = `
-    WHERE
-      (
-        /* Обычная логика Сулейменова:
-           показываем всё, кроме Сервис НС */
-        NOT EXISTS (
-          SELECT 1
-          FROM public.request_items ri
-          LEFT JOIN public.ft_zvk_current_v2 cur
-            ON cur.zvk_row_id = ri.zvk_row_id
-          WHERE ri.request_id = request_head.id
-            AND lower(trim(
-              COALESCE(
-                NULLIF(cur.legal_entity, ''),
-                NULLIF(ri.src_d, ''),
-                ''
-              )
-            )) = lower($1)
-        )
-      )
-
-      OR
-
-      (
-        /* Но свои заявки он видит всегда как инициатор */
-        lower(trim(COALESCE(request_head.created_by, ''))) = lower($2)
-
-        OR EXISTS (
-          SELECT 1
-          FROM public.request_items ri
-          WHERE ri.request_id = request_head.id
-            AND lower(trim(COALESCE(ri.input_name, ''))) = lower($2)
-        )
-      )
-  `;
-
+  // Сулейменов видит ВСЕ реестры,
+  // включая Сервис НС до согласования Заитовой.
+  // Право согласования определяется отдельно.
+  whereSql = "";
     } else if (login === ISMAGULOV_LOGIN) {
       /*
        * Исмагулов согласует ПЕРВЫМ.
