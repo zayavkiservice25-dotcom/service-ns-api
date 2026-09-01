@@ -11938,6 +11938,35 @@ function doFtFindContractRowByRaw_(rawContract, contractRows, contractor) {
 
   return null;
 }
+
+function doFtExtractInvoiceNo_(v) {
+  const text = String(v || "")
+    .replace(/\u00A0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!text) return "";
+
+  // Примеры:
+  // "Счет на оплату № 00000001830" -> "00000001830"
+  // "Счет №937" -> "937"
+  // "Invoice No 123-45" -> "123-45"
+  let m = text.match(/(?:сч[её]т(?:\s+на\s+оплату)?|invoice)?\s*(?:№|no\.?|номер)\s*([A-Za-zА-Яа-я0-9][A-Za-zА-Яа-я0-9._\/-]*)/iu);
+
+  if (m && m[1]) {
+    return String(m[1]).trim();
+  }
+
+  // Если GPT уже вернул только номер — сохраняем как есть.
+  if (/^[A-Za-zА-Яа-я0-9][A-Za-zА-Яа-я0-9._\/-]*$/u.test(text)) {
+    return text;
+  }
+
+  // Последний резерв: длинный числовой/буквенно-цифровой токен.
+  m = text.match(/([A-Za-zА-Яа-я0-9][A-Za-zА-Яа-я0-9._\/-]{2,})/u);
+  return m && m[1] ? String(m[1]).trim() : "";
+}
+
 app.post("/do-ft/recognize", async (req, res) => {
   try {
     const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
@@ -11974,6 +12003,8 @@ app.post("/do-ft/recognize", async (req, res) => {
       "contract_no: верни текст после метки 'Договор:' с номером и датой. Можно сохранить описание между номером и датой.",
       "Пример: 'Договор №20-08 техническое обслуживание и ремонта автомобилей от 20.08.25 г.' -> contract_no='№20-08 техническое обслуживание и ремонта автомобилей от 20.08.25 г.'.",
       "Назначение платежа сформулируй кратко по товарам/услугам.",
+      "invoice_no: верни ТОЛЬКО номер счета, без слов 'Счет', 'Счет на оплату', '№', 'No' и без даты.",
+      "Пример: 'Счет на оплату № 00000001830 от 31 августа 2026 г.' -> invoice_no='00000001830'.",
       "Дату счета верни YYYY-MM-DD.",
       "Сумма — итог к оплате числом.",
       "Ничего не выдумывай."
@@ -12102,7 +12133,7 @@ app.post("/do-ft/recognize", async (req, res) => {
       contract_matched: !!contractRow,
       contract_match_method: contractRow ? "number_date_sheet" : "not_found",
 
-      invoice_no: String(extracted.invoice_no || "").trim(),
+      invoice_no: doFtExtractInvoiceNo_(extracted.invoice_no),
       invoice_date: String(extracted.invoice_date || "").trim(),
       sum_ft: extracted.sum_ft == null ? null : Number(extracted.sum_ft),
       reason: String(extracted.reason || "").trim()
