@@ -12025,6 +12025,9 @@ app.post("/do-ft/recognize", async (req, res) => {
     // Короткий промпт: не передаем справочники в модель — это экономит входные токены.
     const instruction = [
       "Прочитай ТОЛЬКО содержимое PDF. Имя файла полностью игнорируй: оно может содержать служебные коды, номер счета, дату и любой произвольный текст.",
+      "Сначала определи is_invoice. is_invoice=true ТОЛЬКО если документ по смыслу является счетом/инвойсом на оплату. Слова 'Счет на оплату' могут отсутствовать.",
+      "is_invoice=false для договора, акта, накладной, доверенности, письма, банковских реквизитов, коммерческого предложения и любого другого документа, который не является счетом/инвойсом на оплату.",
+      "Если is_invoice=false, document_type кратко укажи тип документа, например 'Договор', 'Акт', 'Накладная', 'Не счет'.",
       "contractor_raw: верни поставщика из строки 'Поставщик:'; если такой строки нет — самого Бенефициара. Не возвращай банк бенефициара, БИК, банк или покупателя.",
       "contract_no: найди номер договора и дату по смыслу, даже если рядом НЕТ слова 'Договор'.",
       "Ищи варианты с маркерами 'Договор', 'Основание', 'No', '№', 'N', а также строки, где сразу указан номер вида букв/цифр с дефисами или слешами и рядом есть дата.",
@@ -12080,6 +12083,8 @@ app.post("/do-ft/recognize", async (req, res) => {
               additionalProperties:false,
               properties:{
                 status:{type:"string",enum:["ok","needs_clarification","error"]},
+                is_invoice:{type:"boolean"},
+                document_type:{type:"string"},
                 contractor_raw:{type:"string"},
                 pay_purpose:{type:"string"},
                 contract_no:{type:"string"},
@@ -12088,7 +12093,7 @@ app.post("/do-ft/recognize", async (req, res) => {
                 sum_ft:{type:["number","null"]},
                 reason:{type:"string"}
               },
-              required:["status","contractor_raw","pay_purpose","contract_no","invoice_no","invoice_date","sum_ft","reason"]
+              required:["status","is_invoice","document_type","contractor_raw","pay_purpose","contract_no","invoice_no","invoice_date","sum_ft","reason"]
             }
           }
         }
@@ -12152,6 +12157,8 @@ app.post("/do-ft/recognize", async (req, res) => {
     const data = {
       ...filenameInfo,
       status: String(extracted.status || "ok"),
+      is_invoice: extracted.is_invoice === true,
+      document_type: String(extracted.document_type || "").trim(),
       contractor_raw: String(extracted.contractor_raw || "").trim(),
       contractor: contractorMatch.contractor || "",
       contractor_matched: !!contractorMatch.matched,
@@ -12172,9 +12179,17 @@ app.post("/do-ft/recognize", async (req, res) => {
       reason: String(extracted.reason || "").trim()
     };
 
-    if (!data.contractor) {
+    if (data.is_invoice && !data.contractor) {
       data.status = "needs_clarification";
       data.reason = [data.reason, "Контрагент не найден в листе Договоры"].filter(Boolean).join("; ");
+    }
+
+    if (!data.is_invoice) {
+      data.status = "ok";
+      data.contractor = "";
+      data.contract_matched = false;
+      data.contract_no = "";
+      data.contract_matched = false;
     }
     return res.json({ success:true, model, image_detail:imageDetail, data });
   } catch (e) {
