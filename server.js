@@ -6585,12 +6585,11 @@ z_karlygash: {
 
     /*
      * ФИНАЛЬНОЕ УТВЕРЖДЕНИЕ ЕРМЕКА:
-     * после текущего утверждения Источник Объект НЕ должен уйти в минус.
+     * утверждение запрещено только если «Остаток после Касенова Е.Е» уже меньше нуля.
      *
      * Важно:
-     * - проверяем не просто «Остаток после оплаты» (s.balance),
-     *   а «Остаток после Касенова Е.Е» (s.balance_kasenov),
-     *   то есть уже с учётом ранее утверждённых Ермеком заявок;
+     * - проверяем готовое поле «Остаток после Касенова Е.Е» (s.balance_kasenov);
+     * - сумму текущей заявки повторно НЕ вычитаем, потому что она уже учтена в этом остатке;
      * - advisory lock не даёт двум параллельным утверждениям одного
      *   Источник Объекта одновременно пройти проверку на одном остатке.
      */
@@ -6609,12 +6608,10 @@ z_karlygash: {
 
       const balanceCheck = await client.query(`
         WITH request_sources AS (
-          SELECT
-            NULLIF(trim(i.src_o), '') AS source_object,
-            COALESCE(SUM(i.to_pay), 0)::numeric AS request_to_pay
+          SELECT DISTINCT
+            NULLIF(trim(i.src_o), '') AS source_object
           FROM public.request_items i
           WHERE i.request_id = $1
-          GROUP BY NULLIF(trim(i.src_o), '')
         ), object_balances AS (
           SELECT
             lower(trim(s.object_name)) AS object_key,
@@ -6624,24 +6621,12 @@ z_karlygash: {
         )
         SELECT
           rs.source_object,
-          rs.request_to_pay,
-          COALESCE(ob.balance_after_kasenov, 0)::numeric AS balance_after_kasenov,
-          (
-            COALESCE(ob.balance_after_kasenov, 0)::numeric
-            - COALESCE(rs.request_to_pay, 0)::numeric
-          ) AS balance_after_this_approve
+          COALESCE(ob.balance_after_kasenov, 0)::numeric AS balance_after_kasenov
         FROM request_sources rs
         LEFT JOIN object_balances ob
           ON ob.object_key = lower(trim(rs.source_object))
         WHERE rs.source_object IS NULL
-           OR (
-                rs.request_to_pay > 0
-                AND COALESCE(ob.balance_after_kasenov, 0) <= 0
-              )
-           OR (
-                COALESCE(ob.balance_after_kasenov, 0)::numeric
-                - COALESCE(rs.request_to_pay, 0)::numeric
-              ) < -0.005
+           OR COALESCE(ob.balance_after_kasenov, 0)::numeric < -0.005
         ORDER BY rs.source_object NULLS FIRST
       `, [requestId]);
 
@@ -6658,17 +6643,15 @@ z_karlygash: {
 
           return (
             `${row.source_object}: ` +
-            `к оплате ${money(row.request_to_pay)} ₸, ` +
-            `остаток после Касенова ${money(row.balance_after_kasenov)} ₸, ` +
-            `после этого утверждения будет ${money(row.balance_after_this_approve)} ₸`
+            `остаток после Касенова ${money(row.balance_after_kasenov)} ₸`
           );
         }).join("; ");
 
         const err = new Error(
-          "Утверждение невозможно. Источник Объект уйдёт в минус: " + details
+          "Утверждение невозможно. Остаток после Касенова Е.Е меньше нуля: " + details
         );
         err.statusCode = 409;
-        err.errorCode = "SOURCE_OBJECT_WOULD_GO_NEGATIVE";
+        err.errorCode = "SOURCE_OBJECT_KASENOV_BALANCE_NEGATIVE";
         throw err;
       }
     }
