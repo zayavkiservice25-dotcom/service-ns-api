@@ -6585,11 +6585,28 @@ z_karlygash: {
 
     /*
      * ФИНАЛЬНОЕ УТВЕРЖДЕНИЕ ЕРМЕКА:
-     * сумма «К оплате» по каждому Источник Объект не должна превышать
-     * «Остаток после оплаты» этого же объекта из public.svod_object_v1.
-     * Проверка выполняется на сервере, поэтому её нельзя обойти из браузера.
+     * после текущего утверждения Источник Объект НЕ должен уйти в минус.
+     *
+     * Важно:
+     * - проверяем не просто «Остаток после оплаты» (s.balance),
+     *   а «Остаток после Касенова Е.Е» (s.balance_kasenov),
+     *   то есть уже с учётом ранее утверждённых Ермеком заявок;
+     * - advisory lock не даёт двум параллельным утверждениям одного
+     *   Источник Объекта одновременно пройти проверку на одном остатке.
      */
     if (login === "k_ermek" && action === "approve") {
+
+      await client.query(`
+        SELECT pg_advisory_xact_lock(hashtext(x.object_key))
+        FROM (
+          SELECT DISTINCT lower(trim(i.src_o)) AS object_key
+          FROM public.request_items i
+          WHERE i.request_id = $1
+            AND NULLIF(trim(i.src_o), '') IS NOT NULL
+          ORDER BY lower(trim(i.src_o))
+        ) x
+      `, [requestId]);
+
       const balanceCheck = await client.query(`
         WITH request_sources AS (
           SELECT
@@ -6601,23 +6618,30 @@ z_karlygash: {
         ), object_balances AS (
           SELECT
             lower(trim(s.object_name)) AS object_key,
-            COALESCE(SUM(s.balance), 0)::numeric AS balance_after_pay
+            COALESCE(SUM(s.balance_kasenov), 0)::numeric AS balance_after_kasenov
           FROM public.svod_object_v1 s
           GROUP BY lower(trim(s.object_name))
         )
         SELECT
           rs.source_object,
           rs.request_to_pay,
-          COALESCE(ob.balance_after_pay, 0)::numeric AS balance_after_pay
+          COALESCE(ob.balance_after_kasenov, 0)::numeric AS balance_after_kasenov,
+          (
+            COALESCE(ob.balance_after_kasenov, 0)::numeric
+            - COALESCE(rs.request_to_pay, 0)::numeric
+          ) AS balance_after_this_approve
         FROM request_sources rs
         LEFT JOIN object_balances ob
           ON ob.object_key = lower(trim(rs.source_object))
         WHERE rs.source_object IS NULL
            OR (
                 rs.request_to_pay > 0
-                AND COALESCE(ob.balance_after_pay, 0) <= 0
+                AND COALESCE(ob.balance_after_kasenov, 0) <= 0
               )
-           OR rs.request_to_pay > COALESCE(ob.balance_after_pay, 0) + 0.005
+           OR (
+                COALESCE(ob.balance_after_kasenov, 0)::numeric
+                - COALESCE(rs.request_to_pay, 0)::numeric
+              ) < -0.005
         ORDER BY rs.source_object NULLS FIRST
       `, [requestId]);
 
@@ -6632,14 +6656,19 @@ z_karlygash: {
             return "не заполнен Источник Объект";
           }
 
-          return `${row.source_object}: к оплате ${money(row.request_to_pay)} ₸, остаток ${money(row.balance_after_pay)} ₸`;
+          return (
+            `${row.source_object}: ` +
+            `к оплате ${money(row.request_to_pay)} ₸, ` +
+            `остаток после Касенова ${money(row.balance_after_kasenov)} ₸, ` +
+            `после этого утверждения будет ${money(row.balance_after_this_approve)} ₸`
+          );
         }).join("; ");
 
         const err = new Error(
-          "Утверждение невозможно. Сумма «К оплате» превышает остаток после оплаты по Источник Объект: " + details
+          "Утверждение невозможно. Источник Объект уйдёт в минус: " + details
         );
         err.statusCode = 409;
-        err.errorCode = "SOURCE_OBJECT_BALANCE_EXCEEDED";
+        err.errorCode = "SOURCE_OBJECT_WOULD_GO_NEGATIVE";
         throw err;
       }
     }
