@@ -2689,7 +2689,7 @@ async function canEditRowByLogin(poolOrClient, zvk_row_id, login) {
   return r.rowCount > 0;
 }
 
-const ISMAGULOV_LOGIN = "zhas";
+const ISMAGULOV_LOGIN = "z_karlygash";
 
 // Исмагулов участвует в согласовании только для этих дивизионов.
 // Проверка выполняется первой: Дивизион -> Объект -> Статья ДДС.
@@ -3079,7 +3079,7 @@ END,
 acc_zhasulan_time = NULL,
 acc_zhasulan_comment = NULL,
 
-acc_zhas_name = 'Исмагулов Жаслан',
+acc_zhas_name = 'Жаркымбаева Карлыгаш ',
 acc_zhas_status = CASE
   WHEN $5::boolean = true THEN 'Не требуется'
   WHEN $4::boolean = true THEN 'Ожидает'
@@ -6490,13 +6490,13 @@ app.post("/approve-rows", async (req, res) => {
         commentCol: "acc_zhasulan_comment"
       },
 
-      zhas: {
-        title: "Исмагулов Жаслан",
-        nameCol: "acc_zhas_name",
-        statusCol: "acc_zhas_status",
-        timeCol: "acc_zhas_time",
-        commentCol: "acc_zhas_comment"
-      },
+z_karlygash: {
+  title: "Жаркымбаева Карлыгаш ",
+  nameCol: "acc_zhas_name",
+  statusCol: "acc_zhas_status",
+  timeCol: "acc_zhas_time",
+  commentCol: "acc_zhas_comment"
+},
 
       a_zaitova: {
         title: "Заитова Алия",
@@ -6705,7 +6705,7 @@ app.post("/approve-rows", async (req, res) => {
       String(head.acc_zhas_status || "").trim() !== "Согласовано"
     ) {
       throw new Error(
-        "Сначала должен согласовать Исмагулов Жаслан"
+        "Сначала должен согласовать Жаркымбаева Карлыгаш "
       );
     }
 
