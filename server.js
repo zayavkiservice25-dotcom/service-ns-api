@@ -4154,6 +4154,70 @@ app.get("/request-list", async (req, res) => {
 });
 
 
+// =====================================================
+// ФАКТИЧЕСКИЙ ОСТАТОК FT
+// Считает по всей истории ZFT, включая уже оплаченные/скрытые строки.
+// excludeRowId нужен при редактировании существующей строки:
+// её старая сумма временно исключается, чтобы пользователь мог изменить её.
+// =====================================================
+async function getFtAvailableAmount(client, idFt, excludeRowId = null) {
+  const ft = String(idFt || "").trim();
+
+  const r = await client.query(
+    `
+    SELECT
+      COALESCE(f.sum_ft, 0)::numeric AS sum_ft,
+
+      COALESCE((
+        SELECT SUM(COALESCE(z.to_pay, 0))
+        FROM public.zvk z
+        WHERE z.id_ft = f.id_ft
+          AND z.request_flag = 'Да'
+          AND ($2::bigint IS NULL OR z.id <> $2::bigint)
+      ), 0)::numeric AS used_sum,
+
+      EXISTS (
+        SELECT 1
+        FROM public.zvk z
+        LEFT JOIN public.zvk_pay p
+          ON p.zvk_row_id = z.id
+        WHERE z.id_ft = f.id_ft
+          AND (
+            COALESCE(z.request_flag, '') = 'Обнуление'
+            OR COALESCE(p.registry_flag, '') = 'Обнуление'
+          )
+      ) AS has_reset
+
+    FROM public.ft f
+    WHERE f.id_ft = $1
+    LIMIT 1
+    `,
+    [ft, excludeRowId ? Number(excludeRowId) : null]
+  );
+
+  if (!r.rowCount) {
+    return {
+      exists: false,
+      sum_ft: 0,
+      used_sum: 0,
+      available: 0,
+      has_reset: false
+    };
+  }
+
+  const sumFt = Number(r.rows[0].sum_ft || 0);
+  const usedSum = Number(r.rows[0].used_sum || 0);
+  const hasReset = r.rows[0].has_reset === true;
+
+  return {
+    exists: true,
+    sum_ft: sumFt,
+    used_sum: usedSum,
+    available: hasReset ? 0 : Math.max(sumFt - usedSum, 0),
+    has_reset: hasReset
+  };
+}
+
 app.post("/zvk-save", async (req, res) => {
   try {
     const {
@@ -4223,6 +4287,34 @@ const toPayNum = isNoRequest
       const finalName = flag === "Нет"
         ? "СИСТЕМА"
         : String(user_name || actor || "СИСТЕМА").trim();
+
+      // Серверная защита от превышения остатка.
+      // Считаем по ВСЕЙ истории FT, а текущую редактируемую строку исключаем.
+      if (flag === "Да") {
+        const balance = await getFtAvailableAmount(pool, ft, rid);
+
+        if (!balance.exists) {
+          return res.status(404).json({ success:false, error:"FT_NOT_FOUND" });
+        }
+
+        if (balance.has_reset) {
+          return res.status(400).json({
+            success:false,
+            error:"FT_ALREADY_RESET",
+            message:"По этому FT уже есть обнуление. Новую сумму к оплате поставить нельзя."
+          });
+        }
+
+        if (toPayNum > balance.available + 0.000001) {
+          return res.status(400).json({
+            success:false,
+            error:"TO_PAY_EXCEEDS_REMAINING",
+            message:"Сумма к оплате больше остатка",
+            remaining: balance.available,
+            requested: toPayNum
+          });
+        }
+      }
 
       const upd = await pool.query(`
         UPDATE public.zvk
@@ -4417,6 +4509,32 @@ const toPayNum = isNoRequest
         `SELECT 'ZFT' || nextval('public.zvk_id_seq')::text AS id_zvk`
       );
       id_zvk = created.rows[0].id_zvk;
+    }
+
+    if (finalFlag === "Да") {
+      const balance = await getFtAvailableAmount(pool, ft, null);
+
+      if (!balance.exists) {
+        return res.status(404).json({ success:false, error:"FT_NOT_FOUND" });
+      }
+
+      if (balance.has_reset) {
+        return res.status(400).json({
+          success:false,
+          error:"FT_ALREADY_RESET",
+          message:"По этому FT уже есть обнуление. Новую сумму к оплате поставить нельзя."
+        });
+      }
+
+      if (finalToPay > balance.available + 0.000001) {
+        return res.status(400).json({
+          success:false,
+          error:"TO_PAY_EXCEEDS_REMAINING",
+          message:"Сумма к оплате больше остатка",
+          remaining: balance.available,
+          requested: finalToPay
+        });
+      }
     }
 
     const r = await pool.query(
@@ -5095,8 +5213,64 @@ if (isAdmin || isAll) {
     const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
 
 const query = `
+  WITH balance_rows AS (
+    SELECT
+      v.*,
+
+      GREATEST(
+        COALESCE(v.sum_ft, 0)
+        - COALESCE(b.used_before, 0),
+        0
+      )::numeric AS base_balance,
+
+      CASE
+        WHEN COALESCE(b.has_reset_to_here, false) THEN 0::numeric
+        ELSE GREATEST(
+          COALESCE(v.sum_ft, 0)
+          - COALESCE(b.used_before, 0)
+          - CASE
+              WHEN COALESCE(v.request_flag, '') = 'Да'
+                THEN COALESCE(v.to_pay, 0)
+              ELSE 0
+            END,
+          0
+        )::numeric
+      END AS ostatok_calc
+
+    FROM public.ft_zvk_current_v2 v
+
+    LEFT JOIN LATERAL (
+      SELECT
+        COALESCE(
+          SUM(COALESCE(z2.to_pay, 0))
+            FILTER (
+              WHERE z2.id < v.zvk_row_id
+                AND COALESCE(z2.request_flag, '') = 'Да'
+            ),
+          0
+        )::numeric AS used_before,
+
+        COALESCE(
+          BOOL_OR(
+            z2.id <= v.zvk_row_id
+            AND (
+              COALESCE(z2.request_flag, '') = 'Обнуление'
+              OR COALESCE(p2.registry_flag, '') = 'Обнуление'
+            )
+          ),
+          false
+        ) AS has_reset_to_here
+
+      FROM public.zvk z2
+      LEFT JOIN public.zvk_pay p2
+        ON p2.zvk_row_id = z2.id
+      WHERE z2.id_ft = v.id_ft
+        AND z2.id <= v.zvk_row_id
+    ) b ON TRUE
+  )
+
   SELECT v.*
-  FROM public.ft_zvk_current_v2 v
+  FROM balance_rows v
   ${whereSql}
   ORDER BY
     COALESCE(NULLIF(substring(v.id_ft from '\\d+'), ''), '0')::int DESC,
