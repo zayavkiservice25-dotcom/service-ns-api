@@ -3837,29 +3837,14 @@ app.get("/request-list", async (req, res) => {
   whereSql = "";
     } else if (login === ISMAGULOV_LOGIN) {
       /*
-       * Исмагулов согласует ПЕРВЫМ.
-       * Предварительный SQL-фильтр:
-       * 1) дивизион = Мост / Сети / Механизация;
-       * 2) объект входит в список Исмагулова.
-       * Статья ДДС дополнительно проверяется ниже через rowNeedsIsmagulov().
+       * Карлыгаш заменяет старого согласующего zhas.
+       * Для уже созданных реестров маршрут уже сохранён в acc_zhas_status.
+       * Поэтому при открытии Реестра НЕ пересчитываем заново Дивизион/Объект/ДДС,
+       * а показываем все заявки, где этот этап был назначен.
        */
-      params.push(Array.from(ISMAGULOV_OBJECTS));
-      params.push(Array.from(ISMAGULOV_DIVISIONS));
-
       whereSql = `
-        WHERE EXISTS (
-          SELECT 1
-          FROM public.request_items ri
-          LEFT JOIN public.ft_zvk_current_v2 cur
-            ON cur.zvk_row_id = ri.zvk_row_id
-          WHERE ri.request_id = request_head.id
-            AND COALESCE(
-                  NULLIF(trim(cur.legal_entity), ''),
-                  NULLIF(trim(ri.src_d), ''),
-                  ''
-                ) = ANY($2::text[])
-            AND ri.object = ANY($1::text[])
-        )
+        WHERE COALESCE(trim(acc_zhas_status), '') <> ''
+          AND lower(trim(COALESCE(acc_zhas_status, ''))) <> 'не требуется'
       `;
 
     } else if (
@@ -3985,20 +3970,8 @@ app.get("/request-list", async (req, res) => {
 
     let requestRows = result.rows;
 
-    // Финальная проверка для Исмагулова выполняется по всем трём условиям:
-    // Дивизион -> Объект -> Статья ДДС.
-    // Это также учитывает изменения ФТ после создания заявки.
-    if (login === ISMAGULOV_LOGIN) {
-      const filteredRows = [];
-
-      for (const headRow of requestRows) {
-        if (await requestNeedsIsmagulov(pool, headRow.id)) {
-          filteredRows.push(headRow);
-        }
-      }
-
-      requestRows = filteredRows;
-    }
+    // Для Карлыгаш маршрут уже зафиксирован в request_head.acc_zhas_status
+    // при создании заявки. Повторная фильтрация здесь не нужна.
 
     const wantsFlat =
       String(req.query.flat || "").trim() === "1";
@@ -4131,9 +4104,15 @@ app.get("/request-list", async (req, res) => {
     const flatRowsWithRoute = [];
 
     for (const item of flatResult.rows) {
+      const savedKarlygashStatus = String(item.acc_zhas_status || '').trim().toLowerCase();
+
       flatRowsWithRoute.push({
         ...item,
-        needs_ismagulov: await rowNeedsIsmagulov(item)
+        // Для Реестра используем сохранённый маршрут согласования.
+        // Это гарантирует, что z_karlygash увидит те же заявки, которые раньше видел zhas.
+        needs_ismagulov:
+          savedKarlygashStatus !== '' &&
+          savedKarlygashStatus !== 'не требуется'
       });
     }
 
