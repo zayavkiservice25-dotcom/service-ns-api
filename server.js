@@ -12195,6 +12195,7 @@ app.post("/do-ft/recognize", async (req, res) => {
       "Если is_invoice=false, document_type кратко укажи тип документа, например 'Договор', 'Акт', 'Накладная', 'Не счет'.",
       "contractor_raw: верни поставщика из строки 'Поставщик:'; если такой строки нет — самого Бенефициара. Не возвращай банк бенефициара, БИК, банк или покупателя.",
       "contract_no: найди номер договора и дату по смыслу, даже если рядом НЕТ слова 'Договор'.",
+      "Если это счет на оплату, но договор в документе НЕ указан, строка 'Договор:' пустая или номера договора нет — верни contract_no пустой строкой. Backend сам поставит финальное значение 'Без договора'.",
       "Ищи варианты с маркерами 'Договор', 'Основание', 'No', '№', 'N', а также строки, где сразу указан номер вида букв/цифр с дефисами или слешами и рядом есть дата.",
       "Верни ТОЛЬКО номер договора и дату из PDF, без описания услуги/товара.",
       "Поддерживай номера с буквами, цифрами, дефисами и слешами: SNS26-MAT-P-20, 160426/002, 26-0001, 020-08.",
@@ -12333,10 +12334,17 @@ app.post("/do-ft/recognize", async (req, res) => {
       // raw = ровно то, что прочитал GPT
       contract_no_raw: String(extracted.contract_no || "").trim(),
 
-      // contract_no = ТОЛЬКО точное значение из листа «Договоры»
-      contract_no: contractRow ? String(contractRow.contract_no || "").trim() : "",
+      // Финальный договор:
+      // 1) если найден в зависимом списке листа «Договоры» — точное значение из листа;
+      // 2) если в самом счете договор вообще не указан — "Без договора";
+      // 3) если GPT увидел договор, но в справочнике он не найден — оставляем пусто.
+      contract_no: contractRow
+        ? String(contractRow.contract_no || "").trim()
+        : (!String(extracted.contract_no || "").trim() ? "Без договора" : ""),
       contract_matched: !!contractRow,
-      contract_match_method: contractRow ? "number_date_sheet" : "not_found",
+      contract_match_method: contractRow
+        ? "number_date_sheet"
+        : (!String(extracted.contract_no || "").trim() ? "no_contract" : "not_found"),
 
       invoice_no: doFtExtractInvoiceNo_(extracted.invoice_no),
       invoice_date: String(extracted.invoice_date || "").trim(),
