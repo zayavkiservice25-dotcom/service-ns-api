@@ -11927,24 +11927,15 @@ function doFtParseFilenameBackend_(fileName, legalRows, objects, dds) {
     return m ? m[1] : "";
   }
 
-  // Текст после цифрового кода НЕ участвует в логике.
-  // 1-57-130(счет 167 от 01.09.26).pdf == 1-57-130.pdf
-  const legalCode  = leadingDigits(p[0]);
+  // ВАЖНО:
+  // ЮрЛицо из имени файла больше НЕ определяем.
+  // Первый сегмент p[0] (бывший код ЮрЛицо) полностью игнорируется.
+  //
+  // Из имени остаются только:
+  // p[1] = Объект, p[2] = Статья ДДС, p[3] = Механизация.
   const objectCode = leadingDigits(p[1]);
   const ddsCode    = leadingDigits(p[2]);
   const mechCode   = leadingDigits(p[3]);
-
-  const legalEntity = (Array.isArray(legalRows) ? legalRows : [])
-    .map(x => ({
-      code: String(x?.code || "").trim(),
-      name: String(x?.name || "").trim()
-    }))
-    .find(x =>
-      x.code &&
-      x.name &&
-      legalCode &&
-      String(Number(x.code)) === String(Number(legalCode))
-    )?.name || "";
 
   let object = "";
   if (objectCode) {
@@ -11965,13 +11956,45 @@ function doFtParseFilenameBackend_(fileName, legalRows, objects, dds) {
   }
 
   return {
-    legal_entity: legalEntity,
+    // Заполняется ниже ТОЛЬКО из Покупателя внутри PDF.
+    legal_entity: "",
     mechanization: mechCode === "1" ? "Да" : "",
     object_code: objectCode,
     object: object,
     dds_code: ddsCode,
     dds_article: ddsArticle
   };
+}
+
+function doFtMatchLegalEntityBackend_(buyerRaw, legalRows) {
+  const raw = String(buyerRaw || "")
+    .replace(/\u00A0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!raw) return "";
+
+  const rawKey = doFtNorm_(raw);
+  if (!rawKey) return "";
+
+  const prepared = (Array.isArray(legalRows) ? legalRows : [])
+    .map(x => ({
+      name: String(x?.name || "").trim(),
+      key: doFtNorm_(x?.name || "")
+    }))
+    .filter(x => x.name && x.key);
+
+  // 1. Полное совпадение после нормализации.
+  let found = prepared.find(x => x.key === rawKey);
+  if (found) return found.name;
+
+  // 2. buyer_raw может содержать БИН/ИИН, адрес и прочий текст.
+  // Ищем каноническое название ЮрЛицо внутри строки Покупателя.
+  const candidates = prepared
+    .filter(x => rawKey.includes(x.key) || x.key.includes(rawKey))
+    .sort((a, b) => b.key.length - a.key.length);
+
+  return candidates.length ? candidates[0].name : "";
 }
 
 function doFtMatchContractorBackend_(rawName, contractors) {
@@ -12184,7 +12207,8 @@ app.post("/do-ft/recognize", async (req, res) => {
       return res.status(400).json({ success:false, error:"UNSUPPORTED_FILE_TYPE", mime_type:mimeType });
     }
 
-    // Разбор имени файла выполняется локально и не расходует токены OpenAI.
+    // Из имени файла определяем только Объект / Статью ДДС / Механизацию.
+    // ЮрЛицо из имени файла полностью исключено.
     const filenameInfo = doFtParseFilenameBackend_(fileName, legalRows, objects, dds);
 
     // Короткий промпт: не передаем справочники в модель — это экономит входные токены.
@@ -12194,6 +12218,9 @@ app.post("/do-ft/recognize", async (req, res) => {
       "is_invoice=false для договора, акта, накладной, доверенности, письма, банковских реквизитов, коммерческого предложения и любого другого документа, который не является счетом/инвойсом на оплату.",
       "Если is_invoice=false, document_type кратко укажи тип документа, например 'Договор', 'Акт', 'Накладная', 'Не счет'.",
       "contractor_raw: верни поставщика из строки 'Поставщик:'; если такой строки нет — самого Бенефициара. Не возвращай банк бенефициара, БИК, банк или покупателя.",
+      "buyer_raw: найди именно ПОКУПАТЕЛЯ внутри PDF. В первую очередь читай строку/блок 'Покупатель:'. Верни полное наименование покупателя вместе с юрформой, если она есть, например 'ТОО СЕрВИС НС'.",
+      "buyer_raw НЕ бери из имени файла. Не путай Покупателя с Поставщиком, Бенефициаром, банком или получателем денег.",
+      "Если строка 'Покупатель:' визуально отделена от реквизитов переносом строки, всё равно свяжи реквизиты сразу после неё с Покупателем.",
       "contract_no: найди номер договора и дату по смыслу, даже если рядом НЕТ слова 'Договор'.",
       "Если это счет на оплату, но договор в документе НЕ указан, строка 'Договор:' пустая или номера договора нет — верни contract_no пустой строкой. Backend сам поставит финальное значение 'Без договора'.",
       "Ищи варианты с маркерами 'Договор', 'Основание', 'No', '№', 'N', а также строки, где сразу указан номер вида букв/цифр с дефисами или слешами и рядом есть дата.",
@@ -12252,6 +12279,7 @@ app.post("/do-ft/recognize", async (req, res) => {
                 is_invoice:{type:"boolean"},
                 document_type:{type:"string"},
                 contractor_raw:{type:"string"},
+                buyer_raw:{type:"string"},
                 pay_purpose:{type:"string"},
                 contract_no:{type:"string"},
                 invoice_no:{type:"string"},
@@ -12259,7 +12287,7 @@ app.post("/do-ft/recognize", async (req, res) => {
                 sum_ft:{type:["number","null"]},
                 reason:{type:"string"}
               },
-              required:["status","is_invoice","document_type","contractor_raw","pay_purpose","contract_no","invoice_no","invoice_date","sum_ft","reason"]
+              required:["status","is_invoice","document_type","contractor_raw","buyer_raw","pay_purpose","contract_no","invoice_no","invoice_date","sum_ft","reason"]
             }
           }
         }
@@ -12286,6 +12314,10 @@ app.post("/do-ft/recognize", async (req, res) => {
     catch (_) {
       return res.status(502).json({ success:false, error:"OPENAI_BAD_JSON", raw:outputText.slice(0,1000) });
     }
+
+    // ЮрЛицо определяем ТОЛЬКО по Покупателю из PDF.
+    // Возвращаем точное название из листа «ЮрЛицо».
+    const legalEntity = doFtMatchLegalEntityBackend_(extracted.buyer_raw, legalRows);
 
     // 1) Сначала пробуем контрагента по сырому ответу GPT.
     let contractorMatch = doFtMatchContractorBackend_(extracted.contractor_raw, contractors);
@@ -12322,6 +12354,9 @@ app.post("/do-ft/recognize", async (req, res) => {
 
     const data = {
       ...filenameInfo,
+      // Перезаписываем пустое filenameInfo.legal_entity значением из Покупателя PDF.
+      legal_entity: legalEntity,
+      buyer_raw: String(extracted.buyer_raw || "").trim(),
       status: String(extracted.status || "ok"),
       is_invoice: extracted.is_invoice === true,
       document_type: String(extracted.document_type || "").trim(),
@@ -12352,6 +12387,11 @@ app.post("/do-ft/recognize", async (req, res) => {
       reason: String(extracted.reason || "").trim()
     };
 
+    if (data.is_invoice && !data.legal_entity) {
+      data.status = "needs_clarification";
+      data.reason = [data.reason, "ЮрЛицо не найдено по Покупателю из PDF"].filter(Boolean).join("; ");
+    }
+
     if (data.is_invoice && !data.contractor) {
       data.status = "needs_clarification";
       data.reason = [data.reason, "Контрагент не найден в листе Договоры"].filter(Boolean).join("; ");
@@ -12359,8 +12399,10 @@ app.post("/do-ft/recognize", async (req, res) => {
 
     if (!data.is_invoice) {
       data.status = "ok";
+      data.legal_entity = "";
+      data.buyer_raw = "";
       data.contractor = "";
-      data.contract_matched = false;
+      data.contractor_matched = false;
       data.contract_no = "";
       data.contract_matched = false;
     }
