@@ -6523,6 +6523,13 @@ z_karlygash: {
       stageName = "Согласование";
     }
 
+    // Только Касенов Ермек может вернуть своё выполненное согласование
+    // из «Согласовано» обратно в «Ожидает».
+    if (action === "reset_agree") {
+      approver = login === "k_ermek" ? agreeApprovers.k_ermek : null;
+      stageName = "Согласование";
+    }
+
     if (
       action === "approve" ||
       action === "reject_approve"
@@ -6566,6 +6573,59 @@ z_karlygash: {
     }
 
     const head = headResult.rows[0];
+
+    // Касенов Ермек может снять только своё собственное согласование.
+    // Финальное утверждение approve_ermek_status и остальные этапы не меняем.
+    if (action === "reset_agree") {
+      const currentStatus = String(head.acc_ermek_status || "").trim().toLowerCase();
+
+      if (!["согласовано", "согласован", "да", "утверждено"].includes(currentStatus)) {
+        const err = new Error("Согласование Касенова Ермека уже находится в статусе «Ожидает»");
+        err.statusCode = 409;
+        throw err;
+      }
+
+      await client.query(`
+        UPDATE public.request_head
+        SET
+          acc_ermek_name = 'Касенов Ермек',
+          acc_ermek_status = 'Ожидает',
+          acc_ermek_time = NULL,
+          acc_ermek_comment = NULL
+        WHERE id = $1
+      `, [requestId]);
+
+      await client.query(`
+        INSERT INTO public.request_approve_log
+        (
+          request_id,
+          stage_name,
+          approver_login,
+          approver_name,
+          action_type,
+          comment_text
+        )
+        VALUES ($1, $2, $3, $4, $5, $6)
+      `, [
+        requestId,
+        "Согласование",
+        login,
+        "Касенов Ермек",
+        "reset_agree",
+        "Возвращено в Ожидает"
+      ]);
+
+      await client.query("COMMIT");
+
+      return res.json({
+        success: true,
+        request_id: requestId,
+        login,
+        action: "reset_agree",
+        status: "Ожидает"
+      });
+    }
+
     const needsIsmagulov = await requestNeedsIsmagulov(
       client,
       requestId
