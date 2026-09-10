@@ -2604,17 +2604,10 @@ async function canEditFtByLogin(poolOrClient, id_ft, login){
 function getDivisionPayRule(login) {
   const lg = String(login || "").trim().toLowerCase();
 
-  if (lg === "zh_elena") {
-    return {
-      mode: "only",
-      divisions: ["СК Жилой дом", "Smart Estate"]
-    };
-  }
-
   if (lg === "s_zhasulan") {
     return {
       mode: "only",
-      divisions: ["Sapa asphalt"]
+      divisions: ["СК Жилой дом", "Smart Estate", "Sapa asphalt"]
     };
   }
 
@@ -2633,7 +2626,6 @@ function canSetPaid(login, roleFt) {
   const role = String(roleFt || "").trim().toLowerCase();
 
   return (
-    lg === "zh_elena" ||
     lg === "s_zhasulan" ||
     lg === "k_arailym"
   );
@@ -7224,7 +7216,7 @@ app.post("/request-items-paid-bulk", async (req, res) => {
       return res.status(400).json({ success:false, error:"is_paid must be Да or Нет" });
     }
 
-    const canPay = ["zh_elena", "k_arailym", "s_zhasulan", "b_erkin", "a_zaitova", "admin"].includes(loginNorm);
+    const canPay = ["k_arailym", "s_zhasulan", "b_erkin", "a_zaitova", "admin"].includes(loginNorm);
     if (!canPay) return res.status(403).json({ success:false, error:"Нет прав ставить Оплачено" });
 
     await client.query("BEGIN");
@@ -7248,14 +7240,12 @@ app.post("/request-items-paid-bulk", async (req, res) => {
       throw new Error("Не все выбранные строки найдены в заявке");
     }
 
-    const ELENA_DIVISIONS = new Set(["СК Жилой дом", "Smart Estate"]);
-    const ZHASULAN_DIVISIONS = new Set(["Sapa asphalt"]);
-    const DELEGATED_DIVISIONS = new Set([...ELENA_DIVISIONS, ...ZHASULAN_DIVISIONS]);
+    const ZHASULAN_DIVISIONS = new Set(["СК Жилой дом", "Smart Estate", "Sapa asphalt"]);
+    const DELEGATED_DIVISIONS = new Set([...ZHASULAN_DIVISIONS]);
 
     const forbidden = divisionCheck.rows.filter(row => {
       const legalEntity = String(row.legal_entity || "").replace(/\s+/g, " ").trim();
       if (loginNorm === "s_zhasulan") return !ZHASULAN_DIVISIONS.has(legalEntity);
-      if (loginNorm === "zh_elena") return !ELENA_DIVISIONS.has(legalEntity);
       if (loginNorm === "k_arailym") return false; // Арай видит и обрабатывает все дивизионы
       return false;
     });
@@ -7281,8 +7271,8 @@ app.post("/request-items-paid-bulk", async (req, res) => {
       throw new Error("Оплачено можно ставить только после утверждения Ермека");
     }
 
-    // Лена и Жасулан завершают оплату только после отметки Арай.
-    if (["zh_elena", "s_zhasulan"].includes(loginNorm)) {
+    // Жасулан завершает оплату только после отметки Арай.
+    if (loginNorm === "s_zhasulan") {
       const withoutAray = divisionCheck.rows.filter(row => String(row.aray_paid || "").trim() !== "Да");
       if (withoutAray.length) {
         return res.status(409).json({ success:false, error:"Сначала Арай должна поставить «Оплачено Арай = Да»" });
@@ -7323,7 +7313,7 @@ app.post("/request-items-paid-bulk", async (req, res) => {
         `, [ownIds, paidValue]);
       }
     } else {
-      // Лена, Жасулан, админ и Беркин меняют финальный столбец «Оплачено».
+      // Жасулан, админ и Беркин меняют финальный столбец «Оплачено».
       await client.query(`
         INSERT INTO public.zvk_pay (zvk_row_id, is_paid, pay_time)
         SELECT x,
