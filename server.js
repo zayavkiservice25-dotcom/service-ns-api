@@ -6636,17 +6636,24 @@ z_karlygash: {
     );
 
     /*
-     * ФИНАЛЬНОЕ УТВЕРЖДЕНИЕ ЕРМЕКА:
-     * утверждение запрещено только если «Остаток после Касенова Е.Е» уже меньше нуля.
+     * КАСЕНОВ ЕРМЕК — ЗАЩИТА ОСТАТКА ПО ИСТОЧНИКУ ОБЪЕКТА.
      *
-     * Важно:
-     * - проверяем готовое поле «Остаток после Касенова Е.Е» (s.balance_kasenov);
-     * - сумму текущей заявки повторно НЕ вычитаем, потому что она уже учтена в этом остатке;
-     * - advisory lock не даёт двум параллельным утверждениям одного
-     *   Источник Объекта одновременно пройти проверку на одном остатке.
+     * 1) На action="agree" текущая заявка ЕЩЁ не входит в «ФТ Касенов Е.Е».
+     *    Поэтому считаем прогноз:
+     *      текущий balance_kasenov - сумма текущей заявки по Источник Объект.
+     *    Если прогноз < 0 — согласование запрещаем.
+     *
+     * 2) На action="approve" заявка уже должна входить в «ФТ Касенов Е.Е».
+     *    Поэтому повторно сумму заявки не вычитаем, а просто запрещаем
+     *    утверждение, если готовый balance_kasenov уже меньше нуля.
+     *
+     * Advisory lock не даёт двум параллельным действиям по одному
+     * Источник Объект одновременно пройти проверку на старом остатке.
      */
-    if (login === "k_ermek" && action === "approve") {
-
+    if (
+      login === "k_ermek" &&
+      (action === "agree" || action === "approve")
+    ) {
       await client.query(`
         SELECT pg_advisory_xact_lock(hashtext(x.object_key))
         FROM (
@@ -6657,14 +6664,102 @@ z_karlygash: {
           ORDER BY lower(trim(i.src_o))
         ) x
       `, [requestId]);
+    }
 
+    if (login === "k_ermek" && action === "agree") {
+      const currentErmekAgreeStatus =
+        String(head.acc_ermek_status || "").trim().toLowerCase();
+
+      if (
+        ["согласовано", "согласован", "да", "утверждено"]
+          .includes(currentErmekAgreeStatus)
+      ) {
+        const err = new Error(
+          "Касенов Ермек уже согласовал эту заявку. " +
+          "Сначала верните его согласование в «Ожидает»."
+        );
+        err.statusCode = 409;
+        err.errorCode = "ERMEK_AGREE_ALREADY_DONE";
+        throw err;
+      }
+
+      const balanceCheck = await client.query(`
+        WITH request_amounts AS (
+          SELECT
+            NULLIF(trim(i.src_o), '') AS source_object,
+            COALESCE(SUM(i.to_pay), 0)::numeric AS request_amount
+          FROM public.request_items i
+          WHERE i.request_id = $1
+          GROUP BY NULLIF(trim(i.src_o), '')
+        ),
+        object_balances AS (
+          SELECT
+            lower(trim(s.object_name)) AS object_key,
+            COALESCE(SUM(s.balance_kasenov), 0)::numeric AS current_balance_kasenov
+          FROM public.svod_object_v1 s
+          GROUP BY lower(trim(s.object_name))
+        )
+        SELECT
+          ra.source_object,
+          ra.request_amount,
+          COALESCE(ob.current_balance_kasenov, 0)::numeric AS current_balance_kasenov,
+          (
+            COALESCE(ob.current_balance_kasenov, 0)::numeric
+            - COALESCE(ra.request_amount, 0)::numeric
+          ) AS projected_balance_kasenov
+        FROM request_amounts ra
+        LEFT JOIN object_balances ob
+          ON ob.object_key = lower(trim(ra.source_object))
+        WHERE ra.source_object IS NULL
+           OR (
+             COALESCE(ob.current_balance_kasenov, 0)::numeric
+             - COALESCE(ra.request_amount, 0)::numeric
+           ) < -0.005
+        ORDER BY ra.source_object NULLS FIRST
+      `, [requestId]);
+
+      if (balanceCheck.rowCount) {
+        const money = value => Number(value || 0).toLocaleString("ru-RU", {
+          minimumFractionDigits: 2,
+          maximumFractionDigits: 2
+        });
+
+        const details = balanceCheck.rows.map(row => {
+          if (!row.source_object) {
+            return "не заполнен Источник Объект";
+          }
+
+          return (
+            `${row.source_object}: ` +
+            `остаток ${money(row.current_balance_kasenov)} ₸, ` +
+            `заявка ${money(row.request_amount)} ₸, ` +
+            `после согласования будет ${money(row.projected_balance_kasenov)} ₸`
+          );
+        }).join("; ");
+
+        const err = new Error(
+          "Согласование невозможно. " +
+          "Остаток после Касенова Е.Е уйдёт в минус: " +
+          details
+        );
+        err.statusCode = 409;
+        err.errorCode = "SOURCE_OBJECT_KASENOV_PROJECTED_NEGATIVE";
+        throw err;
+      }
+    }
+
+    // Дополнительная защита финального утверждения:
+    // если после выполненного согласования остаток уже оказался отрицательным,
+    // финальное утверждение также не пропускаем.
+    if (login === "k_ermek" && action === "approve") {
       const balanceCheck = await client.query(`
         WITH request_sources AS (
           SELECT DISTINCT
             NULLIF(trim(i.src_o), '') AS source_object
           FROM public.request_items i
           WHERE i.request_id = $1
-        ), object_balances AS (
+        ),
+        object_balances AS (
           SELECT
             lower(trim(s.object_name)) AS object_key,
             COALESCE(SUM(s.balance_kasenov), 0)::numeric AS balance_after_kasenov
@@ -6700,7 +6795,8 @@ z_karlygash: {
         }).join("; ");
 
         const err = new Error(
-          "Утверждение невозможно. Остаток после Касенова Е.Е меньше нуля: " + details
+          "Утверждение невозможно. Остаток после Касенова Е.Е меньше нуля: " +
+          details
         );
         err.statusCode = 409;
         err.errorCode = "SOURCE_OBJECT_KASENOV_BALANCE_NEGATIVE";
