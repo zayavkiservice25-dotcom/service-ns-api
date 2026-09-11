@@ -113,7 +113,8 @@ mechanization text,
       invoice_no text,
       invoice_date date,
       invoice_pdf text,
-      sum_ft numeric
+      sum_ft numeric,
+      source_file_id text
     );
   `);
 
@@ -121,6 +122,15 @@ mechanization text,
   await pool.query(`ALTER TABLE public.ft ADD COLUMN IF NOT EXISTS dds_article text;`);
   await pool.query(`ALTER TABLE public.ft ADD COLUMN IF NOT EXISTS contract_no text;`);
   await pool.query(`ALTER TABLE public.ft ADD COLUMN IF NOT EXISTS contract_date date;`);
+
+  // Один исходный PDF Drive может создать только одну запись FT.
+  // Старые строки остаются с NULL и не конфликтуют между собой.
+  await pool.query(`ALTER TABLE public.ft ADD COLUMN IF NOT EXISTS source_file_id text;`);
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS ft_source_file_id_uq
+    ON public.ft (source_file_id)
+    WHERE source_file_id IS NOT NULL AND btrim(source_file_id) <> '';
+  `);
 
   // ✅ СИНХРОНИЗИРУЕМ ft_id_seq (чтобы после FT334 пошло FT335)
   await pool.query(`
@@ -5267,45 +5277,113 @@ const query = `
 // SAVE FT (создать FT + авто ZFT + строка СИСТЕМА)
 // =====================================================
 app.post("/save-ft", async (req, res) => {
+  const client = await pool.connect();
+  let sourceFileId = "";
+
+  const findExistingBySourceFileId = async (db, fileId) => {
+    if (!fileId) return null;
+
+    const existing = await db.query(
+      `
+      SELECT
+        f.id_ft,
+        z.id_zvk
+      FROM public.ft f
+      LEFT JOIN LATERAL (
+        SELECT id_zvk
+        FROM public.zvk
+        WHERE id_ft = f.id_ft
+        ORDER BY zvk_date DESC NULLS LAST, id DESC
+        LIMIT 1
+      ) z ON TRUE
+      WHERE f.source_file_id = $1
+      LIMIT 1
+      `,
+      [fileId]
+    );
+
+    return existing.rows[0] || null;
+  };
+
   try {
     const {
-  input_date,
-  input_name,
-  legal_entity,
-  mechanization,
-  object,
-  contractor,
+      input_date,
+      input_name,
+      legal_entity,
+      mechanization,
+      object,
+      contractor,
 
-  pay_purpose,
-  dds_article,
-  contract_no,
-  contract_date,
+      pay_purpose,
+      dds_article,
+      contract_no,
+      contract_date,
 
-  invoice_no,
-  invoice_date,
-  invoice_pdf,
-  sum_ft
-} = req.body;
+      invoice_no,
+      invoice_date,
+      invoice_pdf,
+      sum_ft,
+      source_file_id
+    } = req.body || {};
 
-    if (!input_name) return res.status(400).json({ success:false, error:"input_name is required" });
-    if (!legal_entity || !object) return res.status(400).json({ success:false, error:"legal_entity/object required" });
-    if (!contractor) return res.status(400).json({ success:false, error:"contractor required" });
-    if (!invoice_no) return res.status(400).json({ success:false, error:"invoice_no required" });
-    if (!invoice_date) return res.status(400).json({ success:false, error:"invoice_date required" });
+    sourceFileId = String(source_file_id || "").trim();
+
+    if (!input_name) {
+      return res.status(400).json({ success:false, error:"input_name is required" });
+    }
+    if (!legal_entity || !object) {
+      return res.status(400).json({ success:false, error:"legal_entity/object required" });
+    }
+    if (!contractor) {
+      return res.status(400).json({ success:false, error:"contractor required" });
+    }
+    if (!invoice_no) {
+      return res.status(400).json({ success:false, error:"invoice_no required" });
+    }
+    if (!invoice_date) {
+      return res.status(400).json({ success:false, error:"invoice_date required" });
+    }
 
     const invoiceDateNormalized = doFtNormalizeInvoiceDateBackend_(invoice_date);
     if (!invoiceDateNormalized) {
       return res.status(400).json({
         success:false,
         error:"invoice_date must be YYYY-MM-DD",
-        received: String(invoice_date || "")
+        received:String(invoice_date || "")
       });
     }
 
-    const sumNum = (sum_ft === "" || sum_ft === null || sum_ft === undefined) ? 0 : Number(sum_ft);
-    if (Number.isNaN(sumNum)) return res.status(400).json({ success:false, error:"sum_ft must be number" });
+    const sumNum =
+      (sum_ft === "" || sum_ft === null || sum_ft === undefined)
+        ? 0
+        : Number(sum_ft);
 
-    const idRow = await pool.query(`SELECT 'FT' || nextval('ft_id_seq')::text AS id_ft`);
+    if (Number.isNaN(sumNum)) {
+      return res.status(400).json({ success:false, error:"sum_ft must be number" });
+    }
+
+    await client.query("BEGIN");
+
+    // Первая проверка идемпотентности:
+    // если этот Google Drive PDF уже отправлялся — просто возвращаем прежние ID.
+    if (sourceFileId) {
+      const existing = await findExistingBySourceFileId(client, sourceFileId);
+
+      if (existing) {
+        await client.query("COMMIT");
+        return res.json({
+          success:true,
+          already_exists:true,
+          message:"Этот PDF уже был отправлен. Повторная запись не создана.",
+          id_ft:String(existing.id_ft || ""),
+          id_zvk:String(existing.id_zvk || "")
+        });
+      }
+    }
+
+    const idRow = await client.query(
+      `SELECT 'FT' || nextval('ft_id_seq')::text AS id_ft`
+    );
     const id_ft = idRow.rows[0].id_ft;
 
     let inputDateFormatted = input_date;
@@ -5313,54 +5391,75 @@ app.post("/save-ft", async (req, res) => {
       inputDateFormatted = new Date(input_date);
     }
 
-  const r = await pool.query(
-  `
-  INSERT INTO public.ft
-    (id_ft, input_date, input_name, legal_entity, mechanization, "object", contractor,
-     pay_purpose, dds_article, contract_no, contract_date,
-     invoice_no, invoice_date, invoice_pdf, sum_ft)
-  VALUES
-    ($1, $2, $3, $4, $5, $6, $7,
-     $8, $9, $10, $11,
-     $12, $13, $14, $15)
-  RETURNING id_ft
-  `,
-  [
-    id_ft,
-    inputDateFormatted,
-    String(input_name).trim(),
-    String(legal_entity).trim(),
-    mechanization ? String(mechanization).trim() : null,
-    String(object).trim(),
-    String(contractor).trim(),
+    const r = await client.query(
+      `
+      INSERT INTO public.ft
+        (
+          id_ft,
+          input_date,
+          input_name,
+          legal_entity,
+          mechanization,
+          "object",
+          contractor,
+          pay_purpose,
+          dds_article,
+          contract_no,
+          contract_date,
+          invoice_no,
+          invoice_date,
+          invoice_pdf,
+          sum_ft,
+          source_file_id
+        )
+      VALUES
+        (
+          $1,$2,$3,$4,$5,$6,$7,
+          $8,$9,$10,$11,
+          $12,$13,$14,$15,$16
+        )
+      RETURNING id_ft
+      `,
+      [
+        id_ft,
+        inputDateFormatted,
+        String(input_name).trim(),
+        String(legal_entity).trim(),
+        mechanization ? String(mechanization).trim() : null,
+        String(object).trim(),
+        String(contractor).trim(),
 
-    pay_purpose ? String(pay_purpose).trim() : null,
-    dds_article ? String(dds_article).trim() : null,
-    contract_no ? String(contract_no).trim() : null,
-    contract_date ? contract_date : null,  // YYYY-MM-DD или null
+        pay_purpose ? String(pay_purpose).trim() : null,
+        dds_article ? String(dds_article).trim() : null,
+        contract_no ? String(contract_no).trim() : null,
+        contract_date ? contract_date : null,
 
-    String(invoice_no).trim(),
-    invoiceDateNormalized,                 // строго YYYY-MM-DD
-    invoice_pdf ? String(invoice_pdf).trim() : null,
-    sumNum
-  ]
-);
+        String(invoice_no).trim(),
+        invoiceDateNormalized,
+        invoice_pdf ? String(invoice_pdf).trim() : null,
+        sumNum,
+        sourceFileId || null
+      ]
+    );
 
-    const zftRow = await pool.query(`SELECT 'ZFT' || nextval('zvk_id_seq')::text AS id_zvk`);
+    const zftRow = await client.query(
+      `SELECT 'ZFT' || nextval('zvk_id_seq')::text AS id_zvk`
+    );
     const id_zvk = zftRow.rows[0].id_zvk;
 
-    const newZvk = await pool.query(
-  `
-  INSERT INTO zvk (id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag)
-  VALUES ($1, $2, NOW(), 'СИСТЕМА', 0, 'Нет')
-  RETURNING id
-  `,
-  [id_zvk, id_ft]
-);
+    const newZvk = await client.query(
+      `
+      INSERT INTO public.zvk
+        (id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag)
+      VALUES
+        ($1, $2, NOW(), 'СИСТЕМА', 0, 'Нет')
+      RETURNING id
+      `,
+      [id_zvk, id_ft]
+    );
 
-    // Источник Див всегда равен выбранному Дивизиону.
-    // Пользователь не передаёт и не редактирует src_d вручную.
-    await pool.query(
+    // Источник Див всегда равен выбранному ЮрЛицо/дивизиону.
+    await client.query(
       `
       INSERT INTO public.zvk_status
         (zvk_row_id, status_time, src_d)
@@ -5374,10 +5473,49 @@ app.post("/save-ft", async (req, res) => {
       [newZvk.rows[0].id, String(legal_entity).trim()]
     );
 
-    res.json({ success:true, id_ft: r.rows[0].id_ft, id_zvk });
+    await client.query("COMMIT");
+
+    return res.json({
+      success:true,
+      already_exists:false,
+      id_ft:r.rows[0].id_ft,
+      id_zvk
+    });
+
   } catch (e) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {}
+
+    // Вторая, обязательная защита от гонки:
+    // два запроса могли одновременно пройти первую проверку.
+    // UNIQUE(source_file_id) пропустит только один.
+    if (e && e.code === "23505" && sourceFileId) {
+      try {
+        const existing = await findExistingBySourceFileId(pool, sourceFileId);
+
+        if (existing) {
+          return res.json({
+            success:true,
+            already_exists:true,
+            message:"Этот PDF уже был отправлен. Повторная запись не создана.",
+            id_ft:String(existing.id_ft || ""),
+            id_zvk:String(existing.id_zvk || "")
+          });
+        }
+      } catch (lookupErr) {
+        console.error("SAVE-FT duplicate lookup error:", lookupErr);
+      }
+    }
+
     console.error("SAVE-FT ERROR:", e);
-    res.status(500).json({ success:false, error:e.message });
+    return res.status(500).json({
+      success:false,
+      error:e && e.message ? e.message : String(e)
+    });
+
+  } finally {
+    client.release();
   }
 });
 
