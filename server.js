@@ -12466,9 +12466,11 @@ app.post("/do-ft/recognize", async (req, res) => {
       "Пример: 'Договор №020-08 техническое обслуживание и ремонта автомобилей от 20.08.25 г.' -> contract_no='020-08 от 20.08.25 г.'.",
       "Пример: 'Договор SNS26-MAT-P-20 от 13.05.2026' -> contract_no='SNS26-MAT-P-20 от 13.05.2026г.'.",
       "Если строка выглядит просто как 'SNS26-MAT-P-20 от 13.05.2026' без слова Договор — тоже верни 'SNS26-MAT-P-20 от 13.05.2026г.'.",
-      "invoice_no: найди номер счета по смыслу, даже если нет точной фразы 'Счет на оплату'. Ищи 'Счет', 'Invoice', '№', 'No' рядом с номером документа.",
-      "Верни только номер счета, без слов Счет/Invoice/№/No и без даты.",
-      "invoice_date: верни дату счета YYYY-MM-DD.",
+      "invoice_no: в первую очередь найди ЗАГОЛОВОК счета, например 'Счет на оплату № 636 от 4 сентября 2026 г.'. В таком случае invoice_no='636'.",
+      "Верни ТОЛЬКО номер, который стоит после №/No в заголовке счета. Не добавляй год, дату или другие цифры.",
+      "Не бери invoice_no из договора, таблицы товаров, кода товара, БИН, ИИК, КБе, суммы, цены или количества.",
+      "Если написано 'Счет на оплату № 636 от 4 сентября 2026 г.' — ответ строго invoice_no='636', НЕ '636-2026', НЕ '638-2026'.",
+      "invoice_date: бери дату именно из заголовка этого счета и верни YYYY-MM-DD.",
       "sum_ft: бери ТОЛЬКО итоговую сумму к оплате из 'Итого', 'Всего', 'Всего к оплате', 'Total'. Не бери НДС, цену позиции или сумму одной строки.",
       "pay_purpose: кратко опиши товары/услуги из строк таблицы.",
       "Если поле реально невозможно прочитать — верни пустую строку. Не пиши 'Not specified clearly' и не придумывай значения."
@@ -12565,14 +12567,16 @@ app.post("/do-ft/recognize", async (req, res) => {
     }
 
     let extractedContract = String(extracted.contract_no || "").trim();
+    let extractedInvoiceNo = doFtExtractInvoiceNo_(extracted.invoice_no);
+    let extractedInvoiceDate = String(extracted.invoice_date || "").trim();
 
-    // Договор проверяем отдельным focused-pass ВСЕГДА.
+    // Покупателя, договор и номер счета проверяем отдельным focused-pass ВСЕГДА.
     // Это нужно, чтобы пустую строку "Договор:" не перепутать
     // с суммами/ценами/кодами из таблицы.
     {
       try {
         const focusInstruction = [
-          "Посмотри на счет на оплату и извлеки ТОЛЬКО Покупателя и Договор.",
+          "Посмотри на счет на оплату и извлеки ТОЛЬКО Покупателя, Договор и номер/дату счета.",
           "Найди строку 'Покупатель:'. legal_entity выбери ТОЛЬКО по названию Покупателя, БИН игнорируй.",
           "Допустимые legal_entity: Сервис НС; СК Жилой дом; Sapa asphalt; Smart Estate.",
           "Если видишь ТОО/товарищество 'СЕрВИС НС' — legal_entity='Сервис НС'.",
@@ -12581,8 +12585,12 @@ app.post("/do-ft/recognize", async (req, res) => {
           "Пример: 'Договор поставки №01-08/SC-39/2026 от 04.09.2026г' -> '01-08/SC-39/2026 от 04.09.2026г.'.",
           "ВАЖНО: если поле 'Договор:' ПУСТОЕ — contract_present=false и contract_no=''.",
           "При пустом поле Договор НЕ бери числа из таблицы товаров, цены, суммы, количество, коды товаров, номер счета, ИИК, БИН или телефон.",
-          "Например '29 047,00', '1 045 692,00', '58', '636' НЕ являются договором, если они взяты из таблицы/счета.",
-          "Не придумывай договор. Не используй имя файла."
+          "Теперь найди ЗАГОЛОВОК счета. Номер счета — это значение сразу после №/No в заголовке 'Счет на оплату'.",
+          "Пример: 'Счет на оплату № 636 от 4 сентября 2026 г.' -> invoice_no='636', invoice_date='2026-09-04'.",
+          "Для этого примера НЕЛЬЗЯ возвращать '636-2026', '638-2026' или номер договора.",
+          "invoice_no верни без слова Счет, без №, без даты и без года.",
+          "Не бери invoice_no из договора, таблицы товаров, БИН, ИИК, КБе, суммы, цены, количества или кода товара.",
+          "Не придумывай значения. Не используй имя файла."
         ].join("\n");
 
         const focusResponse = await fetch("https://api.openai.com/v1/responses", {
@@ -12618,9 +12626,11 @@ app.post("/do-ft/recognize", async (req, res) => {
                       enum:["","Сервис НС","СК Жилой дом","Sapa asphalt","Smart Estate"]
                     },
                     contract_present:{type:"boolean"},
-                    contract_no:{type:"string"}
+                    contract_no:{type:"string"},
+                    invoice_no:{type:"string"},
+                    invoice_date:{type:"string"}
                   },
-                  required:["buyer_raw","legal_entity","contract_present","contract_no"]
+                  required:["buyer_raw","legal_entity","contract_present","contract_no","invoice_no","invoice_date"]
                 }
               }
             }
@@ -12640,6 +12650,8 @@ app.post("/do-ft/recognize", async (req, res) => {
             const focusBuyer = String(focus.buyer_raw || "").trim();
             const focusLegal = String(focus.legal_entity || "").trim();
             const focusContract = String(focus.contract_no || "").trim();
+            const focusInvoiceNo = doFtExtractInvoiceNo_(focus.invoice_no);
+            const focusInvoiceDate = String(focus.invoice_date || "").trim();
 
             if (!buyerRaw && focusBuyer) buyerRaw = focusBuyer;
 
@@ -12657,6 +12669,15 @@ app.post("/do-ft/recognize", async (req, res) => {
               extractedContract = focusContract;
             } else if (focus.contract_present === false) {
               extractedContract = "";
+            }
+
+            // Focused-pass является окончательной проверкой номера и даты счета.
+            // Берём только значение из заголовка "Счет на оплату № ...".
+            if (focusInvoiceNo) {
+              extractedInvoiceNo = focusInvoiceNo;
+            }
+            if (focusInvoiceDate) {
+              extractedInvoiceDate = focusInvoiceDate;
             }
           }
         } else {
@@ -12735,8 +12756,8 @@ app.post("/do-ft/recognize", async (req, res) => {
         ? "number_date_sheet"
         : (extractedContract ? "pdf" : "no_contract"),
 
-      invoice_no: doFtExtractInvoiceNo_(extracted.invoice_no),
-      invoice_date: String(extracted.invoice_date || "").trim(),
+      invoice_no: extractedInvoiceNo,
+      invoice_date: extractedInvoiceDate,
       sum_ft: extracted.sum_ft == null ? null : Number(extracted.sum_ft),
       reason: String(extracted.reason || "").trim()
     };
