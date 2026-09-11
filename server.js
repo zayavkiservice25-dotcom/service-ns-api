@@ -12074,14 +12074,19 @@ function doFtParseFilenameBackend_(fileName, legalRows, objects, dds) {
   }
 
   // ВАЖНО:
-  // ЮрЛицо из имени файла больше НЕ определяем.
-  // Первый сегмент p[0] (бывший код ЮрЛицо) полностью игнорируется.
+  // ЮрЛицо из имени файла НЕ определяем — оно приходит только из «Покупатель» в PDF.
   //
-  // Из имени остаются только:
-  // p[1] = Объект, p[2] = Статья ДДС, p[3] = Механизация.
-  const objectCode = leadingDigits(p[1]);
-  const ddsCode    = leadingDigits(p[2]);
-  const mechCode   = leadingDigits(p[3]);
+  // Формат имени файла:
+  // p[0] = Объект
+  // p[1] = Статья ДДС
+  // p[2] = Механизация (1 = Да, если сегмента нет — пусто)
+  //
+  // Примеры:
+  // 5-136.pdf   -> Объект 5, ДДС 136, Механизация пусто
+  // 5-136-1.pdf -> Объект 5, ДДС 136, Механизация Да
+  const objectCode = leadingDigits(p[0]);
+  const ddsCode    = leadingDigits(p[1]);
+  const mechCode   = leadingDigits(p[2]);
 
   let object = "";
   if (objectCode) {
@@ -12354,7 +12359,7 @@ app.post("/do-ft/recognize", async (req, res) => {
     }
 
     // Из имени файла определяем только Объект / Статью ДДС / Механизацию.
-    // ЮрЛицо из имени файла полностью исключено.
+    // Формат: Объект-ДДС[-Механизация]. ЮрЛицо из имени файла полностью исключено.
     const filenameInfo = doFtParseFilenameBackend_(fileName, legalRows, objects, dds);
 
     // Короткий промпт: не передаем справочники в модель — это экономит входные токены.
