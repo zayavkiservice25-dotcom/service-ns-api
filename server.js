@@ -5293,6 +5293,15 @@ app.post("/save-ft", async (req, res) => {
     if (!invoice_no) return res.status(400).json({ success:false, error:"invoice_no required" });
     if (!invoice_date) return res.status(400).json({ success:false, error:"invoice_date required" });
 
+    const invoiceDateNormalized = doFtNormalizeInvoiceDateBackend_(invoice_date);
+    if (!invoiceDateNormalized) {
+      return res.status(400).json({
+        success:false,
+        error:"invoice_date must be YYYY-MM-DD",
+        received: String(invoice_date || "")
+      });
+    }
+
     const sumNum = (sum_ft === "" || sum_ft === null || sum_ft === undefined) ? 0 : Number(sum_ft);
     if (Number.isNaN(sumNum)) return res.status(400).json({ success:false, error:"sum_ft must be number" });
 
@@ -5331,7 +5340,7 @@ app.post("/save-ft", async (req, res) => {
     contract_date ? contract_date : null,  // YYYY-MM-DD или null
 
     String(invoice_no).trim(),
-    invoice_date ? invoice_date : null,    // YYYY-MM-DD или null
+    invoiceDateNormalized,                 // строго YYYY-MM-DD
     invoice_pdf ? String(invoice_pdf).trim() : null,
     sumNum
   ]
@@ -12255,9 +12264,21 @@ function doFtMatchContractorBackend_(rawName, contractors) {
 }
 
 function doFtNormalizeContractNumberToken_(v) {
-  const raw = String(v || "").trim().toLowerCase();
+  let raw = String(v || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[–—−]/g, "-")
+    .replace(/\s*([\/-])\s*/g, "$1");
+
   if (!raw) return "";
 
+  // OpenAI/OCR иногда читает знак № как N / No и возвращает, например:
+  // "n-01-08/sc-39/2026". Для СОПОСТАВЛЕНИЯ убираем только этот служебный
+  // префикс. Финальное значение всё равно берём дословно из листа «Договоры».
+  raw = raw.replace(/^(?:№|n|no)[.\s:_-]*(?=\d)/iu, "");
+
+  // Для сравнения 01 == 1 и 08 == 8. Это только ключ поиска:
+  // отображаемое значение из листа не меняется и сохраняет ведущие нули/регистр.
   return raw
     .split(/([-/])/)
     .map(part => {
@@ -12316,17 +12337,13 @@ function doFtExtractContractPartsBackend_(v) {
   return { number, date };
 }
 function doFtFormatContractFromPdf_(rawContract) {
-  const raw = String(rawContract || "")
+  // Это только fallback, если в листе «Договоры» ничего не найдено.
+  // Для отображения НЕ нормализуем номер: не убираем ведущие нули,
+  // не меняем регистр SC/sc и не превращаем № в N.
+  return String(rawContract || "")
     .replace(/\u00A0/g, " ")
     .replace(/\s+/g, " ")
     .trim();
-
-  if (!raw) return "";
-
-  const p = doFtExtractContractPartsBackend_(raw);
-  if (!p.number) return raw;
-
-  return p.date ? `${p.number} от ${p.date}г.` : p.number;
 }
 
 function doFtFindContractRowByRaw_(rawContract, contractRows, contractor) {
@@ -12367,6 +12384,17 @@ function doFtFindContractRowByRaw_(rawContract, contractRows, contractor) {
     });
 
     if (sameDate.length === 1) return sameDate[0];
+  }
+
+  // Если OCR слегка исказил номер (например № -> N), но контрагент уже найден
+  // и на эту дату у него есть ровно один договор — берём ТОЧНОЕ значение из листа.
+  // Это не подмена: дата пришла из текущего PDF, а финальный текст — из справочника.
+  if (!sameNumber.length && contractorKey && rawParts.date) {
+    const sameDateScoped = scoped.filter(x => {
+      const p = doFtExtractContractPartsBackend_(x.contract_no);
+      return p.date && p.date === rawParts.date;
+    });
+    if (sameDateScoped.length === 1) return sameDateScoped[0];
   }
 
   // Резерв: если GPT не определил контрагента, но по всему листу
@@ -12417,6 +12445,59 @@ function doFtExtractInvoiceNo_(v) {
   // Последний резерв: длинный числовой/буквенно-цифровой токен.
   m = text.match(/([A-Za-zА-Яа-я0-9][A-Za-zА-Яа-я0-9._\/-]{2,})/u);
   return m && m[1] ? String(m[1]).trim() : "";
+}
+
+function doFtNormalizeInvoiceDateBackend_(v) {
+  const s = String(v || "")
+    .replace(/\u00A0/g, " ")
+    .replace(/,/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+
+  if (!s) return "";
+
+  const pad = n => String(Number(n)).padStart(2, "0");
+  const iso = (y, m, d) => {
+    y = Number(y); m = Number(m); d = Number(d);
+    if (!Number.isInteger(y) || !Number.isInteger(m) || !Number.isInteger(d)) return "";
+    if (y < 1900 || y > 2200 || m < 1 || m > 12 || d < 1 || d > 31) return "";
+    const dt = new Date(Date.UTC(y, m - 1, d));
+    if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== m - 1 || dt.getUTCDate() !== d) return "";
+    return `${String(y).padStart(4, "0")}-${pad(m)}-${pad(d)}`;
+  };
+
+  // Уже ISO / близкий к ISO формат.
+  let m = s.match(/(?:^|\D)(\d{4})[.\/-](\d{1,2})[.\/-](\d{1,2})(?:\D|$)/u);
+  if (m) return iso(m[1], m[2], m[3]);
+
+  // ДД.ММ.ГГГГ / ДД-ММ-ГГГГ / ДД/ММ/ГГГГ.
+  m = s.match(/(?:^|\D)(\d{1,2})[.\/-](\d{1,2})[.\/-](\d{2,4})(?:\D|$)/u);
+  if (m) {
+    let y = Number(m[3]);
+    if (y < 100) y += y >= 70 ? 1900 : 2000;
+    return iso(y, m[2], m[1]);
+  }
+
+  // Русская текстовая дата: "11 сентября 2026" -> "2026-09-11".
+  const months = {
+    "января":1,"январь":1,
+    "февраля":2,"февраль":2,
+    "марта":3,"март":3,
+    "апреля":4,"апрель":4,
+    "мая":5,"май":5,
+    "июня":6,"июнь":6,
+    "июля":7,"июль":7,
+    "августа":8,"август":8,
+    "сентября":9,"сентябрь":9,
+    "октября":10,"октябрь":10,
+    "ноября":11,"ноябрь":11,
+    "декабря":12,"декабрь":12
+  };
+  m = s.match(/(?:^|\s)(\d{1,2})\s+([а-яё]+)\s+(\d{4})(?:\s*г\.?|$)/iu);
+  if (m && months[m[2]]) return iso(m[3], months[m[2]], m[1]);
+
+  return "";
 }
 
 app.post("/do-ft/recognize", async (req, res) => {
@@ -12591,7 +12672,7 @@ app.post("/do-ft/recognize", async (req, res) => {
     let extractedContractorRaw = String(extracted.contractor_raw || "").trim();
     let extractedContract = String(extracted.contract_no || "").trim();
     let extractedInvoiceNo = doFtExtractInvoiceNo_(extracted.invoice_no);
-    let extractedInvoiceDate = String(extracted.invoice_date || "").trim();
+    let extractedInvoiceDate = doFtNormalizeInvoiceDateBackend_(extracted.invoice_date);
     let extractedPayPurpose = String(extracted.pay_purpose || "").trim();
 
     // Поставщика, Покупателя, договор, счет и Назначение платежа
@@ -12620,7 +12701,7 @@ app.post("/do-ft/recognize", async (req, res) => {
           "Скопируй номер буквально из PDF. Если в текущем документе стоит № 664, верни invoice_no='664'.",
           "Не копируй номера и даты из текста инструкции, другого PDF или предыдущего распознавания.",
           "invoice_no верни без слова Счет, без №, без даты и без года.",
-          "invoice_date возьми из того же заголовка текущего счета, а не из строки Договор.",
+          "invoice_date возьми из того же заголовка текущего счета, а не из строки Договор. Верни строго YYYY-MM-DD только цифрами, например 2026-09-11.",
           "Теперь сформируй pay_purpose по типу договора/операции и строкам Наименование.",
           "Если указано 'Договор поставки' или в таблице перечислены товары — pay_purpose обязательно начинай со слова 'Поставка'.",
           "Объединяй одинаковые товары разных размеров/моделей в общие группы и убирай размеры, коды, количество и цену.",
@@ -12692,7 +12773,7 @@ app.post("/do-ft/recognize", async (req, res) => {
             const focusLegal = String(focus.legal_entity || "").trim();
             const focusContract = String(focus.contract_no || "").trim();
             const focusInvoiceNo = doFtExtractInvoiceNo_(focus.invoice_no);
-            const focusInvoiceDate = String(focus.invoice_date || "").trim();
+            const focusInvoiceDate = doFtNormalizeInvoiceDateBackend_(focus.invoice_date);
             const focusPayPurpose = String(focus.pay_purpose || "").trim();
 
             // Focused-pass является окончательной проверкой Поставщика.
