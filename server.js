@@ -12215,6 +12215,16 @@ function doFtMatchContractorBackend_(rawName, contractors) {
 
   if (!raw) return { contractor:"", matched:false, method:"empty" };
 
+  const bankWords = [
+    "банк центркредит", "bank centercredit", "fortebank", "forte bank",
+    "halyk bank", "народный банк", "kaspi bank", "bereke bank",
+    "евразийский банк", "altyn bank", "jusan bank"
+  ];
+  const rawBankKey = doFtNorm_(raw);
+  if (bankWords.some(x => rawBankKey.includes(doFtNorm_(x)))) {
+    return { contractor:"", matched:false, method:"bank_rejected" };
+  }
+
   // Берём название из кавычек, если есть:
   // Индивидуальный предприниматель "JSJ MART" -> JSJ MART
   const quoted = raw.match(/[«"“”]([^«»"“”]+)[»"“”]/);
@@ -12449,7 +12459,10 @@ app.post("/do-ft/recognize", async (req, res) => {
       "Сначала определи is_invoice. is_invoice=true ТОЛЬКО если документ по смыслу является счетом/инвойсом на оплату. Слова 'Счет на оплату' могут отсутствовать.",
       "is_invoice=false для договора, акта, накладной, доверенности, письма, банковских реквизитов, коммерческого предложения и любого другого документа, который не является счетом/инвойсом на оплату.",
       "Если is_invoice=false, document_type кратко укажи тип документа, например 'Договор', 'Акт', 'Накладная', 'Не счет'.",
-      "contractor_raw: верни поставщика из строки 'Поставщик:'; если такой строки нет — самого Бенефициара. Не возвращай банк бенефициара, БИК, банк или покупателя.",
+      "contractor_raw: контрагент = именно ПОСТАВЩИК. В первую очередь найди строку 'Поставщик:' и верни название организации из этой строки.",
+      "Если в строке 'Поставщик:' написано, например, 'Товарищество с ограниченной ответственностью СтальЦинк' — contractor_raw должен быть 'СтальЦинк' или полное название поставщика.",
+      "Банк поставщика/бенефициара НЕ является контрагентом. Никогда не возвращай АО 'Банк ЦентрКредит', ForteBank, Halyk Bank и другие банки, если они указаны только как банк.",
+      "Только если отдельной строки 'Поставщик:' действительно нет — используй самого Бенефициара, но не его банк.",
       "buyer_raw: ОБЯЗАТЕЛЬНО найди именно ПОКУПАТЕЛЯ внутри PDF. В первую очередь читай строку/блок 'Покупатель:'. Верни полное наименование покупателя вместе с юрформой. БИН, адрес и телефон можно оставить в buyer_raw.",
       "legal_entity: по НАЗВАНИЮ Покупателя выбери РОВНО одно значение: 'Сервис НС', 'СК Жилой дом', 'Sapa asphalt', 'Smart Estate'. БИН для выбора ЮрЛицо НЕ используй. Если ни одно название не подходит — верни пустую строку.",
       "buyer_raw и legal_entity НЕ бери из имени файла. Не путай Покупателя с Поставщиком, Бенефициаром, банком или получателем денег.",
@@ -12573,19 +12586,25 @@ app.post("/do-ft/recognize", async (req, res) => {
       legalEntity = doFtMatchLegalEntityBackend_(buyerRaw, legalRows);
     }
 
+    let extractedContractorRaw = String(extracted.contractor_raw || "").trim();
     let extractedContract = String(extracted.contract_no || "").trim();
     let extractedInvoiceNo = doFtExtractInvoiceNo_(extracted.invoice_no);
     let extractedInvoiceDate = String(extracted.invoice_date || "").trim();
     let extractedPayPurpose = String(extracted.pay_purpose || "").trim();
 
-    // Покупателя, договор, счет и Назначение платежа
+    // Поставщика, Покупателя, договор, счет и Назначение платежа
     // проверяем отдельным focused-pass ВСЕГДА.
     // Это нужно, чтобы пустую строку "Договор:" не перепутать
     // с суммами/ценами/кодами из таблицы.
     {
       try {
         const focusInstruction = [
-          "Посмотри на счет на оплату и извлеки Покупателя, Договор, номер/дату счета и сформируй Назначение платежа.",
+          "Посмотри на счет на оплату и извлеки Поставщика, Покупателя, Договор, номер/дату счета и сформируй Назначение платежа.",
+          "СНАЧАЛА найди строку 'Поставщик:'. contractor_raw = название организации именно из этой строки.",
+          "Например: 'Поставщик: БИН ..., Товарищество с ограниченной ответственностью СтальЦинк, ...' -> contractor_raw='СтальЦинк'.",
+          "Не путай Поставщика с его банком. Строки 'Банк поставщика', 'Банк бенефициара', БИК, ИИК не являются контрагентом.",
+          "АО 'Банк ЦентрКредит', ForteBank, Halyk Bank и другие банки нельзя возвращать как contractor_raw, если они указаны только как банк.",
+          "Только если строки 'Поставщик:' нет — используй самого Бенефициара, но НЕ банк бенефициара.",
           "Найди строку 'Покупатель:'. legal_entity выбери ТОЛЬКО по названию Покупателя, БИН игнорируй.",
           "Допустимые legal_entity: Сервис НС; СК Жилой дом; Sapa asphalt; Smart Estate.",
           "Если видишь ТОО/товарищество 'СЕрВИС НС' — legal_entity='Сервис НС'.",
@@ -12634,6 +12653,7 @@ app.post("/do-ft/recognize", async (req, res) => {
                   type:"object",
                   additionalProperties:false,
                   properties:{
+                    contractor_raw:{type:"string"},
                     buyer_raw:{type:"string"},
                     legal_entity:{
                       type:"string",
@@ -12645,7 +12665,7 @@ app.post("/do-ft/recognize", async (req, res) => {
                     invoice_date:{type:"string"},
                     pay_purpose:{type:"string"}
                   },
-                  required:["buyer_raw","legal_entity","contract_present","contract_no","invoice_no","invoice_date","pay_purpose"]
+                  required:["contractor_raw","buyer_raw","legal_entity","contract_present","contract_no","invoice_no","invoice_date","pay_purpose"]
                 }
               }
             }
@@ -12662,12 +12682,19 @@ app.post("/do-ft/recognize", async (req, res) => {
           try { focus = JSON.parse(focusText); } catch (_) {}
 
           if (focus) {
+            const focusContractorRaw = String(focus.contractor_raw || "").trim();
             const focusBuyer = String(focus.buyer_raw || "").trim();
             const focusLegal = String(focus.legal_entity || "").trim();
             const focusContract = String(focus.contract_no || "").trim();
             const focusInvoiceNo = doFtExtractInvoiceNo_(focus.invoice_no);
             const focusInvoiceDate = String(focus.invoice_date || "").trim();
             const focusPayPurpose = String(focus.pay_purpose || "").trim();
+
+            // Focused-pass является окончательной проверкой Поставщика.
+            // Это не дает банку поставщика попасть в поле Контрагент.
+            if (focusContractorRaw) {
+              extractedContractorRaw = focusContractorRaw;
+            }
 
             if (!buyerRaw && focusBuyer) buyerRaw = focusBuyer;
 
@@ -12714,8 +12741,9 @@ app.post("/do-ft/recognize", async (req, res) => {
       }
     }
 
-    // 1) Сначала пробуем контрагента по сырому ответу GPT.
-    let contractorMatch = doFtMatchContractorBackend_(extracted.contractor_raw, contractors);
+    // 1) Контрагент = Поставщик из PDF.
+    // Используем результат focused-pass, который специально отделяет поставщика от его банка.
+    let contractorMatch = doFtMatchContractorBackend_(extractedContractorRaw, contractors);
 
     // 2) Договор ищем по номеру + дате.
     // Если договор однозначно найден в листе «Договоры»,
@@ -12726,14 +12754,15 @@ app.post("/do-ft/recognize", async (req, res) => {
       contractorMatch.contractor
     );
 
-    // 3) ВАЖНО: если GPT ошибся в контрагенте (например, вернул ForteBank
-    // или "Not specified clearly"), но договор однозначно найден,
-    // берем контрагента И договор ИЗ ОДНОЙ СТРОКИ листа «Договоры».
-    if (contractRow) {
+    // 3) Договор может восстановить контрагента ТОЛЬКО если Поставщик
+    // вообще не был найден по строке "Поставщик:".
+    // Если Поставщик уже найден, договор не имеет права заменить его банком
+    // или другим контрагентом из справочника.
+    if (contractRow && !contractorMatch.matched) {
       contractorMatch = {
         contractor: String(contractRow.contractor || "").trim(),
         matched: true,
-        method: "contract_row_sheet"
+        method: "contract_row_sheet_fallback"
       };
     }
 
@@ -12756,7 +12785,7 @@ app.post("/do-ft/recognize", async (req, res) => {
       status: String(extracted.status || "ok"),
       is_invoice: extracted.is_invoice === true,
       document_type: String(extracted.document_type || "").trim(),
-      contractor_raw: String(extracted.contractor_raw || "").trim(),
+      contractor_raw: extractedContractorRaw,
       contractor: contractorMatch.contractor || "",
       contractor_matched: !!contractorMatch.matched,
       contractor_match_method: contractorMatch.method || "",
