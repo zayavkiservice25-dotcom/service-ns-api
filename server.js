@@ -12305,6 +12305,20 @@ function doFtExtractContractPartsBackend_(v) {
 
   return { number, date };
 }
+function doFtFormatContractFromPdf_(rawContract) {
+  const raw = String(rawContract || "")
+    .replace(/\u00A0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!raw) return "";
+
+  const p = doFtExtractContractPartsBackend_(raw);
+  if (!p.number) return raw;
+
+  return p.date ? `${p.number} от ${p.date}г.` : p.number;
+}
+
 function doFtFindContractRowByRaw_(rawContract, contractRows, contractor) {
   const raw = String(rawContract || "").trim();
   const rows = Array.isArray(contractRows) ? contractRows : [];
@@ -12409,6 +12423,12 @@ app.post("/do-ft/recognize", async (req, res) => {
     const contractRows = Array.isArray(req.body?.contract_rows) ? req.body.contract_rows : [];
     const filenameDicts = req.body?.filename_dicts || {};
     const legalRows = Array.isArray(filenameDicts.legal) ? filenameDicts.legal : [];
+    const allowedLegalEntities = [
+      "Сервис НС",
+      "СК Жилой дом",
+      "Sapa asphalt",
+      "Smart Estate"
+    ];
     const objects = doFtUniqueStrings_(filenameDicts.objects);
     const dds = doFtUniqueStrings_(filenameDicts.dds);
 
@@ -12430,10 +12450,13 @@ app.post("/do-ft/recognize", async (req, res) => {
       "is_invoice=false для договора, акта, накладной, доверенности, письма, банковских реквизитов, коммерческого предложения и любого другого документа, который не является счетом/инвойсом на оплату.",
       "Если is_invoice=false, document_type кратко укажи тип документа, например 'Договор', 'Акт', 'Накладная', 'Не счет'.",
       "contractor_raw: верни поставщика из строки 'Поставщик:'; если такой строки нет — самого Бенефициара. Не возвращай банк бенефициара, БИК, банк или покупателя.",
-      "buyer_raw: найди именно ПОКУПАТЕЛЯ внутри PDF. В первую очередь читай строку/блок 'Покупатель:'. Верни полное наименование покупателя вместе с юрформой, если она есть, например 'ТОО СЕрВИС НС'.",
-      "buyer_raw НЕ бери из имени файла. Не путай Покупателя с Поставщиком, Бенефициаром, банком или получателем денег.",
+      "buyer_raw: ОБЯЗАТЕЛЬНО найди именно ПОКУПАТЕЛЯ внутри PDF. В первую очередь читай строку/блок 'Покупатель:'. Верни полное наименование покупателя вместе с юрформой. БИН, адрес и телефон можно оставить в buyer_raw.",
+      "legal_entity: по НАЗВАНИЮ Покупателя выбери РОВНО одно значение: 'Сервис НС', 'СК Жилой дом', 'Sapa asphalt', 'Smart Estate'. БИН для выбора ЮрЛицо НЕ используй. Если ни одно название не подходит — верни пустую строку.",
+      "buyer_raw и legal_entity НЕ бери из имени файла. Не путай Покупателя с Поставщиком, Бенефициаром, банком или получателем денег.",
       "Если строка 'Покупатель:' визуально отделена от реквизитов переносом строки, всё равно свяжи реквизиты сразу после неё с Покупателем.",
-      "contract_no: найди номер договора и дату по смыслу, даже если рядом НЕТ слова 'Договор'.",
+      "contract_no: ОБЯЗАТЕЛЬНО проверь строку 'Договор:' в счете. Если после неё указан договор — верни его номер И дату.",
+      "Пример: 'Договор: Договор поставки №01-08/SC-39/2026 от 04.09.2026г' -> contract_no='01-08/SC-39/2026 от 04.09.2026г.'.",
+      "contract_no также найди по смыслу, если рядом НЕТ точного слова 'Договор'.",
       "Если это счет на оплату, но договор в документе НЕ указан, строка 'Договор:' пустая или номера договора нет — верни contract_no пустой строкой. Backend сам поставит финальное значение 'Без договора'.",
       "Ищи варианты с маркерами 'Договор', 'Основание', 'No', '№', 'N', а также строки, где сразу указан номер вида букв/цифр с дефисами или слешами и рядом есть дата.",
       "Верни ТОЛЬКО номер договора и дату из PDF, без описания услуги/товара.",
@@ -12492,6 +12515,10 @@ app.post("/do-ft/recognize", async (req, res) => {
                 document_type:{type:"string"},
                 contractor_raw:{type:"string"},
                 buyer_raw:{type:"string"},
+                legal_entity:{
+                  type:"string",
+                  enum:["","Сервис НС","СК Жилой дом","Sapa asphalt","Smart Estate"]
+                },
                 pay_purpose:{type:"string"},
                 contract_no:{type:"string"},
                 invoice_no:{type:"string"},
@@ -12499,7 +12526,7 @@ app.post("/do-ft/recognize", async (req, res) => {
                 sum_ft:{type:["number","null"]},
                 reason:{type:"string"}
               },
-              required:["status","is_invoice","document_type","contractor_raw","buyer_raw","pay_purpose","contract_no","invoice_no","invoice_date","sum_ft","reason"]
+              required:["status","is_invoice","document_type","contractor_raw","buyer_raw","legal_entity","pay_purpose","contract_no","invoice_no","invoice_date","sum_ft","reason"]
             }
           }
         }
@@ -12528,8 +12555,112 @@ app.post("/do-ft/recognize", async (req, res) => {
     }
 
     // ЮрЛицо определяем ТОЛЬКО по Покупателю из PDF.
-    // Возвращаем точное название из листа «ЮрЛицо».
-    const legalEntity = doFtMatchLegalEntityBackend_(extracted.buyer_raw, legalRows);
+    let buyerRaw = String(extracted.buyer_raw || "").trim();
+    let legalEntity = allowedLegalEntities.includes(String(extracted.legal_entity || "").trim())
+      ? String(extracted.legal_entity || "").trim()
+      : "";
+
+    if (!legalEntity) {
+      legalEntity = doFtMatchLegalEntityBackend_(buyerRaw, legalRows);
+    }
+
+    let extractedContract = String(extracted.contract_no || "").trim();
+
+    // Если общий проход пропустил Покупателя или Договор,
+    // делаем один короткий дополнительный проход только по этим полям.
+    if (!legalEntity || !extractedContract) {
+      try {
+        const focusInstruction = [
+          "Посмотри на счет на оплату и извлеки ТОЛЬКО Покупателя и Договор.",
+          "Найди строку 'Покупатель:'. legal_entity выбери ТОЛЬКО по названию Покупателя, БИН игнорируй.",
+          "Допустимые legal_entity: Сервис НС; СК Жилой дом; Sapa asphalt; Smart Estate.",
+          "Если видишь ТОО/товарищество 'СЕрВИС НС' — legal_entity='Сервис НС'.",
+          "Найди строку 'Договор:'. Если договор указан — contract_present=true и contract_no верни как 'номер от ДД.ММ.ГГГГг.'.",
+          "Пример: 'Договор поставки №01-08/SC-39/2026 от 04.09.2026г' -> '01-08/SC-39/2026 от 04.09.2026г.'.",
+          "Только если номера договора действительно нет — contract_present=false и contract_no=''.",
+          "Не используй имя файла."
+        ].join("\n");
+
+        const focusResponse = await fetch("https://api.openai.com/v1/responses", {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${apiKey}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            model,
+            store:false,
+            reasoning:{ effort:"minimal" },
+            max_output_tokens:220,
+            input:[{
+              role:"user",
+              content:[
+                { type:"input_text", text:focusInstruction },
+                filePart
+              ]
+            }],
+            text:{
+              format:{
+                type:"json_schema",
+                name:"do_ft_buyer_contract_focus",
+                strict:true,
+                schema:{
+                  type:"object",
+                  additionalProperties:false,
+                  properties:{
+                    buyer_raw:{type:"string"},
+                    legal_entity:{
+                      type:"string",
+                      enum:["","Сервис НС","СК Жилой дом","Sapa asphalt","Smart Estate"]
+                    },
+                    contract_present:{type:"boolean"},
+                    contract_no:{type:"string"}
+                  },
+                  required:["buyer_raw","legal_entity","contract_present","contract_no"]
+                }
+              }
+            }
+          })
+        });
+
+        if (focusResponse.ok) {
+          const focusRaw = await focusResponse.text();
+          let focusOpenAi = null;
+          try { focusOpenAi = JSON.parse(focusRaw); } catch (_) {}
+
+          const focusText = doFtExtractOutputText_(focusOpenAi);
+          let focus = null;
+          try { focus = JSON.parse(focusText); } catch (_) {}
+
+          if (focus) {
+            const focusBuyer = String(focus.buyer_raw || "").trim();
+            const focusLegal = String(focus.legal_entity || "").trim();
+            const focusContract = String(focus.contract_no || "").trim();
+
+            if (!buyerRaw && focusBuyer) buyerRaw = focusBuyer;
+
+            if (!legalEntity && allowedLegalEntities.includes(focusLegal)) {
+              legalEntity = focusLegal;
+            }
+            if (!legalEntity && focusBuyer) {
+              legalEntity = doFtMatchLegalEntityBackend_(focusBuyer, legalRows);
+            }
+
+            if (!extractedContract && focus.contract_present === true && focusContract) {
+              extractedContract = focusContract;
+            }
+          }
+        } else {
+          console.error(
+            "OpenAI focused buyer/contract pass error:",
+            focusResponse.status,
+            await focusResponse.text()
+          );
+        }
+      } catch (focusErr) {
+        console.error("Focused buyer/contract recognition error:", focusErr);
+      }
+    }
 
     // 1) Сначала пробуем контрагента по сырому ответу GPT.
     let contractorMatch = doFtMatchContractorBackend_(extracted.contractor_raw, contractors);
@@ -12538,7 +12669,7 @@ app.post("/do-ft/recognize", async (req, res) => {
     // Если договор однозначно найден в листе «Договоры»,
     // его строка также является надежным источником контрагента.
     let contractRow = doFtFindContractRowByRaw_(
-      extracted.contract_no,
+      extractedContract,
       contractRows,
       contractorMatch.contractor
     );
@@ -12558,7 +12689,7 @@ app.post("/do-ft/recognize", async (req, res) => {
     // среди договоров этого контрагента.
     if (!contractRow && contractorMatch.matched) {
       contractRow = doFtFindContractRowByRaw_(
-        extracted.contract_no,
+        extractedContract,
         contractRows,
         contractorMatch.contractor
       );
@@ -12568,7 +12699,7 @@ app.post("/do-ft/recognize", async (req, res) => {
       ...filenameInfo,
       // Перезаписываем пустое filenameInfo.legal_entity значением из Покупателя PDF.
       legal_entity: legalEntity,
-      buyer_raw: String(extracted.buyer_raw || "").trim(),
+      buyer_raw: buyerRaw,
       legal_match_source: legalEntity ? "buyer_pdf" : "",
       status: String(extracted.status || "ok"),
       is_invoice: extracted.is_invoice === true,
@@ -12579,20 +12710,20 @@ app.post("/do-ft/recognize", async (req, res) => {
       contractor_match_method: contractorMatch.method || "",
       pay_purpose: String(extracted.pay_purpose || "").trim(),
 
-      // raw = ровно то, что прочитал GPT
-      contract_no_raw: String(extracted.contract_no || "").trim(),
+      // raw = то, что модель прочитала из PDF, включая focused-pass.
+      contract_no_raw: extractedContract,
 
       // Финальный договор:
-      // 1) если найден в зависимом списке листа «Договоры» — точное значение из листа;
-      // 2) если в самом счете договор вообще не указан — "Без договора";
-      // 3) если GPT увидел договор, но в справочнике он не найден — оставляем пусто.
+      // 1) найден в листе «Договоры» -> точное значение из листа;
+      // 2) есть в PDF, но нет точного совпадения в листе -> сохраняем договор из PDF;
+      // 3) «Без договора» только если договор действительно не прочитан.
       contract_no: contractRow
         ? String(contractRow.contract_no || "").trim()
-        : (!String(extracted.contract_no || "").trim() ? "Без договора" : ""),
+        : (doFtFormatContractFromPdf_(extractedContract) || "Без договора"),
       contract_matched: !!contractRow,
       contract_match_method: contractRow
         ? "number_date_sheet"
-        : (!String(extracted.contract_no || "").trim() ? "no_contract" : "not_found"),
+        : (extractedContract ? "pdf" : "no_contract"),
 
       invoice_no: doFtExtractInvoiceNo_(extracted.invoice_no),
       invoice_date: String(extracted.invoice_date || "").trim(),
