@@ -12566,19 +12566,23 @@ app.post("/do-ft/recognize", async (req, res) => {
 
     let extractedContract = String(extracted.contract_no || "").trim();
 
-    // Если общий проход пропустил Покупателя или Договор,
-    // делаем один короткий дополнительный проход только по этим полям.
-    if (!legalEntity || !extractedContract) {
+    // Договор проверяем отдельным focused-pass ВСЕГДА.
+    // Это нужно, чтобы пустую строку "Договор:" не перепутать
+    // с суммами/ценами/кодами из таблицы.
+    {
       try {
         const focusInstruction = [
           "Посмотри на счет на оплату и извлеки ТОЛЬКО Покупателя и Договор.",
           "Найди строку 'Покупатель:'. legal_entity выбери ТОЛЬКО по названию Покупателя, БИН игнорируй.",
           "Допустимые legal_entity: Сервис НС; СК Жилой дом; Sapa asphalt; Smart Estate.",
           "Если видишь ТОО/товарищество 'СЕрВИС НС' — legal_entity='Сервис НС'.",
-          "Найди строку 'Договор:'. Если договор указан — contract_present=true и contract_no верни как 'номер от ДД.ММ.ГГГГг.'.",
+          "Найди именно строку/поле 'Договор:' или 'Основание:'.",
+          "Если после 'Договор:' указаны номер и/или дата договора — contract_present=true и contract_no верни как 'номер от ДД.ММ.ГГГГг.'.",
           "Пример: 'Договор поставки №01-08/SC-39/2026 от 04.09.2026г' -> '01-08/SC-39/2026 от 04.09.2026г.'.",
-          "Только если номера договора действительно нет — contract_present=false и contract_no=''.",
-          "Не используй имя файла."
+          "ВАЖНО: если поле 'Договор:' ПУСТОЕ — contract_present=false и contract_no=''.",
+          "При пустом поле Договор НЕ бери числа из таблицы товаров, цены, суммы, количество, коды товаров, номер счета, ИИК, БИН или телефон.",
+          "Например '29 047,00', '1 045 692,00', '58', '636' НЕ являются договором, если они взяты из таблицы/счета.",
+          "Не придумывай договор. Не используй имя файла."
         ].join("\n");
 
         const focusResponse = await fetch("https://api.openai.com/v1/responses", {
@@ -12646,8 +12650,13 @@ app.post("/do-ft/recognize", async (req, res) => {
               legalEntity = doFtMatchLegalEntityBackend_(focusBuyer, legalRows);
             }
 
-            if (!extractedContract && focus.contract_present === true && focusContract) {
+            // Focused-pass является окончательной проверкой договора.
+            // Если поле "Договор:" пустое, стираем ошибочно найденные
+            // в первом проходе суммы/числа — далее backend поставит "Без договора".
+            if (focus.contract_present === true && focusContract) {
               extractedContract = focusContract;
+            } else if (focus.contract_present === false) {
+              extractedContract = "";
             }
           }
         } else {
@@ -12716,7 +12725,8 @@ app.post("/do-ft/recognize", async (req, res) => {
       // Финальный договор:
       // 1) найден в листе «Договоры» -> точное значение из листа;
       // 2) есть в PDF, но нет точного совпадения в листе -> сохраняем договор из PDF;
-      // 3) «Без договора» только если договор действительно не прочитан.
+      // 3) Если focused-pass подтвердил, что поле "Договор:" пустое,
+      //    extractedContract = "" и здесь строго получаем "Без договора".
       contract_no: contractRow
         ? String(contractRow.contract_no || "").trim()
         : (doFtFormatContractFromPdf_(extractedContract) || "Без договора"),
