@@ -12117,6 +12117,21 @@ function doFtParseFilenameBackend_(fileName, legalRows, objects, dds) {
   };
 }
 
+function doFtLegalMatchKey_(v) {
+  // GPT/скан иногда смешивает визуально одинаковые латинские и кириллические буквы:
+  // "CEpBИC HC" и "СЕрВИС НС". Приводим их к одному виду для сравнения.
+  const visualMap = {
+    a:"а", b:"в", c:"с", e:"е", h:"н", k:"к", m:"м",
+    o:"о", p:"р", t:"т", x:"х", y:"у"
+  };
+
+  const fixed = String(v || "")
+    .toLowerCase()
+    .replace(/[abcehkmoptxy]/g, ch => visualMap[ch] || ch);
+
+  return doFtNorm_(fixed);
+}
+
 function doFtMatchLegalEntityBackend_(buyerRaw, legalRows) {
   const raw = String(buyerRaw || "")
     .replace(/\u00A0/g, " ")
@@ -12125,29 +12140,75 @@ function doFtMatchLegalEntityBackend_(buyerRaw, legalRows) {
 
   if (!raw) return "";
 
-  const rawKey = doFtNorm_(raw);
+  // Канонические значения из листа + резерв из интерфейса.
+  // Резерв нужен, чтобы ЮрЛицо не стало пустым, если в листе временно
+  // отсутствует код/строка или справочник загрузился не полностью.
+  const fallbackNames = [
+    "Сервис НС",
+    "СК Жилой дом",
+    "Sapa asphalt",
+    "Smart Estate"
+  ];
+
+  const names = [];
+  for (const x of (Array.isArray(legalRows) ? legalRows : [])) {
+    const name = String(x?.name || "").trim();
+    if (name && !names.some(v => v.toLowerCase() === name.toLowerCase())) {
+      names.push(name);
+    }
+  }
+  for (const name of fallbackNames) {
+    if (!names.some(v => v.toLowerCase() === name.toLowerCase())) {
+      names.push(name);
+    }
+  }
+
+  const canonical = wanted => {
+    const wantedKey = doFtLegalMatchKey_(wanted);
+    const found = names.find(name => doFtLegalMatchKey_(name) === wantedKey);
+    return found || wanted;
+  };
+
+  // БИН НЕ используем для определения ЮрЛицо.
+  // В разных документах БИН может отличаться, поэтому определяем ЮрЛицо
+  // только по названию Покупателя внутри PDF.
+  const rawKey = doFtLegalMatchKey_(raw);
   if (!rawKey) return "";
 
-  const prepared = (Array.isArray(legalRows) ? legalRows : [])
-    .map(x => ({
-      name: String(x?.name || "").trim(),
-      key: doFtNorm_(x?.name || "")
-    }))
-    .filter(x => x.name && x.key);
+  const prepared = names
+    .map(name => ({ name, key: doFtLegalMatchKey_(name) }))
+    .filter(x => x.key);
 
-  // 1. Полное совпадение после нормализации.
+  // 1. Точное совпадение.
   let found = prepared.find(x => x.key === rawKey);
   if (found) return found.name;
 
-  // 2. buyer_raw может содержать БИН/ИИН, адрес и прочий текст.
-  // Ищем каноническое название ЮрЛицо внутри строки Покупателя.
+  // 2. Покупатель часто содержит БИН, адрес и телефон.
+  // Ищем название компании внутри всей строки Покупателя.
   const candidates = prepared
     .filter(x => rawKey.includes(x.key) || x.key.includes(rawKey))
     .sort((a, b) => b.key.length - a.key.length);
 
-  return candidates.length ? candidates[0].name : "";
-}
+  if (candidates.length) return candidates[0].name;
 
+  // 3. Дополнительный резерв для смешения латиницы/кириллицы и OCR:
+  // сравниваем значимые слова названия, а не БИН.
+  const rawTokens = new Set(rawKey.split(/\s+/).filter(x => x.length >= 2));
+
+  const tokenMatches = prepared
+    .map(x => ({
+      ...x,
+      tokens: x.key.split(/\s+/).filter(t => t.length >= 2)
+    }))
+    .map(x => ({
+      ...x,
+      hits: x.tokens.filter(t => rawTokens.has(t)).length
+    }))
+    .filter(x => x.tokens.length && x.hits === x.tokens.length)
+    .sort((a, b) => b.tokens.length - a.tokens.length || b.key.length - a.key.length);
+
+  return tokenMatches.length ? tokenMatches[0].name : "";
+}
 function doFtMatchContractorBackend_(rawName, contractors) {
   const source = doFtUniqueStrings_(contractors);
   const raw = String(rawName || "").replace(/\s+/g, " ").trim();
@@ -12508,6 +12569,7 @@ app.post("/do-ft/recognize", async (req, res) => {
       // Перезаписываем пустое filenameInfo.legal_entity значением из Покупателя PDF.
       legal_entity: legalEntity,
       buyer_raw: String(extracted.buyer_raw || "").trim(),
+      legal_match_source: legalEntity ? "buyer_pdf" : "",
       status: String(extracted.status || "ok"),
       is_invoice: extracted.is_invoice === true,
       document_type: String(extracted.document_type || "").trim(),
