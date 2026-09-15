@@ -13063,4 +13063,565 @@ app.post("/do-ft/recognize", async (req, res) => {
   }
 });
 
+// =====================================================
+// КОНТРАКТЫ / АРХИТЕКТУРА
+// =====================================================
+
+
+// -----------------------------------------------------
+// ОБЪЕКТЫ
+// GET /contracts/objects
+// -----------------------------------------------------
+
+app.get("/contracts/objects", async (req, res) => {
+
+  try {
+
+    const result = await pool.query(`
+      SELECT
+        ob_id,
+        object_no,
+        division,
+        region,
+        customer_type,
+        object_name,
+        object_location,
+        object_description,
+        customer_name,
+        start_date,
+        end_date,
+        google_map_link,
+        contract_no,
+        contract_date,
+        contract_link,
+        contract_sum
+
+      FROM architecture.objects
+
+      ORDER BY
+        object_no NULLS LAST,
+        ob_id
+    `);
+
+
+    return res.json({
+      success: true,
+      rows: result.rows
+    });
+
+
+  } catch (error) {
+
+    console.error(
+      "CONTRACT OBJECTS GET ERROR:",
+      error
+    );
+
+
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+
+  }
+
+});
+
+
+
+// -----------------------------------------------------
+// СОЗДАТЬ ОБЪЕКТ
+// POST /contracts/objects
+// -----------------------------------------------------
+
+app.post("/contracts/objects", async (req, res) => {
+
+  const client = await pool.connect();
+
+
+  try {
+
+    const body = req.body || {};
+
+
+    const text = value => {
+
+      const s =
+        String(
+          value === null ||
+          value === undefined
+            ? ""
+            : value
+        ).trim();
+
+
+      return s || null;
+
+    };
+
+
+    const number = value => {
+
+      if (
+        value === null ||
+        value === undefined ||
+        value === ""
+      ) {
+        return null;
+      }
+
+
+      const n =
+        Number(
+          String(value)
+            .replace(/\s/g, "")
+            .replace(",", ".")
+        );
+
+
+      return Number.isFinite(n)
+        ? n
+        : null;
+
+    };
+
+
+    const objectName =
+      text(body.object_name);
+
+
+    if (!objectName) {
+
+      return res.status(400).json({
+        success: false,
+        error: "Объект не заполнен"
+      });
+
+    }
+
+
+    await client.query("BEGIN");
+
+
+    /*
+     * Чтобы два пользователя одновременно
+     * не получили одинаковый OB.
+     */
+
+    await client.query(`
+      SELECT pg_advisory_xact_lock(
+        hashtext('architecture_objects_ob_id')
+      )
+    `);
+
+
+    const nextResult =
+      await client.query(`
+        SELECT
+          COALESCE(
+            MAX(
+              NULLIF(
+                regexp_replace(
+                  ob_id,
+                  '\\D',
+                  '',
+                  'g'
+                ),
+                ''
+              )::bigint
+            ),
+            0
+          ) + 1 AS next_no
+
+        FROM architecture.objects
+      `);
+
+
+    const nextNo =
+      Number(
+        nextResult.rows[0].next_no
+      );
+
+
+    const obId =
+      "OB" + nextNo;
+
+
+    const result =
+      await client.query(
+        `
+        INSERT INTO architecture.objects (
+
+          ob_id,
+          object_no,
+          division,
+          region,
+          customer_type,
+
+          object_name,
+          object_location,
+          object_description,
+          customer_name,
+
+          start_date,
+          end_date,
+
+          google_map_link,
+
+          contract_no,
+          contract_date,
+          contract_link,
+          contract_sum
+
+        )
+        VALUES (
+
+          $1,$2,$3,$4,$5,
+          $6,$7,$8,$9,
+          $10,$11,$12,
+          $13,$14,$15,$16
+
+        )
+
+        RETURNING *
+        `,
+        [
+
+          obId,
+
+          number(body.object_no),
+
+          text(body.division),
+
+          text(body.region),
+
+          text(body.customer_type),
+
+          objectName,
+
+          text(body.object_location),
+
+          text(body.object_description),
+
+          text(body.customer_name),
+
+          text(body.start_date),
+
+          text(body.end_date),
+
+          text(body.google_map_link),
+
+          text(body.contract_no),
+
+          text(body.contract_date),
+
+          text(body.contract_link),
+
+          number(body.contract_sum)
+
+        ]
+      );
+
+
+    await client.query("COMMIT");
+
+
+    return res.json({
+      success: true,
+      row: result.rows[0]
+    });
+
+
+  } catch (error) {
+
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {}
+
+
+    console.error(
+      "CONTRACT OBJECT CREATE ERROR:",
+      error
+    );
+
+
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+
+
+  } finally {
+
+    client.release();
+
+  }
+
+});
+
+
+
+// -----------------------------------------------------
+// ВСЕ ДАННЫЕ ОДНОГО ОБЪЕКТА
+//
+// OB -> documents
+// DS -> year_amounts
+// SG -> guarantees
+//
+// OB -> object_status
+// OB -> commissioning_acts
+// OB -> subcontracts
+//
+// GET /contracts/object/OB1
+// -----------------------------------------------------
+
+app.get(
+  "/contracts/object/:obId",
+
+  async (req, res) => {
+
+    try {
+
+      const obId =
+        String(
+          req.params.obId || ""
+        ).trim();
+
+
+      if (!obId) {
+
+        return res.status(400).json({
+          success: false,
+          error: "obId пустой"
+        });
+
+      }
+
+
+      const [
+
+        objectResult,
+        documentsResult,
+        yearsResult,
+        guaranteesResult,
+        statusResult,
+        actsResult,
+        subcontractsResult
+
+      ] = await Promise.all([
+
+
+        pool.query(
+          `
+          SELECT *
+          FROM architecture.objects
+          WHERE ob_id = $1
+          LIMIT 1
+          `,
+          [obId]
+        ),
+
+
+        pool.query(
+          `
+          SELECT *
+          FROM architecture.documents
+          WHERE ob_id = $1
+
+          ORDER BY
+            ds_id
+          `,
+          [obId]
+        ),
+
+
+        pool.query(
+          `
+          SELECT
+            ya.*
+
+          FROM architecture.year_amounts ya
+
+          JOIN architecture.documents d
+            ON d.ds_id = ya.ds_id
+
+          WHERE d.ob_id = $1
+
+          ORDER BY
+            ya.amount_year,
+            ya.sg_id
+          `,
+          [obId]
+        ),
+
+
+        pool.query(
+          `
+          SELECT
+            g.*
+
+          FROM architecture.guarantees g
+
+          JOIN architecture.year_amounts ya
+            ON ya.sg_id = g.sg_id
+
+          JOIN architecture.documents d
+            ON d.ds_id = ya.ds_id
+
+          WHERE d.ob_id = $1
+
+          ORDER BY
+            g.bg_id
+          `,
+          [obId]
+        ),
+
+
+        pool.query(
+          `
+          SELECT *
+          FROM architecture.object_status
+
+          WHERE ob_id = $1
+
+          ORDER BY
+            changed_date DESC NULLS LAST,
+            st_id DESC
+          `,
+          [obId]
+        ),
+
+
+        pool.query(
+          `
+          SELECT *
+          FROM architecture.commissioning_acts
+
+          WHERE ob_id = $1
+
+          ORDER BY
+            akt_id
+          `,
+          [obId]
+        ),
+
+
+        pool.query(
+          `
+          SELECT *
+          FROM architecture.subcontracts
+
+          WHERE ob_id = $1
+
+          ORDER BY
+            sp_id
+          `,
+          [obId]
+        )
+
+      ]);
+
+
+      if (!objectResult.rows.length) {
+
+        return res.status(404).json({
+          success: false,
+          error: "Объект не найден"
+        });
+
+      }
+
+
+      return res.json({
+
+        success: true,
+
+        object:
+          objectResult.rows[0],
+
+        documents:
+          documentsResult.rows,
+
+        year_amounts:
+          yearsResult.rows,
+
+        guarantees:
+          guaranteesResult.rows,
+
+        object_status:
+          statusResult.rows,
+
+        commissioning_acts:
+          actsResult.rows,
+
+        subcontracts:
+          subcontractsResult.rows
+
+      });
+
+
+    } catch (error) {
+
+      console.error(
+        "CONTRACT OBJECT DETAIL ERROR:",
+        error
+      );
+
+
+      return res.status(500).json({
+        success: false,
+        error: error.message
+      });
+
+    }
+
+  }
+);
+
+
+
+// -----------------------------------------------------
+// ОТЧЕТ
+// ТОЛЬКО v_big_table
+// -----------------------------------------------------
+
+app.get("/contracts/report", async (req, res) => {
+
+  try {
+
+    const result =
+      await pool.query(`
+        SELECT *
+        FROM architecture.v_big_table
+
+        ORDER BY
+          "№" NULLS LAST,
+          "Дата" NULLS LAST,
+          "Номер" NULLS LAST
+      `);
+
+
+    return res.json({
+      success: true,
+      rows: result.rows
+    });
+
+
+  } catch (error) {
+
+    console.error(
+      "CONTRACT REPORT ERROR:",
+      error
+    );
+
+
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+
+  }
+
+});
+
 app.listen(PORT, () => console.log("Server started on port " + PORT));
