@@ -13073,42 +13073,57 @@ app.post("/do-ft/recognize", async (req, res) => {
 // GET /contracts/objects
 // -----------------------------------------------------
 
-app.get("/contracts/objects", async (req, res) => {
+// =====================================================
+// СПИСОК ОБЪЕКТОВ
+// ИСТОЧНИК: architecture.v_architecture_join
+// =====================================================
 
+app.get("/contracts/objects", async (req, res) => {
   try {
 
     const result = await pool.query(`
-      SELECT
+      SELECT DISTINCT ON (ob_id)
+
         ob_id,
         object_no,
         division,
         region,
         customer_type,
+
         object_name,
         object_location,
         object_description,
         customer_name,
+
         start_date,
         end_date,
+
         google_map_link,
+
         contract_no,
         contract_date,
         contract_link,
         contract_sum
 
-      FROM architecture.objects
+      FROM architecture.v_architecture_join
+
+      WHERE ob_id IS NOT NULL
 
       ORDER BY
-        object_no NULLS LAST,
-        ob_id
+        ob_id,
+        object_no NULLS LAST
     `);
 
+    // после DISTINCT сортируем нормально 1,2,3...
+    result.rows.sort((a, b) => {
+      return Number(a.object_no || 0) -
+             Number(b.object_no || 0);
+    });
 
     return res.json({
       success: true,
       rows: result.rows
     });
-
 
   } catch (error) {
 
@@ -13117,14 +13132,11 @@ app.get("/contracts/objects", async (req, res) => {
       error
     );
 
-
     return res.status(500).json({
       success: false,
       error: error.message
     });
-
   }
-
 });
 
 
@@ -13375,188 +13387,337 @@ app.post("/contracts/objects", async (req, res) => {
 // GET /contracts/object/OB1
 // -----------------------------------------------------
 
+
+// =====================================================
+// ДАННЫЕ ОДНОГО ОБЪЕКТА
+// ИСТОЧНИК: architecture.v_architecture_join
+// =====================================================
+
 app.get(
   "/contracts/object/:obId",
 
   async (req, res) => {
-
     try {
 
       const obId =
-        String(
-          req.params.obId || ""
-        ).trim();
-
+        String(req.params.obId || "").trim();
 
       if (!obId) {
-
         return res.status(400).json({
           success: false,
           error: "obId пустой"
         });
-
       }
 
 
-      const [
-
-        objectResult,
-        documentsResult,
-        yearsResult,
-        guaranteesResult,
-        statusResult,
-        actsResult,
-        subcontractsResult
-
-      ] = await Promise.all([
-
-
-        pool.query(
-          `
-          SELECT *
-          FROM architecture.objects
-          WHERE ob_id = $1
-          LIMIT 1
-          `,
-          [obId]
-        ),
+      const result = await pool.query(
+        `
+        SELECT *
+        FROM architecture.v_architecture_join
+        WHERE ob_id = $1
+        ORDER BY
+          ds_id NULLS LAST,
+          amount_year NULLS LAST,
+          sg_id NULLS LAST,
+          bg_id NULLS LAST,
+          st_id NULLS LAST,
+          akt_id NULLS LAST,
+          sp_id NULLS LAST
+        `,
+        [obId]
+      );
 
 
-        pool.query(
-          `
-          SELECT *
-          FROM architecture.documents
-          WHERE ob_id = $1
+      const rows = result.rows || [];
 
-          ORDER BY
-            ds_id
-          `,
-          [obId]
-        ),
-
-
-        pool.query(
-          `
-          SELECT
-            ya.*
-
-          FROM architecture.year_amounts ya
-
-          JOIN architecture.documents d
-            ON d.ds_id = ya.ds_id
-
-          WHERE d.ob_id = $1
-
-          ORDER BY
-            ya.amount_year,
-            ya.sg_id
-          `,
-          [obId]
-        ),
-
-
-        pool.query(
-          `
-          SELECT
-            g.*
-
-          FROM architecture.guarantees g
-
-          JOIN architecture.year_amounts ya
-            ON ya.sg_id = g.sg_id
-
-          JOIN architecture.documents d
-            ON d.ds_id = ya.ds_id
-
-          WHERE d.ob_id = $1
-
-          ORDER BY
-            g.bg_id
-          `,
-          [obId]
-        ),
-
-
-        pool.query(
-          `
-          SELECT *
-          FROM architecture.object_status
-
-          WHERE ob_id = $1
-
-          ORDER BY
-            changed_date DESC NULLS LAST,
-            st_id DESC
-          `,
-          [obId]
-        ),
-
-
-        pool.query(
-          `
-          SELECT *
-          FROM architecture.commissioning_acts
-
-          WHERE ob_id = $1
-
-          ORDER BY
-            akt_id
-          `,
-          [obId]
-        ),
-
-
-        pool.query(
-          `
-          SELECT *
-          FROM architecture.subcontracts
-
-          WHERE ob_id = $1
-
-          ORDER BY
-            sp_id
-          `,
-          [obId]
-        )
-
-      ]);
-
-
-      if (!objectResult.rows.length) {
-
+      if (!rows.length) {
         return res.status(404).json({
           success: false,
           error: "Объект не найден"
         });
-
       }
 
 
-      return res.json({
+      // -------------------------
+      // УНИКАЛЬНЫЕ СТРОКИ
+      // -------------------------
 
+      function uniqueBy(list, key) {
+
+        const map = new Map();
+
+        for (const row of list) {
+
+          const value = row[key];
+
+          if (
+            value === null ||
+            value === undefined ||
+            value === ""
+          ) {
+            continue;
+          }
+
+          if (!map.has(String(value))) {
+            map.set(String(value), row);
+          }
+        }
+
+        return Array.from(map.values());
+      }
+
+
+      // -------------------------
+      // ОБЪЕКТ
+      // -------------------------
+
+      const first = rows[0];
+
+      const object = {
+        ob_id: first.ob_id,
+        object_no: first.object_no,
+        division: first.division,
+        region: first.region,
+        customer_type: first.customer_type,
+
+        object_name: first.object_name,
+        object_location: first.object_location,
+        object_description: first.object_description,
+        customer_name: first.customer_name,
+
+        start_date: first.start_date,
+        end_date: first.end_date,
+
+        google_map_link: first.google_map_link,
+
+        contract_no: first.contract_no,
+        contract_date: first.contract_date,
+        contract_link: first.contract_link,
+        contract_sum: first.contract_sum
+      };
+
+
+      // -------------------------
+      // ДОПИКИ
+      // -------------------------
+
+      const documents =
+        uniqueBy(rows, "ds_id")
+          .map(r => ({
+            ds_id: r.ds_id,
+            ob_id: r.ob_id,
+
+            addendum_no: r.addendum_no,
+            addendum_date: r.addendum_date,
+            addendum_link: r.addendum_link,
+
+            document_type: r.document_type,
+            is_actual_amount: r.is_actual_amount
+          }));
+
+
+      // -------------------------
+      // ГОД / СУММА
+      // -------------------------
+
+      const year_amounts =
+        uniqueBy(rows, "sg_id")
+          .map(r => ({
+            sg_id: r.sg_id,
+            ds_id: r.ds_id,
+
+            amount_year: r.amount_year,
+            amount: r.amount
+          }));
+
+
+      // -------------------------
+      // ГАРАНТИИ
+      // -------------------------
+
+      const guarantees =
+        uniqueBy(rows, "bg_id")
+          .map(r => ({
+            bg_id: r.bg_id,
+            sg_id: r.sg_id,
+
+            three_percent: r.three_percent,
+            advance: r.advance,
+            three_percent_plus_adv:
+              r.three_percent_plus_adv,
+
+            paid_three_percent_doc:
+              r.paid_three_percent_doc,
+
+            paid_advance_doc:
+              r.paid_advance_doc,
+
+            guarantee_type:
+              r.guarantee_type,
+
+            guarantor:
+              r.guarantor,
+
+            security_status:
+              r.security_status,
+
+            effective_date:
+              r.effective_date,
+
+            term_workdays:
+              r.term_workdays,
+
+            deadline_date:
+              r.deadline_date,
+
+            deadline_days:
+              r.deadline_days,
+
+            actual_security_date:
+              r.actual_security_date,
+
+            security_days_delta:
+              r.security_days_delta,
+
+            comments:
+              r.comments
+          }));
+
+
+      // -------------------------
+      // СТАТУС
+      // -------------------------
+
+      const object_status =
+        uniqueBy(rows, "st_id")
+          .map(r => ({
+            st_id: r.st_id,
+            ob_id: r.ob_id,
+
+            status: r.status,
+            project_manager: r.project_manager,
+            pto_engineer: r.pto_engineer,
+            has_subcontract: r.has_subcontract,
+
+            psd_link: r.psd_link,
+            approved_vdc_estimate:
+              r.approved_vdc_estimate,
+
+            expert_conclusion:
+              r.expert_conclusion,
+
+            approved_gpr_gp:
+              r.approved_gpr_gp,
+
+            approved_ppr:
+              r.approved_ppr,
+
+            responsible_order:
+              r.responsible_order,
+
+            construction_ticket:
+              r.construction_ticket,
+
+            work_permit:
+              r.work_permit,
+
+            avr_accumulator_gp:
+              r.avr_accumulator_gp,
+
+            changed_date:
+              r.changed_date
+          }));
+
+
+      // -------------------------
+      // АКТ ВВОДА
+      // -------------------------
+
+      const commissioning_acts =
+        uniqueBy(rows, "akt_id")
+          .map(r => ({
+            akt_id: r.akt_id,
+            ob_id: r.ob_id,
+
+            commissioning_status:
+              r.commissioning_status,
+
+            commissioning_act:
+              r.commissioning_act,
+
+            in_depository:
+              r.in_depository
+          }));
+
+
+      // -------------------------
+      // СУБПОДРЯД
+      // -------------------------
+
+      const subcontracts =
+        uniqueBy(rows, "sp_id")
+          .map(r => ({
+            sp_id: r.sp_id,
+            ob_id: r.ob_id,
+
+            subcontractor:
+              r.subcontractor,
+
+            contract_no:
+              r.contract_no_sp,
+
+            contract_date:
+              r.contract_date_sp,
+
+            contract_link:
+              r.contract_link_sp,
+
+            estimate:
+              r.estimate,
+
+            general_contractor_pct:
+              r.general_contractor_pct,
+
+            contract_sum:
+              r.contract_sum_sp,
+
+            approved_gpr_sp:
+              r.approved_gpr_sp,
+
+            avr_accumulator_sp:
+              r.avr_accumulator_sp,
+
+            role_name:
+              r.role_name,
+
+            group_name:
+              r.group_name,
+
+            subcontract_contract_1:
+              r.subcontract_contract_1,
+
+            subcontract_contract_2:
+              r.subcontract_contract_2,
+
+            subcontract_contract_3:
+              r.subcontract_contract_3
+          }));
+
+
+      return res.json({
         success: true,
 
-        object:
-          objectResult.rows[0],
+        object,
+        documents,
+        year_amounts,
+        guarantees,
+        object_status,
+        commissioning_acts,
+        subcontracts,
 
-        documents:
-          documentsResult.rows,
-
-        year_amounts:
-          yearsResult.rows,
-
-        guarantees:
-          guaranteesResult.rows,
-
-        object_status:
-          statusResult.rows,
-
-        commissioning_acts:
-          actsResult.rows,
-
-        subcontracts:
-          subcontractsResult.rows
-
+        // полный JOIN тоже оставляем,
+        // если потом понадобится
+        rows
       });
 
 
@@ -13567,45 +13728,42 @@ app.get(
         error
       );
 
-
       return res.status(500).json({
         success: false,
         error: error.message
       });
-
     }
-
   }
 );
-
-
 
 // -----------------------------------------------------
 // ОТЧЕТ
 // ТОЛЬКО v_big_table
 // -----------------------------------------------------
 
-app.get("/contracts/report", async (req, res) => {
+// =====================================================
+// ОТЧЕТ
+// ИСТОЧНИК: architecture.v_architecture_join
+// =====================================================
 
+app.get("/contracts/report", async (req, res) => {
   try {
 
-    const result =
-      await pool.query(`
-        SELECT *
-        FROM architecture.v_big_table
-
-        ORDER BY
-          "№" NULLS LAST,
-          "Дата" NULLS LAST,
-          "Номер" NULLS LAST
-      `);
-
+    const result = await pool.query(`
+      SELECT *
+      FROM architecture.v_architecture_join
+      ORDER BY
+        object_no NULLS LAST,
+        ob_id NULLS LAST,
+        ds_id NULLS LAST,
+        sg_id NULLS LAST,
+        bg_id NULLS LAST
+    `);
 
     return res.json({
       success: true,
       rows: result.rows
     });
-
 
   } catch (error) {
 
@@ -13614,14 +13772,12 @@ app.get("/contracts/report", async (req, res) => {
       error
     );
 
-
     return res.status(500).json({
       success: false,
       error: error.message
     });
-
   }
-
 });
+
 
 app.listen(PORT, () => console.log("Server started on port " + PORT));
