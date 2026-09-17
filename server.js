@@ -13752,12 +13752,6 @@ app.get("/contracts/report", async (req, res) => {
     const result = await pool.query(`
       SELECT *
       FROM architecture.v_architecture_join
-      ORDER BY
-        object_no NULLS LAST,
-        ob_id NULLS LAST,
-        ds_id NULLS LAST,
-        sg_id NULLS LAST,
-        bg_id NULLS LAST
     `);
 
     return res.json({
