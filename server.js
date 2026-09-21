@@ -13378,7 +13378,7 @@ app.post("/contracts/objects", async (req, res) => {
 //
 // OB -> documents
 // DS -> year_amounts
-// SG -> guarantees
+// DS -> guarantees
 //
 // OB -> object_status
 // OB -> commissioning_acts
@@ -13539,48 +13539,52 @@ app.get(
         uniqueBy(rows, "bg_id")
           .map(r => ({
             bg_id: r.bg_id,
-            sg_id: r.sg_id,
+            ds_id: r.ds_id,
 
-            three_percent: r.three_percent,
-            advance: r.advance,
-            three_percent_plus_adv:
-              r.three_percent_plus_adv,
+            security_subject:
+              r.security_subject ?? r["Предмет обеспечения"],
 
-            paid_three_percent_doc:
-              r.paid_three_percent_doc,
+            rate:
+              r.rate ?? r["Ставка"],
 
-            paid_advance_doc:
-              r.paid_advance_doc,
+            amount:
+              r.security_amount ?? r["Сумма обеспечения"],
 
             guarantee_type:
-              r.guarantee_type,
+              r.guarantee_type ?? r["Вид обеспечения"] ?? r["Вид"],
 
-            guarantor:
-              r.guarantor,
+            premium:
+              r.premium ?? r["Премия"],
 
             security_status:
-              r.security_status,
+              r.security_status ?? r["Статус Обеспечения"],
 
             effective_date:
-              r.effective_date,
+              r.effective_date ?? r["Дата вступления в силу"],
 
             term_workdays:
-              r.term_workdays,
+              r.term_workdays ?? r["Срок, раб.дней"],
 
             deadline_date:
-              r.deadline_date,
+              r.deadline_date ?? r["Дедлайн Дата"],
 
             deadline_days:
-              r.deadline_days,
+              r.deadline_days ?? r["Дедлайн Дней"],
+
+            guarantor:
+              r.guarantor ?? r["Гарант"],
+
+            pdf_link:
+              r.pdf_link ?? r["PDF"],
 
             actual_security_date:
-              r.actual_security_date,
+              r.actual_security_date ?? r["Факт дата обеспеч"] ?? r["Факт дата"],
 
             security_days_delta:
-              r.security_days_delta,
+              r.security_days_delta ?? r["Обеспечено (+)раньше/(-)позже"] ?? r["Обеспечено"],
 
             comments:
-              r.comments
+              r.comments ?? r["Комменты"] ?? r["Комментарий"]
           }));
 
 
