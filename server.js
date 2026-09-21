@@ -13318,8 +13318,7 @@ app.get("/contracts/objects", async (req, res) => {
 
         contract_no,
         contract_date,
-        contract_link,
-        contract_sum
+        contract_link
 
       FROM architecture.v_architecture_join
 
@@ -13330,7 +13329,6 @@ app.get("/contracts/objects", async (req, res) => {
         object_no NULLS LAST
     `);
 
-    // после DISTINCT сортируем нормально 1,2,3...
     result.rows.sort((a, b) => {
       return Number(a.object_no || 0) -
              Number(b.object_no || 0);
@@ -13354,7 +13352,6 @@ app.get("/contracts/objects", async (req, res) => {
     });
   }
 });
-
 
 
 // -----------------------------------------------------
