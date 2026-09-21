@@ -154,6 +154,8 @@ mechanization text,
 
   // ✅ технический PK id (bigserial)
   await pool.query(`ALTER TABLE public.zvk ADD COLUMN IF NOT EXISTS id bigserial;`);
+  // ЭСК: плановая сумма возврата, которую инициатор может менять в ФТ.
+  await pool.query(`ALTER TABLE public.zvk ADD COLUMN IF NOT EXISTS return_amount numeric(18,2) DEFAULT 0;`);
   await pool.query(`ALTER TABLE public.zvk DROP CONSTRAINT IF EXISTS zvk_pkey;`);
   await pool.query(`ALTER TABLE public.zvk ADD CONSTRAINT zvk_pkey PRIMARY KEY (id);`);
 
@@ -224,6 +226,12 @@ await pool.query(`
   await pool.query(`ALTER TABLE public.zvk_pay ADD COLUMN IF NOT EXISTS aray_pay_time timestamptz;`);
   await pool.query(`ALTER TABLE public.zvk_pay ADD COLUMN IF NOT EXISTS aray_paid_by text;`);
 
+  // ЭСК: фактический возврат Арай.
+  await pool.query(`ALTER TABLE public.zvk_pay ADD COLUMN IF NOT EXISTS returned_amount numeric(18,2) DEFAULT 0;`);
+  await pool.query(`ALTER TABLE public.zvk_pay ADD COLUMN IF NOT EXISTS return_status text;`);
+  await pool.query(`ALTER TABLE public.zvk_pay ADD COLUMN IF NOT EXISTS return_time timestamptz;`);
+  await pool.query(`ALTER TABLE public.zvk_pay ADD COLUMN IF NOT EXISTS return_by text;`);
+
   // (опционально) согласование по id_zvk
   await pool.query(`
     CREATE TABLE IF NOT EXISTS zvk_agree (
@@ -282,7 +290,12 @@ s.idlzk,
       p.registry_flag,
       p.pay_time,
       p.is_paid,
-      f.mechanization
+      f.mechanization,
+      z.return_amount,
+      COALESCE(p.returned_amount, 0) AS returned_amount,
+      p.return_status,
+      p.return_time,
+      p.return_by
 
     FROM ft f
     LEFT JOIN zvk z ON z.id_ft = f.id_ft
@@ -4035,7 +4048,12 @@ app.get("/request-list", async (req, res) => {
           ''
         ) AS idlzk,
 
-        i.to_pay,
+        COALESCE(cur.to_pay, i.to_pay) AS to_pay,
+        COALESCE(cur.return_amount, 0) AS return_amount,
+        COALESCE(cur.returned_amount, 0) AS returned_amount,
+        COALESCE(cur.return_status, '') AS return_status,
+        cur.return_time,
+        COALESCE(cur.return_by, '') AS return_by,
 
         COALESCE(cur.request_flag, '') AS request_flag,
         COALESCE(cur.registry_flag, '') AS registry_flag,
@@ -4206,6 +4224,7 @@ app.post("/zvk-save", async (req, res) => {
       zvk_row_id,
       user_name,
       to_pay,
+      return_amount,
       request_flag,
       login,
       is_admin,
@@ -4248,6 +4267,15 @@ const toPayNum = isNoRequest
 
     if (Number.isNaN(toPayNum)) {
       return res.status(400).json({ success:false, error:"to_pay must be number" });
+    }
+
+    const returnAmountNum =
+      return_amount === "" || return_amount === undefined || return_amount === null
+        ? 0
+        : Number(return_amount);
+
+    if (Number.isNaN(returnAmountNum) || returnAmountNum < 0) {
+      return res.status(400).json({ success:false, error:"return_amount must be a non-negative number" });
     }
 
     // ✅ ГЛАВНОЕ: если пришёл zvk_row_id — обновляем выбранную строку, не создаём новую
@@ -4301,13 +4329,15 @@ const toPayNum = isNoRequest
         UPDATE public.zvk
            SET request_flag = $1,
                to_pay       = $2,
-               zvk_name     = $3,
+               return_amount = $3,
+               zvk_name     = $4,
                zvk_date     = NOW()
-         WHERE id = $4
-         RETURNING id, id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag
+         WHERE id = $5
+         RETURNING id, id_zvk, id_ft, zvk_date, zvk_name, to_pay, return_amount, request_flag
       `, [
         flag,
         toPayNum,
+        returnAmountNum,
         finalName,
         rid
       ]);
@@ -4382,6 +4412,7 @@ const toPayNum = isNoRequest
           UPDATE public.zvk
              SET request_flag = 'Нет',
                  to_pay       = 0,
+                 return_amount = 0,
                  zvk_name     = 'СИСТЕМА',
                  zvk_date     = NOW()
            WHERE id = $1
@@ -4521,12 +4552,12 @@ const toPayNum = isNoRequest
     const r = await pool.query(
       `
       INSERT INTO public.zvk
-        (id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag)
+        (id_zvk, id_ft, zvk_date, zvk_name, to_pay, return_amount, request_flag)
       VALUES
-        ($1, $2, NOW(), $3, $4, $5)
-      RETURNING id, id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag
+        ($1, $2, NOW(), $3, $4, $5, $6)
+      RETURNING id, id_zvk, id_ft, zvk_date, zvk_name, to_pay, return_amount, request_flag
       `,
-      [id_zvk, ft, finalName, finalToPay, finalFlag]
+      [id_zvk, ft, finalName, finalToPay, finalFlag === "Нет" ? 0 : returnAmountNum, finalFlag]
     );
 
     let rebuild = null;
@@ -4649,6 +4680,75 @@ app.post("/zvk-bulk-request-flag", async (req, res) => {
 // ✅ Источник по строке истории
 // POST /zvk-status-row  { zvk_row_id, src_d, src_o }
 // =====================================================
+
+// =====================================================
+// ЭСК — инициатор может менять плановую "Сумму возврата"
+// даже после отправки строки в Реестр.
+// =====================================================
+app.post("/zvk-return-amount", async (req, res) => {
+  try {
+    const rid = Number(req.body?.zvk_row_id);
+    const login = String(req.body?.login || "").trim().toLowerCase();
+    const amount = Number(req.body?.return_amount ?? 0);
+
+    if (!rid) {
+      return res.status(400).json({ success:false, error:"zvk_row_id required" });
+    }
+    if (!login) {
+      return res.status(400).json({ success:false, error:"login required" });
+    }
+    if (!Number.isFinite(amount) || amount < 0) {
+      return res.status(400).json({ success:false, error:"Сумма возврата должна быть 0 или больше" });
+    }
+
+    const rowRes = await pool.query(`
+      SELECT
+        z.id,
+        COALESCE(s.src_o, '') AS src_o,
+        COALESCE(p.return_status, '') AS return_status
+      FROM public.zvk z
+      LEFT JOIN public.zvk_status s ON s.zvk_row_id = z.id
+      LEFT JOIN public.zvk_pay p ON p.zvk_row_id = z.id
+      WHERE z.id = $1
+      LIMIT 1
+    `, [rid]);
+
+    if (!rowRes.rowCount) {
+      return res.status(404).json({ success:false, error:"ZVK_ROW_NOT_FOUND" });
+    }
+
+    const row = rowRes.rows[0];
+    if (!String(row.src_o || "").toUpperCase().includes("ЭСК")) {
+      return res.status(400).json({ success:false, error:"Сумма возврата доступна только для Источник Объект с ЭСК" });
+    }
+
+    if (String(row.return_status || "").trim().toLowerCase() === "полностью возвращено") {
+      return res.status(409).json({ success:false, error:"Возврат уже закрыт как «Полностью возвращено»" });
+    }
+
+    const adminOk = ["b_erkin", "s_zhasulan", "admin", "a_zaitova"].includes(login);
+    if (!adminOk) {
+      const ownerOk = await canEditRowByLogin(pool, rid, login);
+      if (!ownerOk) {
+        return res.status(403).json({ success:false, error:"NO_RIGHTS_THIS_ROW" });
+      }
+    }
+
+    const upd = await pool.query(`
+      UPDATE public.zvk
+      SET return_amount = $2,
+          zvk_date = NOW()
+      WHERE id = $1
+      RETURNING id, id_zvk, id_ft, return_amount
+    `, [rid, amount]);
+
+    return res.json({ success:true, row:upd.rows[0] });
+  } catch (e) {
+    console.error("ZVK-RETURN-AMOUNT ERROR:", e);
+    return res.status(500).json({ success:false, error:e.message });
+  }
+});
+
 app.post("/zvk-status-row", async (req, res) => {
   try {
     const { zvk_row_id, src_o, idlzk, status_comment, login, is_admin, can_edit_all, is_all } = req.body;
@@ -6529,7 +6629,12 @@ app.get("/request-card", async (req, res) => {
         i.src_d,
         i.src_o,
         COALESCE(NULLIF(i.idlzk, ''), cur.idlzk, '') AS idlzk,
-        i.to_pay,
+        COALESCE(cur.to_pay, i.to_pay) AS to_pay,
+        COALESCE(cur.return_amount, 0) AS return_amount,
+        COALESCE(cur.returned_amount, 0) AS returned_amount,
+        COALESCE(cur.return_status, '') AS return_status,
+        cur.return_time,
+        COALESCE(cur.return_by, '') AS return_by,
 
         COALESCE(cur.request_flag, '') AS request_flag,
         COALESCE(cur.registry_flag, '') AS registry_flag,
@@ -7497,6 +7602,117 @@ app.post("/cancel-rejected-ft-lines", async (req, res) => {
       error: e.message
     });
 
+  } finally {
+    client.release();
+  }
+});
+
+
+// =====================================================
+// ЭСК — фактический возврат Арай
+// action: "returned" | "full"
+// "returned" прибавляет указанную сумму к уже возвращённой.
+// "full" фиксирует статус "Полностью возвращено".
+// =====================================================
+app.post("/request-items-return", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const rowIds = Array.isArray(req.body?.row_ids)
+      ? [...new Set(req.body.row_ids.map(Number).filter(Boolean))]
+      : [];
+    const login = String(req.body?.login || "").trim().toLowerCase();
+    const action = String(req.body?.action || "").trim().toLowerCase();
+    const amount = Number(req.body?.amount ?? 0);
+
+    if (!rowIds.length) {
+      return res.status(400).json({ success:false, error:"row_ids required" });
+    }
+
+    if (!["k_arailym", "admin", "b_erkin"].includes(login)) {
+      return res.status(403).json({ success:false, error:"Возврат доступен только Арай/администратору" });
+    }
+
+    if (!["returned", "full"].includes(action)) {
+      return res.status(400).json({ success:false, error:"action must be returned or full" });
+    }
+
+    if (action === "returned" && (!Number.isFinite(amount) || amount <= 0)) {
+      return res.status(400).json({ success:false, error:"Сумма возврата должна быть больше 0" });
+    }
+
+    const rowsCheck = await client.query(`
+      SELECT
+        z.id AS zvk_row_id,
+        COALESCE(s.src_o, '') AS src_o
+      FROM public.zvk z
+      LEFT JOIN public.zvk_status s ON s.zvk_row_id = z.id
+      WHERE z.id = ANY($1::bigint[])
+    `, [rowIds]);
+
+    if (rowsCheck.rowCount !== rowIds.length) {
+      return res.status(404).json({ success:false, error:"Не все строки ZFT найдены" });
+    }
+
+    const nonEsk = rowsCheck.rows.filter(r =>
+      !String(r.src_o || "").toUpperCase().includes("ЭСК")
+    );
+    if (nonEsk.length) {
+      return res.status(400).json({ success:false, error:"Возврат доступен только для Источник Объект с надписью ЭСК" });
+    }
+
+    await client.query("BEGIN");
+
+    if (action === "returned") {
+      await client.query(`
+        INSERT INTO public.zvk_pay
+          (zvk_row_id, returned_amount, return_status, return_time, return_by)
+        SELECT x, $2::numeric, 'Возвращено', NOW(), $3
+        FROM unnest($1::bigint[]) AS x
+        ON CONFLICT (zvk_row_id)
+        DO UPDATE SET
+          returned_amount = COALESCE(public.zvk_pay.returned_amount, 0) + EXCLUDED.returned_amount,
+          return_status = 'Возвращено',
+          return_time = NOW(),
+          return_by = EXCLUDED.return_by
+      `, [rowIds, amount, login]);
+    } else {
+      await client.query(`
+        INSERT INTO public.zvk_pay
+          (zvk_row_id, returned_amount, return_status, return_time, return_by)
+        SELECT
+          z.id,
+          GREATEST(COALESCE(p.returned_amount,0), COALESCE(z.return_amount,0)),
+          'Полностью возвращено',
+          NOW(),
+          $2
+        FROM public.zvk z
+        LEFT JOIN public.zvk_pay p ON p.zvk_row_id = z.id
+        WHERE z.id = ANY($1::bigint[])
+        ON CONFLICT (zvk_row_id)
+        DO UPDATE SET
+          returned_amount = GREATEST(
+            COALESCE(public.zvk_pay.returned_amount,0),
+            EXCLUDED.returned_amount
+          ),
+          return_status = 'Полностью возвращено',
+          return_time = NOW(),
+          return_by = EXCLUDED.return_by
+      `, [rowIds, login]);
+    }
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success:true,
+      action,
+      amount: action === "returned" ? amount : null,
+      updated: rowIds.length
+    });
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+    console.error("request-items-return error:", e);
+    return res.status(500).json({ success:false, error:e.message });
   } finally {
     client.release();
   }
