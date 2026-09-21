@@ -5237,6 +5237,7 @@ WHERE z.id = $1
 app.get("/ft-zvk-join", async (req, res) => {
   try {
     const login = String(req.query.login || "").trim();
+    const loginNorm = login.toLowerCase();
 
     const isAdmin    = String(req.query.is_admin || "0") === "1";
     const isAll      = String(req.query.is_all || "0") === "1";
@@ -5286,8 +5287,26 @@ if (isAdmin || isAll) {
 // ✅ Для инициатора/оператора НЕ фильтруем оплаченные вообще
 
     if (!(isAdmin || isAll || isOperator)) {
-      params.push(login);
-      where.push(`lower(trim(v.input_name)) = lower(trim($${params.length}))`);
+      if (loginNorm === "a_zaitova") {
+        // Заитова видит:
+        // 1) все свои строки;
+        // 2) строки любых инициаторов только для
+        //    ЮрЛицо = Сервис НС + Статья ДДС = 103.Командировочные.
+        params.push(login);
+        const loginParam = `$${params.length}`;
+
+        where.push(`(
+          lower(trim(v.input_name)) = lower(trim(${loginParam}))
+          OR (
+            lower(trim(COALESCE(v.legal_entity, v.src_d, ''))) = lower('Сервис НС')
+            AND lower(regexp_replace(COALESCE(v.dds_article, ''), '\\s+', '', 'g'))
+                = lower('103.Командировочные')
+          )
+        )`);
+      } else {
+        params.push(login);
+        where.push(`lower(trim(v.input_name)) = lower(trim($${params.length}))`);
+      }
     }
 
 
