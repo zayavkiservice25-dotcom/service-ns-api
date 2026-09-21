@@ -13602,7 +13602,42 @@ app.post("/contracts/objects", async (req, res) => {
 //
 // GET /contracts/object/OB1
 // -----------------------------------------------------
+ 
 
+app.get("/contracts/debug-db", async (req, res) => {
+  try {
+    const info = await pool.query(`
+      SELECT
+        current_database() AS database_name,
+        current_user AS user_name,
+        inet_server_addr() AS server_ip,
+        inet_server_port() AS server_port
+    `);
+
+    const columns = await pool.query(`
+      SELECT
+        ordinal_position,
+        column_name,
+        data_type
+      FROM information_schema.columns
+      WHERE table_schema = 'architecture'
+        AND table_name = 'v_architecture_join'
+      ORDER BY ordinal_position
+    `);
+
+    res.json({
+      success: true,
+      database: info.rows[0],
+      columns: columns.rows
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
 
 // =====================================================
 // ДАННЫЕ ОДНОГО ОБЪЕКТА
