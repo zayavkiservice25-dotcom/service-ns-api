@@ -156,6 +156,8 @@ mechanization text,
   await pool.query(`ALTER TABLE public.zvk ADD COLUMN IF NOT EXISTS id bigserial;`);
   // ЭСК: плановая сумма возврата, которую инициатор может менять в ФТ.
   await pool.query(`ALTER TABLE public.zvk ADD COLUMN IF NOT EXISTS return_amount numeric(18,2) DEFAULT 0;`);
+  // Необязательный признак: платеж должен быть возвращён по ЭСК.
+  await pool.query(`ALTER TABLE public.zvk ADD COLUMN IF NOT EXISTS esk_return boolean DEFAULT false;`);
   await pool.query(`ALTER TABLE public.zvk DROP CONSTRAINT IF EXISTS zvk_pkey;`);
   await pool.query(`ALTER TABLE public.zvk ADD CONSTRAINT zvk_pkey PRIMARY KEY (id);`);
 
@@ -276,6 +278,7 @@ await pool.query(`
       z.zvk_date,
       z.zvk_name,
       z.to_pay,
+      z.esk_return,
       z.request_flag,
 
       z.id AS zvk_row_id,
@@ -739,6 +742,8 @@ await pool.query(`
   await pool.query(`ALTER TABLE public.request_items ADD COLUMN IF NOT EXISTS aray_paid text;`);
   await pool.query(`ALTER TABLE public.request_items ADD COLUMN IF NOT EXISTS aray_pay_time timestamptz;`);
   await pool.query(`ALTER TABLE public.request_items ADD COLUMN IF NOT EXISTS aray_paid_by text;`);
+  // Фиксируем признак «Возврат ЭСК» в строке созданного Реестра.
+  await pool.query(`ALTER TABLE public.request_items ADD COLUMN IF NOT EXISTS esk_return boolean DEFAULT false;`);
 
   await pool.query(`
     CREATE INDEX IF NOT EXISTS request_items_printed_at_idx
@@ -793,7 +798,8 @@ await pool.query(`
           src_d        = cur.src_d,
           src_o        = cur.src_o,
           idlzk        = cur.idlzk,
-          to_pay       = cur.to_pay
+          to_pay       = cur.to_pay,
+          esk_return   = COALESCE(cur.esk_return, false)
         FROM public.ft_zvk_current_v2 cur
         WHERE i.zvk_row_id = cur.zvk_row_id
           AND (p_zvk_row_id IS NULL OR cur.zvk_row_id = p_zvk_row_id)
@@ -813,7 +819,8 @@ await pool.query(`
             i.src_d,
             i.src_o,
             i.idlzk,
-            i.to_pay
+            i.to_pay,
+            i.esk_return
           ) IS DISTINCT FROM ROW(
             cur.id_ft,
             cur.id_zvk,
@@ -829,7 +836,8 @@ await pool.query(`
             cur.src_d,
             cur.src_o,
             cur.idlzk,
-            cur.to_pay
+            cur.to_pay,
+            COALESCE(cur.esk_return, false)
           )
         RETURNING i.request_id
       )
@@ -3048,7 +3056,8 @@ app.post("/create-request", async (req, res) => {
           src_d,
           src_o,
           idlzk,
-          to_pay
+          to_pay,
+          esk_return
         )
         SELECT
           $1,
@@ -3067,7 +3076,8 @@ app.post("/create-request", async (req, res) => {
           v.src_d,
           v.src_o,
           v.idlzk,
-          v.to_pay
+          v.to_pay,
+          COALESCE(v.esk_return, false)
         FROM public.ft_zvk_current_v2 v
         WHERE v.zvk_row_id = $2
         RETURNING to_pay
@@ -4049,6 +4059,7 @@ app.get("/request-list", async (req, res) => {
         ) AS idlzk,
 
         COALESCE(cur.to_pay, i.to_pay) AS to_pay,
+        COALESCE(i.esk_return, cur.esk_return, false) AS esk_return,
         COALESCE(cur.return_amount, 0) AS return_amount,
         COALESCE(cur.returned_amount, 0) AS returned_amount,
         COALESCE(cur.return_status, '') AS return_status,
@@ -4225,6 +4236,7 @@ app.post("/zvk-save", async (req, res) => {
       user_name,
       to_pay,
       return_amount,
+      esk_return,
       request_flag,
       login,
       is_admin,
@@ -4278,6 +4290,12 @@ const toPayNum = isNoRequest
       return res.status(400).json({ success:false, error:"return_amount must be a non-negative number" });
     }
 
+    const eskReturnBool =
+      esk_return === true ||
+      esk_return === 1 ||
+      String(esk_return || "").trim().toLowerCase() === "true" ||
+      String(esk_return || "").trim().toLowerCase() === "да";
+
     // ✅ ГЛАВНОЕ: если пришёл zvk_row_id — обновляем выбранную строку, не создаём новую
     if (zvk_row_id) {
       const rid = Number(zvk_row_id);
@@ -4330,14 +4348,16 @@ const toPayNum = isNoRequest
            SET request_flag = $1,
                to_pay       = $2,
                return_amount = $3,
-               zvk_name     = $4,
+               esk_return   = $4,
+               zvk_name     = $5,
                zvk_date     = NOW()
-         WHERE id = $5
-         RETURNING id, id_zvk, id_ft, zvk_date, zvk_name, to_pay, return_amount, request_flag
+         WHERE id = $6
+         RETURNING id, id_zvk, id_ft, zvk_date, zvk_name, to_pay, return_amount, esk_return, request_flag
       `, [
         flag,
         toPayNum,
         returnAmountNum,
+        flag === "Нет" ? false : eskReturnBool,
         finalName,
         rid
       ]);
@@ -4413,6 +4433,7 @@ const toPayNum = isNoRequest
              SET request_flag = 'Нет',
                  to_pay       = 0,
                  return_amount = 0,
+                 esk_return   = false,
                  zvk_name     = 'СИСТЕМА',
                  zvk_date     = NOW()
            WHERE id = $1
@@ -4552,12 +4573,20 @@ const toPayNum = isNoRequest
     const r = await pool.query(
       `
       INSERT INTO public.zvk
-        (id_zvk, id_ft, zvk_date, zvk_name, to_pay, return_amount, request_flag)
+        (id_zvk, id_ft, zvk_date, zvk_name, to_pay, return_amount, esk_return, request_flag)
       VALUES
-        ($1, $2, NOW(), $3, $4, $5, $6)
-      RETURNING id, id_zvk, id_ft, zvk_date, zvk_name, to_pay, return_amount, request_flag
+        ($1, $2, NOW(), $3, $4, $5, $6, $7)
+      RETURNING id, id_zvk, id_ft, zvk_date, zvk_name, to_pay, return_amount, esk_return, request_flag
       `,
-      [id_zvk, ft, finalName, finalToPay, finalFlag === "Нет" ? 0 : returnAmountNum, finalFlag]
+      [
+        id_zvk,
+        ft,
+        finalName,
+        finalToPay,
+        finalFlag === "Нет" ? 0 : returnAmountNum,
+        finalFlag === "Нет" ? false : eskReturnBool,
+        finalFlag
+      ]
     );
 
     let rebuild = null;
@@ -6649,6 +6678,7 @@ app.get("/request-card", async (req, res) => {
         i.src_o,
         COALESCE(NULLIF(i.idlzk, ''), cur.idlzk, '') AS idlzk,
         COALESCE(cur.to_pay, i.to_pay) AS to_pay,
+        COALESCE(i.esk_return, cur.esk_return, false) AS esk_return,
         COALESCE(cur.return_amount, 0) AS return_amount,
         COALESCE(cur.returned_amount, 0) AS returned_amount,
         COALESCE(cur.return_status, '') AS return_status,
