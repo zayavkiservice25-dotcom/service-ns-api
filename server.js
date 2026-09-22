@@ -12249,7 +12249,7 @@ app.post('/lzk/limit-create', async (req, res) => {
     const groupName = lzkText(body.group_name);
     const materialName = lzkText(body.material_name);
     const unitName = lzkText(body.unit_name);
-    const planQty = lzkNum(body.plan_qty);
+    const login = lzkText(body.login).toLowerCase();
     const priceWithoutVat = lzkNum(body.price_without_vat);
 
     if (!objectName) throw new Error('Объект не заполнен');
@@ -12257,8 +12257,31 @@ app.post('/lzk/limit-create', async (req, res) => {
     if (!groupName) throw new Error('Группа не заполнена');
     if (!materialName) throw new Error('ТМЦ по факту не заполнено');
     if (!unitName) throw new Error('Ед.изм. не заполнена');
-    if (planQty === null || planQty < 0) throw new Error('Кол-во по плану заполнено неправильно');
+    if (!login) throw new Error('Логин пользователя не передан');
     if (priceWithoutVat === null || priceWithoutVat < 0) throw new Error('Цена без НДС заполнена неправильно');
+
+    // Роль определяем на сервере из public.users, а не доверяем роли из браузера.
+    const userRoleResult = await client.query(`
+      SELECT role_lzk
+      FROM public.users
+      WHERE lower(trim(login)) = $1
+      LIMIT 1
+    `, [login]);
+
+    if (!userRoleResult.rows.length) {
+      throw new Error('Пользователь не найден: ' + login);
+    }
+
+    const roleLzk = lzkText(userRoleResult.rows[0].role_lzk).toLowerCase();
+    const isInitiator = roleLzk === 'initiator' || roleLzk === 'инициатор';
+
+    // Инициатор может создать строку лимита, но план ему всегда сохраняем как 0.
+    // Для остальных ролей сохраняем введенное значение.
+    const planQty = isInitiator ? 0 : lzkNum(body.plan_qty);
+
+    if (planQty === null || planQty < 0) {
+      throw new Error('Кол-во по плану заполнено неправильно');
+    }
 
     await client.query('BEGIN');
 
