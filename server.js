@@ -950,7 +950,7 @@ AFTER UPDATE OF
   await pool.query(`
     DROP TRIGGER IF EXISTS zvk_sync_request_items_update_trg ON public.zvk;
     CREATE TRIGGER zvk_sync_request_items_update_trg
-    AFTER UPDATE OF id_ft, id_zvk, to_pay
+    AFTER UPDATE OF id_ft, id_zvk, to_pay, esk_return
     ON public.zvk
     FOR EACH ROW
     EXECUTE FUNCTION public.trg_sync_request_items_by_zvk();
@@ -4059,7 +4059,7 @@ app.get("/request-list", async (req, res) => {
         ) AS idlzk,
 
         COALESCE(cur.to_pay, i.to_pay) AS to_pay,
-        COALESCE(i.esk_return, cur.esk_return, false) AS esk_return,
+        COALESCE(cur.esk_return, i.esk_return, false) AS esk_return,
         COALESCE(cur.return_amount, 0) AS return_amount,
         COALESCE(cur.returned_amount, 0) AS returned_amount,
         COALESCE(cur.return_status, '') AS return_status,
@@ -6678,7 +6678,7 @@ app.get("/request-card", async (req, res) => {
         i.src_o,
         COALESCE(NULLIF(i.idlzk, ''), cur.idlzk, '') AS idlzk,
         COALESCE(cur.to_pay, i.to_pay) AS to_pay,
-        COALESCE(i.esk_return, cur.esk_return, false) AS esk_return,
+        COALESCE(cur.esk_return, i.esk_return, false) AS esk_return,
         COALESCE(cur.return_amount, 0) AS return_amount,
         COALESCE(cur.returned_amount, 0) AS returned_amount,
         COALESCE(cur.return_status, '') AS return_status,
