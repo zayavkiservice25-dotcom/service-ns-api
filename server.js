@@ -3476,7 +3476,7 @@ app.post("/request-created-bulk", async (req, res) => {
       });
     }
 
-    const isBerkinOrZhasulan = ["b_erkin", "s_zhasulan", "a_zaitova"].includes(login);
+    const isBerkinOrZhasulan = ["b_erkin", "s_zhasulan", "a_zaitova", "t_serik"].includes(login);
 
     /*
       Пустое значение вручную могут устанавливать b_erkin, s_zhasulan и a_zaitova.
@@ -3920,6 +3920,7 @@ app.get("/request-list", async (req, res) => {
     } else if (
       login === "admin" ||
       login === "b_erkin" ||
+      login === "t_serik" ||
       login === "k_arailym" ||
       login === "zh_elena" ||
       roleFt === "admin" ||
@@ -4257,7 +4258,7 @@ app.post("/zvk-save", async (req, res) => {
       isTruthy(is_admin) ||
       isTruthy(is_all) ||
       isTruthy(can_edit_all) ||
-      ["b_erkin", "s_zhasulan", "a_zaitova"].includes(actor.toLowerCase());
+      ["b_erkin", "s_zhasulan", "a_zaitova", "t_serik"].includes(actor.toLowerCase());
 
     const ft = String(id_ft).trim();
    let flag = String(request_flag || "Нет").trim();
@@ -4637,7 +4638,7 @@ app.post("/zvk-bulk-request-flag", async (req, res) => {
       isTruthy(is_admin) ||
       isTruthy(is_all) ||
       isTruthy(can_edit_all) ||
-      ["b_erkin", "s_zhasulan", "a_zaitova"].includes(actor.toLowerCase());
+      ["b_erkin", "s_zhasulan", "a_zaitova", "t_serik"].includes(actor.toLowerCase());
 
     if (!adminOk) {
       return res.status(403).json({ success:false, error:"NO_RIGHTS" });
@@ -4799,8 +4800,9 @@ app.post("/zvk-status-row", async (req, res) => {
       if (!ok) return res.status(403).json({ success: false, error: "NO_RIGHTS_THIS_ROW" });
     }
 
-    const hasStatusComment = Object.prototype.hasOwnProperty.call(req.body, "status_comment");
-    const hasIdlzk = Object.prototype.hasOwnProperty.call(req.body, "idlzk");
+    const isSerikActor = actor.toLowerCase() === "t_serik";
+    const hasStatusComment = !isSerikActor && Object.prototype.hasOwnProperty.call(req.body, "status_comment");
+    const hasIdlzk = !isSerikActor && Object.prototype.hasOwnProperty.call(req.body, "idlzk");
 
     // src_d нельзя задавать с клиента.
     // Всегда берём текущее значение legal_entity из основной строки FT.
