@@ -7720,7 +7720,7 @@ app.post("/request-items-return", async (req, res) => {
         FROM unnest($1::bigint[]) AS x
         ON CONFLICT (zvk_row_id)
         DO UPDATE SET
-          returned_amount = COALESCE(public.zvk_pay.returned_amount, 0) + EXCLUDED.returned_amount,
+          returned_amount = EXCLUDED.returned_amount,
           return_status = 'Возвращено',
           return_time = NOW(),
           return_by = EXCLUDED.return_by
