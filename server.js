@@ -10481,6 +10481,196 @@ app.get("/lzk/limits", async (req, res) => {
   }
 });
 
+app.post('/lzk/limit-update', async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const body = req.body || {};
+    const idlzk = lzkText(body.idlzk);
+    const objectName = lzkText(body.object_name);
+    const constructiveName = lzkText(body.constructive_name);
+    const groupName = lzkText(body.group_name);
+    const materialName = lzkText(body.material_name);
+    const unitName = lzkText(body.unit_name);
+    const login = lzkText(body.login).toLowerCase();
+    const planQty = lzkNum(body.plan_qty);
+    const priceWithoutVat = lzkNum(body.price_without_vat);
+
+    if (!idlzk) throw new Error('IDLZK не передан');
+    if (!objectName) throw new Error('Объект не заполнен');
+    if (!constructiveName) throw new Error('Конструктив не заполнен');
+    if (!groupName) throw new Error('Группа не заполнена');
+    if (!materialName) throw new Error('ТМЦ по факту не заполнено');
+    if (!unitName) throw new Error('Ед.изм. не заполнена');
+    if (!login) throw new Error('Логин пользователя не передан');
+    if (planQty === null || planQty < 0) throw new Error('Кол-во по плану заполнено неправильно');
+    if (priceWithoutVat === null || priceWithoutVat < 0) throw new Error('Цена без НДС заполнена неправильно');
+
+    const userResult = await client.query(`
+      SELECT role_lzk
+      FROM public.users
+      WHERE lower(trim(login)) = $1
+      LIMIT 1
+    `, [login]);
+
+    if (!userResult.rows.length) {
+      throw new Error('Пользователь не найден: ' + login);
+    }
+
+    const roleLzk = lzkText(userResult.rows[0].role_lzk).toLowerCase();
+    const canEdit = [
+      'editor', 'редактор',
+      'admin', 'админ', 'администратор'
+    ].includes(roleLzk);
+
+    if (!canEdit) {
+      return res.status(403).json({
+        success: false,
+        error: 'Редактирование лимитов доступно только Редактору/Админу'
+      });
+    }
+
+    await client.query('BEGIN');
+
+    const limitResult = await client.query(`
+      SELECT idlzk
+      FROM lzk.limits
+      WHERE idlzk = $1
+      FOR UPDATE
+    `, [idlzk]);
+
+    if (!limitResult.rows.length) {
+      throw new Error('IDLZK не найден: ' + idlzk);
+    }
+
+    async function findByName(table, idCol, nameCol, name) {
+      const q = await client.query(
+        `SELECT ${idCol} AS id, ${nameCol} AS name
+           FROM ${table}
+          WHERE lower(trim(${nameCol})) = lower(trim($1))
+          ORDER BY ${idCol}
+          LIMIT 1`,
+        [name]
+      );
+      return q.rows[0] || null;
+    }
+
+    let objectRow = await findByName('lzk.spr_objects', 'object_id', 'object_name', objectName);
+    if (!objectRow) {
+      const q = await client.query(`
+        SELECT COALESCE(MAX(NULLIF(regexp_replace(object_id::text, '\\D', '', 'g'), '')::bigint), 100000000) + 1 AS next_id
+        FROM lzk.spr_objects
+      `);
+      const objectId = String(q.rows[0].next_id);
+      await client.query(
+        `INSERT INTO lzk.spr_objects (object_id, object_name) VALUES ($1, $2)`,
+        [objectId, objectName]
+      );
+      objectRow = { id: objectId, name: objectName };
+    }
+
+    let constructiveRow = await findByName('lzk.spr_constructive', 'constructive_id', 'constructive_name', constructiveName);
+    if (!constructiveRow) {
+      const id = await nextLzkTextId(client, 'lzk.spr_constructive', 'constructive_id', 'kt');
+      await client.query(
+        `INSERT INTO lzk.spr_constructive (constructive_id, constructive_name) VALUES ($1, $2)`,
+        [id, constructiveName]
+      );
+      constructiveRow = { id, name: constructiveName };
+    }
+
+    let groupRow = await findByName('lzk.spr_material_groups', 'group_id', 'group_name', groupName);
+    if (!groupRow) {
+      const id = await nextLzkTextId(client, 'lzk.spr_material_groups', 'group_id', 'gr');
+      await client.query(
+        `INSERT INTO lzk.spr_material_groups (group_id, group_name) VALUES ($1, $2)`,
+        [id, groupName]
+      );
+      groupRow = { id, name: groupName };
+    }
+
+    let unitRow = await findByName('lzk.spr_units', 'unit_id', 'unit_name', unitName);
+    if (!unitRow) {
+      const id = await nextLzkTextId(client, 'lzk.spr_units', 'unit_id', 'ed');
+      await client.query(
+        `INSERT INTO lzk.spr_units (unit_id, unit_name) VALUES ($1, $2)`,
+        [id, unitName]
+      );
+      unitRow = { id, name: unitName };
+    }
+
+    let materialRow = await findByName('lzk.spr_materials', 'material_id', 'material_name', materialName);
+    if (!materialRow) {
+      const id = await nextLzkTextId(client, 'lzk.spr_materials', 'material_id', 'NTMC');
+      await client.query(
+        `INSERT INTO lzk.spr_materials (material_id, material_name, unit_id)
+         VALUES ($1, $2, $3)`,
+        [id, materialName, unitRow.id]
+      );
+      materialRow = { id, name: materialName };
+    } else {
+      // Если у существующей ТМЦ поменяли единицу измерения — обновляем справочник.
+      await client.query(`
+        UPDATE lzk.spr_materials
+        SET unit_id = $2
+        WHERE material_id = $1
+      `, [materialRow.id, unitRow.id]);
+    }
+
+    const amount = Number((planQty * priceWithoutVat).toFixed(2));
+
+    const updated = await client.query(`
+      UPDATE lzk.limits
+      SET
+        object_id = $2,
+        object_name = $3,
+        constructive_id = $4,
+        constructive_name = $5,
+        group_id = $6,
+        group_name = $7,
+        material_id = $8,
+        material_name = $9,
+        unit_id = $10,
+        unit_name = $11,
+        plan_qty = $12,
+        price_without_vat = $13,
+        amount = $14
+      WHERE idlzk = $1
+      RETURNING *
+    `, [
+      idlzk,
+      objectRow.id,
+      objectName,
+      constructiveRow.id,
+      constructiveName,
+      groupRow.id,
+      groupName,
+      materialRow.id,
+      materialName,
+      unitRow.id,
+      unitName,
+      planQty,
+      priceWithoutVat,
+      amount
+    ]);
+
+    await client.query('COMMIT');
+
+    return res.json({
+      success: true,
+      idlzk,
+      amount,
+      row: updated.rows[0]
+    });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('LZK LIMIT UPDATE ERROR:', e);
+    return res.status(500).json({ success: false, error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
 app.post("/lzk/requests", async (req, res) => {
   const client = await pool.connect();
 
