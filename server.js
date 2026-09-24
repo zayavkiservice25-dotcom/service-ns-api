@@ -1789,6 +1789,16 @@ await pool.query(`
     ADD COLUMN IF NOT EXISTS ordered_qty numeric(18,6) DEFAULT 0;
   `);
 
+  await pool.query(`
+    ALTER TABLE lzk.supply
+    ADD COLUMN IF NOT EXISTS received_qty numeric(18,6) DEFAULT 0;
+  `);
+
+  await pool.query(`
+    ALTER TABLE lzk.limits
+    ADD COLUMN IF NOT EXISTS fact_received numeric(18,6) DEFAULT 0;
+  `);
+
 
 await pool.query(`
   ALTER TABLE lzk.requests
@@ -10411,6 +10421,7 @@ app.get("/lzk/limits", async (req, res) => {
         COALESCE(l.plan_qty, 0) AS plan,
         COALESCE(l.price_without_vat, 0) AS column_l,
         COALESCE(l.amount, 0) AS amount_sum,
+        COALESCE(l.fact_received, 0) AS fact_received,
 
         COALESCE(
           SUM(
@@ -10450,7 +10461,8 @@ app.get("/lzk/limits", async (req, res) => {
         l.unit_name,
         l.plan_qty,
         l.price_without_vat,
-        l.amount
+        l.amount,
+        l.fact_received
 
       ORDER BY
         regexp_replace(l.idlzk, '\\D', '', 'g')::bigint ASC
@@ -10497,6 +10509,7 @@ app.post('/lzk/limit-update', async (req, res) => {
     const login = lzkText(body.login).toLowerCase();
     const planQty = lzkNum(body.plan_qty);
     const priceWithoutVat = lzkNum(body.price_without_vat);
+    const factReceived = lzkNum(body.fact_received ?? 0);
 
     if (!idlzk) throw new Error('IDLZK не передан');
     if (!objectName) throw new Error('Объект не заполнен');
@@ -10507,6 +10520,7 @@ app.post('/lzk/limit-update', async (req, res) => {
     if (!login) throw new Error('Логин пользователя не передан');
     if (planQty === null || planQty < 0) throw new Error('Кол-во по плану заполнено неправильно');
     if (priceWithoutVat === null || priceWithoutVat < 0) throw new Error('Цена без НДС заполнена неправильно');
+    if (factReceived === null || factReceived < 0) throw new Error('Фактически принято(на склад) заполнено неправильно');
 
     const userResult = await client.query(`
       SELECT role_lzk
@@ -10636,7 +10650,8 @@ app.post('/lzk/limit-update', async (req, res) => {
         unit_name = $11,
         plan_qty = $12,
         price_without_vat = $13,
-        amount = $14
+        amount = $14,
+        fact_received = $15
       WHERE idlzk = $1
       RETURNING *
     `, [
@@ -10653,7 +10668,8 @@ app.post('/lzk/limit-update', async (req, res) => {
       unitName,
       planQty,
       priceWithoutVat,
-      amount
+      amount,
+      factReceived
     ]);
 
     await client.query('COMMIT');
@@ -11083,7 +11099,7 @@ app.get("/lzk/supply", async (req, res) => {
           s.payment_status AS payment,
           s.documents_status AS documents,
           s.receive_status AS receive_tmc,
-          s.done_status AS done,
+          COALESCE(s.received_qty, 0) AS done,
           s.trust_qty,
           s.trust_from AS trust_who,
           s.trust_invoice,
@@ -11137,7 +11153,7 @@ app.get("/lzk/supply", async (req, res) => {
           s.payment_status AS payment,
           s.documents_status AS documents,
           s.receive_status AS receive_tmc,
-          s.done_status AS done,
+          COALESCE(s.received_qty, 0) AS done,
           s.trust_qty,
           s.trust_from AS trust_who,
           s.trust_invoice,
@@ -11179,11 +11195,14 @@ app.get("/lzk/supply", async (req, res) => {
 });
 
 app.post("/lzk/supply/save", async (req, res) => {
+  const client = await pool.connect();
+
   try {
     const body = req.body || {};
 
     const idzlzk = lzkText(body.idzlzk || body.id);
     const idplxk = lzkText(body.idplxk);
+    const receivedQty = lzkNum(body.received_qty ?? body.done ?? 0);
 
     if (!idzlzk) {
       return res.status(400).json({
@@ -11192,7 +11211,16 @@ app.post("/lzk/supply/save", async (req, res) => {
       });
     }
 
-    const q = await pool.query(`
+    if (receivedQty === null || receivedQty < 0) {
+      return res.status(400).json({
+        success: false,
+        error: "Фактически принято(на склад) должно быть числом не меньше 0"
+      });
+    }
+
+    await client.query("BEGIN");
+
+    const q = await client.query(`
       INSERT INTO lzk.supply (
         idzlzk,
         idplxk,
@@ -11201,7 +11229,7 @@ app.post("/lzk/supply/save", async (req, res) => {
         payment_status,
         documents_status,
         receive_status,
-        done_status,
+        received_qty,
         trust_qty,
         trust_from,
         trust_invoice,
@@ -11232,7 +11260,7 @@ app.post("/lzk/supply/save", async (req, res) => {
         payment_status = EXCLUDED.payment_status,
         documents_status = EXCLUDED.documents_status,
         receive_status = EXCLUDED.receive_status,
-        done_status = EXCLUDED.done_status,
+        received_qty = EXCLUDED.received_qty,
         trust_qty = EXCLUDED.trust_qty,
         trust_from = EXCLUDED.trust_from,
         trust_invoice = EXCLUDED.trust_invoice,
@@ -11247,25 +11275,57 @@ app.post("/lzk/supply/save", async (req, res) => {
       body.payment || null,
       body.documents || null,
       body.receive_tmc || null,
-      body.done || null,
+      receivedQty,
       body.trust_qty || null,
       body.trust_who || null,
       body.trust_invoice || null,
       body.trusted_person || null
     ]);
 
+    // Синхронизируем итог по IDLZK: сумма последних значений
+    // "Фактически принято(на склад)" по всем строкам снабжения этого лимита.
+    await client.query(`
+      WITH target AS (
+        SELECT idlzk
+        FROM lzk.requests
+        WHERE idzlzk = $1
+        LIMIT 1
+      ),
+      total_received AS (
+        SELECT
+          t.idlzk,
+          COALESCE(SUM(COALESCE(s.received_qty, 0)), 0) AS qty
+        FROM target t
+        JOIN lzk.requests r
+          ON r.idlzk = t.idlzk
+        LEFT JOIN lzk.supply s
+          ON s.idzlzk = r.idzlzk
+        GROUP BY t.idlzk
+      )
+      UPDATE lzk.limits l
+      SET fact_received = tr.qty
+      FROM total_received tr
+      WHERE l.idlzk = tr.idlzk
+    `, [idzlzk]);
+
+    await client.query("COMMIT");
+
     res.json({
       success: true,
-      row: q.rows[0]
+      row: q.rows[0],
+      received_qty: receivedQty
     });
 
   } catch (e) {
+    await client.query("ROLLBACK");
     console.error("LZK SUPPLY SAVE ERROR:", e);
 
     res.status(500).json({
       success: false,
       error: e.message
     });
+  } finally {
+    client.release();
   }
 });
 
