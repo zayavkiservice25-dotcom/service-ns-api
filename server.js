@@ -10470,13 +10470,14 @@ app.get("/lzk/limits", async (req, res) => {
 
     const rows = q.rows.map(row => {
       const plan = Number(row.plan || 0);
+      const approvedWithoutLzk = Number(row.fact_received || 0);
       const approved = Number(row.fact_approved || 0);
       const pending = Number(row.fact_not_approved || 0);
 
       return {
         ...row,
-        difference: plan - approved,
-        difference2: plan - approved - pending
+        difference: plan - approvedWithoutLzk - approved,
+        difference2: plan - approvedWithoutLzk - approved - pending
       };
     });
 
@@ -10520,7 +10521,7 @@ app.post('/lzk/limit-update', async (req, res) => {
     if (!login) throw new Error('Логин пользователя не передан');
     if (planQty === null || planQty < 0) throw new Error('Кол-во по плану заполнено неправильно');
     if (priceWithoutVat === null || priceWithoutVat < 0) throw new Error('Цена без НДС заполнена неправильно');
-    if (factReceived === null || factReceived < 0) throw new Error('Фактически принято(на склад) заполнено неправильно');
+    if (factReceived === null || factReceived < 0) throw new Error('Одобрено без ЛЗК заполнено неправильно');
 
     const userResult = await client.query(`
       SELECT role_lzk
@@ -11281,32 +11282,8 @@ app.post("/lzk/supply/save", async (req, res) => {
       body.trust_invoice || null,
       body.trusted_person || null
     ]);
-
-    // Синхронизируем итог по IDLZK: сумма последних значений
-    // "Фактически принято(на склад)" по всем строкам снабжения этого лимита.
-    await client.query(`
-      WITH target AS (
-        SELECT idlzk
-        FROM lzk.requests
-        WHERE idzlzk = $1
-        LIMIT 1
-      ),
-      total_received AS (
-        SELECT
-          t.idlzk,
-          COALESCE(SUM(COALESCE(s.received_qty, 0)), 0) AS qty
-        FROM target t
-        JOIN lzk.requests r
-          ON r.idlzk = t.idlzk
-        LEFT JOIN lzk.supply s
-          ON s.idzlzk = r.idzlzk
-        GROUP BY t.idlzk
-      )
-      UPDATE lzk.limits l
-      SET fact_received = tr.qty
-      FROM total_received tr
-      WHERE l.idlzk = tr.idlzk
-    `, [idzlzk]);
+    // ВАЖНО: lzk.limits.fact_received теперь используется как "Одобрено без ЛЗК".
+    // Панель снабженца больше не должна перезаписывать это ручное поле.
 
     await client.query("COMMIT");
 
