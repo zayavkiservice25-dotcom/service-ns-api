@@ -14326,5 +14326,187 @@ app.get("/contracts/report", async (req, res) => {
   }
 });
 
+// =====================================================
+// ЛЗК — страница "Заявка на ТМЦ"
+// ДОБАВИТЬ В server.js ПЕРЕД app.listen(...)
+// =====================================================
+
+
+// -----------------------------------------------------
+// 1. Справочники для страницы:
+//    - список объектов
+//    - список сотрудников ПТО
+// -----------------------------------------------------
+app.get("/lzk/request-print/refs", async (req, res) => {
+  try {
+    const [objectsQ, ptoQ] = await Promise.all([
+
+      pool.query(`
+        SELECT DISTINCT object_name
+        FROM lzk.limits
+        WHERE COALESCE(trim(object_name), '') <> ''
+        ORDER BY object_name
+      `),
+
+      pool.query(`
+        SELECT
+          login,
+          trim(
+            concat_ws(
+              ' ',
+              NULLIF(trim(last_name), ''),
+              NULLIF(trim(first_name), ''),
+              NULLIF(trim(middle_name), '')
+            )
+          ) AS full_name
+        FROM public.users
+        WHERE COALESCE(is_active, true) = true
+          AND lower(trim(COALESCE(role_lzk, ''))) IN ('pto', 'пто')
+        ORDER BY last_name, first_name, middle_name, login
+      `)
+
+    ]);
+
+    return res.json({
+      success: true,
+      objects: objectsQ.rows.map(r => r.object_name),
+      pto: ptoQ.rows
+    });
+
+  } catch (e) {
+    console.error("LZK REQUEST PRINT REFS ERROR:", e);
+
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
+
+
+// -----------------------------------------------------
+// 2. Данные таблицы печатной заявки
+//
+// ОСНОВНАЯ СТРОКА = IDLZK
+//
+// Одобрено без ЛЗК
+// = lzk.limits.fact_received
+// = ваше поле "Фактически одобрено склад"
+//
+// Одобрено через ЛЗК до выбранной даты
+// = сумма fact_qty всех согласованных ZLZK
+//   по этому IDLZK, где pto_date <= выбранной даты
+// -----------------------------------------------------
+app.get("/lzk/request-print/data", async (req, res) => {
+  try {
+    const objectName = lzkText(req.query.object);
+    const dateFrom = lzkText(req.query.date_from);
+    const dateTo = lzkText(req.query.date_to);
+
+    if (!objectName) {
+      return res.status(400).json({
+        success: false,
+        error: "Не выбран проект"
+      });
+    }
+
+    if (!dateFrom || !dateTo) {
+      return res.status(400).json({
+        success: false,
+        error: "Не указан период"
+      });
+    }
+
+    const q = await pool.query(`
+      SELECT
+        l.idlzk,
+        l.object_name AS object,
+        l.constructive_name AS constructive,
+        l.material_name AS tmc_name,
+        l.unit_name AS unit,
+
+        COALESCE(l.plan_qty, 0) AS plan,
+
+        -- Одобрено без ЛЗК =
+        -- текущее "Фактически одобрено склад"
+        COALESCE(l.fact_received, 0) AS approved_without_lzk,
+
+        -- Одобрено через ЛЗК до выбранной даты
+        COALESCE(
+          SUM(
+            CASE
+              WHEN lower(trim(COALESCE(r.pto_status, '')))
+                   IN ('согласован', 'согласовано')
+               AND r.pto_date < ($2::date + INTERVAL '1 day')
+              THEN COALESCE(r.fact_qty, 0)
+              ELSE 0
+            END
+          ),
+          0
+        ) AS approved_via_lzk,
+
+        -- Пока отдельной истории fact_received по датам нет.
+        -- Поэтому здесь показываем текущее значение fact_received.
+        COALESCE(l.fact_received, 0) AS approved_without_lzk_period,
+
+        -- Остаток:
+        -- план - без ЛЗК - согласовано через ЛЗК до выбранной даты
+        (
+          COALESCE(l.plan_qty, 0)
+          -
+          COALESCE(l.fact_received, 0)
+          -
+          COALESCE(
+            SUM(
+              CASE
+                WHEN lower(trim(COALESCE(r.pto_status, '')))
+                     IN ('согласован', 'согласовано')
+                 AND r.pto_date < ($2::date + INTERVAL '1 day')
+                THEN COALESCE(r.fact_qty, 0)
+                ELSE 0
+              END
+            ),
+            0
+          )
+        ) AS remaining
+
+      FROM lzk.limits l
+
+      LEFT JOIN lzk.requests r
+        ON r.idlzk = l.idlzk
+
+      WHERE lower(trim(l.object_name)) = lower(trim($1))
+
+      GROUP BY
+        l.idlzk,
+        l.object_name,
+        l.constructive_name,
+        l.material_name,
+        l.unit_name,
+        l.plan_qty,
+        l.fact_received
+
+      ORDER BY
+        NULLIF(regexp_replace(l.idlzk, '\\D', '', 'g'), '')::bigint,
+        l.idlzk
+    `, [
+      objectName,
+      dateTo
+    ]);
+
+    return res.json({
+      success: true,
+      rows: q.rows
+    });
+
+  } catch (e) {
+    console.error("LZK REQUEST PRINT DATA ERROR:", e);
+
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
 
 app.listen(PORT, () => console.log("Server started on port " + PORT));
