@@ -298,7 +298,6 @@ s.src_d,
 s.src_o,
 s.status_comment,
 s.idlzk,
-s.funding_pool_id,
 
       p.agree_time,
       p.registry_flag,
@@ -4896,8 +4895,10 @@ app.post("/zvk-status-row", async (req, res) => {
 
           COALESCE((
             SELECT SUM(COALESCE(cur.to_pay, 0))
-            FROM public.ft_zvk_current_v2 cur
-            WHERE cur.funding_pool_id = p.id
+            FROM public.zvk_status zs
+            JOIN public.ft_zvk_current_v2 cur
+              ON cur.zvk_row_id = zs.zvk_row_id
+            WHERE zs.funding_pool_id = p.id
               AND cur.zvk_row_id <> $2
               AND lower(trim(COALESCE(cur.request_flag, ''))) <> lower('Обнуление')
           ), 0)::numeric AS used_other
@@ -5552,8 +5553,12 @@ const query = `
     ) b ON TRUE
   )
 
-  SELECT v.*
+  SELECT
+    v.*,
+    zs.funding_pool_id
   FROM balance_rows v
+  LEFT JOIN public.zvk_status zs
+    ON zs.zvk_row_id = v.zvk_row_id
   ${whereSql}
   ORDER BY
     COALESCE(NULLIF(substring(v.id_ft from '\\d+'), ''), '0')::int DESC,
@@ -14756,8 +14761,11 @@ app.get("/draft-funding-pools/options", async (req, res) => {
 
       FROM public.draft_funding_pool p
 
+      LEFT JOIN public.zvk_status zs
+        ON zs.funding_pool_id = p.id
+
       LEFT JOIN public.ft_zvk_current_v2 cur
-        ON cur.funding_pool_id = p.id
+        ON cur.zvk_row_id = zs.zvk_row_id
 
       WHERE p.is_active = true
         AND p.parent_pool_id IS NOT NULL
@@ -14809,8 +14817,10 @@ app.get("/draft-funding-summary", async (req, res) => {
 
         COALESCE((
           SELECT SUM(COALESCE(cur.to_pay, 0))
-          FROM public.ft_zvk_current_v2 cur
-          WHERE cur.funding_pool_id = p.id
+          FROM public.zvk_status zs
+          JOIN public.ft_zvk_current_v2 cur
+            ON cur.zvk_row_id = zs.zvk_row_id
+          WHERE zs.funding_pool_id = p.id
             AND lower(trim(COALESCE(cur.request_flag, ''))) <> lower('Обнуление')
         ), 0)::numeric AS ft_amount,
 
@@ -14818,8 +14828,10 @@ app.get("/draft-funding-summary", async (req, res) => {
           p.amount
           - COALESCE((
               SELECT SUM(COALESCE(cur.to_pay, 0))
-              FROM public.ft_zvk_current_v2 cur
-              WHERE cur.funding_pool_id = p.id
+              FROM public.zvk_status zs
+              JOIN public.ft_zvk_current_v2 cur
+                ON cur.zvk_row_id = zs.zvk_row_id
+              WHERE zs.funding_pool_id = p.id
                 AND lower(trim(COALESCE(cur.request_flag, ''))) <> lower('Обнуление')
             ), 0)
         )::numeric AS ft_balance,
