@@ -14427,17 +14427,19 @@ app.get("/lzk/request-print/data", async (req, res) => {
 
         COALESCE(l.plan_qty, 0) AS plan,
 
-        -- Одобрено без ЛЗК =
-        -- текущее "Фактически одобрено склад"
+        -- 1. Одобрено без ЛЗК:
+        -- текущее ручное поле "Фактически одобрено склад"
         COALESCE(l.fact_received, 0) AS approved_without_lzk,
 
-        -- Одобрено через ЛЗК до выбранной даты
+        -- 2. Одобрено через ЛЗК ДО даты "с".
+        -- Например при date_from = 01.09:
+        -- берем все согласованные заявки, где pto_date < 01.09 00:00.
         COALESCE(
           SUM(
             CASE
               WHEN lower(trim(COALESCE(r.pto_status, '')))
                    IN ('согласован', 'согласовано')
-               AND r.pto_date < ($2::date + INTERVAL '1 day')
+               AND r.pto_date < $2::date
               THEN COALESCE(r.fact_qty, 0)
               ELSE 0
             END
@@ -14445,29 +14447,52 @@ app.get("/lzk/request-print/data", async (req, res) => {
           0
         ) AS approved_via_lzk,
 
-        -- Пока отдельной истории fact_received по датам нет.
-        -- Поэтому здесь показываем текущее значение fact_received.
-        COALESCE(l.fact_received, 0) AS approved_without_lzk_period,
+        -- 3. Одобрено ЛЗК ЗА ПЕРИОД.
+        -- date_from включительно, date_to включительно.
+        COALESCE(
+          SUM(
+            CASE
+              WHEN lower(trim(COALESCE(r.pto_status, '')))
+                   IN ('согласован', 'согласовано')
+               AND r.pto_date >= $2::date
+               AND r.pto_date < ($3::date + INTERVAL '1 day')
+              THEN COALESCE(r.fact_qty, 0)
+              ELSE 0
+            END
+          ),
+          0
+        ) AS approved_via_lzk_period,
 
-        -- Остаток:
-        -- план - без ЛЗК - согласовано через ЛЗК до выбранной даты
+        -- 4. Остаток на конец выбранного периода:
+        -- План - Без ЛЗК - Через ЛЗК до периода - ЛЗК за период.
         (
           COALESCE(l.plan_qty, 0)
-          -
-          COALESCE(l.fact_received, 0)
-          -
-          COALESCE(
-            SUM(
-              CASE
-                WHEN lower(trim(COALESCE(r.pto_status, '')))
-                     IN ('согласован', 'согласовано')
-                 AND r.pto_date < ($2::date + INTERVAL '1 day')
-                THEN COALESCE(r.fact_qty, 0)
-                ELSE 0
-              END
-            ),
-            0
-          )
+          - COALESCE(l.fact_received, 0)
+          - COALESCE(
+              SUM(
+                CASE
+                  WHEN lower(trim(COALESCE(r.pto_status, '')))
+                       IN ('согласован', 'согласовано')
+                   AND r.pto_date < $2::date
+                  THEN COALESCE(r.fact_qty, 0)
+                  ELSE 0
+                END
+              ),
+              0
+            )
+          - COALESCE(
+              SUM(
+                CASE
+                  WHEN lower(trim(COALESCE(r.pto_status, '')))
+                       IN ('согласован', 'согласовано')
+                   AND r.pto_date >= $2::date
+                   AND r.pto_date < ($3::date + INTERVAL '1 day')
+                  THEN COALESCE(r.fact_qty, 0)
+                  ELSE 0
+                END
+              ),
+              0
+            )
         ) AS remaining
 
       FROM lzk.limits l
@@ -14491,6 +14516,7 @@ app.get("/lzk/request-print/data", async (req, res) => {
         l.idlzk
     `, [
       objectName,
+      dateFrom,
       dateTo
     ]);
 
