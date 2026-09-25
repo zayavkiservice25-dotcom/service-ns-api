@@ -14509,4 +14509,28 @@ app.get("/lzk/request-print/data", async (req, res) => {
   }
 });
 
+app.get("/draft-funding-pools", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT *
+      FROM public.draft_funding_pool
+      WHERE is_active = true
+      ORDER BY legal_entity, source_name, money_type, object_name
+    `);
+
+    res.json({
+      success: true,
+      rows: result.rows
+    });
+
+  } catch (e) {
+    console.error("DRAFT FUNDING POOLS ERROR:", e);
+
+    res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
+
 app.listen(PORT, () => console.log("Server started on port " + PORT));
