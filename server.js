@@ -207,6 +207,30 @@ await pool.query(`
   ON public.zvk_status (funding_pool_id);
 `);
 
+// Одна ZFT может расходоваться из нескольких денежных пулов.
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS public.zvk_funding_pool_allocations (
+    id bigserial PRIMARY KEY,
+    zvk_row_id bigint NOT NULL,
+    funding_pool_id bigint NOT NULL,
+    amount numeric(18,2) NOT NULL CHECK (amount >= 0),
+    created_by text,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+    UNIQUE (zvk_row_id, funding_pool_id)
+  );
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS zvk_funding_alloc_row_idx
+  ON public.zvk_funding_pool_allocations (zvk_row_id);
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS zvk_funding_alloc_pool_idx
+  ON public.zvk_funding_pool_allocations (funding_pool_id);
+`);
+
 await pool.query(`
   ALTER TABLE public.zvk_status
   ADD COLUMN IF NOT EXISTS chief_approved text;
@@ -14713,17 +14737,15 @@ app.get("/draft-funding-pools", async (req, res) => {
 // Фильтр: ЮрЛицо + Объект.
 // Возвращаются только реально распределённые дочерние пулы.
 // =====================================================
+
 app.get("/draft-funding-pools/options", async (req, res) => {
   try {
     const legalEntity = String(req.query.legal_entity || "").trim();
     const objectName = String(req.query.object || "").trim();
-    const excludeRowId = Number(req.query.zvk_row_id || 0) || null;
+    const rowId = Number(req.query.zvk_row_id || 0) || null;
 
     if (!legalEntity || !objectName) {
-      return res.json({
-        success:true,
-        rows:[]
-      });
+      return res.json({ success:true, rows:[] });
     }
 
     const q = await pool.query(`
@@ -14736,70 +14758,281 @@ app.get("/draft-funding-pools/options", async (req, res) => {
         p.object_name,
         p.amount::numeric AS amount,
 
-        COALESCE(SUM(
-          CASE
-            WHEN cur.zvk_row_id IS NOT NULL
-             AND ($3::bigint IS NULL OR cur.zvk_row_id <> $3::bigint)
-             AND lower(trim(COALESCE(cur.request_flag, ''))) <> lower('Обнуление')
-            THEN COALESCE(cur.to_pay, 0)
-            ELSE 0
-          END
-        ), 0)::numeric AS used_amount,
+        COALESCE((
+          SELECT SUM(a.amount)
+          FROM public.zvk_funding_pool_allocations a
+          WHERE a.funding_pool_id = p.id
+            AND ($3::bigint IS NULL OR a.zvk_row_id <> $3::bigint)
+        ), 0)::numeric AS used_other,
 
-        (
+        GREATEST(
           p.amount
-          - COALESCE(SUM(
-              CASE
-                WHEN cur.zvk_row_id IS NOT NULL
-                 AND ($3::bigint IS NULL OR cur.zvk_row_id <> $3::bigint)
-                 AND lower(trim(COALESCE(cur.request_flag, ''))) <> lower('Обнуление')
-                THEN COALESCE(cur.to_pay, 0)
-                ELSE 0
-              END
-            ), 0)
-        )::numeric AS available_amount
+          - COALESCE((
+              SELECT SUM(a.amount)
+              FROM public.zvk_funding_pool_allocations a
+              WHERE a.funding_pool_id = p.id
+                AND ($3::bigint IS NULL OR a.zvk_row_id <> $3::bigint)
+            ), 0),
+          0
+        )::numeric AS available_amount,
+
+        COALESCE((
+          SELECT a.amount
+          FROM public.zvk_funding_pool_allocations a
+          WHERE a.funding_pool_id = p.id
+            AND a.zvk_row_id = $3::bigint
+          LIMIT 1
+        ), 0)::numeric AS current_amount,
+
+        EXISTS(
+          SELECT 1
+          FROM public.zvk_funding_pool_allocations a
+          WHERE a.funding_pool_id = p.id
+            AND a.zvk_row_id = $3::bigint
+        ) AS is_selected
 
       FROM public.draft_funding_pool p
-
-      LEFT JOIN public.zvk_status zs
-        ON zs.funding_pool_id = p.id
-
-      LEFT JOIN public.ft_zvk_current_v2 cur
-        ON cur.zvk_row_id = zs.zvk_row_id
-
       WHERE p.is_active = true
         AND p.parent_pool_id IS NOT NULL
-        AND lower(trim(COALESCE(p.legal_entity, '')))
-            = lower(trim($1))
-        AND lower(trim(COALESCE(p.object_name, '')))
-            = lower(trim($2))
+        AND lower(trim(COALESCE(p.legal_entity, ''))) = lower(trim($1))
+        AND lower(trim(COALESCE(p.object_name, ''))) = lower(trim($2))
+      ORDER BY p.amount ASC, p.source_name, p.money_type, p.id
+    `, [legalEntity, objectName, rowId]);
 
-      GROUP BY
+    return res.json({ success:true, rows:q.rows });
+  } catch (e) {
+    console.error("DRAFT FUNDING OPTIONS ERROR:", e);
+    return res.status(500).json({ success:false, error:e.message });
+  }
+});
+
+// Сохраняет распределение одной строки ZFT по нескольким пулам.
+// Пользователь только отмечает пулы. Система сама берёт сначала меньший остаток
+// полностью, а последний пул использует частично.
+app.post("/zvk-funding-pools/save", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const rid = Number(req.body?.zvk_row_id || 0);
+    const actor = String(req.body?.login || "").trim();
+    const requestedIds = Array.isArray(req.body?.pool_ids)
+      ? [...new Set(req.body.pool_ids.map(Number).filter(x => Number.isInteger(x) && x > 0))]
+      : [];
+
+    if (!rid) {
+      return res.status(400).json({ success:false, error:"zvk_row_id required" });
+    }
+
+    if (!actor) {
+      return res.status(400).json({ success:false, error:"login required" });
+    }
+
+    const adminOk =
+      isTruthy(req.body?.is_admin) ||
+      isTruthy(req.body?.is_all) ||
+      isTruthy(req.body?.can_edit_all) ||
+      ["b_erkin", "s_zhasulan", "a_zaitova", "t_serik"].includes(actor.toLowerCase());
+
+    if (!adminOk) {
+      const ok = await canEditRowByLogin(client, rid, actor);
+      if (!ok) {
+        return res.status(403).json({ success:false, error:"NO_RIGHTS_THIS_ROW" });
+      }
+    }
+
+    await client.query("BEGIN");
+
+    const rowQ = await client.query(`
+      SELECT
+        z.id,
+        z.to_pay,
+        z.request_flag,
+        f.legal_entity,
+        f."object" AS object_name
+      FROM public.zvk z
+      JOIN public.ft f ON f.id_ft = z.id_ft
+      WHERE z.id = $1
+      FOR UPDATE
+    `, [rid]);
+
+    if (!rowQ.rowCount) {
+      throw new Error("ZVK_ROW_NOT_FOUND");
+    }
+
+    const ftRow = rowQ.rows[0];
+    const requestFlag = String(ftRow.request_flag || "").trim();
+    const toPay = Number(ftRow.to_pay || 0);
+
+    // Заявка выключена/обнулена — освобождаем все пулы.
+    if (requestFlag !== "Да" || toPay <= 0) {
+      await client.query(
+        `DELETE FROM public.zvk_funding_pool_allocations WHERE zvk_row_id = $1`,
+        [rid]
+      );
+      await client.query("COMMIT");
+      return res.json({ success:true, rows:[], allocated_total:0 });
+    }
+
+    if (!requestedIds.length) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        success:false,
+        error:"Выберите хотя бы один денежный пул"
+      });
+    }
+
+    const poolsQ = await client.query(`
+      SELECT
         p.id,
-        p.parent_pool_id,
         p.legal_entity,
         p.source_name,
         p.money_type,
         p.object_name,
-        p.amount
+        p.amount::numeric AS pool_amount,
 
-      ORDER BY
-        p.source_name,
-        p.money_type,
-        p.id
-    `, [legalEntity, objectName, excludeRowId]);
+        GREATEST(
+          p.amount
+          - COALESCE((
+              SELECT SUM(a.amount)
+              FROM public.zvk_funding_pool_allocations a
+              WHERE a.funding_pool_id = p.id
+                AND a.zvk_row_id <> $2
+            ), 0),
+          0
+        )::numeric AS available_amount
+
+      FROM public.draft_funding_pool p
+      WHERE p.id = ANY($1::bigint[])
+        AND p.is_active = true
+        AND p.parent_pool_id IS NOT NULL
+      ORDER BY p.amount ASC, p.id ASC
+      FOR UPDATE
+    `, [requestedIds, rid]);
+
+    if (poolsQ.rowCount !== requestedIds.length) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        success:false,
+        error:"Один из выбранных пулов не найден или уже не активен"
+      });
+    }
+
+    const legalKey = String(ftRow.legal_entity || "").trim().toLowerCase();
+    const objectKey = String(ftRow.object_name || "").trim().toLowerCase();
+
+    for (const p of poolsQ.rows) {
+      if (
+        String(p.legal_entity || "").trim().toLowerCase() !== legalKey ||
+        String(p.object_name || "").trim().toLowerCase() !== objectKey
+      ) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          success:false,
+          error:"Выбранный пул не соответствует ЮрЛицу и Объекту ФТ"
+        });
+      }
+    }
+
+    // Сначала используем меньшие доступные суммы полностью.
+    const poolsSorted = [...poolsQ.rows].sort((a,b) => {
+      const av = Number(a.available_amount || 0);
+      const bv = Number(b.available_amount || 0);
+      if (av !== bv) return av - bv;
+      return Number(a.id) - Number(b.id);
+    });
+
+    const totalAvailable = poolsSorted.reduce(
+      (s,p) => s + Number(p.available_amount || 0),
+      0
+    );
+
+    if (totalAvailable + 0.000001 < toPay) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        success:false,
+        error:
+          "Недостаточно суммы в выбранных пулах. Доступно: " +
+          totalAvailable.toLocaleString("ru-RU", {
+            minimumFractionDigits:2,
+            maximumFractionDigits:2
+          })
+      });
+    }
+
+    let remaining = toPay;
+    const allocations = [];
+
+    for (const p of poolsSorted) {
+      if (remaining <= 0.000001) break;
+
+      const available = Number(p.available_amount || 0);
+      const take = Math.min(available, remaining);
+
+      if (take > 0.000001) {
+        allocations.push({
+          funding_pool_id: Number(p.id),
+          source_name: p.source_name,
+          money_type: p.money_type,
+          amount: Math.round((take + Number.EPSILON) * 100) / 100
+        });
+
+        remaining -= take;
+      }
+    }
+
+    if (remaining > 0.009) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        success:false,
+        error:"Не удалось полностью распределить сумму К оплате"
+      });
+    }
+
+    await client.query(
+      `DELETE FROM public.zvk_funding_pool_allocations WHERE zvk_row_id = $1`,
+      [rid]
+    );
+
+    for (const a of allocations) {
+      await client.query(`
+        INSERT INTO public.zvk_funding_pool_allocations
+          (zvk_row_id, funding_pool_id, amount, created_by, created_at, updated_at)
+        VALUES
+          ($1, $2, $3, $4, NOW(), NOW())
+      `, [rid, a.funding_pool_id, a.amount, actor]);
+    }
+
+    // Старое поле Источник Объект оставляем для совместимости.
+    await client.query(`
+      INSERT INTO public.zvk_status
+        (zvk_row_id, status_time, src_d, src_o)
+      VALUES
+        ($1, NOW(), $2, $3)
+      ON CONFLICT (zvk_row_id)
+      DO UPDATE SET
+        status_time = NOW(),
+        src_d = EXCLUDED.src_d,
+        src_o = EXCLUDED.src_o
+    `, [
+      rid,
+      String(ftRow.legal_entity || "").trim() || null,
+      String(ftRow.object_name || "").trim() || null
+    ]);
+
+    await client.query("COMMIT");
 
     return res.json({
       success:true,
-      rows:q.rows
+      allocated_total:toPay,
+      rows:allocations
     });
 
   } catch (e) {
-    console.error("DRAFT FUNDING OPTIONS ERROR:", e);
-    return res.status(500).json({
-      success:false,
-      error:e.message
-    });
+    try { await client.query("ROLLBACK"); } catch (_) {}
+    console.error("ZVK FUNDING POOLS SAVE ERROR:", e);
+    return res.status(500).json({ success:false, error:e.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -14816,22 +15049,22 @@ app.get("/draft-funding-summary", async (req, res) => {
         p.amount AS pool_amount,
 
         COALESCE((
-          SELECT SUM(COALESCE(cur.to_pay, 0))
-          FROM public.zvk_status zs
+          SELECT SUM(a.amount)
+          FROM public.zvk_funding_pool_allocations a
           JOIN public.ft_zvk_current_v2 cur
-            ON cur.zvk_row_id = zs.zvk_row_id
-          WHERE zs.funding_pool_id = p.id
+            ON cur.zvk_row_id = a.zvk_row_id
+          WHERE a.funding_pool_id = p.id
             AND lower(trim(COALESCE(cur.request_flag, ''))) <> lower('Обнуление')
         ), 0)::numeric AS ft_amount,
 
         (
           p.amount
           - COALESCE((
-              SELECT SUM(COALESCE(cur.to_pay, 0))
-              FROM public.zvk_status zs
+              SELECT SUM(a.amount)
+              FROM public.zvk_funding_pool_allocations a
               JOIN public.ft_zvk_current_v2 cur
-                ON cur.zvk_row_id = zs.zvk_row_id
-              WHERE zs.funding_pool_id = p.id
+                ON cur.zvk_row_id = a.zvk_row_id
+              WHERE a.funding_pool_id = p.id
                 AND lower(trim(COALESCE(cur.request_flag, ''))) <> lower('Обнуление')
             ), 0)
         )::numeric AS ft_balance,
