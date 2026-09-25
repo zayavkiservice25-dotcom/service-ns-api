@@ -14562,6 +14562,7 @@ app.get("/draft-funding-pools", async (req, res) => {
 
 app.get("/draft-funding-summary", async (req, res) => {
   try {
+
     const result = await pool.query(`
       SELECT
         p.id,
@@ -14573,48 +14574,87 @@ app.get("/draft-funding-summary", async (req, res) => {
 
         COALESCE(SUM(
           CASE
-            WHEN o.operation_type = 'IN'
-              THEN o.amount
-
-            WHEN o.operation_type = 'ADJUST'
-              THEN o.amount
-
-            WHEN o.operation_type = 'RELEASE'
-              THEN o.amount
-
             WHEN o.operation_type = 'RESERVE'
-              THEN -o.amount
-
-            WHEN o.operation_type = 'PAYMENT'
-              THEN -o.amount
-
+              THEN o.amount
             ELSE 0
           END
-        ), 0) AS operation_balance,
+        ), 0) AS reserved_amount,
+
+        COALESCE(SUM(
+          CASE
+            WHEN o.operation_type = 'PAYMENT'
+              THEN o.amount
+            ELSE 0
+          END
+        ), 0) AS paid_amount,
+
+        COALESCE(SUM(
+          CASE
+            WHEN o.operation_type = 'RELEASE'
+              THEN o.amount
+            ELSE 0
+          END
+        ), 0) AS released_amount,
+
+        COALESCE(SUM(
+          CASE
+            WHEN o.operation_type = 'IN'
+              THEN o.amount
+            ELSE 0
+          END
+        ), 0) AS incoming_amount,
+
+        COALESCE(SUM(
+          CASE
+            WHEN o.operation_type = 'ADJUST'
+              THEN o.amount
+            ELSE 0
+          END
+        ), 0) AS adjust_amount,
 
         (
           p.amount
-          +
-          COALESCE(SUM(
-            CASE
-              WHEN o.operation_type = 'IN'
-                THEN o.amount
 
-              WHEN o.operation_type = 'ADJUST'
-                THEN o.amount
+          + COALESCE(SUM(
+              CASE
+                WHEN o.operation_type = 'IN'
+                  THEN o.amount
+                ELSE 0
+              END
+            ), 0)
 
-              WHEN o.operation_type = 'RELEASE'
-                THEN o.amount
+          + COALESCE(SUM(
+              CASE
+                WHEN o.operation_type = 'ADJUST'
+                  THEN o.amount
+                ELSE 0
+              END
+            ), 0)
 
-              WHEN o.operation_type = 'RESERVE'
-                THEN -o.amount
+          + COALESCE(SUM(
+              CASE
+                WHEN o.operation_type = 'RELEASE'
+                  THEN o.amount
+                ELSE 0
+              END
+            ), 0)
 
-              WHEN o.operation_type = 'PAYMENT'
-                THEN -o.amount
+          - COALESCE(SUM(
+              CASE
+                WHEN o.operation_type = 'RESERVE'
+                  THEN o.amount
+                ELSE 0
+              END
+            ), 0)
 
-              ELSE 0
-            END
-          ), 0)
+          - COALESCE(SUM(
+              CASE
+                WHEN o.operation_type = 'PAYMENT'
+                  THEN o.amount
+                ELSE 0
+              END
+            ), 0)
+
         ) AS available_amount
 
       FROM public.draft_funding_pool p
@@ -14639,13 +14679,19 @@ app.get("/draft-funding-summary", async (req, res) => {
         p.object_name
     `);
 
+
     return res.json({
       success: true,
       rows: result.rows
     });
 
+
   } catch (e) {
-    console.error("DRAFT FUNDING SUMMARY ERROR:", e);
+
+    console.error(
+      "DRAFT FUNDING SUMMARY ERROR:",
+      e
+    );
 
     return res.status(500).json({
       success: false,
@@ -14653,4 +14699,5 @@ app.get("/draft-funding-summary", async (req, res) => {
     });
   }
 });
+
 app.listen(PORT, () => console.log("Server started on port " + PORT));
