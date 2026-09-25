@@ -14700,4 +14700,96 @@ app.get("/draft-funding-summary", async (req, res) => {
   }
 });
 
+app.get("/draft-funding-objects", async (req, res) => {
+  try {
+
+    const result = await pool.query(`
+      SELECT
+        p.object_name,
+
+        SUM(
+          p.amount
+
+          + COALESCE((
+              SELECT SUM(
+                CASE
+                  WHEN o.operation_type = 'IN'
+                    THEN o.amount
+
+                  WHEN o.operation_type = 'ADJUST'
+                    THEN o.amount
+
+                  WHEN o.operation_type = 'RELEASE'
+                    THEN o.amount
+
+                  WHEN o.operation_type = 'RESERVE'
+                    THEN -o.amount
+
+                  WHEN o.operation_type = 'PAYMENT'
+                    THEN -o.amount
+
+                  ELSE 0
+                END
+              )
+              FROM public.draft_funding_operation o
+              WHERE o.pool_id = p.id
+            ), 0)
+
+        ) AS available_amount
+
+      FROM public.draft_funding_pool p
+
+      WHERE p.is_active = true
+
+      GROUP BY p.object_name
+
+      HAVING SUM(
+        p.amount
+
+        + COALESCE((
+            SELECT SUM(
+              CASE
+                WHEN o.operation_type = 'IN'
+                  THEN o.amount
+
+                WHEN o.operation_type = 'ADJUST'
+                  THEN o.amount
+
+                WHEN o.operation_type = 'RELEASE'
+                  THEN o.amount
+
+                WHEN o.operation_type = 'RESERVE'
+                  THEN -o.amount
+
+                WHEN o.operation_type = 'PAYMENT'
+                  THEN -o.amount
+
+                ELSE 0
+              END
+            )
+            FROM public.draft_funding_operation o
+            WHERE o.pool_id = p.id
+          ), 0)
+
+      ) > 0
+
+      ORDER BY p.object_name
+    `);
+
+    return res.json({
+      success: true,
+      rows: result.rows
+    });
+
+  } catch (e) {
+
+    console.error("DRAFT FUNDING OBJECTS ERROR:", e);
+
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
+
 app.listen(PORT, () => console.log("Server started on port " + PORT));
