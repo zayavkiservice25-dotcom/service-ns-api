@@ -14792,4 +14792,282 @@ app.get("/draft-funding-objects", async (req, res) => {
   }
 });
 
+
+// =====================================================
+// DRAFT FUNDING — СОЗДАНИЕ ОБЩИХ ПУЛОВ И РАСПРЕДЕЛЕНИЕ
+// =====================================================
+
+app.get("/draft-funding-pools/manage", async (req, res) => {
+  try {
+    const q = await pool.query(`
+      SELECT
+        p.id,
+        p.legal_entity,
+        p.source_name,
+        p.money_type,
+        p.amount AS total_amount,
+        COALESCE(SUM(CASE WHEN c.is_active = true THEN c.amount ELSE 0 END), 0) AS allocated_amount,
+        (
+          p.amount
+          - COALESCE(SUM(CASE WHEN c.is_active = true THEN c.amount ELSE 0 END), 0)
+        ) AS unallocated_amount,
+        p.created_at
+      FROM public.draft_funding_pool p
+      LEFT JOIN public.draft_funding_pool c
+        ON c.parent_pool_id = p.id
+      WHERE p.is_active = true
+        AND p.parent_pool_id IS NULL
+        AND COALESCE(trim(p.object_name), '') = ''
+      GROUP BY
+        p.id,
+        p.legal_entity,
+        p.source_name,
+        p.money_type,
+        p.amount,
+        p.created_at
+      ORDER BY p.created_at DESC, p.id DESC
+    `);
+
+    return res.json({ success: true, rows: q.rows });
+  } catch (e) {
+    console.error("DRAFT FUNDING MANAGE ERROR:", e);
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.post("/draft-funding-pools/create", async (req, res) => {
+  try {
+    const body = req.body || {};
+
+    const legalEntity = String(body.legal_entity || "").trim();
+    const sourceName = String(body.source_name || "").trim();
+    const moneyType = String(body.money_type || body.source_type || "").trim();
+    const createdBy = String(body.created_by || body.login || "").trim();
+    const amount = Number(body.amount);
+
+    if (!legalEntity) {
+      return res.status(400).json({ success: false, error: "ЮрЛицо не заполнено" });
+    }
+    if (!sourceName) {
+      return res.status(400).json({ success: false, error: "Источник не заполнен" });
+    }
+    if (!moneyType) {
+      return res.status(400).json({ success: false, error: "Тип не заполнен" });
+    }
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ success: false, error: "Сумма должна быть больше 0" });
+    }
+
+    const q = await pool.query(`
+      INSERT INTO public.draft_funding_pool (
+        legal_entity,
+        source_name,
+        money_type,
+        object_name,
+        amount,
+        parent_pool_id,
+        is_active,
+        created_by,
+        created_at
+      )
+      VALUES (
+        $1, $2, $3, '', $4, NULL, true, NULLIF($5, ''), NOW()
+      )
+      RETURNING *
+    `, [legalEntity, sourceName, moneyType, amount, createdBy]);
+
+    return res.json({ success: true, row: q.rows[0] });
+  } catch (e) {
+    console.error("DRAFT FUNDING CREATE ERROR:", e);
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.get("/draft-funding-pools/:poolId/allocations", async (req, res) => {
+  try {
+    const poolId = Number(req.params.poolId);
+
+    if (!Number.isInteger(poolId) || poolId <= 0) {
+      return res.status(400).json({ success: false, error: "Неверный pool_id" });
+    }
+
+    const parentQ = await pool.query(`
+      SELECT
+        p.id,
+        p.legal_entity,
+        p.source_name,
+        p.money_type,
+        p.amount AS total_amount,
+        COALESCE((
+          SELECT SUM(c.amount)
+          FROM public.draft_funding_pool c
+          WHERE c.parent_pool_id = p.id
+            AND c.is_active = true
+        ), 0) AS allocated_amount,
+        (
+          p.amount
+          - COALESCE((
+              SELECT SUM(c.amount)
+              FROM public.draft_funding_pool c
+              WHERE c.parent_pool_id = p.id
+                AND c.is_active = true
+            ), 0)
+        ) AS unallocated_amount
+      FROM public.draft_funding_pool p
+      WHERE p.id = $1
+        AND p.is_active = true
+        AND p.parent_pool_id IS NULL
+      LIMIT 1
+    `, [poolId]);
+
+    if (!parentQ.rows.length) {
+      return res.status(404).json({ success: false, error: "Общий пул не найден" });
+    }
+
+    const rowsQ = await pool.query(`
+      SELECT
+        c.id,
+        c.parent_pool_id,
+        c.legal_entity,
+        c.source_name,
+        c.money_type,
+        c.object_name,
+        c.amount,
+        c.created_by,
+        c.created_at
+      FROM public.draft_funding_pool c
+      WHERE c.parent_pool_id = $1
+        AND c.is_active = true
+      ORDER BY c.created_at, c.id
+    `, [poolId]);
+
+    return res.json({
+      success: true,
+      pool: parentQ.rows[0],
+      rows: rowsQ.rows
+    });
+  } catch (e) {
+    console.error("DRAFT FUNDING ALLOCATIONS ERROR:", e);
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.post("/draft-funding-pools/:poolId/allocate", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const poolId = Number(req.params.poolId);
+    const body = req.body || {};
+
+    const objectName = String(body.object_name || body.object || "").trim();
+    const createdBy = String(body.created_by || body.login || "").trim();
+    const amount = Number(body.amount);
+
+    if (!Number.isInteger(poolId) || poolId <= 0) {
+      return res.status(400).json({ success: false, error: "Неверный pool_id" });
+    }
+    if (!objectName) {
+      return res.status(400).json({ success: false, error: "Объект не выбран" });
+    }
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: "Сумма распределения должна быть больше 0"
+      });
+    }
+
+    await client.query("BEGIN");
+
+    const parentQ = await client.query(`
+      SELECT
+        id,
+        legal_entity,
+        source_name,
+        money_type,
+        amount
+      FROM public.draft_funding_pool
+      WHERE id = $1
+        AND is_active = true
+        AND parent_pool_id IS NULL
+      FOR UPDATE
+    `, [poolId]);
+
+    if (!parentQ.rows.length) {
+      throw new Error("Общий пул не найден");
+    }
+
+    const parent = parentQ.rows[0];
+
+    const allocatedQ = await client.query(`
+      SELECT COALESCE(SUM(amount), 0) AS allocated_amount
+      FROM public.draft_funding_pool
+      WHERE parent_pool_id = $1
+        AND is_active = true
+    `, [poolId]);
+
+    const totalAmount = Number(parent.amount || 0);
+    const allocatedAmount = Number(allocatedQ.rows[0].allocated_amount || 0);
+    const unallocatedAmount = totalAmount - allocatedAmount;
+
+    if (amount > unallocatedAmount) {
+      await client.query("ROLLBACK");
+
+      return res.status(400).json({
+        success: false,
+        error:
+          "Нельзя распределить больше остатка. Доступно: " +
+          unallocatedAmount.toLocaleString("ru-RU")
+      });
+    }
+
+    const insertQ = await client.query(`
+      INSERT INTO public.draft_funding_pool (
+        legal_entity,
+        source_name,
+        money_type,
+        object_name,
+        amount,
+        parent_pool_id,
+        is_active,
+        created_by,
+        created_at
+      )
+      VALUES (
+        $1, $2, $3, $4, $5, $6, true, NULLIF($7, ''), NOW()
+      )
+      RETURNING *
+    `, [
+      parent.legal_entity,
+      parent.source_name,
+      parent.money_type,
+      objectName,
+      amount,
+      poolId,
+      createdBy
+    ]);
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success: true,
+      row: insertQ.rows[0],
+      total_amount: totalAmount,
+      allocated_amount: allocatedAmount + amount,
+      unallocated_amount: unallocatedAmount - amount
+    });
+
+  } catch (e) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {}
+
+    console.error("DRAFT FUNDING ALLOCATE ERROR:", e);
+    return res.status(500).json({ success: false, error: e.message });
+
+  } finally {
+    client.release();
+  }
+});
+
+
 app.listen(PORT, () => console.log("Server started on port " + PORT));
