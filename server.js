@@ -199,6 +199,16 @@ await pool.query(`
 
 await pool.query(`
   ALTER TABLE public.zvk_status
+  ADD COLUMN IF NOT EXISTS funding_pool_id bigint;
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS zvk_status_funding_pool_idx
+  ON public.zvk_status (funding_pool_id);
+`);
+
+await pool.query(`
+  ALTER TABLE public.zvk_status
   ADD COLUMN IF NOT EXISTS chief_approved text;
 `);
 
@@ -288,6 +298,7 @@ s.src_d,
 s.src_o,
 s.status_comment,
 s.idlzk,
+s.funding_pool_id,
 
       p.agree_time,
       p.registry_flag,
@@ -4791,7 +4802,17 @@ app.post("/zvk-return-amount", async (req, res) => {
 
 app.post("/zvk-status-row", async (req, res) => {
   try {
-    const { zvk_row_id, src_o, idlzk, status_comment, login, is_admin, can_edit_all, is_all } = req.body;
+    const {
+      zvk_row_id,
+      src_o,
+      funding_pool_id,
+      idlzk,
+      status_comment,
+      login,
+      is_admin,
+      can_edit_all,
+      is_all
+    } = req.body;
 
     const rid = Number(zvk_row_id);
     if (isNaN(rid)) {
@@ -4801,24 +4822,37 @@ app.post("/zvk-status-row", async (req, res) => {
     // Проверка прав
     const actor = String(login || "").trim();
     const adminOk =
-  isTruthy(is_admin) ||
-  isTruthy(can_edit_all) ||
-  String(is_all || "0") === "1" ||
-  ["b_erkin", "s_zhasulan", "a_zaitova"].includes(actor.toLowerCase());
+      isTruthy(is_admin) ||
+      isTruthy(can_edit_all) ||
+      String(is_all || "0") === "1" ||
+      ["b_erkin", "s_zhasulan", "a_zaitova"].includes(actor.toLowerCase());
+
     if (!adminOk) {
       const ok = await canEditRowByLogin(pool, rid, actor);
-      if (!ok) return res.status(403).json({ success: false, error: "NO_RIGHTS_THIS_ROW" });
+      if (!ok) {
+        return res.status(403).json({ success: false, error: "NO_RIGHTS_THIS_ROW" });
+      }
     }
 
     const isSerikActor = actor.toLowerCase() === "t_serik";
-    const hasStatusComment = !isSerikActor && Object.prototype.hasOwnProperty.call(req.body, "status_comment");
-    const hasIdlzk = !isSerikActor && Object.prototype.hasOwnProperty.call(req.body, "idlzk");
+    const hasStatusComment =
+      !isSerikActor &&
+      Object.prototype.hasOwnProperty.call(req.body, "status_comment");
+    const hasIdlzk =
+      !isSerikActor &&
+      Object.prototype.hasOwnProperty.call(req.body, "idlzk");
 
-    // src_d нельзя задавать с клиента.
-    // Всегда берём текущее значение legal_entity из основной строки FT.
-    const divisionResult = await pool.query(
+    const hasFundingPoolId =
+      Object.prototype.hasOwnProperty.call(req.body, "funding_pool_id");
+
+    // Всегда берём ЮрЛицо и Объект напрямую из FT.
+    const ftResult = await pool.query(
       `
-      SELECT f.legal_entity
+      SELECT
+        f.legal_entity,
+        f."object" AS object_name,
+        z.to_pay,
+        z.request_flag
       FROM public.zvk z
       JOIN public.ft f ON f.id_ft = z.id_ft
       WHERE z.id = $1
@@ -4827,53 +4861,161 @@ app.post("/zvk-status-row", async (req, res) => {
       [rid]
     );
 
-    if (!divisionResult.rowCount) {
+    if (!ftResult.rowCount) {
       return res.status(404).json({ success:false, error:"ZVK_ROW_NOT_FOUND" });
     }
 
-    const autoSrcD = String(divisionResult.rows[0].legal_entity || "").trim() || null;
+    const ftRow = ftResult.rows[0];
+    const autoSrcD = String(ftRow.legal_entity || "").trim() || null;
+    const ftObject = String(ftRow.object_name || "").trim();
+
+    let poolId = null;
+    let autoSrcO = src_o ?? null;
+
+    if (hasFundingPoolId && funding_pool_id !== null && funding_pool_id !== "") {
+      poolId = Number(funding_pool_id);
+
+      if (!Number.isInteger(poolId) || poolId <= 0) {
+        return res.status(400).json({
+          success:false,
+          error:"Некорректный денежный пул"
+        });
+      }
+
+      // Пул должен быть дочерним распределением, активным,
+      // а его ЮрЛицо + Объект должны совпасть со строкой ФТ.
+      const poolRes = await pool.query(
+        `
+        SELECT
+          p.id,
+          p.legal_entity,
+          p.source_name,
+          p.money_type,
+          p.object_name,
+          p.amount,
+
+          COALESCE((
+            SELECT SUM(COALESCE(cur.to_pay, 0))
+            FROM public.ft_zvk_current_v2 cur
+            WHERE cur.funding_pool_id = p.id
+              AND cur.zvk_row_id <> $2
+              AND lower(trim(COALESCE(cur.request_flag, ''))) <> lower('Обнуление')
+          ), 0)::numeric AS used_other
+
+        FROM public.draft_funding_pool p
+        WHERE p.id = $1
+          AND p.is_active = true
+          AND p.parent_pool_id IS NOT NULL
+          AND lower(trim(COALESCE(p.legal_entity, '')))
+              = lower(trim(COALESCE($3, '')))
+          AND lower(trim(COALESCE(p.object_name, '')))
+              = lower(trim(COALESCE($4, '')))
+        LIMIT 1
+        `,
+        [poolId, rid, autoSrcD, ftObject]
+      );
+
+      if (!poolRes.rowCount) {
+        return res.status(400).json({
+          success:false,
+          error:"Выбранный пул не соответствует ЮрЛицу и Объекту этой строки ФТ"
+        });
+      }
+
+      const selectedPool = poolRes.rows[0];
+      const usedOther = Number(selectedPool.used_other || 0);
+      const currentToPay =
+        String(ftRow.request_flag || "").trim().toLowerCase() === "обнуление"
+          ? 0
+          : Number(ftRow.to_pay || 0);
+
+      const poolAmount = Number(selectedPool.amount || 0);
+
+      if (usedOther + currentToPay > poolAmount + 0.000001) {
+        return res.status(400).json({
+          success:false,
+          error:
+            "Недостаточно остатка в пуле. Доступно: " +
+            Math.max(0, poolAmount - usedOther).toLocaleString("ru-RU", {
+              minimumFractionDigits: 2,
+              maximumFractionDigits: 2
+            })
+        });
+      }
+
+      // Старое поле src_o сохраняем для совместимости старой логики:
+      // в нём остаётся объект, а конкретный пул хранится в funding_pool_id.
+      autoSrcO = String(selectedPool.object_name || "").trim() || null;
+    } else if (hasFundingPoolId) {
+      // Явное очищение выбора пула.
+      poolId = null;
+      autoSrcO = null;
+    }
 
     const result = await pool.query(
       `
       INSERT INTO zvk_status
-        (zvk_row_id, status_time, src_d, src_o, status_comment, idlzk)
+        (
+          zvk_row_id,
+          status_time,
+          src_d,
+          src_o,
+          funding_pool_id,
+          status_comment,
+          idlzk
+        )
       VALUES
-        ($1, NOW(), $2, $3, $4, $6)
+        ($1, NOW(), $2, $3, $4, $5, $7)
+
       ON CONFLICT (zvk_row_id)
       DO UPDATE SET
         status_time = NOW(),
         src_d = EXCLUDED.src_d,
+
         src_o = CASE
+                  WHEN $8 THEN EXCLUDED.src_o
                   WHEN EXCLUDED.src_o IS NULL THEN NULL
                   ELSE COALESCE(EXCLUDED.src_o, zvk_status.src_o)
                 END,
+
+        funding_pool_id = CASE
+                            WHEN $8 THEN EXCLUDED.funding_pool_id
+                            ELSE zvk_status.funding_pool_id
+                          END,
+
         status_comment = CASE
-                           WHEN $5 THEN EXCLUDED.status_comment
+                           WHEN $6 THEN EXCLUDED.status_comment
                            ELSE zvk_status.status_comment
                          END,
+
         idlzk = CASE
-                  WHEN $7 THEN EXCLUDED.idlzk
+                  WHEN $9 THEN EXCLUDED.idlzk
                   ELSE zvk_status.idlzk
                 END
+
       RETURNING *
       `,
       [
-        rid,
-        autoSrcD,
-        src_o ?? null,
-        hasStatusComment ? String(status_comment || "") : null,
-        hasStatusComment,
-        hasIdlzk ? String(idlzk || "").trim() : null,
-        hasIdlzk
+        rid,                                             // $1
+        autoSrcD,                                        // $2
+        autoSrcO,                                        // $3
+        poolId,                                          // $4
+        hasStatusComment ? String(status_comment || "") : null, // $5
+        hasStatusComment,                                // $6
+        hasIdlzk ? String(idlzk || "").trim() : null,    // $7
+        hasFundingPoolId,                                // $8
+        hasIdlzk                                         // $9
       ]
     );
 
     res.json({ success: true, row: result.rows[0] });
+
   } catch (e) {
     console.error("ZVK-STATUS-ROW ERROR:", e);
     res.status(500).json({ success: false, error: e.message });
   }
 });
+
 // =====================================================
 // ✅ Оплата/Реестр — ПО СТРОКЕ истории (zvk_row_id)
 // POST /zvk-pay-row  { is_admin, zvk_row_id, registry_flag, is_paid }
@@ -14560,6 +14702,99 @@ app.get("/draft-funding-pools", async (req, res) => {
 });
 
 
+
+// =====================================================
+// ПУЛЫ ДЛЯ ВЫБОРА В ФИНАНСОВОЙ ТАБЛИЦЕ
+// Фильтр: ЮрЛицо + Объект.
+// Возвращаются только реально распределённые дочерние пулы.
+// =====================================================
+app.get("/draft-funding-pools/options", async (req, res) => {
+  try {
+    const legalEntity = String(req.query.legal_entity || "").trim();
+    const objectName = String(req.query.object || "").trim();
+    const excludeRowId = Number(req.query.zvk_row_id || 0) || null;
+
+    if (!legalEntity || !objectName) {
+      return res.json({
+        success:true,
+        rows:[]
+      });
+    }
+
+    const q = await pool.query(`
+      SELECT
+        p.id,
+        p.parent_pool_id,
+        p.legal_entity,
+        p.source_name,
+        p.money_type,
+        p.object_name,
+        p.amount::numeric AS amount,
+
+        COALESCE(SUM(
+          CASE
+            WHEN cur.zvk_row_id IS NOT NULL
+             AND ($3::bigint IS NULL OR cur.zvk_row_id <> $3::bigint)
+             AND lower(trim(COALESCE(cur.request_flag, ''))) <> lower('Обнуление')
+            THEN COALESCE(cur.to_pay, 0)
+            ELSE 0
+          END
+        ), 0)::numeric AS used_amount,
+
+        (
+          p.amount
+          - COALESCE(SUM(
+              CASE
+                WHEN cur.zvk_row_id IS NOT NULL
+                 AND ($3::bigint IS NULL OR cur.zvk_row_id <> $3::bigint)
+                 AND lower(trim(COALESCE(cur.request_flag, ''))) <> lower('Обнуление')
+                THEN COALESCE(cur.to_pay, 0)
+                ELSE 0
+              END
+            ), 0)
+        )::numeric AS available_amount
+
+      FROM public.draft_funding_pool p
+
+      LEFT JOIN public.ft_zvk_current_v2 cur
+        ON cur.funding_pool_id = p.id
+
+      WHERE p.is_active = true
+        AND p.parent_pool_id IS NOT NULL
+        AND lower(trim(COALESCE(p.legal_entity, '')))
+            = lower(trim($1))
+        AND lower(trim(COALESCE(p.object_name, '')))
+            = lower(trim($2))
+
+      GROUP BY
+        p.id,
+        p.parent_pool_id,
+        p.legal_entity,
+        p.source_name,
+        p.money_type,
+        p.object_name,
+        p.amount
+
+      ORDER BY
+        p.source_name,
+        p.money_type,
+        p.id
+    `, [legalEntity, objectName, excludeRowId]);
+
+    return res.json({
+      success:true,
+      rows:q.rows
+    });
+
+  } catch (e) {
+    console.error("DRAFT FUNDING OPTIONS ERROR:", e);
+    return res.status(500).json({
+      success:false,
+      error:e.message
+    });
+  }
+});
+
 app.get("/draft-funding-summary", async (req, res) => {
   try {
 
@@ -14571,6 +14806,23 @@ app.get("/draft-funding-summary", async (req, res) => {
         p.money_type,
         p.object_name,
         p.amount AS pool_amount,
+
+        COALESCE((
+          SELECT SUM(COALESCE(cur.to_pay, 0))
+          FROM public.ft_zvk_current_v2 cur
+          WHERE cur.funding_pool_id = p.id
+            AND lower(trim(COALESCE(cur.request_flag, ''))) <> lower('Обнуление')
+        ), 0)::numeric AS ft_amount,
+
+        (
+          p.amount
+          - COALESCE((
+              SELECT SUM(COALESCE(cur.to_pay, 0))
+              FROM public.ft_zvk_current_v2 cur
+              WHERE cur.funding_pool_id = p.id
+                AND lower(trim(COALESCE(cur.request_flag, ''))) <> lower('Обнуление')
+            ), 0)
+        )::numeric AS ft_balance,
 
         COALESCE(SUM(
           CASE
