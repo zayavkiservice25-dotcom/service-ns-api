@@ -15512,6 +15512,16 @@ app.post("/draft-funding-pools/:poolId/allocate", async (req, res) => {
     const createdBy = String(body.created_by || body.login || "").trim();
     const amount = Number(body.amount);
 
+    const allocatorLogin = createdBy.toLowerCase();
+    const allowedAllocators = ["b_erkin", "s_zhasulan", "k_ermek"];
+
+    if (!allowedAllocators.includes(allocatorLogin)) {
+      return res.status(403).json({
+        success: false,
+        error: "Нет доступа к распределению сумм"
+      });
+    }
+
     if (!Number.isInteger(poolId) || poolId <= 0) {
       return res.status(400).json({ success: false, error: "Неверный pool_id" });
     }
