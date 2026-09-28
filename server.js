@@ -231,6 +231,20 @@ await pool.query(`
   ON public.zvk_funding_pool_allocations (funding_pool_id);
 `);
 
+
+// Логин инициатора, которому выделена сумма дочернего денежного пула.
+// Для старых распределений поле остаётся NULL и ничего не ломает.
+await pool.query(`
+  ALTER TABLE public.draft_funding_pool
+  ADD COLUMN IF NOT EXISTS beneficiary_login text;
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS draft_funding_pool_beneficiary_login_idx
+  ON public.draft_funding_pool (lower(trim(beneficiary_login)))
+  WHERE beneficiary_login IS NOT NULL AND trim(beneficiary_login) <> '';
+`);
+
 await pool.query(`
   ALTER TABLE public.zvk_status
   ADD COLUMN IF NOT EXISTS chief_approved text;
@@ -15046,6 +15060,7 @@ app.get("/draft-funding-summary", async (req, res) => {
         p.source_name,
         p.money_type,
         p.object_name,
+        p.beneficiary_login,
         p.amount AS pool_amount,
 
         COALESCE((
@@ -15167,6 +15182,7 @@ app.get("/draft-funding-summary", async (req, res) => {
         p.source_name,
         p.money_type,
         p.object_name,
+        p.beneficiary_login,
         p.amount
 
       ORDER BY
@@ -15293,6 +15309,35 @@ app.get("/draft-funding-objects", async (req, res) => {
 // =====================================================
 // DRAFT FUNDING — СОЗДАНИЕ ОБЩИХ ПУЛОВ И РАСПРЕДЕЛЕНИЕ
 // =====================================================
+
+
+// =====================================================
+// ЛОГИНЫ ДЛЯ РАСПРЕДЕЛЕНИЯ ДЕНЕЖНЫХ ПУЛОВ
+// Источник: public.users.login
+// =====================================================
+app.get("/draft-funding-logins", async (req, res) => {
+  try {
+    const q = await pool.query(`
+      SELECT DISTINCT trim(login) AS login
+      FROM public.users
+      WHERE COALESCE(is_active, true) = true
+        AND login IS NOT NULL
+        AND trim(login) <> ''
+      ORDER BY trim(login)
+    `);
+
+    return res.json({
+      success: true,
+      rows: q.rows
+    });
+  } catch (e) {
+    console.error("DRAFT FUNDING LOGINS ERROR:", e);
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
 
 app.get("/draft-funding-pools/manage", async (req, res) => {
   try {
@@ -15429,6 +15474,7 @@ app.get("/draft-funding-pools/:poolId/allocations", async (req, res) => {
         c.source_name,
         c.money_type,
         c.object_name,
+        c.beneficiary_login,
         c.amount,
         c.created_by,
         c.created_at
@@ -15457,6 +15503,7 @@ app.post("/draft-funding-pools/:poolId/allocate", async (req, res) => {
     const body = req.body || {};
 
     const objectName = String(body.object_name || body.object || "").trim();
+    const beneficiaryLogin = String(body.beneficiary_login || "").trim();
     const createdBy = String(body.created_by || body.login || "").trim();
     const amount = Number(body.amount);
 
@@ -15466,6 +15513,29 @@ app.post("/draft-funding-pools/:poolId/allocate", async (req, res) => {
     if (!objectName) {
       return res.status(400).json({ success: false, error: "Объект не выбран" });
     }
+    if (!beneficiaryLogin) {
+      return res.status(400).json({
+        success: false,
+        error: "Выберите логин инициатора"
+      });
+    }
+
+    const userQ = await pool.query(`
+      SELECT trim(login) AS login
+      FROM public.users
+      WHERE COALESCE(is_active, true) = true
+        AND lower(trim(login)) = lower(trim($1))
+      LIMIT 1
+    `, [beneficiaryLogin]);
+
+    if (!userQ.rows.length) {
+      return res.status(400).json({
+        success: false,
+        error: "Логин не найден в public.users"
+      });
+    }
+
+    const normalizedBeneficiaryLogin = String(userQ.rows[0].login || "").trim();
     if (!Number.isFinite(amount) || amount <= 0) {
       return res.status(400).json({
         success: false,
@@ -15523,6 +15593,7 @@ app.post("/draft-funding-pools/:poolId/allocate", async (req, res) => {
         source_name,
         money_type,
         object_name,
+        beneficiary_login,
         amount,
         parent_pool_id,
         is_active,
@@ -15530,7 +15601,7 @@ app.post("/draft-funding-pools/:poolId/allocate", async (req, res) => {
         created_at
       )
       VALUES (
-        $1, $2, $3, $4, $5, $6, true, NULLIF($7, ''), NOW()
+        $1, $2, $3, $4, $5, $6, $7, true, NULLIF($8, ''), NOW()
       )
       RETURNING *
     `, [
@@ -15538,6 +15609,7 @@ app.post("/draft-funding-pools/:poolId/allocate", async (req, res) => {
       parent.source_name,
       parent.money_type,
       objectName,
+      normalizedBeneficiaryLogin,
       amount,
       poolId,
       createdBy
