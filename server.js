@@ -14756,9 +14756,10 @@ app.get("/draft-funding-pools/options", async (req, res) => {
   try {
     const legalEntity = String(req.query.legal_entity || "").trim();
     const objectName = String(req.query.object || "").trim();
+    const login = String(req.query.login || "").trim();
     const rowId = Number(req.query.zvk_row_id || 0) || null;
 
-    if (!legalEntity || !objectName) {
+    if (!legalEntity || !objectName || !login) {
       return res.json({ success:true, rows:[] });
     }
 
@@ -14770,6 +14771,7 @@ app.get("/draft-funding-pools/options", async (req, res) => {
         p.source_name,
         p.money_type,
         p.object_name,
+        p.beneficiary_login,
         p.amount::numeric AS amount,
 
         COALESCE((
@@ -14810,8 +14812,9 @@ app.get("/draft-funding-pools/options", async (req, res) => {
         AND p.parent_pool_id IS NOT NULL
         AND lower(trim(COALESCE(p.legal_entity, ''))) = lower(trim($1))
         AND lower(trim(COALESCE(p.object_name, ''))) = lower(trim($2))
+        AND lower(trim(COALESCE(p.beneficiary_login, ''))) = lower(trim($4))
       ORDER BY p.amount ASC, p.source_name, p.money_type, p.id
-    `, [legalEntity, objectName, rowId]);
+    `, [legalEntity, objectName, rowId, login]);
 
     return res.json({ success:true, rows:q.rows });
   } catch (e) {
@@ -14902,6 +14905,7 @@ app.post("/zvk-funding-pools/save", async (req, res) => {
         p.source_name,
         p.money_type,
         p.object_name,
+        p.beneficiary_login,
         p.amount::numeric AS pool_amount,
 
         GREATEST(
@@ -14937,12 +14941,13 @@ app.post("/zvk-funding-pools/save", async (req, res) => {
     for (const p of poolsQ.rows) {
       if (
         String(p.legal_entity || "").trim().toLowerCase() !== legalKey ||
-        String(p.object_name || "").trim().toLowerCase() !== objectKey
+        String(p.object_name || "").trim().toLowerCase() !== objectKey ||
+        String(p.beneficiary_login || "").trim().toLowerCase() !== actor.toLowerCase()
       ) {
         await client.query("ROLLBACK");
         return res.status(400).json({
           success:false,
-          error:"Выбранный пул не соответствует ЮрЛицу и Объекту ФТ"
+          error:"Выбранный пул не соответствует ЮрЛицу, Объекту или логину инициатора"
         });
       }
     }
