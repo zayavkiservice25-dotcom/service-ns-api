@@ -247,6 +247,11 @@ await pool.query(`
 
 await pool.query(`
   ALTER TABLE public.zvk_status
+  ADD COLUMN IF NOT EXISTS money_type text;
+`);
+
+await pool.query(`
+  ALTER TABLE public.zvk_status
   ADD COLUMN IF NOT EXISTS chief_approved text;
 `);
 
@@ -334,6 +339,7 @@ await pool.query(`
 s.status_time,
 s.src_d,
 s.src_o,
+s.money_type,
 s.status_comment,
 s.idlzk,
 
@@ -766,6 +772,7 @@ await pool.query(`
       invoice_pdf text,
       src_d text,
       src_o text,
+      money_type text,
       idlzk text,
       to_pay numeric(18,2) DEFAULT 0
     );
@@ -791,6 +798,7 @@ await pool.query(`
   await pool.query(`ALTER TABLE public.request_items ADD COLUMN IF NOT EXISTS aray_pay_time timestamptz;`);
   await pool.query(`ALTER TABLE public.request_items ADD COLUMN IF NOT EXISTS aray_paid_by text;`);
   // Фиксируем признак «Возврат ЭСК» в строке созданного Реестра.
+  await pool.query(`ALTER TABLE public.request_items ADD COLUMN IF NOT EXISTS money_type text;`);
   await pool.query(`ALTER TABLE public.request_items ADD COLUMN IF NOT EXISTS esk_return boolean DEFAULT false;`);
 
   await pool.query(`
@@ -845,6 +853,7 @@ await pool.query(`
           invoice_pdf  = cur.invoice_pdf,
           src_d        = cur.src_d,
           src_o        = cur.src_o,
+          money_type   = cur.money_type,
           idlzk        = cur.idlzk,
           to_pay       = cur.to_pay,
           esk_return   = COALESCE(cur.esk_return, false)
@@ -866,6 +875,7 @@ await pool.query(`
             i.invoice_pdf,
             i.src_d,
             i.src_o,
+            i.money_type,
             i.idlzk,
             i.to_pay,
             i.esk_return
@@ -883,6 +893,7 @@ await pool.query(`
             cur.invoice_pdf,
             cur.src_d,
             cur.src_o,
+            cur.money_type,
             cur.idlzk,
             cur.to_pay,
             COALESCE(cur.esk_return, false)
@@ -1015,7 +1026,7 @@ AFTER UPDATE OF
   await pool.query(`
     DROP TRIGGER IF EXISTS zvk_status_sync_request_items_update_trg ON public.zvk_status;
     CREATE TRIGGER zvk_status_sync_request_items_update_trg
-    AFTER UPDATE OF src_d, src_o, idlzk
+    AFTER UPDATE OF src_d, src_o, money_type, idlzk
     ON public.zvk_status
     FOR EACH ROW
     EXECUTE FUNCTION public.trg_sync_request_items_by_status();
@@ -3113,6 +3124,7 @@ app.post("/create-request", async (req, res) => {
           invoice_pdf,
           src_d,
           src_o,
+          money_type,
           idlzk,
           to_pay,
           esk_return
@@ -3133,6 +3145,7 @@ app.post("/create-request", async (req, res) => {
           v.invoice_pdf,
           v.src_d,
           v.src_o,
+          v.money_type,
           v.idlzk,
           v.to_pay,
           COALESCE(v.esk_return, false)
@@ -3462,6 +3475,7 @@ app.get("/registry-card", async (req, res) => {
         COALESCE(cur.invoice_pdf, i.invoice_pdf) AS invoice_pdf,
         COALESCE(cur.src_d, i.src_d) AS src_d,
         COALESCE(cur.src_o, i.src_o) AS src_o,
+        COALESCE(cur.money_type, i.money_type) AS money_type,
         COALESCE(cur.to_pay, i.to_pay) AS to_pay,
 
         COALESCE(cur.request_flag, '') AS request_flag,
@@ -3795,12 +3809,13 @@ async function resetExpiredZhasulanRequests() {
 
       // Источник Объект = пусто
       await client.query(`
-        INSERT INTO public.zvk_status (zvk_row_id, status_time, src_o)
-        SELECT x, NOW(), ''
+        INSERT INTO public.zvk_status (zvk_row_id, status_time, src_o, money_type)
+        SELECT x, NOW(), '', NULL
         FROM unnest($1::bigint[]) AS x
         ON CONFLICT (zvk_row_id)
         DO UPDATE SET
           src_o = '',
+          money_type = NULL,
           status_time = NOW()
       `, [rowIds]);
 
@@ -4793,6 +4808,7 @@ app.post("/zvk-return-amount", async (req, res) => {
       SELECT
         z.id,
         COALESCE(s.src_o, '') AS src_o,
+        COALESCE(s.money_type, '') AS money_type,
         COALESCE(p.return_status, '') AS return_status
       FROM public.zvk z
       LEFT JOIN public.zvk_status s ON s.zvk_row_id = z.id
@@ -4806,7 +4822,7 @@ app.post("/zvk-return-amount", async (req, res) => {
     }
 
     const row = rowRes.rows[0];
-    if (!String(row.src_o || "").toUpperCase().includes("ЭСК")) {
+    if (!String(row.money_type || "").toUpperCase().includes("ЭСК")) {
       return res.status(400).json({ success:false, error:"Сумма возврата доступна только для Источник Объект с ЭСК" });
     }
 
@@ -4842,6 +4858,7 @@ app.post("/zvk-status-row", async (req, res) => {
     const {
       zvk_row_id,
       src_o,
+      money_type,
       funding_pool_id,
       idlzk,
       status_comment,
@@ -7829,7 +7846,8 @@ app.post("/request-items-return", async (req, res) => {
     const rowsCheck = await client.query(`
       SELECT
         z.id AS zvk_row_id,
-        COALESCE(s.src_o, '') AS src_o
+        COALESCE(s.src_o, '') AS src_o,
+        COALESCE(s.money_type, '') AS money_type
       FROM public.zvk z
       LEFT JOIN public.zvk_status s ON s.zvk_row_id = z.id
       WHERE z.id = ANY($1::bigint[])
@@ -7840,7 +7858,7 @@ app.post("/request-items-return", async (req, res) => {
     }
 
     const nonEsk = rowsCheck.rows.filter(r =>
-      !String(r.src_o || "").toUpperCase().includes("ЭСК")
+      !String(r.money_type || "").toUpperCase().includes("ЭСК")
     );
     if (nonEsk.length) {
       return res.status(400).json({ success:false, error:"Возврат доступен только для Источник Объект с надписью ЭСК" });
@@ -15031,19 +15049,19 @@ app.post("/zvk-funding-pools/save", async (req, res) => {
       `, [rid, a.funding_pool_id, a.amount, actor]);
     }
 
-    // В Источник Объект сохраняем реальные источники выбранных пулов,
-    // из которых фактически распределилась сумма К оплате.
+    // Источник Объект и Тип сохраняем отдельно.
     const actualSourceNames = [
       ...new Set(
         allocations
-          .map(a => {
-            const source = String(a.source_name || "").trim();
-            const type = String(a.money_type || "").trim();
+          .map(a => String(a.source_name || "").trim())
+          .filter(Boolean)
+      )
+    ];
 
-            return type.toUpperCase() === "ЭСК"
-              ? [source, "ЭСК"].filter(Boolean).join(" ")
-              : source;
-          })
+    const actualMoneyTypes = [
+      ...new Set(
+        allocations
+          .map(a => String(a.money_type || "").trim())
           .filter(Boolean)
       )
     ];
@@ -15052,20 +15070,26 @@ app.post("/zvk-funding-pools/save", async (req, res) => {
       ? actualSourceNames.join(" + ")
       : null;
 
+    const moneyTypeValue = actualMoneyTypes.length
+      ? actualMoneyTypes.join(" + ")
+      : null;
+
     await client.query(`
       INSERT INTO public.zvk_status
-        (zvk_row_id, status_time, src_d, src_o)
+        (zvk_row_id, status_time, src_d, src_o, money_type)
       VALUES
-        ($1, NOW(), $2, $3)
+        ($1, NOW(), $2, $3, $4)
       ON CONFLICT (zvk_row_id)
       DO UPDATE SET
         status_time = NOW(),
         src_d = EXCLUDED.src_d,
-        src_o = EXCLUDED.src_o
+        src_o = EXCLUDED.src_o,
+        money_type = EXCLUDED.money_type
     `, [
       rid,
       String(ftRow.legal_entity || "").trim() || null,
-      sourceObjectValue
+      sourceObjectValue,
+      moneyTypeValue
     ]);
 
     await client.query("COMMIT");
@@ -15491,6 +15515,200 @@ app.post("/draft-funding-pools/create", async (req, res) => {
     return res.status(500).json({ success: false, error: e.message });
   }
 });
+
+
+// Изменение общего денежного пула.
+// Доступ: b_erkin, s_zhasulan, k_ermek.
+app.put("/draft-funding-pools/:poolId", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const poolId = Number(req.params.poolId);
+    const body = req.body || {};
+    const login = String(body.login || body.created_by || "").trim().toLowerCase();
+    const allowed = ["b_erkin", "s_zhasulan", "k_ermek"];
+
+    if (!allowed.includes(login)) {
+      return res.status(403).json({ success:false, error:"Нет доступа к изменению пула" });
+    }
+
+    if (!Number.isInteger(poolId) || poolId <= 0) {
+      return res.status(400).json({ success:false, error:"Неверный pool_id" });
+    }
+
+    const legalEntity = String(body.legal_entity || "").trim();
+    const sourceName = String(body.source_name || "").trim();
+    const moneyType = String(body.money_type || body.source_type || "").trim();
+    const amount = Number(body.amount);
+
+    if (!legalEntity || !sourceName || !moneyType) {
+      return res.status(400).json({ success:false, error:"Заполните ЮрЛицо, Источник и Тип" });
+    }
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ success:false, error:"Сумма должна быть больше 0" });
+    }
+
+    await client.query("BEGIN");
+
+    const parentQ = await client.query(`
+      SELECT id
+      FROM public.draft_funding_pool
+      WHERE id = $1
+        AND parent_pool_id IS NULL
+        AND is_active = true
+      FOR UPDATE
+    `, [poolId]);
+
+    if (!parentQ.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success:false, error:"Общий пул не найден" });
+    }
+
+    const allocatedQ = await client.query(`
+      SELECT COALESCE(SUM(amount), 0)::numeric AS allocated_amount
+      FROM public.draft_funding_pool
+      WHERE parent_pool_id = $1
+        AND is_active = true
+    `, [poolId]);
+
+    const allocated = Number(allocatedQ.rows[0]?.allocated_amount || 0);
+
+    if (amount + 0.000001 < allocated) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        success:false,
+        error:
+          "Общая сумма не может быть меньше уже распределенной суммы: " +
+          allocated.toLocaleString("ru-RU", {
+            minimumFractionDigits:2,
+            maximumFractionDigits:2
+          })
+      });
+    }
+
+    const upd = await client.query(`
+      UPDATE public.draft_funding_pool
+      SET
+        legal_entity = $2,
+        source_name = $3,
+        money_type = $4,
+        amount = $5
+      WHERE id = $1
+      RETURNING *
+    `, [poolId, legalEntity, sourceName, moneyType, amount]);
+
+    // Дочерние распределения принадлежат этому же общему пулу,
+    // поэтому справочные поля синхронизируем с родителем.
+    await client.query(`
+      UPDATE public.draft_funding_pool
+      SET
+        legal_entity = $2,
+        source_name = $3,
+        money_type = $4
+      WHERE parent_pool_id = $1
+    `, [poolId, legalEntity, sourceName, moneyType]);
+
+    await client.query("COMMIT");
+    return res.json({ success:true, row:upd.rows[0] });
+
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+    console.error("DRAFT FUNDING UPDATE ERROR:", e);
+    return res.status(500).json({ success:false, error:e.message });
+  } finally {
+    client.release();
+  }
+});
+
+// Полное удаление общего денежного пула.
+// Удаляются родитель, дочерние распределения и связи этих пулов с ZFT.
+app.delete("/draft-funding-pools/:poolId", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const poolId = Number(req.params.poolId);
+    const login = String(req.body?.login || "").trim().toLowerCase();
+    const allowed = ["b_erkin", "s_zhasulan", "k_ermek"];
+
+    if (!allowed.includes(login)) {
+      return res.status(403).json({ success:false, error:"Нет доступа к удалению пула" });
+    }
+
+    if (!Number.isInteger(poolId) || poolId <= 0) {
+      return res.status(400).json({ success:false, error:"Неверный pool_id" });
+    }
+
+    await client.query("BEGIN");
+
+    const parentQ = await client.query(`
+      SELECT id
+      FROM public.draft_funding_pool
+      WHERE id = $1
+        AND parent_pool_id IS NULL
+      FOR UPDATE
+    `, [poolId]);
+
+    if (!parentQ.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success:false, error:"Общий пул не найден" });
+    }
+
+    const childQ = await client.query(`
+      SELECT id
+      FROM public.draft_funding_pool
+      WHERE parent_pool_id = $1
+    `, [poolId]);
+
+    const childIds = childQ.rows.map(r => Number(r.id)).filter(Boolean);
+    const allIds = [poolId, ...childIds];
+
+    // Удаляем связи ZFT с дочерними пулами.
+    await client.query(`
+      DELETE FROM public.zvk_funding_pool_allocations
+      WHERE funding_pool_id = ANY($1::bigint[])
+    `, [allIds]);
+
+    // Старое одиночное поле funding_pool_id больше не должно ссылаться на удаленный пул.
+    await client.query(`
+      UPDATE public.zvk_status
+      SET funding_pool_id = NULL
+      WHERE funding_pool_id = ANY($1::bigint[])
+    `, [allIds]);
+
+    // Если есть старые операции по этим пулам — удаляем их тоже.
+    await client.query(`
+      DELETE FROM public.draft_funding_operation
+      WHERE pool_id = ANY($1::bigint[])
+    `, [allIds]);
+
+    await client.query(`
+      DELETE FROM public.draft_funding_pool
+      WHERE parent_pool_id = $1
+    `, [poolId]);
+
+    await client.query(`
+      DELETE FROM public.draft_funding_pool
+      WHERE id = $1
+    `, [poolId]);
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success:true,
+      deleted_pool_id:poolId,
+      deleted_child_pools:childIds.length
+    });
+
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+    console.error("DRAFT FUNDING DELETE ERROR:", e);
+    return res.status(500).json({ success:false, error:e.message });
+  } finally {
+    client.release();
+  }
+});
+
 
 app.get("/draft-funding-pools/:poolId/allocations", async (req, res) => {
   try {
