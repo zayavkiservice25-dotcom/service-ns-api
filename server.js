@@ -6564,39 +6564,24 @@ app.get("/svod-object", async (req, res) => {
 
   try {
     const r = await client.query(`
-      WITH registry_by_object AS (
-        SELECT
-          lower(trim(cur.object)) AS object_key,
-          COALESCE(SUM(cur.to_pay), 0)::numeric AS to_pay_registry
-        FROM public.ft_zvk_current_v2 cur
-        WHERE NULLIF(trim(cur.object), '') IS NOT NULL
-          AND trim(COALESCE(cur.registry_flag, '')) = 'Да'
-          AND trim(COALESCE(cur.is_paid, '')) <> 'Да'
-        GROUP BY lower(trim(cur.object))
-      )
       SELECT
-        s.object_name,
+        object_name,
 
-        -- Названия полей должны совпадать с FtObjects.html
-        s.amount AS amount_in,
-        s.to_pay_paid AS to_pay,
-        s.balance,
+        amount AS amount_in,
+        to_pay_paid AS to_pay,
+        balance,
 
-        COALESCE(r.to_pay_registry, 0)::numeric AS registry,
+        ft_kasenov,
+        balance_kasenov,
 
-        (
-          COALESCE(s.balance, 0)::numeric
-          - COALESCE(r.to_pay_registry, 0)::numeric
-        ) AS balance_registry,
+        to_pay_registry AS registry,
+        balance_after_registry AS balance_registry,
 
-        s.ft_zayavka,
-        s.balance_zayavka,
-        s.ft_kasenov,
-        s.balance_kasenov
-      FROM public.svod_object_v1 s
-      LEFT JOIN registry_by_object r
-        ON r.object_key = lower(trim(s.object_name))
-      ORDER BY s.object_name
+        ft_zayavka,
+        balance_zayavka
+
+      FROM public.svod_object_v1
+      ORDER BY object_name
     `);
 
     res.json({
