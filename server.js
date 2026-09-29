@@ -5616,7 +5616,7 @@ const query = `
   SELECT
     v.*,
     COALESCE(
-      NULLIF(trim(v.money_type), ''),
+      NULLIF(trim(zs.money_type), ''),
       pool_type.money_type,
       ''
     ) AS money_type,
