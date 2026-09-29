@@ -8271,52 +8271,115 @@ app.get("/matrix-sources", async (req, res) => {
     const { date_from, date_to } = req.query;
 
     const params = [];
-    let where = `
-      WHERE COALESCE(TRIM(src_o), '') <> ''
-        AND COALESCE(TRIM(object), '') <> ''
-        AND COALESCE(TRIM(is_paid), '') = 'Да'
-    `;
+    let dateWhere = "";
 
     if (date_from) {
       params.push(date_from);
-      where += ` AND pay_time::date >= $${params.length}::date`;
+      dateWhere += ` AND cur.pay_time::date >= $${params.length}::date`;
     }
 
     if (date_to) {
       params.push(date_to);
-      where += ` AND pay_time::date <= $${params.length}::date`;
+      dateWhere += ` AND cur.pay_time::date <= $${params.length}::date`;
     }
 
+    /*
+      ВАЖНО:
+      - новые платежи, которые распределены по денежным пулам,
+        показываем ПО ФАКТИЧЕСКИМ allocations;
+      - если один ZFT оплачен из 2 пулов, будет 2 строки с суммами каждого пула;
+      - старые платежи, у которых allocations нет, оставляем по старому src_o.
+      Так мы не считаем всю сумму ZFT целиком на один источник.
+    */
     const result = await pool.query(`
-      SELECT
-        id_ft,
-        id_zvk,
-        input_date,
-        zvk_date,
-        pay_time,
+      WITH paid_current AS (
+        SELECT *
+        FROM public.ft_zvk_current_v2 cur
+        WHERE COALESCE(TRIM(cur.object), '') <> ''
+          AND COALESCE(TRIM(cur.is_paid), '') = 'Да'
+          ${dateWhere}
+      ),
 
-        legal_entity,
-        object,
-        contractor,
-        pay_purpose,
-        dds_article,
-        contract_no,
-        invoice_no,
-        invoice_date,
-        invoice_pdf,
+      pool_rows AS (
+        SELECT
+          cur.id_ft,
+          cur.id_zvk,
+          cur.input_date,
+          cur.zvk_date,
+          cur.pay_time,
 
-        src_d,
-        src_o,
-        to_pay,
-        request_flag,
-        status_comment,
-        chief_approved,
-        registry_flag,
-        is_paid
+          cur.legal_entity,
+          cur.object,
+          cur.contractor,
+          cur.pay_purpose,
+          cur.dds_article,
+          cur.contract_no,
+          cur.invoice_no,
+          cur.invoice_date,
+          cur.invoice_pdf,
 
-      FROM public.ft_zvk_current_v2
-      ${where}
-      ORDER BY 
+          cur.src_d,
+          p.source_name AS src_o,
+          a.amount::numeric AS to_pay,
+          cur.request_flag,
+          cur.status_comment,
+          cur.chief_approved,
+          cur.registry_flag,
+          cur.is_paid
+
+        FROM paid_current cur
+        JOIN public.zvk_funding_pool_allocations a
+          ON a.zvk_row_id = cur.zvk_row_id
+        JOIN public.draft_funding_pool p
+          ON p.id = a.funding_pool_id
+
+        WHERE COALESCE(TRIM(p.source_name), '') <> ''
+      ),
+
+      legacy_rows AS (
+        SELECT
+          cur.id_ft,
+          cur.id_zvk,
+          cur.input_date,
+          cur.zvk_date,
+          cur.pay_time,
+
+          cur.legal_entity,
+          cur.object,
+          cur.contractor,
+          cur.pay_purpose,
+          cur.dds_article,
+          cur.contract_no,
+          cur.invoice_no,
+          cur.invoice_date,
+          cur.invoice_pdf,
+
+          cur.src_d,
+          cur.src_o,
+          cur.to_pay::numeric AS to_pay,
+          cur.request_flag,
+          cur.status_comment,
+          cur.chief_approved,
+          cur.registry_flag,
+          cur.is_paid
+
+        FROM paid_current cur
+        WHERE COALESCE(TRIM(cur.src_o), '') <> ''
+          AND NOT EXISTS (
+            SELECT 1
+            FROM public.zvk_funding_pool_allocations a
+            WHERE a.zvk_row_id = cur.zvk_row_id
+          )
+      )
+
+      SELECT *
+      FROM (
+        SELECT * FROM pool_rows
+        UNION ALL
+        SELECT * FROM legacy_rows
+      ) x
+
+      ORDER BY
         pay_time DESC NULLS LAST,
         object,
         src_o,
