@@ -8258,11 +8258,15 @@ app.get("/matrix-sources", async (req, res) => {
           cur.invoice_pdf,
 
           cur.src_d,
-          concat_ws(
-            ' ',
-            NULLIF(trim(p.source_name), ''),
-            NULLIF(trim(p.money_type), '')
-          ) AS src_o,
+          CASE
+            WHEN upper(trim(COALESCE(p.money_type, ''))) = 'ЭСК'
+              THEN concat_ws(
+                ' ',
+                NULLIF(trim(p.source_name), ''),
+                'ЭСК'
+              )
+            ELSE NULLIF(trim(p.source_name), '')
+          END AS src_o,
           a.amount::numeric AS to_pay,
           cur.request_flag,
           cur.status_comment,
@@ -15036,9 +15040,9 @@ app.post("/zvk-funding-pools/save", async (req, res) => {
             const source = String(a.source_name || "").trim();
             const type = String(a.money_type || "").trim();
 
-            return [source, type]
-              .filter(Boolean)
-              .join(" ");
+            return type.toUpperCase() === "ЭСК"
+              ? [source, "ЭСК"].filter(Boolean).join(" ")
+              : source;
           })
           .filter(Boolean)
       )
