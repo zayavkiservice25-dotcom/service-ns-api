@@ -15736,6 +15736,137 @@ app.delete("/draft-funding-pools/:poolId", async (req, res) => {
 });
 
 
+
+// Вернуть свободную сумму дочернего пула обратно в общий родительский пул.
+// Фактически уменьшаем amount дочернего пула.
+// Общая сумма родителя не меняется, поэтому его "Не распределено" автоматически увеличивается.
+app.post("/draft-funding-pools/:poolId/return", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const poolId = Number(req.params.poolId);
+    const amount = Number(req.body?.amount);
+    const login = String(req.body?.login || "").trim().toLowerCase();
+    const allowed = ["b_erkin", "s_zhasulan", "k_ermek"];
+
+    if (!allowed.includes(login)) {
+      return res.status(403).json({
+        success:false,
+        error:"Нет доступа к возврату суммы"
+      });
+    }
+
+    if (!Number.isInteger(poolId) || poolId <= 0) {
+      return res.status(400).json({
+        success:false,
+        error:"Неверный pool_id"
+      });
+    }
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({
+        success:false,
+        error:"Сумма возврата должна быть больше 0"
+      });
+    }
+
+    await client.query("BEGIN");
+
+    const childQ = await client.query(`
+      SELECT
+        id,
+        parent_pool_id,
+        amount
+      FROM public.draft_funding_pool
+      WHERE id = $1
+        AND parent_pool_id IS NOT NULL
+        AND is_active = true
+      FOR UPDATE
+    `, [poolId]);
+
+    if (!childQ.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({
+        success:false,
+        error:"Распределенный пул не найден"
+      });
+    }
+
+    const child = childQ.rows[0];
+    const childAmount = Number(child.amount || 0);
+
+    // Использовано в ФТ: считаем только действующие распределения,
+    // точно так же как в сводке пулов.
+    const usedQ = await client.query(`
+      SELECT COALESCE(SUM(a.amount), 0)::numeric AS used_amount
+      FROM public.zvk_funding_pool_allocations a
+      LEFT JOIN public.ft_zvk_current_v2 cur
+        ON cur.zvk_row_id = a.zvk_row_id
+      WHERE a.funding_pool_id = $1
+        AND (
+          cur.zvk_row_id IS NULL
+          OR lower(trim(COALESCE(cur.request_flag, ''))) <> lower('Обнуление')
+        )
+    `, [poolId]);
+
+    const usedAmount = Number(usedQ.rows[0]?.used_amount || 0);
+    const freeAmount = Math.max(0, childAmount - usedAmount);
+
+    if (amount > freeAmount + 0.009) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        success:false,
+        error:
+          "Можно вернуть не больше свободного остатка: " +
+          freeAmount.toLocaleString("ru-RU", {
+            minimumFractionDigits:2,
+            maximumFractionDigits:2
+          })
+      });
+    }
+
+    const newAmount = Math.max(0, childAmount - amount);
+
+    if (newAmount <= 0.009 && usedAmount <= 0.009) {
+      // Полный возврат неиспользованного дочернего пула:
+      // удаляем строку распределения целиком.
+      await client.query(`
+        DELETE FROM public.draft_funding_pool
+        WHERE id = $1
+      `, [poolId]);
+    } else {
+      await client.query(`
+        UPDATE public.draft_funding_pool
+        SET amount = $2
+        WHERE id = $1
+      `, [poolId, newAmount]);
+    }
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success:true,
+      pool_id:poolId,
+      returned_amount:amount,
+      old_amount:childAmount,
+      used_amount:usedAmount,
+      new_amount:newAmount,
+      parent_pool_id:Number(child.parent_pool_id)
+    });
+
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+    console.error("DRAFT FUNDING RETURN ERROR:", e);
+    return res.status(500).json({
+      success:false,
+      error:e.message
+    });
+  } finally {
+    client.release();
+  }
+});
+
+
 app.get("/draft-funding-pools/:poolId/allocations", async (req, res) => {
   try {
     const poolId = Number(req.params.poolId);
