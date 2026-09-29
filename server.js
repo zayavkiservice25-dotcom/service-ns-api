@@ -4125,6 +4125,11 @@ app.get("/request-list", async (req, res) => {
         i.invoice_pdf,
         i.src_d,
         i.src_o,
+        COALESCE(
+          NULLIF(trim(cur.money_type), ''),
+          NULLIF(trim(i.money_type), ''),
+          ''
+        ) AS money_type,
 
         COALESCE(
           NULLIF(trim(i.idlzk), ''),
@@ -5610,10 +5615,26 @@ const query = `
 
   SELECT
     v.*,
+    COALESCE(
+      NULLIF(trim(v.money_type), ''),
+      pool_type.money_type,
+      ''
+    ) AS money_type,
     zs.funding_pool_id
   FROM balance_rows v
   LEFT JOIN public.zvk_status zs
     ON zs.zvk_row_id = v.zvk_row_id
+  LEFT JOIN LATERAL (
+    SELECT string_agg(
+      DISTINCT NULLIF(trim(p.money_type), ''),
+      ' + '
+      ORDER BY NULLIF(trim(p.money_type), '')
+    ) AS money_type
+    FROM public.zvk_funding_pool_allocations a
+    JOIN public.draft_funding_pool p
+      ON p.id = a.funding_pool_id
+    WHERE a.zvk_row_id = v.zvk_row_id
+  ) pool_type ON TRUE
   ${whereSql}
   ORDER BY
     COALESCE(NULLIF(substring(v.id_ft from '\\d+'), ''), '0')::int DESC,
@@ -6890,6 +6911,11 @@ app.get("/request-card", async (req, res) => {
         i.invoice_pdf,
         i.src_d,
         i.src_o,
+        COALESCE(
+          NULLIF(trim(cur.money_type), ''),
+          NULLIF(trim(i.money_type), ''),
+          ''
+        ) AS money_type,
         COALESCE(NULLIF(i.idlzk, ''), cur.idlzk, '') AS idlzk,
         COALESCE(cur.to_pay, i.to_pay) AS to_pay,
         COALESCE(cur.esk_return, i.esk_return, false) AS esk_return,
