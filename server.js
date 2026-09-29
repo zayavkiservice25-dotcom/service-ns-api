@@ -2973,18 +2973,16 @@ function getRequestDdsCode(value) {
 }
 
 async function rowNeedsIsmagulov(row) {
-  // Условие 1: сначала должен подходить дивизион.
-  // Только: Мост, Сети или Механизация.
-  if (!divisionNeedsIsmagulov(row?.legal_entity)) {
-    return false;
-  }
+  // Жаркымбаева Карлыгаш согласует, если:
+  // 1) объект входит в установленный список;
+  // 2) Статья ДДС разрешена в Google Sheets.
 
-  // Условие 2: затем должен подходить объект.
+  // Условие 1: должен подходить объект.
   if (!objectNeedsIsmagulov(row?.object)) {
     return false;
   }
 
-  // Условие 3: Статья ДДС должна быть в столбце B,
+  // Условие 2: Статья ДДС должна быть в столбце B,
   // а в столбце G напротив неё должно стоять «Да».
   const allowed = await loadIsmagulovDdsArticles();
   const currentArticle = normalizeRequestDds(row?.dds_article);
@@ -16069,7 +16067,7 @@ app.post("/draft-funding-pools/:poolId/allocate", async (req, res) => {
       await client.query("ROLLBACK");
     } catch (_) {}
 
-    console.error("DRAFT FUNDING ALLOCATE ERROR:", e);
+    console.error("DRAFT FUNDING ALLOCATE ERROR:", e);Й
     return res.status(500).json({ success: false, error: e.message });
 
   } finally {
