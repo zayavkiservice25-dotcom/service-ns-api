@@ -6541,13 +6541,13 @@ app.get("/svod-object", async (req, res) => {
     const r = await client.query(`
       WITH registry_by_object AS (
         SELECT
-          lower(trim(cur.src_o)) AS object_key,
+          lower(trim(cur.object)) AS object_key,
           COALESCE(SUM(cur.to_pay), 0)::numeric AS to_pay_registry
         FROM public.ft_zvk_current_v2 cur
-        WHERE NULLIF(trim(cur.src_o), '') IS NOT NULL
+        WHERE NULLIF(trim(cur.object), '') IS NOT NULL
           AND trim(COALESCE(cur.registry_flag, '')) = 'Да'
           AND trim(COALESCE(cur.is_paid, '')) <> 'Да'
-        GROUP BY lower(trim(cur.src_o))
+        GROUP BY lower(trim(cur.object))
       )
       SELECT
         s.object_name,
@@ -15101,6 +15101,38 @@ app.get("/draft-funding-summary", async (req, res) => {
                 AND lower(trim(COALESCE(cur.request_flag, ''))) <> lower('Обнуление')
             ), 0)
         )::numeric AS ft_balance,
+
+        COALESCE((
+          SELECT SUM(a.amount)
+          FROM public.zvk_funding_pool_allocations a
+          JOIN public.ft_zvk_current_v2 cur
+            ON cur.zvk_row_id = a.zvk_row_id
+          WHERE a.funding_pool_id = p.id
+            AND trim(COALESCE(cur.is_paid, '')) = 'Да'
+            AND lower(trim(COALESCE(cur.request_flag, ''))) <> lower('Обнуление')
+        ), 0)::numeric AS paid_since_launch,
+
+        COALESCE((
+          SELECT SUM(a.amount)
+          FROM public.zvk_funding_pool_allocations a
+          JOIN public.ft_zvk_current_v2 cur
+            ON cur.zvk_row_id = a.zvk_row_id
+          WHERE a.funding_pool_id = p.id
+            AND trim(COALESCE(cur.registry_flag, '')) = 'Да'
+            AND trim(COALESCE(cur.is_paid, '')) <> 'Да'
+            AND lower(trim(COALESCE(cur.request_flag, ''))) <> lower('Обнуление')
+        ), 0)::numeric AS registry_amount,
+
+        COALESCE((
+          SELECT SUM(a.amount)
+          FROM public.zvk_funding_pool_allocations a
+          JOIN public.ft_zvk_current_v2 cur
+            ON cur.zvk_row_id = a.zvk_row_id
+          WHERE a.funding_pool_id = p.id
+            AND trim(COALESCE(cur.request_flag, '')) = 'Да'
+            AND trim(COALESCE(cur.registry_flag, '')) <> 'Да'
+            AND trim(COALESCE(cur.is_paid, '')) <> 'Да'
+        ), 0)::numeric AS request_amount,
 
         COALESCE(SUM(
           CASE
