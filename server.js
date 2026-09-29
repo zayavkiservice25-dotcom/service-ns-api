@@ -2973,16 +2973,18 @@ function getRequestDdsCode(value) {
 }
 
 async function rowNeedsIsmagulov(row) {
-  // Жаркымбаева Карлыгаш согласует, если:
-  // 1) объект входит в установленный список;
-  // 2) Статья ДДС разрешена в Google Sheets.
+  // Условие 1: сначала должен подходить дивизион.
+  // Только: Мост, Сети или Механизация.
+  if (!divisionNeedsIsmagulov(row?.legal_entity)) {
+    return false;
+  }
 
-  // Условие 1: должен подходить объект.
+  // Условие 2: затем должен подходить объект.
   if (!objectNeedsIsmagulov(row?.object)) {
     return false;
   }
 
-  // Условие 2: Статья ДДС должна быть в столбце B,
+  // Условие 3: Статья ДДС должна быть в столбце B,
   // а в столбце G напротив неё должно стоять «Да».
   const allowed = await loadIsmagulovDdsArticles();
   const currentArticle = normalizeRequestDds(row?.dds_article);
@@ -15480,6 +15482,8 @@ app.get("/draft-funding-pools/manage", async (req, res) => {
 });
 
 app.post("/draft-funding-pools/create", async (req, res) => {
+  const client = await pool.connect();
+
   try {
     const body = req.body || {};
 
@@ -15502,28 +15506,77 @@ app.post("/draft-funding-pools/create", async (req, res) => {
       return res.status(400).json({ success: false, error: "Сумма должна быть больше 0" });
     }
 
-    const q = await pool.query(`
-      INSERT INTO public.draft_funding_pool (
-        legal_entity,
-        source_name,
-        money_type,
-        object_name,
-        amount,
-        parent_pool_id,
-        is_active,
-        created_by,
-        created_at
-      )
-      VALUES (
-        $1, $2, $3, '', $4, NULL, true, NULLIF($5, ''), NOW()
-      )
-      RETURNING *
-    `, [legalEntity, sourceName, moneyType, amount, createdBy]);
+    await client.query("BEGIN");
 
-    return res.json({ success: true, row: q.rows[0] });
+    // Один общий пул на комбинацию:
+    // ЮрЛицо + Источник + Тип.
+    // Если такой пул уже есть, новую сумму ДОБАВЛЯЕМ к нему,
+    // а не создаём вторую одинаковую строку.
+    const existing = await client.query(`
+      SELECT id, amount
+      FROM public.draft_funding_pool
+      WHERE parent_pool_id IS NULL
+        AND is_active = true
+        AND COALESCE(trim(object_name), '') = ''
+        AND lower(trim(legal_entity)) = lower(trim($1))
+        AND lower(trim(source_name)) = lower(trim($2))
+        AND lower(trim(money_type)) = lower(trim($3))
+      ORDER BY id
+      LIMIT 1
+      FOR UPDATE
+    `, [legalEntity, sourceName, moneyType]);
+
+    let row;
+
+    if (existing.rowCount) {
+      const poolId = Number(existing.rows[0].id);
+
+      const upd = await client.query(`
+        UPDATE public.draft_funding_pool
+        SET
+          amount = COALESCE(amount, 0) + $2,
+          created_by = COALESCE(NULLIF($3, ''), created_by)
+        WHERE id = $1
+        RETURNING *
+      `, [poolId, amount, createdBy]);
+
+      row = upd.rows[0];
+    } else {
+      const ins = await client.query(`
+        INSERT INTO public.draft_funding_pool (
+          legal_entity,
+          source_name,
+          money_type,
+          object_name,
+          amount,
+          parent_pool_id,
+          is_active,
+          created_by,
+          created_at
+        )
+        VALUES (
+          $1, $2, $3, '', $4, NULL, true, NULLIF($5, ''), NOW()
+        )
+        RETURNING *
+      `, [legalEntity, sourceName, moneyType, amount, createdBy]);
+
+      row = ins.rows[0];
+    }
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success: true,
+      row,
+      merged_with_existing: !!existing.rowCount
+    });
+
   } catch (e) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
     console.error("DRAFT FUNDING CREATE ERROR:", e);
     return res.status(500).json({ success: false, error: e.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -16067,7 +16120,7 @@ app.post("/draft-funding-pools/:poolId/allocate", async (req, res) => {
       await client.query("ROLLBACK");
     } catch (_) {}
 
-    console.error("DRAFT FUNDING ALLOCATE ERROR:", e);Й
+    console.error("DRAFT FUNDING ALLOCATE ERROR:", e);
     return res.status(500).json({ success: false, error: e.message });
 
   } finally {
