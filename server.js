@@ -4254,28 +4254,31 @@ async function getFtAvailableAmount(client, idFt, excludeRowId = null) {
 
   const r = await client.query(
     `
+    WITH last_reset AS (
+      SELECT MAX(z.id)::bigint AS reset_row_id
+      FROM public.zvk z
+      LEFT JOIN public.zvk_pay p
+        ON p.zvk_row_id = z.id
+      WHERE z.id_ft = $1
+        AND (
+          COALESCE(z.request_flag, '') = 'Обнуление'
+          OR COALESCE(p.registry_flag, '') = 'Обнуление'
+        )
+    )
     SELECT
       COALESCE(f.sum_ft, 0)::numeric AS sum_ft,
 
       COALESCE((
         SELECT SUM(COALESCE(z.to_pay, 0))
         FROM public.zvk z
+        CROSS JOIN last_reset lr
         WHERE z.id_ft = f.id_ft
           AND z.request_flag = 'Да'
+          AND z.id > COALESCE(lr.reset_row_id, 0)
           AND ($2::bigint IS NULL OR z.id <> $2::bigint)
       ), 0)::numeric AS used_sum,
 
-      EXISTS (
-        SELECT 1
-        FROM public.zvk z
-        LEFT JOIN public.zvk_pay p
-          ON p.zvk_row_id = z.id
-        WHERE z.id_ft = f.id_ft
-          AND (
-            COALESCE(z.request_flag, '') = 'Обнуление'
-            OR COALESCE(p.registry_flag, '') = 'Обнуление'
-          )
-      ) AS has_reset
+      COALESCE((SELECT reset_row_id FROM last_reset), 0)::bigint AS last_reset_row_id
 
     FROM public.ft f
     WHERE f.id_ft = $1
@@ -4290,20 +4293,20 @@ async function getFtAvailableAmount(client, idFt, excludeRowId = null) {
       sum_ft: 0,
       used_sum: 0,
       available: 0,
-      has_reset: false
+      last_reset_row_id: 0
     };
   }
 
   const sumFt = Number(r.rows[0].sum_ft || 0);
   const usedSum = Number(r.rows[0].used_sum || 0);
-  const hasReset = r.rows[0].has_reset === true;
+  const lastResetRowId = Number(r.rows[0].last_reset_row_id || 0);
 
   return {
     exists: true,
     sum_ft: sumFt,
     used_sum: usedSum,
-    available: hasReset ? 0 : Math.max(sumFt - usedSum, 0),
-    has_reset: hasReset
+    available: Math.max(sumFt - usedSum, 0),
+    last_reset_row_id: lastResetRowId
   };
 }
 
@@ -4401,14 +4404,6 @@ const toPayNum = isNoRequest
 
         if (!balance.exists) {
           return res.status(404).json({ success:false, error:"FT_NOT_FOUND" });
-        }
-
-        if (balance.has_reset) {
-          return res.status(400).json({
-            success:false,
-            error:"FT_ALREADY_RESET",
-            message:"По этому FT уже есть обнуление. Новую сумму к оплате поставить нельзя."
-          });
         }
 
         if (toPayNum > balance.available + 0.000001) {
@@ -4628,14 +4623,6 @@ const toPayNum = isNoRequest
 
       if (!balance.exists) {
         return res.status(404).json({ success:false, error:"FT_NOT_FOUND" });
-      }
-
-      if (balance.has_reset) {
-        return res.status(400).json({
-          success:false,
-          error:"FT_ALREADY_RESET",
-          message:"По этому FT уже есть обнуление. Новую сумму к оплате поставить нельзя."
-        });
       }
 
       if (finalToPay > balance.available + 0.000001) {
