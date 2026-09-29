@@ -7215,61 +7215,8 @@ z_karlygash: {
       // Согласование Ермека больше не блокируется по этому условию.
     }
 
-    // Дополнительная защита финального утверждения:
-    // если после выполненного согласования остаток уже оказался отрицательным,
-    // финальное утверждение также не пропускаем.
-    if (login === "k_ermek" && action === "approve") {
-      const balanceCheck = await client.query(`
-        WITH request_sources AS (
-          SELECT DISTINCT
-            NULLIF(trim(i.src_o), '') AS source_object
-          FROM public.request_items i
-          WHERE i.request_id = $1
-        ),
-        object_balances AS (
-          SELECT
-            lower(trim(s.object_name)) AS object_key,
-            COALESCE(SUM(s.balance_kasenov), 0)::numeric AS balance_after_kasenov
-          FROM public.svod_object_v1 s
-          GROUP BY lower(trim(s.object_name))
-        )
-        SELECT
-          rs.source_object,
-          COALESCE(ob.balance_after_kasenov, 0)::numeric AS balance_after_kasenov
-        FROM request_sources rs
-        LEFT JOIN object_balances ob
-          ON ob.object_key = lower(trim(rs.source_object))
-        WHERE rs.source_object IS NULL
-           OR COALESCE(ob.balance_after_kasenov, 0)::numeric < -0.005
-        ORDER BY rs.source_object NULLS FIRST
-      `, [requestId]);
-
-      if (balanceCheck.rowCount) {
-        const money = value => Number(value || 0).toLocaleString("ru-RU", {
-          minimumFractionDigits: 2,
-          maximumFractionDigits: 2
-        });
-
-        const details = balanceCheck.rows.map(row => {
-          if (!row.source_object) {
-            return "не заполнен Источник Объект";
-          }
-
-          return (
-            `${row.source_object}: ` +
-            `остаток после Касенова ${money(row.balance_after_kasenov)} ₸`
-          );
-        }).join("; ");
-
-        const err = new Error(
-          "Утверждение невозможно. Остаток после Касенова Е.Е меньше нуля: " +
-          details
-        );
-        err.statusCode = 409;
-        err.errorCode = "SOURCE_OBJECT_KASENOV_BALANCE_NEGATIVE";
-        throw err;
-      }
-    }
+    // Проверка отрицательного остатка при финальном утверждении отключена.
+    // Ермек может утвердить заявку независимо от balance_kasenov.
 
     // Сервис НС: Исмагулов и Сулейменов не участвуют, согласует Заитова Алия.
     if (
