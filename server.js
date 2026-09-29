@@ -8258,7 +8258,11 @@ app.get("/matrix-sources", async (req, res) => {
           cur.invoice_pdf,
 
           cur.src_d,
-          p.source_name AS src_o,
+          concat_ws(
+            ' ',
+            NULLIF(trim(p.source_name), ''),
+            NULLIF(trim(p.money_type), '')
+          ) AS src_o,
           a.amount::numeric AS to_pay,
           cur.request_flag,
           cur.status_comment,
@@ -15028,7 +15032,14 @@ app.post("/zvk-funding-pools/save", async (req, res) => {
     const actualSourceNames = [
       ...new Set(
         allocations
-          .map(a => String(a.source_name || "").trim())
+          .map(a => {
+            const source = String(a.source_name || "").trim();
+            const type = String(a.money_type || "").trim();
+
+            return [source, type]
+              .filter(Boolean)
+              .join(" ");
+          })
           .filter(Boolean)
       )
     ];
