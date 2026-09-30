@@ -158,6 +158,9 @@ mechanization text,
   await pool.query(`ALTER TABLE public.zvk ADD COLUMN IF NOT EXISTS return_amount numeric(18,2) DEFAULT 0;`);
   // Необязательный признак: платеж должен быть возвращён по ЭСК.
   await pool.query(`ALTER TABLE public.zvk ADD COLUMN IF NOT EXISTS esk_return boolean DEFAULT false;`);
+  // ДоРеестр: предварительная сумма Гулнур. Не связана с обычным to_pay.
+  await pool.query(`ALTER TABLE public.zvk ADD COLUMN IF NOT EXISTS pre_registry_amount numeric(18,2);`);
+
   await pool.query(`ALTER TABLE public.zvk DROP CONSTRAINT IF EXISTS zvk_pkey;`);
   await pool.query(`ALTER TABLE public.zvk ADD CONSTRAINT zvk_pkey PRIMARY KEY (id);`);
 
@@ -2974,30 +2977,15 @@ function getRequestDdsCode(value) {
 }
 
 async function rowNeedsIsmagulov(row) {
-  // Условие 1: сначала должен подходить дивизион.
-  // Только: Мост, Сети или Механизация.
-  if (!divisionNeedsIsmagulov(row?.legal_entity)) {
-    return false;
-  }
-
-  // Условие 2: затем должен подходить объект.
-  if (!objectNeedsIsmagulov(row?.object)) {
-    return false;
-  }
-
-  // Условие 3: Статья ДДС должна быть в столбце B,
-  // а в столбце G напротив неё должно стоять «Да».
+  // Карлыгаш согласует ТОЛЬКО по Статье ДДС.
+  // Дивизион, объект и ЮрЛицо больше не участвуют в определении маршрута.
   const allowed = await loadIsmagulovDdsArticles();
   const currentArticle = normalizeRequestDds(row?.dds_article);
 
-  // Сначала проверяем полное совпадение.
   if (allowed.has(currentArticle)) {
     return true;
   }
 
-  // Затем проверяем код статьи, например 84 или 135.
-  // Это нужно, если название статьи в FT и Google Sheets
-  // немного отличается пробелами или окончанием текста.
   const currentCode = getRequestDdsCode(currentArticle);
   if (!currentCode) {
     return false;
@@ -3178,7 +3166,6 @@ acc_zhasulan_comment = NULL,
 
 acc_zhas_name = 'Жаркымбаева Карлыгаш ',
 acc_zhas_status = CASE
-  WHEN $5::boolean = true THEN 'Не требуется'
   WHEN $4::boolean = true THEN 'Ожидает'
   ELSE 'Не требуется'
 END,
@@ -3234,13 +3221,9 @@ await client.query(`
 ]);
 
 // ✅ Уведомление согласующим, когда заявка попала в "Отправленные заявки"
-const notifyUsers = isServiceNsForNewRequest
-  ? ["a_zaitova"]
-  : (
-      needsIsmagulovForNewRequest
-        ? [ISMAGULOV_LOGIN]
-        : ["s_zhasulan"]
-    );
+const notifyUsers = needsIsmagulovForNewRequest
+  ? [ISMAGULOV_LOGIN]
+  : (isServiceNsForNewRequest ? ["a_zaitova"] : ["s_zhasulan"]);
 
 for (const userLogin of notifyUsers) {
   await client.query(`
@@ -3838,6 +3821,20 @@ async function resetExpiredZhasulanRequests() {
         `, [rowIds]);
       }
 
+      // Освобождаем денежные пулы при автообнулении D+2.
+      await client.query(`
+        DELETE FROM public.zvk_funding_pool_allocations
+        WHERE zvk_row_id = ANY($1::bigint[])
+      `, [rowIds]);
+
+      await client.query(`
+        UPDATE public.zvk_status
+        SET
+          funding_pool_id = NULL,
+          money_type = NULL
+        WHERE zvk_row_id = ANY($1::bigint[])
+      `, [rowIds]);
+
       // Удаляем отправленную заявку, чтобы инициатор создал заново
       await client.query(`
         DELETE FROM public.request_approve_log
@@ -3951,31 +3948,8 @@ app.get("/request-list", async (req, res) => {
       login === "k_marat" ||
       login === "k_ermek"
     ) {
-      /*
-       * После Сулейменова заявка видна основным согласующим, если:
-       * - Исмагулов согласовал; или
-       * - Исмагулов для этой заявки не требуется.
-       *
-       * Маршрут уже определён при создании заявки и записан
-       * в request_head.acc_zhas_status.
-       */
-      whereSql = `
-        WHERE
-          (
-            COALESCE(acc_zaitova_status, '') = 'Согласовано'
-            AND COALESCE(acc_zhasulan_status, '') = 'Не требуется'
-            AND COALESCE(acc_zhas_status, '') = 'Не требуется'
-          )
-          OR
-          (
-            COALESCE(acc_zaitova_status, '') = 'Не требуется'
-            AND COALESCE(acc_zhasulan_status, '') = 'Согласовано'
-            AND COALESCE(acc_zhas_status, '') IN (
-              'Согласовано',
-              'Не требуется'
-            )
-          )
-      `;
+      // Видят все реестры сразу, но действия сервер проверяет по этапам.
+      whereSql = "";
 
 } else if (login === "o_bakytzhan") {
   // Бакытжан видит только реестры,
@@ -5603,19 +5577,31 @@ const query = `
 
   SELECT
     v.*,
+
+    -- Берём сумму ДоРеестра напрямую из живой строки public.zvk.
+    -- Так отображение не зависит от того, успел ли пересоздаться VIEW.
+    zlive.pre_registry_amount AS pre_registry_amount_live,
+
     COALESCE(
       NULLIF(trim(zs.money_type), ''),
       pool_type.money_type,
       ''
     ) AS money_type,
+
     zs.funding_pool_id,
+
     EXISTS (
       SELECT 1
       FROM public.pre_registry_items pri
       WHERE pri.zvk_row_id = v.zvk_row_id
         AND COALESCE(pri.approval_status, '') NOT IN ('Отменено', 'Отклонено')
     ) AS pre_registry_sent
+
   FROM balance_rows v
+
+  LEFT JOIN public.zvk zlive
+    ON zlive.id = v.zvk_row_id
+
   LEFT JOIN public.zvk_status zs
     ON zs.zvk_row_id = v.zvk_row_id
   LEFT JOIN LATERAL (
@@ -7210,13 +7196,14 @@ z_karlygash: {
     // Проверка отрицательного остатка при финальном утверждении отключена.
     // Ермек может утвердить заявку независимо от balance_kasenov.
 
-    // Сервис НС: Исмагулов и Сулейменов не участвуют, согласует Заитова Алия.
+    // Для Сервис НС Жасулан не участвует — после Карлыгаш идёт Алия.
+    // Карлыгаш может участвовать и в Сервис НС, если Статья ДДС требует её согласования.
     if (
       isServiceNs &&
-      (login === ISMAGULOV_LOGIN || login === "s_zhasulan")
+      login === "s_zhasulan"
     ) {
       throw new Error(
-        "Для ЮрЛицо «Сервис НС» согласование Исмагулова и Сулейменова не требуется"
+        "Для ЮрЛицо «Сервис НС» после Карлыгаш согласует Заитова Алия"
       );
     }
 
@@ -7227,65 +7214,94 @@ z_karlygash: {
     }
 
     /*
-     * 1. Исмагулов согласует первым, только когда совпали:
-     * Дивизион -> Объект -> Статья ДДС.
+     * 1. Жаркымбаева Карлыгаш согласует первым ТОЛЬКО по Статье ДДС.
+     * Объект, Дивизион и ЮрЛицо на необходимость её этапа больше не влияют.
      */
     if (
       login === ISMAGULOV_LOGIN &&
       !needsIsmagulov
     ) {
       throw new Error(
-        "Для этого дивизиона, объекта или статьи ДДС согласование Исмагулова не требуется"
+        "Для этой Статьи ДДС согласование Жаркымбаевой Карлыгаш не требуется"
       );
     }
 
     /*
-     * 2. Если совпали Дивизион + Объект + Статья ДДС,
-     * Сулейменов ждёт Исмагулова. В остальных случаях согласует сразу.
+     * Этапность:
+     * 1) Карлыгаш — если Статья ДДС требует её согласования.
+     * 2) Затем либо Жасулан (обычные ЮрЛицо), либо Алия (Сервис НС).
+     * 3) Шевченко.
+     * 4) Марат.
+     * 5) Согласование Ермека.
+     *
+     * Исключение: action="approve" Касенова Ермека НЕ ждёт ни один этап —
+     * Ермек может финально утвердить заявку сразу.
      */
+
+    const karlygashDone =
+      !needsIsmagulov ||
+      String(head.acc_zhas_status || "").trim() === "Согласовано";
+
+    const secondStageDone = isServiceNs
+      ? String(head.acc_zaitova_status || "").trim() === "Согласовано"
+      : String(head.acc_zhasulan_status || "").trim() === "Согласовано";
+
+    const shevchenkoDone =
+      String(head.acc_shevchenko_status || "").trim() === "Согласовано";
+
+    const maratDone =
+      String(head.acc_marat_status || "").trim() === "Согласовано";
+
+    // Алия и Жасулан ждут Карлыгаш, только если её этап требуется.
     if (
-      !isServiceNs &&
+      (action === "agree" || action === "reject_agree") &&
+      login === "a_zaitova" &&
+      !karlygashDone
+    ) {
+      throw new Error("Сначала должна согласовать Жаркымбаева Карлыгаш");
+    }
+
+    if (
+      (action === "agree" || action === "reject_agree") &&
       login === "s_zhasulan" &&
-      needsIsmagulov &&
-      String(head.acc_zhas_status || "").trim() !== "Согласовано"
+      !karlygashDone
+    ) {
+      throw new Error("Сначала должна согласовать Жаркымбаева Карлыгаш");
+    }
+
+    // Шевченко ждёт Карлыгаш + Жасулана/Алию.
+    if (
+      (action === "agree" || action === "reject_agree") &&
+      login === "v_shevchenko" &&
+      (!karlygashDone || !secondStageDone)
     ) {
       throw new Error(
-        "Сначала должен согласовать Жаркымбаева Карлыгаш "
+        isServiceNs
+          ? "Сначала должна согласовать Заитова Алия"
+          : "Сначала должен согласовать Сулейменов Жасулан"
       );
     }
 
-    /*
-     * 3. Основные согласующие ждут нужный первый этап:
-     * - Сервис НС -> Заитова Алия;
-     * - остальные -> Сулейменов (и Исмагулов, если требуется).
-     */
-    const isMainApprover =
-      login === "v_shevchenko" ||
-      login === "k_marat" ||
-      login === "k_ermek";
+    // Марат ждёт Шевченко.
+    if (
+      (action === "agree" || action === "reject_agree") &&
+      login === "k_marat" &&
+      !shevchenkoDone
+    ) {
+      throw new Error("Сначала должен согласовать Шевченко Владимир");
+    }
 
-    if (isMainApprover) {
-      if (
-        isServiceNs &&
-        String(head.acc_zaitova_status || "").trim() !== "Согласовано"
-      ) {
-        throw new Error("Сначала должна согласовать Заитова Алия");
-      }
-
-      if (
-        !isServiceNs &&
-        String(head.acc_zhasulan_status || "").trim() !== "Согласовано"
-      ) {
-        throw new Error("Сначала должен согласовать Сулейменов Жасулан");
-      }
-
-      if (
-        !isServiceNs &&
-        needsIsmagulov &&
-        String(head.acc_zhas_status || "").trim() !== "Согласовано"
-      ) {
-        throw new Error("Сначала должен согласовать Исмагулов Жаслан");
-      }
+    // Согласование Ермека ждёт Марата.
+    // Финальное утверждение action="approve" проходит сразу.
+    if (
+      (action === "agree" || action === "reject_agree") &&
+      login === "k_ermek" &&
+      !maratDone
+    ) {
+      throw new Error(
+        "Сначала должен согласовать Койлибаев Марат. " +
+        "Финально утвердить Касенов Ермек может сразу."
+      );
     }
 
     const isReject =
@@ -7349,7 +7365,7 @@ z_karlygash: {
         (isServiceNs && login === "a_zaitova")
       )
     ) {
-      const nextUsers = ["v_shevchenko", "k_marat", "k_ermek"];
+      const nextUsers = ["v_shevchenko"];
 
       for (const nextLogin of nextUsers) {
         await client.query(`
@@ -7385,16 +7401,17 @@ z_karlygash: {
     }
 
     /*
-     * После Исмагулова заявка передаётся Сулейменову.
+     * После Карлыгаш заявка передаётся:
+     * - Сервис НС -> Алие;
+     * - остальные -> Жасулану.
      */
     if (
-      !isServiceNs &&
       login === ISMAGULOV_LOGIN &&
       action === "agree"
     ) {
       for (
         const nextLogin of [
-          "s_zhasulan"
+          isServiceNs ? "a_zaitova" : "s_zhasulan"
         ]
       ) {
         await client.query(`
@@ -7422,11 +7439,39 @@ z_karlygash: {
           )
         `, [
           nextLogin,
-          `Заявка №${head.request_no} согласована Исмагуловым`,
-          `Заявка передана Сулейменову Жасулану. Сумма: ${Number(head.total_amount || 0).toLocaleString("ru-RU")} ₸`,
+          `Заявка №${head.request_no} согласована Жаркымбаевой Карлыгаш`,
+          `${isServiceNs ? "Заявка передана Заитовой Алие." : "Заявка передана Сулейменову Жасулану."} Сумма: ${Number(head.total_amount || 0).toLocaleString("ru-RU")} ₸`,
           requestId
         ]);
       }
+    }
+
+    // После Шевченко уведомляем Марата.
+    if (login === "v_shevchenko" && action === "agree") {
+      await client.query(`
+        INSERT INTO public.notifications
+          (user_login, type, title, message, entity_id, entity_page, is_read, created_at)
+        VALUES
+          ('k_marat', 'request', $1, $2, $3, 'request_card', false, NOW())
+      `, [
+        `Заявка №${head.request_no} ожидает согласования Марата`,
+        `Шевченко Владимир согласовал заявку. Сумма: ${Number(head.total_amount || 0).toLocaleString("ru-RU")} ₸`,
+        requestId
+      ]);
+    }
+
+    // После Марата уведомляем Ермека о его этапе согласования.
+    if (login === "k_marat" && action === "agree") {
+      await client.query(`
+        INSERT INTO public.notifications
+          (user_login, type, title, message, entity_id, entity_page, is_read, created_at)
+        VALUES
+          ('k_ermek', 'request', $1, $2, $3, 'request_card', false, NOW())
+      `, [
+        `Заявка №${head.request_no} ожидает согласования Ермека`,
+        `Койлибаев Марат согласовал заявку. Сумма: ${Number(head.total_amount || 0).toLocaleString("ru-RU")} ₸`,
+        requestId
+      ]);
     }
 
     /*
@@ -7637,14 +7682,18 @@ app.post("/cancel-rejected-ft-lines", async (req, res) => {
           status_time,
           src_d,
           src_o,
+          money_type,
+          funding_pool_id,
           chief_approved
         )
-        VALUES ($1, NOW(), NULL, NULL, NULL)
+        VALUES ($1, NOW(), NULL, NULL, NULL, NULL, NULL)
         ON CONFLICT (zvk_row_id)
         DO UPDATE SET
           status_time = NOW(),
           src_d = NULL,
           src_o = NULL,
+          money_type = NULL,
+          funding_pool_id = NULL,
           chief_approved = NULL
       `, [keepId]);
 
@@ -7655,6 +7704,16847 @@ app.post("/cancel-rejected-ft-lines", async (req, res) => {
           agree_time = NULL
         WHERE zvk_row_id = $1
       `, [keepId]);
+
+      // Освобождаем денежные пулы по всем отклонённым ZFT.
+      // После этого суммы снова доступны инициатору при новой заявке.
+      await client.query(`
+        DELETE FROM public.zvk_funding_pool_allocations
+        WHERE zvk_row_id = ANY($1::bigint[])
+      `, [allRejectedIds]);
+
+      // Очищаем старую одиночную связь с пулом и Тип у отклонённых строк.
+      await client.query(`
+        UPDATE public.zvk_status
+        SET
+          funding_pool_id = NULL,
+          money_type = NULL
+        WHERE zvk_row_id = ANY($1::bigint[])
+      `, [allRejectedIds]);
+
+      // Все отклонённые строки убираем из «Отправленных заявок», включая оставляемую ZFT.
+      await client.query(`
+        DELETE FROM public.request_items
+        WHERE zvk_row_id = ANY($1::bigint[])
+      `, [allRejectedIds]);
+
+      if (deleteIds.length) {
+        await client.query(`
+          DELETE FROM public.zvk_pay
+          WHERE zvk_row_id = ANY($1::bigint[])
+        `, [deleteIds]);
+
+        await client.query(`
+          DELETE FROM public.zvk_status
+          WHERE zvk_row_id = ANY($1::bigint[])
+        `, [deleteIds]);
+
+        await client.query(`
+          DELETE FROM public.zvk
+          WHERE id = ANY($1::bigint[])
+        `, [deleteIds]);
+      }
+
+      keptCount += 1;
+      deletedCount += deleteIds.length;
+      details.push({
+        id_ft: idFt,
+        kept_zvk_row_id: keepId,
+        kept_id_zvk: keepRow.id_zvk || "",
+        deleted_zvk_row_ids: deleteIds
+      });
+    }
+
+    const requestIds = [...affectedRequestIds].filter(Boolean);
+
+    if (requestIds.length) {
+      // Обновляем непустые шапки.
+      await client.query(`
+        UPDATE public.request_head h
+        SET
+          items_count = x.items_count,
+          total_amount = x.total_amount
+        FROM (
+          SELECT
+            request_id,
+            COUNT(*)::integer AS items_count,
+            COALESCE(SUM(to_pay), 0)::numeric(18,2) AS total_amount
+          FROM public.request_items
+          WHERE request_id = ANY($1::bigint[])
+          GROUP BY request_id
+        ) x
+        WHERE h.id = x.request_id
+      `, [requestIds]);
+
+      // Удаляем журнал и шапки заявок, в которых больше не осталось строк.
+      const emptyRequests = await client.query(`
+        SELECT h.id
+        FROM public.request_head h
+        WHERE h.id = ANY($1::bigint[])
+          AND NOT EXISTS (
+            SELECT 1
+            FROM public.request_items i
+            WHERE i.request_id = h.id
+          )
+      `, [requestIds]);
+
+      const emptyIds = emptyRequests.rows.map(row => Number(row.id)).filter(Boolean);
+
+      if (emptyIds.length) {
+        await client.query(`
+          DELETE FROM public.request_approve_log
+          WHERE request_id = ANY($1::bigint[])
+        `, [emptyIds]);
+
+        await client.query(`
+          DELETE FROM public.request_head
+          WHERE id = ANY($1::bigint[])
+        `, [emptyIds]);
+      }
+    }
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success: true,
+      kept_count: keptCount,
+      deleted_count: deletedCount,
+      details
+    });
+
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+
+    console.error("cancel-rejected-ft-lines error:", e);
+
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+
+  } finally {
+    client.release();
+  }
+});
+
+
+// =====================================================
+// ЭСК — фактический возврат Арай
+// action: "returned" | "full"
+// "returned" прибавляет указанную сумму к уже возвращённой.
+// "full" фиксирует статус "Полностью возвращено".
+// =====================================================
+app.post("/request-items-return", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const rowIds = Array.isArray(req.body?.row_ids)
+      ? [...new Set(req.body.row_ids.map(Number).filter(Boolean))]
+      : [];
+    const login = String(req.body?.login || "").trim().toLowerCase();
+    const action = String(req.body?.action || "").trim().toLowerCase();
+    const amount = Number(req.body?.amount ?? 0);
+
+    if (!rowIds.length) {
+      return res.status(400).json({ success:false, error:"row_ids required" });
+    }
+
+    if (!["k_arailym", "admin", "b_erkin"].includes(login)) {
+      return res.status(403).json({ success:false, error:"Возврат доступен только Арай/администратору" });
+    }
+
+    if (!["returned", "full"].includes(action)) {
+      return res.status(400).json({ success:false, error:"action must be returned or full" });
+    }
+
+    if (action === "returned" && (!Number.isFinite(amount) || amount <= 0)) {
+      return res.status(400).json({ success:false, error:"Сумма возврата должна быть больше 0" });
+    }
+
+    const rowsCheck = await client.query(`
+      SELECT
+        z.id AS zvk_row_id,
+        COALESCE(s.src_o, '') AS src_o,
+        COALESCE(s.money_type, '') AS money_type
+      FROM public.zvk z
+      LEFT JOIN public.zvk_status s ON s.zvk_row_id = z.id
+      WHERE z.id = ANY($1::bigint[])
+    `, [rowIds]);
+
+    if (rowsCheck.rowCount !== rowIds.length) {
+      return res.status(404).json({ success:false, error:"Не все строки ZFT найдены" });
+    }
+
+    const nonEsk = rowsCheck.rows.filter(r =>
+      !String(r.money_type || "").toUpperCase().includes("ЭСК")
+    );
+    if (nonEsk.length) {
+      return res.status(400).json({ success:false, error:"Возврат доступен только для Источник Объект с надписью ЭСК" });
+    }
+
+    await client.query("BEGIN");
+
+    if (action === "returned") {
+      await client.query(`
+        INSERT INTO public.zvk_pay
+          (zvk_row_id, returned_amount, return_status, return_time, return_by)
+        SELECT x, $2::numeric, 'Возвращено', NOW(), $3
+        FROM unnest($1::bigint[]) AS x
+        ON CONFLICT (zvk_row_id)
+        DO UPDATE SET
+          returned_amount = EXCLUDED.returned_amount,
+          return_status = 'Возвращено',
+          return_time = NOW(),
+          return_by = EXCLUDED.return_by
+      `, [rowIds, amount, login]);
+    } else {
+      await client.query(`
+        INSERT INTO public.zvk_pay
+          (zvk_row_id, returned_amount, return_status, return_time, return_by)
+        SELECT
+          z.id,
+          GREATEST(COALESCE(p.returned_amount,0), COALESCE(z.return_amount,0)),
+          'Полностью возвращено',
+          NOW(),
+          $2
+        FROM public.zvk z
+        LEFT JOIN public.zvk_pay p ON p.zvk_row_id = z.id
+        WHERE z.id = ANY($1::bigint[])
+        ON CONFLICT (zvk_row_id)
+        DO UPDATE SET
+          returned_amount = GREATEST(
+            COALESCE(public.zvk_pay.returned_amount,0),
+            EXCLUDED.returned_amount
+          ),
+          return_status = 'Полностью возвращено',
+          return_time = NOW(),
+          return_by = EXCLUDED.return_by
+      `, [rowIds, login]);
+    }
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success:true,
+      action,
+      amount: action === "returned" ? amount : null,
+      updated: rowIds.length
+    });
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+    console.error("request-items-return error:", e);
+    return res.status(500).json({ success:false, error:e.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/request-items-paid-bulk", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const request_id = Number(req.body?.request_id);
+    const row_ids = Array.isArray(req.body?.row_ids)
+      ? req.body.row_ids.map(Number).filter(Boolean)
+      : [];
+    const loginNorm = String(req.body?.login || "").trim().toLowerCase();
+    const paidValue = String(req.body?.is_paid || "").trim();
+
+    if (!request_id) return res.status(400).json({ success:false, error:"request_id required" });
+    if (!row_ids.length) return res.status(400).json({ success:false, error:"row_ids required" });
+    if (!["Да", "Нет"].includes(paidValue)) {
+      return res.status(400).json({ success:false, error:"is_paid must be Да or Нет" });
+    }
+
+    const canPay = ["k_arailym", "s_zhasulan", "b_erkin", "a_zaitova", "admin"].includes(loginNorm);
+    if (!canPay) return res.status(403).json({ success:false, error:"Нет прав ставить Оплачено" });
+
+    await client.query("BEGIN");
+
+    const divisionCheck = await client.query(`
+      SELECT
+        i.id AS request_item_id,
+        i.zvk_row_id,
+        COALESCE(NULLIF(trim(f.legal_entity), ''), NULLIF(trim(s.src_d), ''), '') AS legal_entity,
+        COALESCE(i.aray_paid, '') AS aray_paid
+      FROM public.request_items i
+      JOIN public.zvk z ON z.id = i.zvk_row_id
+      JOIN public.ft f ON f.id_ft = z.id_ft
+      LEFT JOIN public.zvk_status s ON s.zvk_row_id = z.id
+      WHERE i.request_id = $1
+        AND i.zvk_row_id = ANY($2::bigint[])
+        AND i.zvk_row_id IS NOT NULL
+    `, [request_id, row_ids]);
+
+    if (divisionCheck.rowCount !== row_ids.length) {
+      throw new Error("Не все выбранные строки найдены в заявке");
+    }
+
+    const ZHASULAN_DIVISIONS = new Set(["СК Жилой дом", "Smart Estate", "Sapa asphalt"]);
+    const DELEGATED_DIVISIONS = new Set([...ZHASULAN_DIVISIONS]);
+
+    const forbidden = divisionCheck.rows.filter(row => {
+      const legalEntity = String(row.legal_entity || "").replace(/\s+/g, " ").trim();
+      if (loginNorm === "s_zhasulan") return !ZHASULAN_DIVISIONS.has(legalEntity);
+      if (loginNorm === "k_arailym") return false; // Арай видит и обрабатывает все дивизионы
+      return false;
+    });
+
+    if (forbidden.length) {
+      const divisions = [...new Set(forbidden.map(row => String(row.legal_entity || "").trim() || "Без дивизиона"))];
+      return res.status(403).json({
+        success:false,
+        error:"Нет прав менять Оплачено для дивизиона: " + divisions.join(", ")
+      });
+    }
+
+    const head = await client.query(`
+      SELECT approve_ermek_status
+      FROM public.request_head
+      WHERE id = $1
+      LIMIT 1
+    `, [request_id]);
+
+    if (!head.rowCount) throw new Error("Заявка не найдена");
+    const approveStatus = String(head.rows[0].approve_ermek_status || "").trim();
+    if (!["Согласовано", "Утверждено", "Да"].includes(approveStatus)) {
+      throw new Error("Оплачено можно ставить только после утверждения Ермека");
+    }
+
+    // Жасулан завершает оплату только после отметки Арай.
+    if (loginNorm === "s_zhasulan") {
+      const withoutAray = divisionCheck.rows.filter(row => String(row.aray_paid || "").trim() !== "Да");
+      if (withoutAray.length) {
+        return res.status(409).json({ success:false, error:"Сначала Арай должна поставить «Оплачено Арай = Да»" });
+      }
+    }
+
+    if (loginNorm === "k_arailym") {
+      const delegatedRows = divisionCheck.rows.filter(row =>
+        DELEGATED_DIVISIONS.has(String(row.legal_entity || "").replace(/\s+/g, " ").trim())
+      );
+      const ownRows = divisionCheck.rows.filter(row =>
+        !DELEGATED_DIVISIONS.has(String(row.legal_entity || "").replace(/\s+/g, " ").trim())
+      );
+
+      // Отметка Арай сохраняется только в request_items — обычную FT не меняет.
+      await client.query(`
+        UPDATE public.request_items
+        SET aray_paid = CASE WHEN $3 = 'Да' THEN 'Да' ELSE NULL END,
+            aray_pay_time = CASE WHEN $3 = 'Да' THEN NOW() ELSE NULL END,
+            aray_paid_by = CASE WHEN $3 = 'Да' THEN $4 ELSE NULL END
+        WHERE request_id = $1
+          AND zvk_row_id = ANY($2::bigint[])
+      `, [request_id, row_ids, paidValue, loginNorm]);
+
+      // Для собственных дивизионов Арай дополнительно ставит окончательное
+      // старое Оплачено в zvk_pay. Только это поле влияет на обычную FT.
+      const ownIds = ownRows.map(row => Number(row.zvk_row_id));
+      if (ownIds.length) {
+        await client.query(`
+          INSERT INTO public.zvk_pay (zvk_row_id, is_paid, pay_time)
+          SELECT x,
+                 CASE WHEN $2 = 'Да' THEN 'Да' ELSE NULL END,
+                 CASE WHEN $2 = 'Да' THEN NOW() ELSE NULL END
+          FROM unnest($1::bigint[]) AS x
+          ON CONFLICT (zvk_row_id) DO UPDATE SET
+            is_paid = EXCLUDED.is_paid,
+            pay_time = EXCLUDED.pay_time
+        `, [ownIds, paidValue]);
+      }
+    } else {
+      // Жасулан, админ и Беркин меняют финальный столбец «Оплачено».
+      await client.query(`
+        INSERT INTO public.zvk_pay (zvk_row_id, is_paid, pay_time)
+        SELECT x,
+               CASE WHEN $2 = 'Да' THEN 'Да' ELSE NULL END,
+               CASE WHEN $2 = 'Да' THEN NOW() ELSE NULL END
+        FROM unnest($1::bigint[]) AS x
+        ON CONFLICT (zvk_row_id) DO UPDATE SET
+          is_paid = EXCLUDED.is_paid,
+          pay_time = EXCLUDED.pay_time
+      `, [row_ids, paidValue]);
+    }
+
+    await client.query("COMMIT");
+    return res.json({ success:true, request_id, paid:paidValue, updated:row_ids.length });
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+    console.error("request-items-paid-bulk error:", e);
+    return res.status(500).json({ success:false, error:e.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/update-row", async (req,res)=>{
+  try{
+    const {
+      zvk_row_id,
+      request_flag,
+      to_pay,
+      src_o,
+      status_comment,
+      is_paid,
+      login
+    } = req.body;
+
+    // запрет если уже в реестре
+    const check = await pool.query(`
+      SELECT registry_flag FROM zvk_pay WHERE zvk_row_id=$1
+    `,[zvk_row_id]);
+
+    if (check.rows[0]?.registry_flag === "Да"){
+      return res.json({ success:false, error:"LOCKED_BY_REGISTRY" });
+    }
+
+    // обновление
+    await pool.query(`
+      UPDATE zvk
+      SET request_flag=$1,
+          to_pay=$2
+      WHERE id=$3
+    `,[request_flag, to_pay, zvk_row_id]);
+
+    await pool.query(`
+      INSERT INTO zvk_status(zvk_row_id, src_o, status_comment)
+      VALUES($1,$2,$3)
+      ON CONFLICT (zvk_row_id)
+      DO UPDATE SET
+        src_o=EXCLUDED.src_o,
+        status_comment=EXCLUDED.status_comment
+    `,[zvk_row_id, src_o, status_comment]);
+
+    // только админ
+    if (is_paid !== null){
+      await pool.query(`
+        UPDATE zvk_pay
+        SET is_paid=$1
+        WHERE zvk_row_id=$2
+      `,[is_paid, zvk_row_id]);
+    }
+
+    res.json({ success:true });
+
+  }catch(e){
+    console.error(e);
+    res.status(500).json({ success:false, error:e.message });
+  }
+});
+
+
+
+
+app.get("/notifications", async (req, res) => {
+  try {
+    const login = String(req.query.login || "").trim();
+    const filter = String(req.query.filter || "all").trim();
+
+    if (!login) {
+      return res.status(400).json({ success:false, error:"login required" });
+    }
+
+    let whereFilter = "";
+    if (filter === "unread") whereFilter = "AND is_read = false";
+    if (filter === "read") whereFilter = "AND is_read = true";
+
+    const r = await pool.query(`
+      SELECT
+        id,
+        type,
+        title,
+        message,
+        entity_id,
+        entity_page,
+        is_read,
+        created_at
+      FROM public.notifications
+      WHERE lower(trim(user_login)) = lower(trim($1))
+      ${whereFilter}
+      ORDER BY created_at DESC
+      LIMIT 100
+    `, [login]);
+
+    const cnt = await pool.query(`
+      SELECT COUNT(*)::int AS unread_count
+      FROM public.notifications
+      WHERE lower(trim(user_login)) = lower(trim($1))
+        AND is_read = false
+    `, [login]);
+
+    return res.json({
+      success: true,
+      rows: r.rows,
+      unread_count: Number(cnt.rows[0]?.unread_count || 0)
+    });
+
+  } catch (e) {
+    return res.status(500).json({ success:false, error:e.message });
+  }
+});
+app.post("/notifications/read-all", async (req, res) => {
+  try {
+    const { login } = req.body || {};
+
+    if (!login) {
+      return res.status(400).json({
+        success:false,
+        error:"login required"
+      });
+    }
+
+    await pool.query(`
+      UPDATE public.notifications
+      SET is_read = true
+      WHERE lower(trim(user_login)) = lower(trim($1))
+    `, [String(login).trim()]);
+
+    return res.json({ success:true });
+
+  } catch (e) {
+    console.error("READ ALL ERROR:", e);
+    return res.status(500).json({
+      success:false,
+      error:e.message
+    });
+  }
+});
+app.post("/notifications/read", async (req, res) => {
+  try {
+    const { id, login } = req.body || {};
+
+    if (!id || !login) {
+      return res.status(400).json({
+        success:false,
+        error:"id and login required"
+      });
+    }
+
+    await pool.query(`
+      UPDATE public.notifications
+      SET is_read = true
+      WHERE id = $1
+        AND lower(trim(user_login)) = lower(trim($2))
+    `, [
+      Number(id),
+      String(login).trim()
+    ]);
+
+    return res.json({ success:true });
+
+  } catch (e) {
+    console.error("READ ONE ERROR:", e);
+    return res.status(500).json({
+      success:false,
+      error:e.message
+    });
+  }
+});
+
+app.get("/matrix-sources", async (req, res) => {
+  try {
+    const { date_from, date_to } = req.query;
+
+    const params = [];
+    let dateWhere = "";
+
+    if (date_from) {
+      params.push(date_from);
+      dateWhere += ` AND cur.pay_time::date >= $${params.length}::date`;
+    }
+
+    if (date_to) {
+      params.push(date_to);
+      dateWhere += ` AND cur.pay_time::date <= $${params.length}::date`;
+    }
+
+    /*
+      ВАЖНО:
+      - новые платежи, которые распределены по денежным пулам,
+        показываем ПО ФАКТИЧЕСКИМ allocations;
+      - если один ZFT оплачен из 2 пулов, будет 2 строки с суммами каждого пула;
+      - старые платежи, у которых allocations нет, оставляем по старому src_o.
+      Так мы не считаем всю сумму ZFT целиком на один источник.
+    */
+    const result = await pool.query(`
+      WITH paid_current AS (
+        SELECT *
+        FROM public.ft_zvk_current_v2 cur
+        WHERE COALESCE(TRIM(cur.object), '') <> ''
+          AND COALESCE(TRIM(cur.is_paid), '') = 'Да'
+          ${dateWhere}
+      ),
+
+      pool_rows AS (
+        SELECT
+          cur.id_ft,
+          cur.id_zvk,
+          cur.input_date,
+          cur.zvk_date,
+          cur.pay_time,
+
+          cur.legal_entity,
+          cur.object,
+          cur.contractor,
+          cur.pay_purpose,
+          cur.dds_article,
+          cur.contract_no,
+          cur.invoice_no,
+          cur.invoice_date,
+          cur.invoice_pdf,
+
+          cur.src_d,
+          CASE
+            WHEN upper(trim(COALESCE(p.money_type, ''))) = 'ЭСК'
+              THEN concat_ws(
+                ' ',
+                NULLIF(trim(p.source_name), ''),
+                'ЭСК'
+              )
+            ELSE NULLIF(trim(p.source_name), '')
+          END AS src_o,
+          a.amount::numeric AS to_pay,
+          cur.request_flag,
+          cur.status_comment,
+          cur.chief_approved,
+          cur.registry_flag,
+          cur.is_paid
+
+        FROM paid_current cur
+        JOIN public.zvk_funding_pool_allocations a
+          ON a.zvk_row_id = cur.zvk_row_id
+        JOIN public.draft_funding_pool p
+          ON p.id = a.funding_pool_id
+
+        WHERE COALESCE(TRIM(p.source_name), '') <> ''
+      ),
+
+      legacy_rows AS (
+        SELECT
+          cur.id_ft,
+          cur.id_zvk,
+          cur.input_date,
+          cur.zvk_date,
+          cur.pay_time,
+
+          cur.legal_entity,
+          cur.object,
+          cur.contractor,
+          cur.pay_purpose,
+          cur.dds_article,
+          cur.contract_no,
+          cur.invoice_no,
+          cur.invoice_date,
+          cur.invoice_pdf,
+
+          cur.src_d,
+          cur.src_o,
+          cur.to_pay::numeric AS to_pay,
+          cur.request_flag,
+          cur.status_comment,
+          cur.chief_approved,
+          cur.registry_flag,
+          cur.is_paid
+
+        FROM paid_current cur
+        WHERE COALESCE(TRIM(cur.src_o), '') <> ''
+          AND NOT EXISTS (
+            SELECT 1
+            FROM public.zvk_funding_pool_allocations a
+            WHERE a.zvk_row_id = cur.zvk_row_id
+          )
+      )
+
+      SELECT *
+      FROM (
+        SELECT * FROM pool_rows
+        UNION ALL
+        SELECT * FROM legacy_rows
+      ) x
+
+      ORDER BY
+        pay_time DESC NULLS LAST,
+        object,
+        src_o,
+        contractor
+    `, params);
+
+    res.json({ success:true, rows: result.rows });
+
+  } catch (e) {
+    console.error("matrix-sources error:", e);
+    res.status(500).json({ success:false, error:e.message });
+  }
+});
+
+
+// =====================================================
+// JSON API-ПРИЁМНИКИ ДЛЯ 1С
+// =====================================================
+
+function oneCArray(body) {
+  if (Array.isArray(body)) return body;
+  if (Array.isArray(body?.rows)) return body.rows;
+  if (Array.isArray(body?.data)) return body.data;
+  return body && typeof body === "object" ? [body] : [];
+}
+
+function oneCText(value) {
+  if (value === undefined || value === null) return null;
+
+  const result = String(value).trim();
+  return result === "" ? null : result;
+}
+
+function oneCNumber(value) {
+  if (value === undefined || value === null || value === "") return null;
+
+  const result = Number(
+    String(value)
+      .replace(/\s/g, "")
+      .replace(",", ".")
+  );
+
+  return Number.isFinite(result) ? result : null;
+}
+
+function oneCBoolean(value) {
+  if (value === undefined || value === null || value === "") return null;
+  if (typeof value === "boolean") return value;
+
+  const normalized = String(value).trim().toLowerCase();
+
+  if (["true", "1", "да", "yes"].includes(normalized)) return true;
+  if (["false", "0", "нет", "no"].includes(normalized)) return false;
+
+  return null;
+}
+
+// Необязательная защита API ключом.
+// В Render можно добавить переменную 1C_API_KEY.
+// 1С должна передавать заголовок: x-api-key
+function checkOneCApiKey(req, res, next) {
+  const expectedKey = String(process.env.ONE_C_API_KEY || "").trim();
+
+  // Пока ключ не задан в ENV, запросы пропускаются.
+  if (!expectedKey) return next();
+
+  const receivedKey = String(req.headers["x-api-key"] || "").trim();
+
+  if (receivedKey !== expectedKey) {
+    return res.status(401).json({
+      success: false,
+      error: "INVALID_API_KEY",
+      message: "Неверный API-ключ"
+    });
+  }
+
+  next();
+}
+
+// Проверка работы API
+app.get("/api/1c/health", (req, res) => {
+  return res.json({
+    success: true,
+    service: "1C integration API",
+    time: new Date().toISOString()
+  });
+});
+
+
+// =====================================================
+// 1. ПРИЁМ ДОКУМЕНТОВ doc_receipts
+// Внутри: doc_items и doc_services
+// =====================================================
+
+app.post(
+  "/api/1c/doc_receipts",
+  checkOneCApiKey,
+  async (req, res) => {
+    const client = await pool.connect();
+
+    try {
+      const documents = oneCArray(req.body);
+
+      if (!documents.length) {
+        return res.status(400).json({
+          success: false,
+          error: "EMPTY_BODY",
+          message: "JSON не содержит документов"
+        });
+      }
+
+      await client.query("BEGIN");
+
+      const results = [];
+
+      for (const doc of documents) {
+        const documentId = oneCText(doc.document_id);
+
+        if (!documentId) {
+          throw new Error("В одном из документов отсутствует document_id");
+        }
+
+        const oldDocument = await client.query(
+          `
+          SELECT document_id
+          FROM onec.doc_receipts
+          WHERE document_id = $1
+          LIMIT 1
+          `,
+          [documentId]
+        );
+
+        const operation =
+          oldDocument.rowCount > 0 ? "updated" : "inserted";
+
+        await client.query(
+          `
+          INSERT INTO onec.doc_receipts (
+            document_id,
+            base_id,
+            document_number,
+            document_posted,
+            document_date,
+            organization_bin,
+            organization_name,
+            warehouse_id,
+            warehouse_name,
+            counterparty_id,
+            counterparty_bin,
+            counterparty_name,
+            contract_id,
+            contract_name,
+            currency_name,
+            income_kpn,
+            settlement_account,
+            advance_account,
+            vat_enable,
+            vat_mode,
+            document_sum,
+            document_commentary,
+            document_author_name,
+            document_type,
+            advance_withheld,
+            guarantee_withheld,
+            penalty_withheld,
+            other_withheld,
+            target_entity,
+            action_required,
+            is_executed,
+            is_managerial,
+            id_dov,
+            dov_name,
+            deleted,
+            updated_at
+          )
+          VALUES (
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+            $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+            $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,
+            $31,$32,$33,$34,$35,NOW()
+          )
+          ON CONFLICT (document_id)
+          DO UPDATE SET
+            base_id = EXCLUDED.base_id,
+            document_number = EXCLUDED.document_number,
+            document_posted = EXCLUDED.document_posted,
+            document_date = EXCLUDED.document_date,
+            organization_bin = EXCLUDED.organization_bin,
+            organization_name = EXCLUDED.organization_name,
+            warehouse_id = EXCLUDED.warehouse_id,
+            warehouse_name = EXCLUDED.warehouse_name,
+            counterparty_id = EXCLUDED.counterparty_id,
+            counterparty_bin = EXCLUDED.counterparty_bin,
+            counterparty_name = EXCLUDED.counterparty_name,
+            contract_id = EXCLUDED.contract_id,
+            contract_name = EXCLUDED.contract_name,
+            currency_name = EXCLUDED.currency_name,
+            income_kpn = EXCLUDED.income_kpn,
+            settlement_account = EXCLUDED.settlement_account,
+            advance_account = EXCLUDED.advance_account,
+            vat_enable = EXCLUDED.vat_enable,
+            vat_mode = EXCLUDED.vat_mode,
+            document_sum = EXCLUDED.document_sum,
+            document_commentary = EXCLUDED.document_commentary,
+            document_author_name = EXCLUDED.document_author_name,
+            document_type = EXCLUDED.document_type,
+            advance_withheld = EXCLUDED.advance_withheld,
+            guarantee_withheld = EXCLUDED.guarantee_withheld,
+            penalty_withheld = EXCLUDED.penalty_withheld,
+            other_withheld = EXCLUDED.other_withheld,
+            target_entity = EXCLUDED.target_entity,
+            action_required = EXCLUDED.action_required,
+            is_executed = EXCLUDED.is_executed,
+            is_managerial = EXCLUDED.is_managerial,
+            id_dov = EXCLUDED.id_dov,
+            dov_name = EXCLUDED.dov_name,
+            deleted = EXCLUDED.deleted,
+            updated_at = NOW()
+          `,
+          [
+            documentId,
+            oneCText(doc.base_id),
+            oneCText(doc.document_number),
+            oneCBoolean(doc.document_posted),
+            oneCText(doc.document_date),
+
+            oneCText(doc.organization_bin),
+            oneCText(doc.organization_name),
+
+            oneCText(doc.warehouse_id),
+            oneCText(doc.warehouse_name),
+
+            oneCText(doc.counterparty_id),
+            oneCText(doc.counterparty_bin),
+            oneCText(doc.counterparty_name),
+
+            oneCText(doc.contract_id),
+            oneCText(doc.contract_name),
+
+            oneCText(doc.currency_name),
+            oneCText(doc.income_kpn),
+            oneCText(doc.settlement_account),
+            oneCText(doc.advance_account),
+
+            oneCBoolean(doc.vat_enable),
+            oneCText(doc.vat_mode),
+
+            oneCNumber(doc.document_sum),
+            oneCText(doc.document_commentary),
+            oneCText(doc.document_author_name),
+            oneCText(doc.document_type),
+
+            oneCNumber(doc.advance_withheld),
+            oneCNumber(doc.guarantee_withheld),
+            oneCNumber(doc.penalty_withheld),
+            oneCNumber(doc.other_withheld),
+
+            oneCText(doc.target_entity),
+oneCText(doc.action_required),
+oneCText(doc.is_executed),
+oneCText(doc.is_managerial),
+
+            oneCText(doc.id_dov),
+            oneCText(doc.dov_name),
+            oneCBoolean(doc.deleted) ?? false
+          ]
+        );
+
+        /*
+         * При повторной отправке документа очищаем старые массивы
+         * и записываем актуальные строки из 1С.
+         */
+        await client.query(
+          `DELETE FROM onec.doc_receipts_items WHERE document_id = $1`,
+          [documentId]
+        );
+
+        await client.query(
+          `DELETE FROM onec.doc_receipts_services WHERE document_id = $1`,
+          [documentId]
+        );
+
+        const docItems = Array.isArray(doc.doc_items)
+          ? doc.doc_items
+          : [];
+
+        for (let index = 0; index < docItems.length; index++) {
+          const item = docItems[index];
+          const lineNo = index + 1;
+          const itemId = oneCText(item.item_id);
+
+          if (!itemId) {
+            throw new Error(
+              `В doc_items документа ${documentId} отсутствует item_id`
+            );
+          }
+
+          await client.query(
+            `
+            INSERT INTO onec.doc_receipts_items (
+              document_id,
+              line_no,
+              item_id,
+              item_name,
+              quantity,
+              price,
+              amount,
+              vat_percent,
+              vat_amount,
+              amount_with_vat,
+              vat_account,
+              turnover_type,
+              receipt_type_name,
+              cost_account_bu,
+              cost_account_nu,
+              project_id,
+              project_name,
+              updated_at
+            )
+            VALUES (
+              $1,$2,$3,$4,$5,$6,$7,$8,
+              $9,$10,$11,$12,$13,$14,$15,$16,$17,NOW()
+            )
+            `,
+            [
+              documentId,
+              lineNo,
+              itemId,
+              oneCText(item.item_name),
+              oneCNumber(item.quantity),
+              oneCNumber(item.price),
+              oneCNumber(item.amount),
+              oneCNumber(item.vat_percent),
+              oneCNumber(item.vat_amount),
+              oneCNumber(item.amount_with_vat),
+              oneCText(item.vat_account),
+              oneCText(item.turnover_type ?? item.Turnover_type),
+              oneCText(item.receipt_type_name),
+              oneCText(item.cost_account_bu),
+              oneCText(item.cost_account_nu),
+              oneCText(item.project_id),
+              oneCText(item.project_name)
+            ]
+          );
+        }
+
+        const docServices = Array.isArray(doc.doc_services)
+          ? doc.doc_services
+          : [];
+
+        for (let index = 0; index < docServices.length; index++) {
+          const service = docServices[index];
+          const lineNo = index + 1;
+          const serviceId = oneCText(service.service_id);
+
+          if (!serviceId) {
+            throw new Error(
+              `В doc_services документа ${documentId} отсутствует service_id`
+            );
+          }
+
+          await client.query(
+            `
+            INSERT INTO onec.doc_receipts_services (
+              document_id,
+              line_no,
+              service_id,
+              service_name,
+              service_content,
+              quantity,
+              price,
+              amount,
+              vat_percent,
+              vat_amount,
+              amount_with_vat,
+              vat_account,
+              turnover_type,
+              receipt_type_name,
+              cost_account_bu,
+              cost_account_nu,
+              project_id,
+              project_name,
+              updated_at
+            )
+            VALUES (
+              $1,$2,$3,$4,$5,$6,$7,$8,$9,
+              $10,$11,$12,$13,$14,$15,$16,$17,$18,NOW()
+            )
+            `,
+            [
+              documentId,
+              lineNo,
+              serviceId,
+              oneCText(service.service_name),
+              oneCText(service.service_content),
+              oneCNumber(service.quantity),
+              oneCNumber(service.price),
+              oneCNumber(service.amount),
+              oneCNumber(service.vat_percent),
+              oneCNumber(service.vat_amount),
+              oneCNumber(service.amount_with_vat),
+              oneCText(service.vat_account),
+              oneCText(service.turnover_type ?? service.Turnover_type),
+              oneCText(service.receipt_type_name),
+              oneCText(service.cost_account_bu),
+              oneCText(service.cost_account_nu),
+              oneCText(service.project_id),
+              oneCText(service.project_name)
+            ]
+          );
+        }
+
+        results.push({
+          document_id: documentId,
+          operation,
+          doc_items_count: docItems.length,
+          doc_services_count: docServices.length
+        });
+      }
+
+      await client.query("COMMIT");
+
+      return res.json({
+        success: true,
+        received: documents.length,
+        results
+      });
+
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {}
+
+      console.error("1C DOC_RECEIPTS ERROR:", error);
+
+      return res.status(500).json({
+        success: false,
+        error: "DOC_RECEIPTS_ERROR",
+        message: error.message
+      });
+
+    } finally {
+      client.release();
+    }
+  }
+);
+
+
+// =====================================================
+// 2. КОНТРАГЕНТЫ
+// =====================================================
+
+app.post(
+  "/api/1c/ref_counterparties",
+  checkOneCApiKey,
+  async (req, res) => {
+    try {
+      const rows = oneCArray(req.body);
+      let saved = 0;
+
+      for (const row of rows) {
+        const id = oneCText(row.counterparty_id);
+
+        if (!id) {
+          return res.status(400).json({
+            success: false,
+            message: "counterparty_id обязателен"
+          });
+        }
+
+        await pool.query(
+          `
+          INSERT INTO onec.ref_counterparties (
+            counterparty_id,
+            counterparty_name,
+            individual_or_legal,
+            group_name,
+            counterparty_bin,
+            counterparty_kbe,
+            is_government_institution,
+            is_small_retail_outlet,
+            residence_country,
+            vat_series,
+            vat_number,
+            vat_date,
+            bank_account,
+            bank_name,
+            counterparty_comment,
+            deleted,
+            updated_at
+          )
+          VALUES (
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,
+            $10,$11,$12,$13,$14,$15,$16,NOW()
+          )
+          ON CONFLICT (counterparty_id)
+          DO UPDATE SET
+            counterparty_name = EXCLUDED.counterparty_name,
+            individual_or_legal = EXCLUDED.individual_or_legal,
+            group_name = EXCLUDED.group_name,
+            counterparty_bin = EXCLUDED.counterparty_bin,
+            counterparty_kbe = EXCLUDED.counterparty_kbe,
+            is_government_institution =
+              EXCLUDED.is_government_institution,
+            is_small_retail_outlet =
+              EXCLUDED.is_small_retail_outlet,
+            residence_country = EXCLUDED.residence_country,
+            vat_series = EXCLUDED.vat_series,
+            vat_number = EXCLUDED.vat_number,
+            vat_date = EXCLUDED.vat_date,
+            bank_account = EXCLUDED.bank_account,
+            bank_name = EXCLUDED.bank_name,
+            counterparty_comment = EXCLUDED.counterparty_comment,
+            deleted = EXCLUDED.deleted,
+            updated_at = NOW()
+          `,
+          [
+            id,
+            oneCText(row.counterparty_name),
+            oneCText(row.individual_or_legal),
+            oneCText(row.group_name),
+            oneCText(row.counterparty_bin),
+            oneCText(row.counterparty_kbe),
+            oneCBoolean(row.is_government_institution),
+            oneCBoolean(row.is_small_retail_outlet),
+            oneCText(row.residence_country),
+            oneCText(row.vat_series),
+            oneCText(row.vat_number),
+            oneCText(row.vat_date),
+            oneCText(row.bank_account),
+            oneCText(row.bank_name),
+            oneCText(row.counterparty_comment),
+            oneCBoolean(row.deleted) ?? false
+          ]
+        );
+
+        saved++;
+      }
+
+      return res.json({ success: true, received: rows.length, saved });
+
+    } catch (error) {
+      console.error("1C COUNTERPARTIES ERROR:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: error.message
+      });
+    }
+  }
+);
+
+
+// =====================================================
+// 3. СКЛАДЫ
+// =====================================================
+
+app.post(
+  "/api/1c/ref_warehouses",
+  checkOneCApiKey,
+  async (req, res) => {
+    try {
+      const rows = oneCArray(req.body);
+      let saved = 0;
+
+      for (const row of rows) {
+        const id = oneCText(row.warehouse_id);
+
+        if (!id) {
+          return res.status(400).json({
+            success: false,
+            message: "warehouse_id обязателен"
+          });
+        }
+
+        await pool.query(
+          `
+          INSERT INTO onec.ref_warehouses (
+            warehouse_id,
+            warehouse_name,
+            warehouse_comment,
+            deleted,
+            updated_at
+          )
+          VALUES ($1,$2,$3,$4,NOW())
+          ON CONFLICT (warehouse_id)
+          DO UPDATE SET
+            warehouse_name = EXCLUDED.warehouse_name,
+            warehouse_comment = EXCLUDED.warehouse_comment,
+            deleted = EXCLUDED.deleted,
+            updated_at = NOW()
+          `,
+          [
+            id,
+            oneCText(row.warehouse_name),
+            oneCText(row.warehouse_comment),
+            oneCBoolean(row.deleted) ?? false
+          ]
+        );
+
+        saved++;
+      }
+
+      return res.json({ success: true, received: rows.length, saved });
+
+    } catch (error) {
+      console.error("1C WAREHOUSES ERROR:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: error.message
+      });
+    }
+  }
+);
+
+
+// =====================================================
+// 4. ТОВАРЫ И УСЛУГИ
+// =====================================================
+
+app.post(
+  "/api/1c/ref_products",
+  checkOneCApiKey,
+  async (req, res) => {
+    try {
+      const rows = oneCArray(req.body);
+      let saved = 0;
+
+      for (const row of rows) {
+        const id = oneCText(row.product_id);
+
+        if (!id) {
+          return res.status(400).json({
+            success: false,
+            message: "product_id обязателен"
+          });
+        }
+
+        await pool.query(
+          `
+          INSERT INTO onec.ref_products (
+            product_id,
+            product_code,
+            product_name,
+            is_group,
+            is_service,
+            article,
+            unit,
+            vat_percent,
+            tnvd_code,
+            kpvd_code,
+            nkt_code,
+            product_type,
+            product_group,
+            product_comment,
+            deleted,
+            updated_at
+          )
+          VALUES (
+            $1,$2,$3,$4,$5,$6,$7,$8,
+            $9,$10,$11,$12,$13,$14,$15,NOW()
+          )
+          ON CONFLICT (product_id)
+          DO UPDATE SET
+            product_code = EXCLUDED.product_code,
+            product_name = EXCLUDED.product_name,
+            is_group = EXCLUDED.is_group,
+            is_service = EXCLUDED.is_service,
+            article = EXCLUDED.article,
+            unit = EXCLUDED.unit,
+            vat_percent = EXCLUDED.vat_percent,
+            tnvd_code = EXCLUDED.tnvd_code,
+            kpvd_code = EXCLUDED.kpvd_code,
+            nkt_code = EXCLUDED.nkt_code,
+            product_type = EXCLUDED.product_type,
+            product_group = EXCLUDED.product_group,
+            product_comment = EXCLUDED.product_comment,
+            deleted = EXCLUDED.deleted,
+            updated_at = NOW()
+          `,
+          [
+            id,
+            oneCText(row.product_code),
+            oneCText(row.product_name),
+            oneCBoolean(row.is_group),
+            oneCBoolean(row.is_service),
+            oneCText(row.article),
+            oneCText(row.unit),
+            oneCNumber(row.vat_percent),
+            oneCText(row.tnvd_code),
+            oneCText(row.kpvd_code),
+            oneCText(row.nkt_code),
+            oneCText(row.product_type),
+            oneCText(row.product_group),
+            oneCText(row.product_comment),
+            oneCBoolean(row.deleted) ?? false
+          ]
+        );
+
+        saved++;
+      }
+
+      return res.json({ success: true, received: rows.length, saved });
+
+    } catch (error) {
+      console.error("1C PRODUCTS ERROR:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: error.message
+      });
+    }
+  }
+);
+
+
+// =====================================================
+// 5. ДОГОВОРЫ КОНТРАГЕНТОВ
+// =====================================================
+
+app.post(
+  "/api/1c/ref_counterparties_contracts",
+  checkOneCApiKey,
+  async (req, res) => {
+    try {
+      const rows = oneCArray(req.body);
+      let saved = 0;
+
+      for (const row of rows) {
+        const id = oneCText(row.contract_id);
+
+        if (!id) {
+          return res.status(400).json({
+            success: false,
+            message: "contract_id обязателен"
+          });
+        }
+
+        await pool.query(
+          `
+          INSERT INTO onec.ref_counterparties_contracts (
+            contract_id,
+            contract_number,
+            contract_date,
+            contract_name,
+            contract_type,
+            organization_name,
+            organization_bin,
+            counterparty_id,
+            counterparty_bin,
+            counterparty_name,
+            deleted,
+            updated_at
+          )
+          VALUES (
+            $1,$2,$3,$4,$5,$6,
+            $7,$8,$9,$10,$11,NOW()
+          )
+          ON CONFLICT (contract_id)
+          DO UPDATE SET
+            contract_number = EXCLUDED.contract_number,
+            contract_date = EXCLUDED.contract_date,
+            contract_name = EXCLUDED.contract_name,
+            contract_type = EXCLUDED.contract_type,
+            organization_name = EXCLUDED.organization_name,
+            organization_bin = EXCLUDED.organization_bin,
+            counterparty_id = EXCLUDED.counterparty_id,
+            counterparty_bin = EXCLUDED.counterparty_bin,
+            counterparty_name = EXCLUDED.counterparty_name,
+            deleted = EXCLUDED.deleted,
+            updated_at = NOW()
+          `,
+          [
+            id,
+            oneCText(row.contract_number),
+            oneCText(row.contract_date),
+            oneCText(row.contract_name),
+            oneCText(row.contract_type),
+            oneCText(row.organization_name),
+            oneCText(row.organization_bin),
+            oneCText(row.counterparty_id),
+            oneCText(row.counterparty_bin),
+            oneCText(row.counterparty_name),
+            oneCBoolean(row.deleted) ?? false
+          ]
+        );
+
+        saved++;
+      }
+
+      return res.json({ success: true, received: rows.length, saved });
+
+    } catch (error) {
+      console.error("1C CONTRACTS ERROR:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: error.message
+      });
+    }
+  }
+);
+
+
+// =====================================================
+// 6. ПРОЕКТЫ
+// =====================================================
+
+app.post(
+  "/api/1c/ref_project_groups",
+  checkOneCApiKey,
+  async (req, res) => {
+    try {
+      const rows = oneCArray(req.body);
+      let saved = 0;
+
+      for (const row of rows) {
+        const id = oneCText(row.project_id);
+
+        if (!id) {
+          return res.status(400).json({
+            success: false,
+            message: "project_id обязателен"
+          });
+        }
+
+        await pool.query(
+          `
+          INSERT INTO onec.ref_project_groups (
+            project_id,
+            project_name,
+            deleted,
+            updated_at
+          )
+          VALUES ($1,$2,$3,NOW())
+          ON CONFLICT (project_id)
+          DO UPDATE SET
+            project_name = EXCLUDED.project_name,
+            deleted = EXCLUDED.deleted,
+            updated_at = NOW()
+          `,
+          [
+            id,
+            oneCText(row.project_name),
+            oneCBoolean(row.deleted) ?? false
+          ]
+        );
+
+        saved++;
+      }
+
+      return res.json({ success: true, received: rows.length, saved });
+
+    } catch (error) {
+      console.error("1C PROJECT GROUPS ERROR:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: error.message
+      });
+    }
+  }
+);
+
+// =====================================================
+// ПРИЁМ ДОКУМЕНТОВ ПРОДАЖИ doc_sales
+// Внутри JSON: doc_items и doc_services
+// =====================================================
+
+app.post(
+  "/api/1c/doc_sales",
+  checkOneCApiKey,
+  async (req, res) => {
+    const client = await pool.connect();
+
+    try {
+      const documents = oneCArray(req.body);
+
+      if (!documents.length) {
+        return res.status(400).json({
+          success: false,
+          error: "EMPTY_BODY",
+          message: "JSON не содержит документов продажи"
+        });
+      }
+
+      await client.query("BEGIN");
+
+      const results = [];
+
+      for (const doc of documents) {
+        const documentId = oneCText(doc.document_id);
+
+        if (!documentId) {
+          throw new Error(
+            "В одном из документов продажи отсутствует document_id"
+          );
+        }
+
+        const oldDocument = await client.query(
+          `
+          SELECT document_id
+          FROM onec.doc_sales
+          WHERE document_id = $1
+          LIMIT 1
+          `,
+          [documentId]
+        );
+
+        const operation =
+          oldDocument.rowCount > 0 ? "updated" : "inserted";
+
+        // =================================================
+        // ШАПКА ДОКУМЕНТА ПРОДАЖИ
+        // =================================================
+
+        await client.query(
+          `
+          INSERT INTO onec.doc_sales (
+            document_id,
+            document_number,
+            document_posted,
+            document_date,
+
+            organization_bin,
+            organization_name,
+
+            warehouse_id,
+            warehouse_name,
+
+            counterparty_id,
+            counterparty_bin,
+            counterparty_name,
+
+            contract_id,
+            contract_name,
+
+            currency_name,
+            income_kpn,
+            settlement_account,
+            advance_account,
+
+            vat_enable,
+            vat_mode,
+
+            document_sum,
+            document_commentary,
+            document_author_name,
+            document_type,
+
+            advance_withheld,
+            guarantee_withheld,
+            penalty_withheld,
+            other_withheld,
+
+            target_entity,
+            action_required,
+            is_executed,
+            is_managerial,
+
+            id_dov,
+            dov_name,
+            deleted,
+            updated_at
+          )
+          VALUES (
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+            $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+            $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,
+            $31,$32,$33,$34,NOW()
+          )
+          ON CONFLICT (document_id)
+          DO UPDATE SET
+            document_number = EXCLUDED.document_number,
+            document_posted = EXCLUDED.document_posted,
+            document_date = EXCLUDED.document_date,
+
+            organization_bin = EXCLUDED.organization_bin,
+            organization_name = EXCLUDED.organization_name,
+
+            warehouse_id = EXCLUDED.warehouse_id,
+            warehouse_name = EXCLUDED.warehouse_name,
+
+            counterparty_id = EXCLUDED.counterparty_id,
+            counterparty_bin = EXCLUDED.counterparty_bin,
+            counterparty_name = EXCLUDED.counterparty_name,
+
+            contract_id = EXCLUDED.contract_id,
+            contract_name = EXCLUDED.contract_name,
+
+            currency_name = EXCLUDED.currency_name,
+            income_kpn = EXCLUDED.income_kpn,
+            settlement_account = EXCLUDED.settlement_account,
+            advance_account = EXCLUDED.advance_account,
+
+            vat_enable = EXCLUDED.vat_enable,
+            vat_mode = EXCLUDED.vat_mode,
+
+            document_sum = EXCLUDED.document_sum,
+            document_commentary = EXCLUDED.document_commentary,
+            document_author_name = EXCLUDED.document_author_name,
+            document_type = EXCLUDED.document_type,
+
+            advance_withheld = EXCLUDED.advance_withheld,
+            guarantee_withheld = EXCLUDED.guarantee_withheld,
+            penalty_withheld = EXCLUDED.penalty_withheld,
+            other_withheld = EXCLUDED.other_withheld,
+
+            target_entity = EXCLUDED.target_entity,
+            action_required = EXCLUDED.action_required,
+            is_executed = EXCLUDED.is_executed,
+            is_managerial = EXCLUDED.is_managerial,
+
+            id_dov = EXCLUDED.id_dov,
+            dov_name = EXCLUDED.dov_name,
+            deleted = EXCLUDED.deleted,
+            updated_at = NOW()
+          `,
+          [
+            documentId,
+            oneCText(doc.document_number),
+            oneCBoolean(doc.document_posted),
+            oneCText(doc.document_date),
+
+            oneCText(doc.organization_bin),
+            oneCText(doc.organization_name),
+
+            oneCText(doc.warehouse_id),
+            oneCText(doc.warehouse_name),
+
+            oneCText(doc.counterparty_id),
+            oneCText(doc.counterparty_bin),
+            oneCText(doc.counterparty_name),
+
+            oneCText(doc.contract_id),
+            oneCText(doc.contract_name),
+
+            oneCText(doc.currency_name),
+            oneCText(doc.income_kpn),
+            oneCText(doc.settlement_account),
+            oneCText(doc.advance_account),
+
+            oneCBoolean(doc.vat_enable),
+            oneCText(doc.vat_mode),
+
+            oneCNumber(doc.document_sum),
+            oneCText(doc.document_commentary),
+            oneCText(doc.document_author_name),
+            oneCText(doc.document_type),
+
+            oneCNumber(doc.advance_withheld),
+            oneCNumber(doc.guarantee_withheld),
+            oneCNumber(doc.penalty_withheld),
+            oneCNumber(doc.other_withheld),
+
+            oneCText(doc.target_entity),
+oneCText(doc.action_required),
+oneCText(doc.is_executed),
+oneCText(doc.is_managerial),
+
+            oneCText(doc.id_dov),
+            oneCText(doc.dov_name),
+            oneCBoolean(doc.deleted) ?? false
+          ]
+        );
+
+        /*
+         * При повторной отправке документа продажи удаляем
+         * старые строки массивов и записываем новые из 1С.
+         */
+        await client.query(
+          `
+          DELETE FROM onec.doc_sales_items
+          WHERE document_id = $1
+          `,
+          [documentId]
+        );
+
+        await client.query(
+          `
+          DELETE FROM onec.doc_sales_services
+          WHERE document_id = $1
+          `,
+          [documentId]
+        );
+
+        // =================================================
+        // МАССИВ doc_items
+        // =================================================
+
+        const docItems = Array.isArray(doc.doc_items)
+          ? doc.doc_items
+          : [];
+
+        for (let index = 0; index < docItems.length; index++) {
+          const item = docItems[index];
+          const lineNo = index + 1;
+          const itemId = oneCText(item.item_id);
+
+          if (!itemId) {
+            throw new Error(
+              `В doc_items документа продажи ${documentId} отсутствует item_id`
+            );
+          }
+
+          await client.query(
+            `
+            INSERT INTO onec.doc_sales_items (
+              document_id,
+              line_no,
+              item_id,
+              item_name,
+              quantity,
+              price,
+              amount,
+              vat_percent,
+              vat_amount,
+              amount_with_vat,
+              vat_account,
+              cost_account_bu,
+              cost_account_nu,
+              project_id,
+              project_name,
+              updated_at
+            )
+            VALUES (
+              $1,$2,$3,$4,$5,$6,$7,$8,
+              $9,$10,$11,$12,$13,$14,$15,NOW()
+            )
+            `,
+            [
+              documentId,
+              lineNo,
+              itemId,
+              oneCText(item.item_name),
+              oneCNumber(item.quantity),
+              oneCNumber(item.price),
+              oneCNumber(item.amount),
+              oneCNumber(item.vat_percent),
+              oneCNumber(item.vat_amount),
+              oneCNumber(item.amount_with_vat),
+              oneCText(item.vat_account),
+              oneCText(item.cost_account_bu),
+              oneCText(item.cost_account_nu),
+              oneCText(item.project_id),
+              oneCText(item.project_name)
+            ]
+          );
+        }
+
+        // =================================================
+        // МАССИВ doc_services
+        // =================================================
+
+        const docServices = Array.isArray(doc.doc_services)
+          ? doc.doc_services
+          : [];
+
+        for (let index = 0; index < docServices.length; index++) {
+          const service = docServices[index];
+          const lineNo = index + 1;
+          const serviceId = oneCText(service.service_id);
+
+          if (!serviceId) {
+            throw new Error(
+              `В doc_services документа продажи ${documentId} отсутствует service_id`
+            );
+          }
+
+          await client.query(
+            `
+            INSERT INTO onec.doc_sales_services (
+              document_id,
+              line_no,
+              service_id,
+              service_name,
+              service_content,
+              quantity,
+              price,
+              amount,
+              vat_percent,
+              vat_amount,
+              amount_with_vat,
+              vat_account,
+              cost_account_bu,
+              cost_account_nu,
+              project_id,
+              project_name,
+              updated_at
+            )
+            VALUES (
+              $1,$2,$3,$4,$5,$6,$7,$8,$9,
+              $10,$11,$12,$13,$14,$15,$16,NOW()
+            )
+            `,
+            [
+              documentId,
+              lineNo,
+              serviceId,
+              oneCText(service.service_name),
+              oneCText(service.service_content),
+              oneCNumber(service.quantity),
+              oneCNumber(service.price),
+              oneCNumber(service.amount),
+              oneCNumber(service.vat_percent),
+              oneCNumber(service.vat_amount),
+              oneCNumber(service.amount_with_vat),
+              oneCText(service.vat_account),
+              oneCText(service.cost_account_bu),
+              oneCText(service.cost_account_nu),
+              oneCText(service.project_id),
+              oneCText(service.project_name)
+            ]
+          );
+        }
+
+        results.push({
+          document_id: documentId,
+          operation,
+          doc_items_count: docItems.length,
+          doc_services_count: docServices.length
+        });
+      }
+
+      await client.query("COMMIT");
+
+      return res.json({
+        success: true,
+        received: documents.length,
+        results
+      });
+
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {}
+
+      console.error("1C DOC_SALES ERROR:", error);
+
+      return res.status(500).json({
+        success: false,
+        error: "DOC_SALES_ERROR",
+        message: error.message
+      });
+
+    } finally {
+      client.release();
+    }
+  }
+);
+
+// =====================================================
+// ПЛАТЕЖНОЕ ПОРУЧЕНИЕ ВХОДЯЩЕЕ
+// POST /api/1c/doc_incomingpaymentorder
+// Табличная часть: payment_transcript
+// =====================================================
+
+app.post(
+  "/api/1c/doc_incomingpaymentorder",
+  checkOneCApiKey,
+  async (req, res) => {
+    const client = await pool.connect();
+
+    try {
+      const documents = oneCArray(req.body);
+
+      if (!documents.length) {
+        return res.status(400).json({
+          success: false,
+          error: "EMPTY_BODY",
+          message: "JSON не содержит документов"
+        });
+      }
+
+      await client.query("BEGIN");
+
+      const results = [];
+
+      for (const doc of documents) {
+        const documentId = oneCText(doc.document_id);
+
+        if (!documentId) {
+          throw new Error(
+            "В одном из документов отсутствует document_id"
+          );
+        }
+
+        const oldDocument = await client.query(
+          `
+          SELECT document_id
+          FROM onec.doc_incomingpaymentorder
+          WHERE document_id = $1
+          LIMIT 1
+          `,
+          [documentId]
+        );
+
+        const operation =
+          oldDocument.rowCount > 0 ? "updated" : "inserted";
+
+        await client.query(
+          `
+          INSERT INTO onec.doc_incomingpaymentorder (
+            document_id,
+            document_number,
+            document_posted,
+            document_date,
+
+            organization_bin,
+            organization_name,
+
+            paid,
+            document_author_name,
+            responsible,
+            operation_type,
+            currency_name,
+            document_commentary,
+
+            statement_date,
+            document_sum,
+
+            cash_flow_item,
+            bank_account,
+            counterparty_account,
+            organization_account,
+            purpose_of_payment,
+
+            incoming_doc_date,
+            incoming_doc_number,
+
+            advance,
+
+            counterparty_id,
+            counterparty_bin,
+            counterparty_name,
+
+            deleted,
+            updated_at
+          )
+          VALUES (
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+            $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+            $21,$22,$23,$24,$25,$26,NOW()
+          )
+          ON CONFLICT (document_id)
+          DO UPDATE SET
+            document_number = EXCLUDED.document_number,
+            document_posted = EXCLUDED.document_posted,
+            document_date = EXCLUDED.document_date,
+
+            organization_bin = EXCLUDED.organization_bin,
+            organization_name = EXCLUDED.organization_name,
+
+            paid = EXCLUDED.paid,
+            document_author_name = EXCLUDED.document_author_name,
+            responsible = EXCLUDED.responsible,
+            operation_type = EXCLUDED.operation_type,
+            currency_name = EXCLUDED.currency_name,
+            document_commentary = EXCLUDED.document_commentary,
+
+            statement_date = EXCLUDED.statement_date,
+            document_sum = EXCLUDED.document_sum,
+
+            cash_flow_item = EXCLUDED.cash_flow_item,
+            bank_account = EXCLUDED.bank_account,
+            counterparty_account = EXCLUDED.counterparty_account,
+            organization_account = EXCLUDED.organization_account,
+            purpose_of_payment = EXCLUDED.purpose_of_payment,
+
+            incoming_doc_date = EXCLUDED.incoming_doc_date,
+            incoming_doc_number = EXCLUDED.incoming_doc_number,
+
+            advance = EXCLUDED.advance,
+
+            counterparty_id = EXCLUDED.counterparty_id,
+            counterparty_bin = EXCLUDED.counterparty_bin,
+            counterparty_name = EXCLUDED.counterparty_name,
+
+            deleted = EXCLUDED.deleted,
+            updated_at = NOW()
+          `,
+          [
+            documentId,
+            oneCText(doc.document_number),
+            oneCBoolean(doc.document_posted),
+            oneCText(doc.document_date),
+
+            oneCText(doc.organization_bin),
+            oneCText(doc.organization_name),
+
+            oneCBoolean(doc.paid),
+            oneCText(doc.document_author_name),
+            oneCText(doc.responsible),
+            oneCText(doc.operation_type),
+            oneCText(doc.currency_name),
+            oneCText(doc.document_commentary),
+
+            oneCText(doc.statement_date),
+            oneCNumber(doc.document_sum),
+
+            oneCText(doc.cash_flow_item),
+            oneCText(doc.bank_account),
+            oneCText(doc.counterparty_account),
+            oneCText(doc.organization_account),
+            oneCText(doc.purpose_of_payment),
+
+            oneCText(doc.incoming_doc_date),
+            oneCText(doc.incoming_doc_number),
+
+            oneCText(doc.advance),
+
+            oneCText(doc.counterparty_id),
+            oneCText(doc.counterparty_bin),
+            oneCText(doc.counterparty_name),
+
+            oneCBoolean(doc.deleted)
+          ]
+        );
+
+        // При обновлении документа старые строки расшифровки удаляются.
+        await client.query(
+          `
+          DELETE FROM onec.doc_incomingpaymentorder_payment_transcript
+          WHERE document_id = $1
+          `,
+          [documentId]
+        );
+
+        await client.query(
+          `
+          DELETE FROM onec.doc_incomingpaymentorder_payment_return_other
+          WHERE document_id = $1
+          `,
+          [documentId]
+        );
+
+        const paymentTranscript = Array.isArray(doc.payment_transcript)
+          ? doc.payment_transcript
+          : [];
+
+        let insertedRows = 0;
+
+        for (let index = 0; index < paymentTranscript.length; index++) {
+          const row = paymentTranscript[index];
+          const lineNo = index + 1;
+
+          await client.query(
+            `
+            INSERT INTO onec.doc_incomingpaymentorder_payment_transcript (
+              document_id,
+              line_no,
+
+              contract_id,
+              contract_name,
+              doc_deal,
+
+              settlement_rate,
+              payment_amount,
+              frequency_settlements,
+              settlement_amount,
+
+              vat_percent,
+              vat_amount,
+
+              cash_flow_item,
+              project_id,
+              project_name,
+              updated_at
+            )
+            VALUES (
+              $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW()
+            )
+            `,
+            [
+              documentId,
+              lineNo,
+
+              oneCText(row.contract_id),
+              oneCText(row.contract_name),
+              oneCText(row.doc_deal),
+
+              oneCNumber(row.settlement_rate),
+              oneCNumber(row.payment_amount),
+              oneCNumber(row.frequency_settlements),
+              oneCNumber(row.settlement_amount),
+
+              oneCNumber(row.vat_percent),
+              oneCNumber(row.vat_amount),
+
+              oneCText(row.cash_flow_item),
+              oneCText(row.project_id),
+              oneCText(row.project_name)
+            ]
+          );
+
+          insertedRows++;
+        }
+
+        const paymentReturnOther = Array.isArray(doc.payment_return_other)
+          ? doc.payment_return_other
+          : [];
+
+        let paymentReturnOtherRows = 0;
+
+        for (let index = 0; index < paymentReturnOther.length; index++) {
+          const row = paymentReturnOther[index] || {};
+          const lineNo = index + 1;
+
+          await client.query(
+            `
+            INSERT INTO onec.doc_incomingpaymentorder_payment_return_other (
+              document_id,
+              line_no,
+              return_sum,
+              doc_return,
+              updated_at
+            )
+            VALUES ($1,$2,$3,$4,NOW())
+            `,
+            [
+              documentId,
+              lineNo,
+              oneCNumber(row.return_sum),
+              oneCText(row.doc_return)
+            ]
+          );
+
+          paymentReturnOtherRows++;
+        }
+
+        results.push({
+          document_id: documentId,
+          operation,
+          payment_transcript_count: insertedRows,
+          payment_return_other_count: paymentReturnOtherRows
+        });
+      }
+
+      await client.query("COMMIT");
+
+      return res.json({
+        success: true,
+        count: results.length,
+        results
+      });
+
+    } catch (e) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {}
+
+      console.error("DOC-INCOMINGPAYMENTORDER ERROR:", e);
+
+      return res.status(500).json({
+        success: false,
+        error: e.message
+      });
+
+    } finally {
+      client.release();
+    }
+  }
+);
+
+// =====================================================
+// Start
+// =====================================================
+const PORT = process.env.PORT || 3000;
+
+// =====================================================
+// ПЛАТЕЖНОЕ ПОРУЧЕНИЕ ИСХОДЯЩЕЕ
+// POST /api/1c/doc_outgoingpaymentorder
+// Один API принимает шапку и 10 массивов
+// =====================================================
+
+const OUTGOING_PAYMENT_PARTS = {
+  payment_transcript: {
+    table: "doc_outgoingpaymentorder_payment_transcript",
+    fields: [
+      ["contract_id", oneCText],
+      ["contract_name", oneCText],
+      ["doc_deal", oneCText],
+      ["settlement_rate", oneCNumber],
+      ["payment_amount", oneCNumber],
+      ["frequency_settlements", oneCNumber],
+      ["settlement_amount", oneCNumber],
+      ["vat_percent", oneCNumber],
+      ["vat_amount", oneCNumber],
+      ["cash_flow_item", oneCText],
+      ["project_id", oneCText],
+      ["project_name", oneCText]
+    ]
+  },
+
+  payment_transfer_salary: {
+    table: "doc_outgoingpaymentorder_payment_transfer_salary",
+    fields: [
+      ["project_id", oneCText],
+      ["project_name", oneCText],
+      ["transfer_sum", oneCNumber],
+      ["doc_transfer", oneCText]
+    ]
+  },
+
+  payment_transfer_pension: {
+    table: "doc_outgoingpaymentorder_payment_transfer_pension",
+    fields: [
+      ["project_id", oneCText],
+      ["project_name", oneCText],
+      ["transfer_sum", oneCNumber],
+      ["doc_transfer", oneCText]
+    ]
+  },
+
+  payment_transfer_social: {
+    table: "doc_outgoingpaymentorder_payment_transfer_social",
+    fields: [
+      ["project_id", oneCText],
+      ["project_name", oneCText],
+      ["transfer_sum", oneCNumber],
+      ["doc_transfer", oneCText]
+    ]
+  },
+
+  payment_transfer_execution: {
+    table: "doc_outgoingpaymentorder_payment_transfer_execution",
+    fields: [
+      ["project_id", oneCText],
+      ["project_name", oneCText],
+      ["transfer_sum", oneCNumber],
+      ["transfer_sum_payment", oneCNumber],
+      ["transfer_sum_fees", oneCNumber],
+      ["doc_transfer", oneCText]
+    ]
+  },
+
+  payment_transfer_vat: {
+    table: "doc_outgoingpaymentorder_payment_transfer_vat",
+    fields: [
+      ["project_id", oneCText],
+      ["project_name", oneCText],
+      ["contract_id", oneCText],
+      ["contract_name", oneCText],
+      ["counterparty_id", oneCText],
+      ["counterparty_bin", oneCText],
+      ["counterparty_name", oneCText],
+      ["type_receipt_vat", oneCText],
+      ["type_turnover_vat", oneCText],
+      ["vat_percent", oneCNumber],
+      ["term_of_payment", oneCText],
+      ["sum_of_payment", oneCNumber]
+    ]
+  },
+
+  payment_transfer_report: {
+    table: "doc_outgoingpaymentorder_payment_transfer_report",
+    fields: [
+      ["project_id", oneCText],
+      ["project_name", oneCText],
+      ["individual", oneCText],
+      ["number_card_account", oneCText],
+      ["type_of_debt", oneCText],
+      ["sum_of_payment", oneCNumber]
+    ]
+  },
+
+  payment_transfer_single: {
+    table: "doc_outgoingpaymentorder_payment_transfer_single",
+    fields: [
+      ["project_id", oneCText],
+      ["project_name", oneCText],
+      ["transfer_sum", oneCNumber],
+      ["doc_transfer", oneCText]
+    ]
+  },
+
+  payment_transfer_other: {
+    table: "doc_outgoingpaymentorder_payment_transfer_other",
+    fields: [
+      ["transfer_sum", oneCNumber],
+      ["doc_transfer", oneCText]
+    ]
+  },
+
+  payment_transfer_other_income: {
+    table: "doc_outgoingpaymentorder_payment_transfer_other_income",
+    fields: [
+      ["transfer_sum", oneCNumber],
+      ["doc_transfer", oneCText]
+    ]
+  }
+};
+
+async function replaceOutgoingPaymentPart(
+  client,
+  documentId,
+  rows,
+  config
+) {
+  await client.query(
+    `DELETE FROM onec.${config.table} WHERE document_id = $1`,
+    [documentId]
+  );
+
+  const list = Array.isArray(rows) ? rows : [];
+  const fieldNames = config.fields.map(([name]) => name);
+
+  for (let index = 0; index < list.length; index++) {
+    const row = list[index] || {};
+    const lineNo = index + 1;
+
+    const columns = ["document_id", "line_no", ...fieldNames, "updated_at"];
+    const placeholders = [
+      "$1",
+      "$2",
+      ...fieldNames.map((_, fieldIndex) => `$${fieldIndex + 3}`),
+      "NOW()"
+    ];
+
+    const values = [
+      documentId,
+      lineNo,
+      ...config.fields.map(([name, converter]) => converter(row[name]))
+    ];
+
+    await client.query(
+      `
+      INSERT INTO onec.${config.table} (
+        ${columns.join(", ")}
+      )
+      VALUES (
+        ${placeholders.join(", ")}
+      )
+      `,
+      values
+    );
+  }
+
+  return list.length;
+}
+
+app.post(
+  "/api/1c/doc_outgoingpaymentorder",
+  checkOneCApiKey,
+  async (req, res) => {
+    const client = await pool.connect();
+
+    try {
+      const documents = oneCArray(req.body);
+
+      if (!documents.length) {
+        return res.status(400).json({
+          success: false,
+          error: "EMPTY_BODY",
+          message: "JSON не содержит документов"
+        });
+      }
+
+      await client.query("BEGIN");
+
+      const results = [];
+
+      for (const doc of documents) {
+        const documentId = oneCText(doc.document_id);
+
+        if (!documentId) {
+          throw new Error(
+            "В одном из документов отсутствует document_id"
+          );
+        }
+
+        const exists = await client.query(
+          `
+          SELECT document_id
+          FROM onec.doc_outgoingpaymentorder
+          WHERE document_id = $1
+          LIMIT 1
+          `,
+          [documentId]
+        );
+
+        const operation = exists.rowCount ? "updated" : "inserted";
+
+        await client.query(
+          `
+          INSERT INTO onec.doc_outgoingpaymentorder (
+            document_id,
+            document_number,
+            document_date,
+            document_posted,
+
+            bank_intermediary,
+            bank_intermediary_account,
+            tax_type,
+            payment_type,
+            include_bank_commission,
+
+            value_date,
+            statement_date,
+            date_receipt_goods,
+
+            code_bk,
+            code_purpose_of_payment,
+            document_commentary,
+
+            rnn_payer,
+            rnn_recipient,
+            text_payer,
+            text_recipient,
+
+            percent_commission,
+            amount_commission,
+            fact_payer,
+
+            organization_bin,
+            organization_name,
+
+            paid,
+            document_author_name,
+            responsible,
+            operation_type,
+            currency_name,
+            document_sum,
+
+            cash_flow_item,
+            bank_account,
+            counterparty_account,
+            organization_account,
+            purpose_of_payment,
+
+            incoming_doc_date,
+            incoming_doc_number,
+
+            advance,
+            target_entity,
+            action_required,
+            is_executed,
+            ft_idzft,
+
+            counterparty_id,
+            counterparty_bin,
+            counterparty_name,
+
+            deleted,
+            updated_at
+          )
+          VALUES (
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+            $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+            $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,
+            $31,$32,$33,$34,$35,$36,$37,$38,$39,$40,
+            $41,$42,$43,$44,$45,$46,NOW()
+          )
+          ON CONFLICT (document_id)
+          DO UPDATE SET
+            document_number = EXCLUDED.document_number,
+            document_date = EXCLUDED.document_date,
+            document_posted = EXCLUDED.document_posted,
+
+            bank_intermediary = EXCLUDED.bank_intermediary,
+            bank_intermediary_account = EXCLUDED.bank_intermediary_account,
+            tax_type = EXCLUDED.tax_type,
+            payment_type = EXCLUDED.payment_type,
+            include_bank_commission = EXCLUDED.include_bank_commission,
+
+            value_date = EXCLUDED.value_date,
+            statement_date = EXCLUDED.statement_date,
+            date_receipt_goods = EXCLUDED.date_receipt_goods,
+
+            code_bk = EXCLUDED.code_bk,
+            code_purpose_of_payment = EXCLUDED.code_purpose_of_payment,
+            document_commentary = EXCLUDED.document_commentary,
+
+            rnn_payer = EXCLUDED.rnn_payer,
+            rnn_recipient = EXCLUDED.rnn_recipient,
+            text_payer = EXCLUDED.text_payer,
+            text_recipient = EXCLUDED.text_recipient,
+
+            percent_commission = EXCLUDED.percent_commission,
+            amount_commission = EXCLUDED.amount_commission,
+            fact_payer = EXCLUDED.fact_payer,
+
+            organization_bin = EXCLUDED.organization_bin,
+            organization_name = EXCLUDED.organization_name,
+
+            paid = EXCLUDED.paid,
+            document_author_name = EXCLUDED.document_author_name,
+            responsible = EXCLUDED.responsible,
+            operation_type = EXCLUDED.operation_type,
+            currency_name = EXCLUDED.currency_name,
+            document_sum = EXCLUDED.document_sum,
+
+            cash_flow_item = EXCLUDED.cash_flow_item,
+            bank_account = EXCLUDED.bank_account,
+            counterparty_account = EXCLUDED.counterparty_account,
+            organization_account = EXCLUDED.organization_account,
+            purpose_of_payment = EXCLUDED.purpose_of_payment,
+
+            incoming_doc_date = EXCLUDED.incoming_doc_date,
+            incoming_doc_number = EXCLUDED.incoming_doc_number,
+
+            advance = EXCLUDED.advance,
+            target_entity = EXCLUDED.target_entity,
+            action_required = EXCLUDED.action_required,
+            is_executed = EXCLUDED.is_executed,
+            ft_idzft = EXCLUDED.ft_idzft,
+
+            counterparty_id = EXCLUDED.counterparty_id,
+            counterparty_bin = EXCLUDED.counterparty_bin,
+            counterparty_name = EXCLUDED.counterparty_name,
+
+            deleted = EXCLUDED.deleted,
+            updated_at = NOW()
+          `,
+          [
+            documentId,
+            oneCText(doc.document_number),
+            oneCText(doc.document_date),
+            oneCBoolean(doc.document_posted),
+
+            oneCText(doc.bank_intermediary),
+            oneCText(doc.bank_intermediary_account),
+            oneCText(doc.tax_type),
+            oneCText(doc.payment_type),
+            oneCBoolean(doc.include_bank_commission),
+
+            oneCText(doc.value_date),
+            oneCText(doc.statement_date),
+            oneCText(doc.date_receipt_goods),
+
+            oneCText(doc.code_bk),
+            oneCText(doc.code_purpose_of_payment),
+            oneCText(doc.document_commentary),
+
+            oneCText(doc.rnn_payer),
+            oneCText(doc.rnn_recipient),
+            oneCText(doc.text_payer),
+            oneCText(doc.text_recipient),
+
+            oneCNumber(doc.percent_commission),
+            oneCNumber(doc.amount_commission),
+            oneCText(doc.fact_payer),
+
+            oneCText(doc.organization_bin),
+            oneCText(doc.organization_name),
+
+            oneCBoolean(doc.paid),
+            oneCText(doc.document_author_name),
+            oneCText(doc.responsible),
+            oneCText(doc.operation_type),
+            oneCText(doc.currency_name),
+            oneCNumber(doc.document_sum),
+
+            oneCText(doc.cash_flow_item),
+            oneCText(doc.bank_account),
+            oneCText(doc.counterparty_account),
+            oneCText(doc.organization_account),
+            oneCText(doc.purpose_of_payment),
+
+            oneCText(doc.incoming_doc_date),
+            oneCText(doc.incoming_doc_number),
+
+            oneCText(doc.advance),
+            oneCText(doc.target_entity),
+            oneCText(doc.action_required),
+            oneCBoolean(doc.is_executed),
+            oneCText(doc.ft_idzft),
+
+            oneCText(doc.counterparty_id),
+            oneCText(doc.counterparty_bin),
+            oneCText(doc.counterparty_name),
+
+            oneCBoolean(doc.deleted)
+          ]
+        );
+
+        const counts = {};
+
+        for (const [jsonName, config] of Object.entries(OUTGOING_PAYMENT_PARTS)) {
+          counts[`${jsonName}_count`] = await replaceOutgoingPaymentPart(
+            client,
+            documentId,
+            doc[jsonName],
+            config
+          );
+        }
+
+        results.push({
+          document_id: documentId,
+          operation,
+          ...counts
+        });
+      }
+
+      await client.query("COMMIT");
+
+      return res.json({
+        success: true,
+        count: results.length,
+        results
+      });
+
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {}
+
+      console.error("DOC-OUTGOINGPAYMENTORDER ERROR:", error);
+
+      return res.status(500).json({
+        success: false,
+        error: "DOC_OUTGOINGPAYMENTORDER_ERROR",
+        message: error.message
+      });
+
+    } finally {
+      client.release();
+    }
+  }
+);
+
+
+app.post(["/api/doc_debt_adjustment", "/api/1c/doc_debt_adjustment"], async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const data = req.body || {};
+    const rows = Array.isArray(data.debt_amounts) ? data.debt_amounts : [];
+
+    if (!data.document_id) {
+      return res.status(400).json({
+        success: false,
+        error: "document_id required"
+      });
+    }
+
+    await client.query("BEGIN");
+
+    await client.query(`
+      INSERT INTO onec.doc_debt_adjustment (
+        document_id,
+        document_number,
+        document_date,
+        document_posted,
+        currency_name,
+        counterparty_id,
+        counterparty_bin,
+        counterparty_name,
+        document_commentary,
+        counterparty_id_debitor,
+        counterparty_bin_debitor,
+        counterparty_name_debitor,
+        counterparty_id_creditor,
+        counterparty_bin_creditor,
+        counterparty_name_creditor,
+        multiplicity,
+        rate_of_document,
+        organization_bin,
+        organization_name,
+        responsible,
+        consider_kpn,
+        management_act,
+        deleted,
+        updated_at
+      )
+      VALUES (
+        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+        $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+        $21,$22,$23,NOW()
+      )
+      ON CONFLICT (document_id)
+      DO UPDATE SET
+        document_number = EXCLUDED.document_number,
+        document_date = EXCLUDED.document_date,
+        document_posted = EXCLUDED.document_posted,
+        currency_name = EXCLUDED.currency_name,
+        counterparty_id = EXCLUDED.counterparty_id,
+        counterparty_bin = EXCLUDED.counterparty_bin,
+        counterparty_name = EXCLUDED.counterparty_name,
+        document_commentary = EXCLUDED.document_commentary,
+        counterparty_id_debitor = EXCLUDED.counterparty_id_debitor,
+        counterparty_bin_debitor = EXCLUDED.counterparty_bin_debitor,
+        counterparty_name_debitor = EXCLUDED.counterparty_name_debitor,
+        counterparty_id_creditor = EXCLUDED.counterparty_id_creditor,
+        counterparty_bin_creditor = EXCLUDED.counterparty_bin_creditor,
+        counterparty_name_creditor = EXCLUDED.counterparty_name_creditor,
+        multiplicity = EXCLUDED.multiplicity,
+        rate_of_document = EXCLUDED.rate_of_document,
+        organization_bin = EXCLUDED.organization_bin,
+        organization_name = EXCLUDED.organization_name,
+        responsible = EXCLUDED.responsible,
+        consider_kpn = EXCLUDED.consider_kpn,
+        management_act = EXCLUDED.management_act,
+        deleted = EXCLUDED.deleted,
+        updated_at = NOW()
+    `, [
+      data.document_id,
+      data.document_number || null,
+      data.document_date || null,
+      data.document_posted ?? null,
+      data.currency_name || null,
+      data.counterparty_id || null,
+      data.counterparty_bin || null,
+      data.counterparty_name || null,
+      data.document_commentary || null,
+      data.counterparty_id_debitor || null,
+      data.counterparty_bin_debitor || null,
+      data.counterparty_name_debitor || null,
+      data.counterparty_id_creditor || null,
+      data.counterparty_bin_creditor || null,
+      data.counterparty_name_creditor || null,
+      data.multiplicity ?? null,
+      data.rate_of_document ?? null,
+      data.organization_bin || null,
+      data.organization_name || null,
+      data.responsible || null,
+      data.consider_kpn ?? null,
+      data.management_act ?? null,
+      data.deleted ?? false
+    ]);
+
+    await client.query(`
+      DELETE FROM onec.doc_debt_adjustment_debt_amounts
+      WHERE document_id = $1
+    `, [data.document_id]);
+
+    let lineNo = 0;
+
+    for (const r of rows) {
+      lineNo++;
+
+      await client.query(`
+        INSERT INTO onec.doc_debt_adjustment_debt_amounts (
+          document_id,
+          line_no,
+          contract_id,
+          contract_name,
+          deal,
+          sum,
+          settlement_amount,
+          settlement_rate,
+          frequency_settlements,
+          type_of_debt,
+          sum_of_nu,
+          project_id,
+          project_name,
+          updated_at
+        )
+        VALUES (
+          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW()
+        )
+      `, [
+        data.document_id,
+        lineNo,
+        r.contract_id || null,
+        r.contract_name || null,
+        r.deal || null,
+        r.sum ?? null,
+        r.settlement_amount ?? null,
+        r.settlement_rate ?? null,
+        r.frequency_settlements ?? null,
+        r.type_of_debt || null,
+        r.sum_of_nu ?? null,
+        r.project_id || null,
+        r.project_name || null
+      ]);
+    }
+
+    await client.query("COMMIT");
+
+    res.json({
+      success: true,
+      document_id: data.document_id,
+      debt_amounts_count: rows.length
+    });
+
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("DOC_DEBT_ADJUSTMENT ERROR:", e);
+    res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  } finally {
+    client.release();
+  }
+});
+
+// =====================================================
+// ЛЗК API — POSTGRESQL
+// Google Sheets в этих маршрутах не используется.
+// =====================================================
+
+function lzkText(v) {
+  return v === null || v === undefined ? "" : String(v).trim();
+}
+
+function lzkNum(v) {
+  if (v === null || v === undefined || lzkText(v) === "") return null;
+  const n = Number(String(v).replace(/\s/g, "").replace(",", "."));
+  return Number.isFinite(n) ? n : null;
+}
+
+function lzkYes(v) {
+  const s = lzkText(v).toLowerCase();
+  return s === "да" || s === "true" || s === "1";
+}
+
+function lzkDate(v) {
+  const s = lzkText(v);
+  if (!s) return null;
+
+  const direct = new Date(s);
+  if (!Number.isNaN(direct.getTime())) return direct;
+
+  const m = s.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/);
+  if (!m) return null;
+
+  return new Date(
+    Number(m[3]),
+    Number(m[2]) - 1,
+    Number(m[1]),
+    Number(m[4] || 0),
+    Number(m[5] || 0),
+    Number(m[6] || 0)
+  );
+}
+
+function lzkRoleCanSeeAll(role) {
+  const r = lzkText(role).toLowerCase();
+  return [
+    "admin", "админ", "администратор",
+    "editor", "редактор",
+    "pto", "пто",
+    "supervisor", "супервайзер",
+    "operator", "оператор",
+    "supplier", "снабженец"
+  ].includes(r);
+}
+
+async function nextLzkTextId(client, tableName, columnName, prefix) {
+  await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [
+    "lzk:" + tableName + ":" + columnName
+  ]);
+
+  const sql = `
+    SELECT COALESCE(
+      MAX(NULLIF(regexp_replace(${columnName}, '\\D', '', 'g'), '')::bigint),
+      0
+    ) + 1 AS next_no
+    FROM ${tableName}
+  `;
+
+  const result = await client.query(sql);
+  return prefix + String(result.rows[0].next_no);
+}
+
+app.get("/lzk/materials", async (req, res) => {
+  try {
+    const q = await pool.query(`
+      SELECT DISTINCT material_name AS value
+      FROM lzk.limits
+      WHERE COALESCE(trim(material_name), '') <> ''
+      ORDER BY material_name
+    `);
+
+    res.json({
+      success: true,
+      rows: q.rows.map(r => r.value)
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.get("/lzk/limits", async (req, res) => {
+  try {
+    const q = await pool.query(`
+      SELECT
+        l.idlzk,
+        l.object_name AS object,
+        l.constructive_name AS constructive,
+        l.group_name,
+        l.material_name AS tmc_name,
+        l.unit_name AS unit,
+        COALESCE(l.plan_qty, 0) AS plan,
+        COALESCE(l.price_without_vat, 0) AS column_l,
+        COALESCE(l.amount, 0) AS amount_sum,
+        COALESCE(l.fact_received, 0) AS fact_received,
+
+        COALESCE(
+          SUM(
+            CASE
+              WHEN lower(trim(COALESCE(r.pto_status, '')))
+                   IN ('согласован', 'согласовано')
+              THEN COALESCE(r.fact_qty, 0)
+              ELSE 0
+            END
+          ),
+          0
+        ) AS fact_approved,
+
+        COALESCE(
+          SUM(
+            CASE
+              WHEN lower(trim(COALESCE(r.pto_status, '')))
+                   NOT IN ('согласован', 'согласовано', 'отклонено')
+              THEN COALESCE(r.fact_qty, 0)
+              ELSE 0
+            END
+          ),
+          0
+        ) AS fact_not_approved
+
+      FROM lzk.limits l
+
+      LEFT JOIN lzk.requests r
+        ON r.idlzk = l.idlzk
+
+      GROUP BY
+        l.idlzk,
+        l.object_name,
+        l.constructive_name,
+        l.group_name,
+        l.material_name,
+        l.unit_name,
+        l.plan_qty,
+        l.price_without_vat,
+        l.amount,
+        l.fact_received
+
+      ORDER BY
+        regexp_replace(l.idlzk, '\\D', '', 'g')::bigint ASC
+    `);
+
+    const rows = q.rows.map(row => {
+      const plan = Number(row.plan || 0);
+      const approvedWithoutLzk = Number(row.fact_received || 0);
+      const approved = Number(row.fact_approved || 0);
+      const pending = Number(row.fact_not_approved || 0);
+
+      return {
+        ...row,
+        difference: plan - approvedWithoutLzk - approved,
+        difference2: plan - approvedWithoutLzk - approved - pending
+      };
+    });
+
+    res.json({
+      success: true,
+      rows
+    });
+
+  } catch (e) {
+    console.error("LZK LIMITS ERROR:", e);
+
+    res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
+
+app.post('/lzk/limit-update', async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const body = req.body || {};
+    const idlzk = lzkText(body.idlzk);
+    const objectName = lzkText(body.object_name);
+    const constructiveName = lzkText(body.constructive_name);
+    const groupName = lzkText(body.group_name);
+    const materialName = lzkText(body.material_name);
+    const unitName = lzkText(body.unit_name);
+    const login = lzkText(body.login).toLowerCase();
+    const planQty = lzkNum(body.plan_qty);
+    const priceWithoutVat = lzkNum(body.price_without_vat);
+    const factReceived = lzkNum(body.fact_received ?? 0);
+
+    if (!idlzk) throw new Error('IDLZK не передан');
+    if (!objectName) throw new Error('Объект не заполнен');
+    if (!constructiveName) throw new Error('Конструктив не заполнен');
+    if (!groupName) throw new Error('Группа не заполнена');
+    if (!materialName) throw new Error('ТМЦ по факту не заполнено');
+    if (!unitName) throw new Error('Ед.изм. не заполнена');
+    if (!login) throw new Error('Логин пользователя не передан');
+    if (planQty === null || planQty < 0) throw new Error('Кол-во по плану заполнено неправильно');
+    if (priceWithoutVat === null || priceWithoutVat < 0) throw new Error('Цена без НДС заполнена неправильно');
+    if (factReceived === null || factReceived < 0) throw new Error('Одобрено без ЛЗК заполнено неправильно');
+
+    const userResult = await client.query(`
+      SELECT role_lzk
+      FROM public.users
+      WHERE lower(trim(login)) = $1
+      LIMIT 1
+    `, [login]);
+
+    if (!userResult.rows.length) {
+      throw new Error('Пользователь не найден: ' + login);
+    }
+
+    const roleLzk = lzkText(userResult.rows[0].role_lzk).toLowerCase();
+    const canEdit = [
+      'editor', 'редактор',
+      'admin', 'админ', 'администратор'
+    ].includes(roleLzk);
+
+    if (!canEdit) {
+      return res.status(403).json({
+        success: false,
+        error: 'Редактирование лимитов доступно только Редактору/Админу'
+      });
+    }
+
+    await client.query('BEGIN');
+
+    const limitResult = await client.query(`
+      SELECT idlzk
+      FROM lzk.limits
+      WHERE idlzk = $1
+      FOR UPDATE
+    `, [idlzk]);
+
+    if (!limitResult.rows.length) {
+      throw new Error('IDLZK не найден: ' + idlzk);
+    }
+
+    async function findByName(table, idCol, nameCol, name) {
+      const q = await client.query(
+        `SELECT ${idCol} AS id, ${nameCol} AS name
+           FROM ${table}
+          WHERE lower(trim(${nameCol})) = lower(trim($1))
+          ORDER BY ${idCol}
+          LIMIT 1`,
+        [name]
+      );
+      return q.rows[0] || null;
+    }
+
+    let objectRow = await findByName('lzk.spr_objects', 'object_id', 'object_name', objectName);
+    if (!objectRow) {
+      const q = await client.query(`
+        SELECT COALESCE(MAX(NULLIF(regexp_replace(object_id::text, '\\D', '', 'g'), '')::bigint), 100000000) + 1 AS next_id
+        FROM lzk.spr_objects
+      `);
+      const objectId = String(q.rows[0].next_id);
+      await client.query(
+        `INSERT INTO lzk.spr_objects (object_id, object_name) VALUES ($1, $2)`,
+        [objectId, objectName]
+      );
+      objectRow = { id: objectId, name: objectName };
+    }
+
+    let constructiveRow = await findByName('lzk.spr_constructive', 'constructive_id', 'constructive_name', constructiveName);
+    if (!constructiveRow) {
+      const id = await nextLzkTextId(client, 'lzk.spr_constructive', 'constructive_id', 'kt');
+      await client.query(
+        `INSERT INTO lzk.spr_constructive (constructive_id, constructive_name) VALUES ($1, $2)`,
+        [id, constructiveName]
+      );
+      constructiveRow = { id, name: constructiveName };
+    }
+
+    let groupRow = await findByName('lzk.spr_material_groups', 'group_id', 'group_name', groupName);
+    if (!groupRow) {
+      const id = await nextLzkTextId(client, 'lzk.spr_material_groups', 'group_id', 'gr');
+      await client.query(
+        `INSERT INTO lzk.spr_material_groups (group_id, group_name) VALUES ($1, $2)`,
+        [id, groupName]
+      );
+      groupRow = { id, name: groupName };
+    }
+
+    let unitRow = await findByName('lzk.spr_units', 'unit_id', 'unit_name', unitName);
+    if (!unitRow) {
+      const id = await nextLzkTextId(client, 'lzk.spr_units', 'unit_id', 'ed');
+      await client.query(
+        `INSERT INTO lzk.spr_units (unit_id, unit_name) VALUES ($1, $2)`,
+        [id, unitName]
+      );
+      unitRow = { id, name: unitName };
+    }
+
+    let materialRow = await findByName('lzk.spr_materials', 'material_id', 'material_name', materialName);
+    if (!materialRow) {
+      const id = await nextLzkTextId(client, 'lzk.spr_materials', 'material_id', 'NTMC');
+      await client.query(
+        `INSERT INTO lzk.spr_materials (material_id, material_name, unit_id)
+         VALUES ($1, $2, $3)`,
+        [id, materialName, unitRow.id]
+      );
+      materialRow = { id, name: materialName };
+    } else {
+      // Если у существующей ТМЦ поменяли единицу измерения — обновляем справочник.
+      await client.query(`
+        UPDATE lzk.spr_materials
+        SET unit_id = $2
+        WHERE material_id = $1
+      `, [materialRow.id, unitRow.id]);
+    }
+
+    const amount = Number((planQty * priceWithoutVat).toFixed(2));
+
+    const updated = await client.query(`
+      UPDATE lzk.limits
+      SET
+        object_id = $2,
+        object_name = $3,
+        constructive_id = $4,
+        constructive_name = $5,
+        group_id = $6,
+        group_name = $7,
+        material_id = $8,
+        material_name = $9,
+        unit_id = $10,
+        unit_name = $11,
+        plan_qty = $12,
+        price_without_vat = $13,
+        amount = $14,
+        fact_received = $15
+      WHERE idlzk = $1
+      RETURNING *
+    `, [
+      idlzk,
+      objectRow.id,
+      objectName,
+      constructiveRow.id,
+      constructiveName,
+      groupRow.id,
+      groupName,
+      materialRow.id,
+      materialName,
+      unitRow.id,
+      unitName,
+      planQty,
+      priceWithoutVat,
+      amount,
+      factReceived
+    ]);
+
+    await client.query('COMMIT');
+
+    return res.json({
+      success: true,
+      idlzk,
+      amount,
+      row: updated.rows[0]
+    });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('LZK LIMIT UPDATE ERROR:', e);
+    return res.status(500).json({ success: false, error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/lzk/requests", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const body = req.body || {};
+    const idlzk = lzkText(body.idlzk);
+    const initiator = lzkText(body.initiator || body.login);
+    const qty = lzkNum(body.qty ?? body.fact_qty);
+
+    if (!idlzk) throw new Error("IDLZK не передан");
+    if (!initiator) throw new Error("Инициатор не передан");
+    if (qty === null) throw new Error("Кол-во не заполнено");
+
+    await client.query("BEGIN");
+
+    const limitResult = await client.query(`
+      SELECT *
+      FROM lzk.limits
+      WHERE idlzk = $1
+      LIMIT 1
+    `, [idlzk]);
+
+    if (!limitResult.rows.length) {
+      throw new Error("IDLZK не найден в lzk.limits: " + idlzk);
+    }
+
+    const limit = limitResult.rows[0];
+    const idzlzk = await nextLzkTextId(
+      client,
+      "lzk.requests",
+      "idzlzk",
+      "ZLZK"
+    );
+
+    await client.query(`
+      INSERT INTO lzk.requests (
+        idzlzk,
+        idlzk,
+        initiator,
+        request_date,
+        object_name,
+        constructive_name,
+        group_name,
+        material_name,
+        unit,
+        fact_qty,
+        pto_status,
+        note,
+        deadline,
+        documents_url,
+        created_at,
+        updated_at
+      )
+      VALUES (
+        $1,$2,$3,COALESCE($4,NOW()),$5,$6,$7,$8,$9,$10,
+        'На рассмотрении',$11,$12,$13,NOW(),NOW()
+      )
+    `, [
+      idzlzk,
+      idlzk,
+      initiator,
+      lzkDate(body.request_date),
+      lzkText(body.object) || limit.object_name,
+      lzkText(body.constructive) || limit.constructive_name,
+      lzkText(body.group_name) || limit.group_name,
+      lzkText(body.tmc_name) || limit.material_name,
+      lzkText(body.unit) || limit.unit_name,
+      qty,
+      lzkText(body.note),
+      lzkDate(body.deadline),
+      lzkText(body.documents_url || body.pdf)
+    ]);
+
+    await client.query("COMMIT");
+
+    res.json({
+      success: true,
+      id: idzlzk,
+      idzlzk
+    });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    res.status(500).json({ success: false, error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+async function getLzkRequestRows(req, res, approvedOnly) {
+  try {
+    const idlzk = lzkText(req.query.idlzk);
+    const login = lzkText(req.query.login).toLowerCase();
+    const role = lzkText(req.query.role);
+    const canSeeAll = lzkRoleCanSeeAll(role);
+
+    const params = [idlzk];
+    let accessSql = "";
+
+    if (!canSeeAll && login) {
+      params.push(login);
+      accessSql = `AND lower(trim(r.initiator)) = $${params.length}`;
+    }
+
+    const statusSql = approvedOnly
+      ? `lower(trim(COALESCE(r.pto_status, ''))) IN ('согласован', 'согласовано')`
+      : `lower(trim(COALESCE(r.pto_status, ''))) NOT IN ('согласован', 'согласовано', 'отклонено')`;
+
+    const q = await pool.query(`
+      SELECT
+        r.idzlzk AS id,
+        r.idzlzk,
+        r.idlzk,
+        r.initiator,
+        to_char(r.request_date, 'DD.MM.YYYY HH24:MI') AS request_date,
+        to_char(r.request_date, 'YYYY-MM-DD\"T\"HH24:MI') AS request_date_input,
+        r.object_name AS object,
+        r.constructive_name AS constructive,
+        r.group_name,
+        r.material_name AS tmc_name,
+        r.unit,
+        COALESCE(l.plan_qty, 0) AS plan,
+        COALESCE(r.fact_qty, 0) AS qty,
+        r.note,
+        to_char(r.deadline, 'YYYY-MM-DD') AS deadline,
+        r.documents_url AS pdf,
+        r.pto_status AS pto
+      FROM lzk.requests r
+      LEFT JOIN lzk.limits l
+        ON l.idlzk = r.idlzk
+      WHERE r.idlzk = $1
+        AND ${statusSql}
+        ${accessSql}
+      ORDER BY r.request_date, r.idzlzk
+    `, params);
+
+    const total = q.rows.reduce(
+      (sum, row) => sum + Number(row.qty || 0),
+      0
+    );
+
+    res.json({
+      success: true,
+      rows: q.rows,
+      total
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+}
+
+app.get("/lzk/requests/pending", (req, res) => {
+  return getLzkRequestRows(req, res, false);
+});
+
+app.get("/lzk/requests/approved", (req, res) => {
+  return getLzkRequestRows(req, res, true);
+});
+
+app.post("/lzk/requests/qty", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+    if (!rows.length) throw new Error("Строки не переданы");
+
+    await client.query("BEGIN");
+
+    let updated = 0;
+
+    for (const row of rows) {
+      const id = lzkText(row.idzlzk || row.id);
+      const qty = lzkNum(row.qty);
+
+      if (!id || qty === null) continue;
+
+      const q = await client.query(`
+        UPDATE lzk.requests
+        SET
+          fact_qty = $2,
+          updated_at = NOW()
+        WHERE idzlzk = $1
+          AND lower(trim(COALESCE(pto_status, ''))) NOT IN
+              ('согласован', 'согласовано', 'отклонено')
+      `, [id, qty]);
+
+      updated += q.rowCount;
+    }
+
+    await client.query("COMMIT");
+    res.json({ success: true, updated });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    res.status(500).json({ success: false, error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/lzk/requests/editor-update", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+    await client.query("BEGIN");
+
+    let updated = 0;
+
+    for (const row of rows) {
+      const id = lzkText(row.idzlzk || row.id);
+      if (!id) continue;
+
+      const q = await client.query(`
+        UPDATE lzk.requests
+        SET
+          fact_qty = COALESCE($2, fact_qty),
+          initiator = COALESCE(NULLIF($3, ''), initiator),
+          request_date = COALESCE($4, request_date),
+          object_name = COALESCE(NULLIF($5, ''), object_name),
+          constructive_name = COALESCE(NULLIF($6, ''), constructive_name),
+          group_name = COALESCE(NULLIF($7, ''), group_name),
+          material_name = COALESCE(NULLIF($8, ''), material_name),
+          unit = COALESCE(NULLIF($9, ''), unit),
+          note = $10,
+          deadline = $11,
+          documents_url = $12,
+          updated_at = NOW()
+        WHERE idzlzk = $1
+          AND lower(trim(COALESCE(pto_status, ''))) NOT IN
+              ('согласован', 'согласовано', 'отклонено')
+      `, [
+        id,
+        lzkNum(row.qty),
+        lzkText(row.initiator),
+        lzkDate(row.request_date),
+        lzkText(row.object),
+        lzkText(row.constructive),
+        lzkText(row.group_name),
+        lzkText(row.tmc_name),
+        lzkText(row.unit),
+        lzkText(row.note),
+        lzkDate(row.deadline),
+        lzkText(row.pdf)
+      ]);
+
+      updated += q.rowCount;
+    }
+
+    await client.query("COMMIT");
+    res.json({ success: true, updated });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    res.status(500).json({ success: false, error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/lzk/requests/status", async (req, res) => {
+  const ids = Array.isArray(req.body?.ids)
+    ? req.body.ids.map(lzkText).filter(Boolean)
+    : [];
+
+  const status = lzkText(req.body?.status);
+
+  if (!ids.length) {
+    return res.status(400).json({
+      success: false,
+      error: "Не выбраны строки"
+    });
+  }
+
+  if (!["Согласован", "Отклонено"].includes(status)) {
+    return res.status(400).json({
+      success: false,
+      error: "Неверный статус"
+    });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const updated = await client.query(`
+      UPDATE lzk.requests
+      SET
+        pto_status = $2,
+        pto_date = NOW(),
+        updated_at = NOW()
+      WHERE idzlzk = ANY($1::text[])
+      RETURNING idzlzk
+    `, [ids, status]);
+
+    if (status === "Согласован") {
+      await client.query(`
+        INSERT INTO lzk.supply (
+          idzlzk,
+          idplxk,
+          component,
+          recipe,
+          payment_status,
+          documents_status,
+          created_at,
+          updated_at
+        )
+        SELECT
+          r.idzlzk,
+          'PLXK' || nextval('lzk.plxk_seq')::text,
+          c.material_name,
+          c.coefficient::text,
+          ''::text,
+          ''::text,
+          NOW(),
+          NOW()
+        FROM lzk.requests r
+        JOIN lzk.components c
+          ON lower(trim(c.object_name)) = lower(trim(r.object_name))
+         AND lower(trim(c.recipe_name)) = lower(trim(r.material_name))
+         AND (
+           COALESCE(trim(to_jsonb(c)->>'group_name'), '') = ''
+           OR lower(trim(to_jsonb(c)->>'group_name')) =
+              lower(trim(r.group_name))
+         )
+        WHERE r.idzlzk = ANY($1::text[])
+          AND NOT EXISTS (
+            SELECT 1
+            FROM lzk.supply s
+            WHERE s.idzlzk = r.idzlzk
+              AND lower(trim(COALESCE(s.component, ''))) =
+                  lower(trim(COALESCE(c.material_name, '')))
+              AND COALESCE(s.recipe, '') =
+                  COALESCE(c.coefficient::text, '')
+          )
+      `, [ids]);
+    }
+
+    await client.query("COMMIT");
+
+    res.json({
+      success: true,
+      updated: updated.rowCount
+    });
+  } catch (e) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {}
+
+    console.error("LZK STATUS ERROR:", e);
+
+    res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/lzk/supply", async (req, res) => {
+  try {
+    const q = await pool.query(`
+      WITH approved AS (
+        SELECT
+          r.idzlzk,
+          r.idlzk,
+          r.initiator,
+          r.request_date,
+          r.object_name,
+          r.constructive_name,
+          r.group_name,
+          r.material_name,
+          r.unit,
+          r.fact_qty,
+          r.note,
+          r.deadline,
+          r.documents_url,
+          r.pto_status,
+          r.pto_date
+        FROM lzk.requests r
+        WHERE lower(trim(COALESCE(r.pto_status, '')))
+              IN ('согласован', 'согласовано')
+      ),
+
+      base_rows AS (
+        SELECT
+          a.idzlzk AS id,
+          a.idzlzk,
+          a.idlzk,
+          ''::text AS idplxk,
+          'base'::text AS row_type,
+          a.initiator,
+          to_char(a.request_date, 'DD.MM.YYYY HH24:MI') AS request_date,
+          a.object_name AS object,
+          a.constructive_name AS constructive,
+          a.group_name,
+          a.material_name AS tmc_name,
+          a.unit,
+          COALESCE(a.fact_qty, 0) AS qty,
+          a.note,
+          to_char(a.deadline, 'YYYY-MM-DD') AS deadline,
+          a.documents_url AS pdf,
+          a.pto_status AS pto,
+          a.pto_date AS approved_at,
+          ''::text AS component,
+          ''::text AS recipe,
+          s.attention,
+          s.responsible,
+          s.payment_status AS payment,
+          s.documents_status AS documents,
+          s.receive_status AS receive_tmc,
+          COALESCE(s.received_qty, 0) AS done,
+          s.trust_qty,
+          s.trust_from AS trust_who,
+          s.trust_invoice,
+          s.trusted_person,
+          EXISTS (
+            SELECT 1
+            FROM lzk.supply sx
+            WHERE sx.idzlzk = a.idzlzk
+              AND COALESCE(trim(sx.idplxk), '') <> ''
+          ) AS is_component_source
+        FROM approved a
+        LEFT JOIN lzk.supply s
+          ON s.idzlzk = a.idzlzk
+         AND COALESCE(trim(s.idplxk), '') = ''
+
+        -- Если у заявки есть компоненты, исходная заявка после ПТО
+        -- не должна попадать в панель снабженца.
+        -- Она появится там только после заказа конкретного компонента.
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM lzk.supply component_source
+          WHERE component_source.idzlzk = a.idzlzk
+            AND COALESCE(trim(component_source.idplxk), '') <> ''
+        )
+      ),
+
+      component_rows AS (
+        SELECT
+          a.idzlzk || ':' || s.idplxk AS id,
+          a.idzlzk,
+          a.idlzk,
+          s.idplxk,
+          'component'::text AS row_type,
+          a.initiator,
+          to_char(a.request_date, 'DD.MM.YYYY HH24:MI') AS request_date,
+          a.object_name AS object,
+          a.constructive_name AS constructive,
+          a.material_name AS group_name,
+          s.component AS tmc_name,
+          a.unit,
+          COALESCE(s.ordered_qty, 0) AS qty,
+          a.note,
+          to_char(a.deadline, 'YYYY-MM-DD') AS deadline,
+          a.documents_url AS pdf,
+          a.pto_status AS pto,
+          a.pto_date AS approved_at,
+          s.component,
+          s.recipe,
+          s.attention,
+          s.responsible,
+          s.payment_status AS payment,
+          s.documents_status AS documents,
+          s.receive_status AS receive_tmc,
+          COALESCE(s.received_qty, 0) AS done,
+          s.trust_qty,
+          s.trust_from AS trust_who,
+          s.trust_invoice,
+          s.trusted_person,
+          true AS is_component_source
+        FROM approved a
+        JOIN lzk.supply s
+          ON s.idzlzk = a.idzlzk
+         AND COALESCE(trim(s.idplxk), '') <> ''
+         AND COALESCE(s.ordered_qty, 0) > 0
+      )
+
+      SELECT *
+      FROM (
+        SELECT * FROM base_rows
+        UNION ALL
+        SELECT * FROM component_rows
+      ) all_rows
+      ORDER BY
+        all_rows.approved_at ASC NULLS FIRST,
+        NULLIF(regexp_replace(all_rows.idzlzk, '\\D', '', 'g'), '')::bigint ASC,
+        CASE WHEN all_rows.row_type = 'base' THEN 0 ELSE 1 END,
+        NULLIF(regexp_replace(all_rows.idplxk, '\\D', '', 'g'), '')::bigint ASC NULLS FIRST
+    `);
+
+    res.json({
+      success: true,
+      role: lzkText(req.query.role),
+      rows: q.rows
+    });
+  } catch (e) {
+    console.error("LZK SUPPLY ERROR:", e);
+
+    res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
+
+app.post("/lzk/supply/save", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const body = req.body || {};
+
+    const idzlzk = lzkText(body.idzlzk || body.id);
+    const idplxk = lzkText(body.idplxk);
+    const receivedQty = lzkNum(body.received_qty ?? body.done ?? 0);
+
+    if (!idzlzk) {
+      return res.status(400).json({
+        success: false,
+        error: "IDZLZK не передан"
+      });
+    }
+
+    if (receivedQty === null || receivedQty < 0) {
+      return res.status(400).json({
+        success: false,
+        error: "Фактически принято(на склад) должно быть числом не меньше 0"
+      });
+    }
+
+    await client.query("BEGIN");
+
+    const q = await client.query(`
+      INSERT INTO lzk.supply (
+        idzlzk,
+        idplxk,
+        attention,
+        responsible,
+        payment_status,
+        documents_status,
+        receive_status,
+        received_qty,
+        trust_qty,
+        trust_from,
+        trust_invoice,
+        trusted_person,
+        created_at,
+        updated_at
+      )
+      VALUES (
+        $1,
+        COALESCE($2, ''),
+        $3,
+        $4,
+        $5,
+        $6,
+        $7,
+        $8,
+        $9,
+        $10,
+        $11,
+        $12,
+        NOW(),
+        NOW()
+      )
+      ON CONFLICT (idzlzk, idplxk)
+      DO UPDATE SET
+        attention = EXCLUDED.attention,
+        responsible = EXCLUDED.responsible,
+        payment_status = EXCLUDED.payment_status,
+        documents_status = EXCLUDED.documents_status,
+        receive_status = EXCLUDED.receive_status,
+        received_qty = EXCLUDED.received_qty,
+        trust_qty = EXCLUDED.trust_qty,
+        trust_from = EXCLUDED.trust_from,
+        trust_invoice = EXCLUDED.trust_invoice,
+        trusted_person = EXCLUDED.trusted_person,
+        updated_at = NOW()
+      RETURNING *
+    `, [
+      idzlzk,
+      idplxk || "",
+      body.attention || null,
+      body.responsible || null,
+      body.payment || null,
+      body.documents || null,
+      body.receive_tmc || null,
+      receivedQty,
+      body.trust_qty || null,
+      body.trust_who || null,
+      body.trust_invoice || null,
+      body.trusted_person || null
+    ]);
+    // ВАЖНО: lzk.limits.fact_received теперь используется как "Одобрено без ЛЗК".
+    // Панель снабженца больше не должна перезаписывать это ручное поле.
+
+    await client.query("COMMIT");
+
+    res.json({
+      success: true,
+      row: q.rows[0],
+      received_qty: receivedQty
+    });
+
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("LZK SUPPLY SAVE ERROR:", e);
+
+    res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/lzk/trust-requests", async (req, res) => {
+  try {
+    const q = await pool.query(`
+      SELECT
+        iddlzk,
+        idzlzk,
+        initiator,
+        object_name AS object,
+        to_char(request_date, 'DD.MM.YYYY HH24:MI') AS request_date,
+        constructive_name AS constructive,
+        group_name,
+        material_name AS tmc_name,
+        unit,
+        approved_qty AS qty,
+        applicant,
+        trusted_person AS mol,
+        supplier_name AS supplier_tmc,
+        receive_qty AS qty_receive,
+        invoice_pdf_url AS invoice_pdf,
+        to_char(submitted_at, 'DD.MM.YYYY HH24:MI') AS trust_request_datetime,
+        prepared_number,
+        to_char(prepared_date, 'DD.MM.YYYY HH24:MI') AS prepared_date,
+        deadline_days,
+        CASE WHEN received_status THEN 'Да' ELSE '' END AS received_status,
+        received_by AS received_name,
+        to_char(received_at, 'DD.MM.YYYY HH24:MI') AS received_date,
+        to_char(deadline_close_date, 'YYYY-MM-DD') AS deadline_close_date,
+        overdue_days,
+        closed_qty AS qty_closed,
+        CASE WHEN closed_status THEN 'Да' ELSE '' END AS closed_status,
+        to_char(closed_at, 'DD.MM.YYYY HH24:MI') AS closed_date
+      FROM lzk.trust_requests
+      ORDER BY submitted_at DESC NULLS LAST, iddlzk, idzlzk
+    `);
+
+    res.json({ success: true, rows: q.rows });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.post("/lzk/trust-requests/create", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const body = req.body || {};
+    const items = Array.isArray(body.items) ? body.items : [];
+
+    if (!items.length) throw new Error("Строки заявки не переданы");
+
+    await client.query("BEGIN");
+
+    const iddlzk = await nextLzkTextId(
+      client,
+      "lzk.trust_requests",
+      "iddlzk",
+      "DLZK"
+    );
+
+    for (const item of items) {
+      const idzlzk = lzkText(item.idzlzk || item.id);
+      if (!idzlzk) throw new Error("IDZLZK не передан");
+
+      await client.query(`
+        INSERT INTO lzk.trust_requests (
+          iddlzk,
+          idzlzk,
+          initiator,
+          object_name,
+          request_date,
+          constructive_name,
+          group_name,
+          material_name,
+          unit,
+          approved_qty,
+          applicant,
+          trusted_person,
+          supplier_name,
+          receive_qty,
+          invoice_pdf_url,
+          submitted_at,
+          created_at,
+          updated_at
+        )
+        VALUES (
+          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
+          COALESCE($16,NOW()),NOW(),NOW()
+        )
+      `, [
+        iddlzk,
+        idzlzk,
+        lzkText(item.initiator),
+        lzkText(item.object),
+        lzkDate(item.request_date),
+        lzkText(item.constructive),
+        lzkText(item.group_name),
+        lzkText(item.tmc_name),
+        lzkText(item.unit),
+        lzkNum(item.qty),
+        lzkText(body.applicant || body.login),
+        lzkText(item.mol),
+        lzkText(item.supplier_tmc),
+        lzkNum(item.qty_receive),
+        lzkText(item.invoice_pdf || body.invoice_pdf),
+        lzkDate(body.trust_request_datetime)
+      ]);
+    }
+
+    await client.query("COMMIT");
+    res.json({ success: true, iddlzk, created: items.length });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    res.status(500).json({ success: false, error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/lzk/trust-requests/manual", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const body = req.body || {};
+    const firstItem =
+      Array.isArray(body.items) && body.items.length
+        ? body.items[0]
+        : body;
+
+    await client.query("BEGIN");
+
+    const iddlzk = await nextLzkTextId(
+      client,
+      "lzk.trust_requests",
+      "iddlzk",
+      "DLZK"
+    );
+
+    await client.query(`
+      INSERT INTO lzk.trust_requests (
+        iddlzk,
+        idzlzk,
+        initiator,
+        object_name,
+        request_date,
+        constructive_name,
+        group_name,
+        material_name,
+        unit,
+        approved_qty,
+        applicant,
+        trusted_person,
+        supplier_name,
+        receive_qty,
+        invoice_pdf_url,
+        submitted_at,
+        created_at,
+        updated_at
+      )
+      VALUES (
+        $1,NULL,$2,$3,NULL,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,
+        COALESCE($14,NOW()),NOW(),NOW()
+      )
+    `, [
+      iddlzk,
+      lzkText(firstItem.initiator || body.initiator),
+      lzkText(firstItem.object || body.object),
+      lzkText(firstItem.constructive || body.constructive),
+      lzkText(firstItem.group_name || body.group_name),
+      lzkText(firstItem.tmc_name || body.tmc_name),
+      lzkText(firstItem.unit || body.unit),
+      lzkNum(firstItem.qty ?? body.qty),
+      lzkText(body.applicant || body.login),
+      lzkText(firstItem.mol || body.mol),
+      lzkText(firstItem.supplier_tmc || body.supplier_tmc),
+      lzkNum(firstItem.qty_receive ?? body.qty_receive),
+      lzkText(firstItem.invoice_pdf || body.invoice_pdf),
+      lzkDate(body.trust_request_datetime)
+    ]);
+
+    await client.query("COMMIT");
+    res.json({ success: true, iddlzk, created: 1 });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    res.status(500).json({ success: false, error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/lzk/trust-requests/update", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const iddlzk = lzkText(body.iddlzk);
+
+    if (!iddlzk) throw new Error("IDDlzk не передан");
+
+    const q = await pool.query(`
+      UPDATE lzk.trust_requests
+      SET
+        prepared_number = $2,
+        prepared_date = $3,
+        deadline_days = $4,
+        received_status = $5,
+        received_by = $6,
+        received_at = $7,
+        deadline_close_date = $8,
+        overdue_days = $9,
+        closed_qty = $10,
+        closed_status = $11,
+        closed_at = $12,
+        updated_at = NOW()
+      WHERE iddlzk = $1
+    `, [
+      iddlzk,
+      lzkText(body.prepared_number) || null,
+      lzkDate(body.prepared_date),
+      lzkNum(body.deadline_days),
+      lzkYes(body.received_status),
+      lzkText(body.received_name) || null,
+      lzkDate(body.received_date),
+      lzkDate(body.deadline_close_date),
+      lzkNum(body.overdue_days),
+      lzkNum(body.qty_closed),
+      lzkYes(body.closed_status),
+      lzkDate(body.closed_date)
+    ]);
+
+    res.json({ success: true, updated: q.rowCount });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.get("/lzk/trusted-persons", async (req, res) => {
+  try {
+    const q = await pool.query(`
+      SELECT DISTINCT trusted_person AS value
+      FROM lzk.trust_requests
+      WHERE COALESCE(trim(trusted_person), '') <> ''
+      ORDER BY trusted_person
+    `);
+
+    res.json({
+      success: true,
+      rows: q.rows.map(r => r.value)
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.get("/lzk/suppliers", async (req, res) => {
+  try {
+    const q = await pool.query(`
+      SELECT DISTINCT supplier_name AS value
+      FROM lzk.trust_requests
+      WHERE COALESCE(trim(supplier_name), '') <> ''
+      ORDER BY supplier_name
+    `);
+
+    res.json({
+      success: true,
+      rows: q.rows.map(r => r.value)
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.get("/lzk/trusted-persons", async (req, res) => {
+  try {
+    const q = await pool.query(`
+      SELECT trusted_person_name
+      FROM lzk.spr_trusted_person
+      WHERE COALESCE(trim(trusted_person_name), '') <> ''
+      ORDER BY trusted_person_name
+    `);
+
+    res.json({
+      success: true,
+      rows: q.rows
+    });
+  } catch (e) {
+    console.error("LZK TRUSTED PERSONS ERROR:", e);
+
+    res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
+
+
+
+// =====================================================
+// ЛЗК: компоненты в разделе «Лимиты»
+// =====================================================
+app.get("/lzk/components", async (req, res) => {
+  try {
+    const login = lzkText(req.query.login).toLowerCase();
+    const role = lzkText(req.query.role).toLowerCase();
+    const showAll = ["pto", "пто", "editor", "редактор", "admin", "админ", "администратор"].includes(role);
+    const q = await pool.query(`
+      SELECT
+        r.idzlzk,
+        s.idplxk,
+        r.initiator,
+        r.object_name AS object,
+        r.material_name AS source_tmc,
+        r.material_name AS group_name,
+        s.component AS tmc_name,
+        r.unit,
+        COALESCE(r.fact_qty, 0) * COALESCE(NULLIF(replace(s.recipe, ',', '.'), '')::numeric, 0) AS plan_qty,
+        COALESCE(s.ordered_qty, 0) AS ordered_qty,
+        GREATEST(
+          COALESCE(r.fact_qty, 0) * COALESCE(NULLIF(replace(s.recipe, ',', '.'), '')::numeric, 0)
+          - COALESCE(s.ordered_qty, 0),
+          0
+        ) AS remaining_qty
+      FROM lzk.requests r
+      JOIN lzk.supply s
+        ON s.idzlzk = r.idzlzk
+       AND COALESCE(trim(s.idplxk), '') <> ''
+      WHERE lower(trim(COALESCE(r.pto_status, ''))) IN ('согласован', 'согласовано')
+        AND ($1::boolean OR lower(trim(COALESCE(r.initiator, ''))) = $2)
+      ORDER BY
+        NULLIF(regexp_replace(r.idzlzk, '\\D', '', 'g'), '')::bigint DESC,
+        NULLIF(regexp_replace(s.idplxk, '\\D', '', 'g'), '')::bigint
+    `, [showAll, login]);
+    res.json({ success: true, rows: q.rows });
+  } catch (e) {
+    console.error("LZK COMPONENTS ERROR:", e);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.post("/lzk/components/order", async (req, res) => {
+  const body = req.body || {};
+  const items = Array.isArray(body.items) ? body.items : [];
+  if (!items.length) return res.status(400).json({ success:false, error:"Не выбраны компоненты" });
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    for (const item of items) {
+      const idzlzk = lzkText(item.idzlzk);
+      const idplxk = lzkText(item.idplxk);
+      const qty = Number(String(item.qty || 0).replace(',', '.'));
+      if (!idzlzk || !idplxk || !Number.isFinite(qty) || qty <= 0) throw new Error("Неверное количество компонента");
+      const check = await client.query(`
+        SELECT
+          COALESCE(r.fact_qty,0) * COALESCE(NULLIF(replace(s.recipe, ',', '.'), '')::numeric,0) AS plan_qty,
+          COALESCE(s.ordered_qty,0) AS ordered_qty
+        FROM lzk.requests r JOIN lzk.supply s ON s.idzlzk=r.idzlzk
+        WHERE r.idzlzk=$1 AND s.idplxk=$2
+        FOR UPDATE OF s
+      `,[idzlzk,idplxk]);
+      if (!check.rowCount) throw new Error(`Компонент ${idplxk} не найден`);
+      const plan=Number(check.rows[0].plan_qty||0), ordered=Number(check.rows[0].ordered_qty||0);
+      if (ordered + qty > plan + 0.000001) throw new Error(`Количество по ${idplxk} превышает остаток`);
+      await client.query(`UPDATE lzk.supply SET ordered_qty=COALESCE(ordered_qty,0)+$3, updated_at=NOW() WHERE idzlzk=$1 AND idplxk=$2`,[idzlzk,idplxk,qty]);
+    }
+    await client.query("COMMIT");
+    res.json({success:true,updated:items.length});
+  } catch(e) {
+    try{await client.query("ROLLBACK");}catch(_){}
+    console.error("LZK COMPONENT ORDER ERROR:",e);
+    res.status(500).json({success:false,error:e.message});
+  } finally { client.release(); }
+});
+
+
+
+// =====================================================
+// ALATAU CITY BANK BUSINESS API: САЛЬДО СЧЕТОВ
+// ENV: ALATAU_CLIENT_ID, ALATAU_CLIENT_SECRET
+// =====================================================
+const ALATAU_API_URL = String(
+  process.env.ALATAU_API_URL || "https://business.alataucitybank.kz/jbapi"
+).replace(/\/$/, "");
+
+let alatauTokenCache = {
+  accessToken: "",
+  companyId: "",
+  expiresAt: 0
+};
+
+function bankDate_(value) {
+  const text = String(value || "").trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : "";
+}
+
+function bankAmount_(money) {
+  const raw = money && typeof money === "object" ? money.amount : money;
+  if (raw === null || raw === undefined || raw === "") return null;
+  const n = Number(String(raw).replace(/\s/g, "").replace(",", "."));
+  return Number.isFinite(n) ? n : null;
+}
+
+function bankCurrency_(money) {
+  return String(money?.currency || "").trim() || null;
+}
+
+async function bankJsonRequest_(url, options = {}) {
+  const response = await fetch(url, options);
+  const text = await response.text();
+  let json = {};
+
+  try {
+    json = text ? JSON.parse(text) : {};
+  } catch (_) {
+    throw new Error(`Банк вернул не JSON. HTTP ${response.status}: ${text.slice(0, 300)}`);
+  }
+
+  if (!response.ok) {
+    const message =
+      json?.error?.description ||
+      json?.error?.message ||
+      json?.message ||
+      `HTTP ${response.status}`;
+    const error = new Error(message);
+    error.status = response.status;
+    error.bankResponse = json;
+    throw error;
+  }
+
+  return json;
+}
+
+async function getAlatauToken_() {
+  const now = Date.now();
+  if (
+    alatauTokenCache.accessToken &&
+    alatauTokenCache.companyId &&
+    now < alatauTokenCache.expiresAt - 60000
+  ) {
+    return alatauTokenCache;
+  }
+
+  const clientId = String(process.env.ALATAU_CLIENT_ID || "").trim();
+  const clientSecret = String(process.env.ALATAU_CLIENT_SECRET || "").trim();
+
+  if (!clientId || !clientSecret) {
+    const error = new Error("На Render не заполнены ALATAU_CLIENT_ID и ALATAU_CLIENT_SECRET");
+    error.status = 503;
+    throw error;
+  }
+
+  const json = await bankJsonRequest_(`${ALATAU_API_URL}/v1/oauth/token`, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ clientId, clientSecret })
+  });
+
+  if (!json.accessToken || !json.companyId) {
+    throw new Error("Банк не вернул accessToken или companyId");
+  }
+
+  alatauTokenCache = {
+    accessToken: String(json.accessToken),
+    companyId: String(json.companyId),
+    expiresAt: now + Number(json.expiresIn || 3600) * 1000
+  };
+
+  return alatauTokenCache;
+}
+
+async function alatauGet_(pathName, query = {}) {
+  let auth = await getAlatauToken_();
+  const url = new URL(`${ALATAU_API_URL}${pathName}`);
+  Object.entries(query).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== "") {
+      url.searchParams.set(key, String(value));
+    }
+  });
+
+  try {
+    return await bankJsonRequest_(url.toString(), {
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${auth.accessToken}`
+      }
+    });
+  } catch (error) {
+    if (error.status !== 401) throw error;
+
+    alatauTokenCache = { accessToken: "", companyId: "", expiresAt: 0 };
+    auth = await getAlatauToken_();
+
+    return bankJsonRequest_(url.toString(), {
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${auth.accessToken}`
+      }
+    });
+  }
+}
+
+function normalizeBankAccounts_(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (Array.isArray(payload?.accounts)) return payload.accounts;
+  if (payload?.iban) return [payload];
+  return [];
+}
+
+async function saveBankSaldo_(auth, account, saldo) {
+  const q = await pool.query(`
+    INSERT INTO public.account_saldo (
+      company_id, iban, account_type, account_status,
+      date_from, date_to, statement_date,
+      balance_in, balance_in_currency,
+      balance_out, balance_out_currency,
+      balance_in_lcy, balance_in_lcy_currency,
+      balance_out_lcy, balance_out_lcy_currency,
+      received_at, raw_json
+    ) VALUES (
+      $1,$2,$3,$4,$5,$6,$7,
+      $8,$9,$10,$11,$12,$13,$14,$15,
+      now(),$16::jsonb
+    )
+    ON CONFLICT (company_id, iban, date_from, date_to)
+    DO UPDATE SET
+      account_type = EXCLUDED.account_type,
+      account_status = EXCLUDED.account_status,
+      statement_date = EXCLUDED.statement_date,
+      balance_in = EXCLUDED.balance_in,
+      balance_in_currency = EXCLUDED.balance_in_currency,
+      balance_out = EXCLUDED.balance_out,
+      balance_out_currency = EXCLUDED.balance_out_currency,
+      balance_in_lcy = EXCLUDED.balance_in_lcy,
+      balance_in_lcy_currency = EXCLUDED.balance_in_lcy_currency,
+      balance_out_lcy = EXCLUDED.balance_out_lcy,
+      balance_out_lcy_currency = EXCLUDED.balance_out_lcy_currency,
+      received_at = now(),
+      raw_json = EXCLUDED.raw_json
+    RETURNING *
+  `, [
+    auth.companyId,
+    String(saldo.iban || account.iban || "").trim(),
+    String(account.accountType || "").trim() || null,
+    String(account.status || "").trim() || null,
+    saldo.dateFrom,
+    saldo.dateTo,
+    saldo.statementDate || null,
+    bankAmount_(saldo.balanceIn),
+    bankCurrency_(saldo.balanceIn),
+    bankAmount_(saldo.balanceOut),
+    bankCurrency_(saldo.balanceOut),
+    bankAmount_(saldo.balanceInLCY),
+    bankCurrency_(saldo.balanceInLCY),
+    bankAmount_(saldo.balanceOutLCY),
+    bankCurrency_(saldo.balanceOutLCY),
+    JSON.stringify(saldo)
+  ]);
+
+  return q.rows[0];
+}
+
+app.get("/bank/saldo", async (req, res) => {
+  try {
+    const dateFrom = bankDate_(req.query.dateFrom);
+    const dateTo = bankDate_(req.query.dateTo);
+
+    let q;
+
+    // Если даты переданы — показываем именно этот период
+    if (dateFrom && dateTo) {
+      q = await pool.query(`
+        SELECT
+          id, company_id, iban, account_type, account_status,
+          date_from, date_to, statement_date,
+          balance_in, balance_in_currency,
+          balance_out, balance_out_currency,
+          balance_in_lcy, balance_in_lcy_currency,
+          balance_out_lcy, balance_out_lcy_currency,
+          received_at
+        FROM public.account_saldo
+        WHERE date_from = $1::date
+          AND date_to = $2::date
+        ORDER BY iban
+      `, [dateFrom, dateTo]);
+
+      return res.json({
+        success: true,
+        dateFrom,
+        dateTo,
+        rows: q.rows
+      });
+    }
+
+    // Если даты не переданы — показываем последний сохраненный запрос
+    q = await pool.query(`
+      WITH last_period AS (
+        SELECT date_from, date_to
+        FROM public.account_saldo
+        ORDER BY received_at DESC
+        LIMIT 1
+      )
+      SELECT
+        s.id, s.company_id, s.iban, s.account_type, s.account_status,
+        s.date_from, s.date_to, s.statement_date,
+        s.balance_in, s.balance_in_currency,
+        s.balance_out, s.balance_out_currency,
+        s.balance_in_lcy, s.balance_in_lcy_currency,
+        s.balance_out_lcy, s.balance_out_lcy_currency,
+        s.received_at
+      FROM public.account_saldo s
+      JOIN last_period lp
+        ON lp.date_from = s.date_from
+       AND lp.date_to = s.date_to
+      ORDER BY s.iban
+    `);
+
+    res.json({
+      success: true,
+      dateFrom: q.rows[0]?.date_from || null,
+      dateTo: q.rows[0]?.date_to || null,
+      rows: q.rows
+    });
+  } catch (error) {
+    console.error("BANK SALDO LIST ERROR:", error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// =====================================================
+// ALATAU CITY BANK: дневной лимит синхронизации
+// 50 нажатий «Получить из банка» в сутки по времени Алматы
+// =====================================================
+const BANK_SALDO_DAILY_LIMIT = 50;
+
+async function ensureBankSaldoDailyLimitTable_() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.bank_saldo_daily_limit (
+      limit_date date PRIMARY KEY,
+      used_count integer NOT NULL DEFAULT 0,
+      updated_at timestamptz NOT NULL DEFAULT now(),
+      CHECK (used_count >= 0)
+    )
+  `);
+}
+
+async function getBankSaldoDailyLimitStatus_() {
+  await ensureBankSaldoDailyLimitTable_();
+
+  const q = await pool.query(`
+    SELECT COALESCE(
+      (
+        SELECT used_count
+        FROM public.bank_saldo_daily_limit
+        WHERE limit_date = (now() AT TIME ZONE 'Asia/Almaty')::date
+      ),
+      0
+    )::integer AS used
+  `);
+
+  const used = Number(q.rows[0]?.used || 0);
+
+  return {
+    success: true,
+    date: null,
+    used,
+    limit: BANK_SALDO_DAILY_LIMIT,
+    remaining: Math.max(0, BANK_SALDO_DAILY_LIMIT - used),
+    reached: used >= BANK_SALDO_DAILY_LIMIT
+  };
+}
+
+async function takeBankSaldoDailyLimit_() {
+  await ensureBankSaldoDailyLimitTable_();
+
+  const q = await pool.query(`
+    INSERT INTO public.bank_saldo_daily_limit
+      (limit_date, used_count, updated_at)
+    VALUES (
+      (now() AT TIME ZONE 'Asia/Almaty')::date,
+      1,
+      now()
+    )
+    ON CONFLICT (limit_date)
+    DO UPDATE SET
+      used_count = public.bank_saldo_daily_limit.used_count + 1,
+      updated_at = now()
+    WHERE public.bank_saldo_daily_limit.used_count < $1
+    RETURNING limit_date, used_count
+  `, [BANK_SALDO_DAILY_LIMIT]);
+
+  if (!q.rowCount) {
+    return {
+      allowed: false,
+      ...(await getBankSaldoDailyLimitStatus_())
+    };
+  }
+
+  const used = Number(q.rows[0].used_count || 0);
+
+  return {
+    allowed: true,
+    success: true,
+    date: q.rows[0].limit_date,
+    used,
+    limit: BANK_SALDO_DAILY_LIMIT,
+    remaining: Math.max(0, BANK_SALDO_DAILY_LIMIT - used),
+    reached: used >= BANK_SALDO_DAILY_LIMIT
+  };
+}
+
+app.get("/bank/saldo/limit", async (req, res) => {
+  try {
+    const status = await getBankSaldoDailyLimitStatus_();
+    res.json(status);
+  } catch (error) {
+    console.error("BANK SALDO LIMIT ERROR:", error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.post("/bank/saldo/sync", async (req, res) => {
+  try {
+    const dateFrom = bankDate_(req.body?.dateFrom);
+    const dateTo = bankDate_(req.body?.dateTo);
+
+    if (!dateFrom || !dateTo) {
+      return res.status(400).json({
+        success: false,
+        error: "dateFrom и dateTo обязательны в формате YYYY-MM-DD"
+      });
+    }
+
+    if (dateFrom > dateTo) {
+      return res.status(400).json({
+        success: false,
+        error: "Дата начала позже даты окончания"
+      });
+    }
+
+    const limitStatus = await takeBankSaldoDailyLimit_();
+
+    if (!limitStatus.allowed) {
+      return res.status(429).json({
+        success: false,
+        error: "Дневной лимит исчерпан: 50 запросов в день",
+        limitStatus
+      });
+    }
+
+    const auth = await getAlatauToken_();
+
+    const accountPayload = await alatauGet_(
+      `/v1/companies/${encodeURIComponent(auth.companyId)}/accounts`
+    );
+
+    const accounts = normalizeBankAccounts_(accountPayload)
+      .filter(a => String(a?.iban || "").trim())
+      .filter(a => !a.accountType || String(a.accountType).toUpperCase() === "ACCOUNT");
+
+    const result = [];
+
+    for (const account of accounts) {
+      const iban = String(account.iban).trim();
+
+      try {
+        const saldo = await alatauGet_(
+          `/v1/companies/${encodeURIComponent(auth.companyId)}/accounts/${encodeURIComponent(iban)}/saldo`,
+          { dateFrom, dateTo }
+        );
+
+        const saved = await saveBankSaldo_(auth, account, saldo);
+
+        result.push({
+          success: true,
+          iban,
+          row: saved
+        });
+
+      } catch (error) {
+        result.push({
+          success: false,
+          iban,
+          error: error.message,
+          bankResponse: error.bankResponse || null
+        });
+      }
+    }
+
+    const savedRows = result
+      .filter(x => x.success && x.row)
+      .map(x => x.row);
+
+    if (savedRows.length) {
+      // Оставляем только последний успешно полученный период.
+      // Все старые периоды удаляются.
+      await pool.query(`
+        DELETE FROM public.account_saldo
+        WHERE NOT (
+          date_from = $1::date
+          AND date_to = $2::date
+        )
+      `, [dateFrom, dateTo]);
+    }
+
+    res.json({
+      success: true,
+      dateFrom,
+      dateTo,
+      accountsFound: accounts.length,
+      saved: result.filter(x => x.success).length,
+      failed: result.filter(x => !x.success).length,
+      limitStatus,
+      rows: savedRows,
+      result
+    });
+
+  } catch (error) {
+    console.error("BANK SALDO SYNC ERROR:", error);
+
+    let limitStatus = null;
+
+    try {
+      limitStatus = await getBankSaldoDailyLimitStatus_();
+    } catch (_) {}
+
+    res.status(error.status || 500).json({
+      success: false,
+      error: error.message,
+      bankResponse: error.bankResponse || null,
+      limitStatus
+    });
+  }
+});
+
+
+
+// =====================================================
+// FORTE BANK BUSINESS API: ТЕКУЩИЙ БАЛАНС СЧЕТОВ
+// ENV:
+// FORTE_CLIENT_ID
+// FORTE_CLIENT_SECRET
+// FORTE_GRAVITEE_API_KEY
+// FORTE_API_URL=https://gravitee-api-gateway.forte.kz
+// FORTE_ACCOUNTS=KZ...,KZ...   (можно оставить пустым до добавления IBAN)
+// =====================================================
+const FORTE_API_URL = String(
+  process.env.FORTE_API_URL || "https://gravitee-api-gateway.forte.kz"
+).replace(/\/$/, "");
+
+let forteTokenCache = {
+  token: "",
+  expiresAt: 0
+};
+
+function forteConfiguredAccounts_() {
+  return String(process.env.FORTE_ACCOUNTS || "")
+    .split(/[;,\n]/)
+    .map(v => v.trim().replace(/\s+/g, "").toUpperCase())
+    .filter(Boolean);
+}
+
+async function forteJsonRequest_(url, options = {}) {
+  const response = await fetch(url, options);
+  const text = await response.text();
+  let json = {};
+
+  try {
+    json = text ? JSON.parse(text) : {};
+  } catch (_) {
+    const error = new Error(`Forte вернул не JSON. HTTP ${response.status}: ${text.slice(0, 300)}`);
+    error.status = response.status;
+    throw error;
+  }
+
+  if (!response.ok) {
+    const message = json?.message || json?.error?.message || json?.error || `HTTP ${response.status}`;
+    const error = new Error(typeof message === "string" ? message : JSON.stringify(message));
+    error.status = response.status;
+    error.bankResponse = json;
+    throw error;
+  }
+
+  return json;
+}
+
+async function getForteToken_(force = false) {
+  const now = Date.now();
+  if (!force && forteTokenCache.token && now < forteTokenCache.expiresAt - 30000) {
+    return forteTokenCache.token;
+  }
+
+  const clientIdRaw = String(process.env.FORTE_CLIENT_ID || "").trim();
+  const clientSecret = String(process.env.FORTE_CLIENT_SECRET || "").trim();
+  const apiKey = String(process.env.FORTE_GRAVITEE_API_KEY || "").trim();
+
+  if (!clientIdRaw || !clientSecret || !apiKey) {
+    const error = new Error("На Render не заполнены FORTE_CLIENT_ID, FORTE_CLIENT_SECRET и FORTE_GRAVITEE_API_KEY");
+    error.status = 503;
+    throw error;
+  }
+
+  const json = await forteJsonRequest_(`${FORTE_API_URL}/fincore/auth/login`, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      "x-gravitee-api-key": apiKey
+    },
+    // В Postman Forte clientId передается без кавычек.
+    // Поэтому цифровой id (например 623) отправляем как number.
+    body: JSON.stringify({
+      clientId: /^\d+$/.test(clientIdRaw) ? Number(clientIdRaw) : clientIdRaw,
+      clientSecret
+    })
+  });
+
+  // В разных версиях документации ответ может быть token
+  // либо token внутри data. Поддерживаем оба варианта.
+  const token = String(
+    json?.token ||
+    json?.accessToken ||
+    json?.data?.token ||
+    json?.data?.accessToken ||
+    ""
+  ).trim();
+
+  if (!token) {
+    const error = new Error("Forte Bank авторизация успешна, но token не найден в ответе");
+    error.bankResponse = json;
+    throw error;
+  }
+
+  // По документации Forte токен живет 10 минут.
+  forteTokenCache = {
+    token,
+    expiresAt: now + 10 * 60 * 1000
+  };
+
+  return token;
+}
+
+async function forteGet_(pathName, query = {}) {
+  const apiKey = String(process.env.FORTE_GRAVITEE_API_KEY || "").trim();
+  let token = await getForteToken_();
+  const url = new URL(`${FORTE_API_URL}${pathName}`);
+
+  Object.entries(query).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== "") {
+      url.searchParams.set(key, String(value));
+    }
+  });
+
+  const doRequest = currentToken => forteJsonRequest_(url.toString(), {
+    headers: {
+      Accept: "application/json",
+      Authorization: `Bearer ${currentToken}`,
+      "x-gravitee-api-key": apiKey
+    }
+  });
+
+  try {
+    return await doRequest(token);
+  } catch (error) {
+    if (error.status !== 401) throw error;
+    forteTokenCache = { token: "", expiresAt: 0 };
+    token = await getForteToken_(true);
+    return doRequest(token);
+  }
+}
+
+async function ensureForteBalanceTable_() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.forte_account_balance (
+      id bigserial PRIMARY KEY,
+      iban text NOT NULL,
+      balance numeric(20,2),
+      currency text DEFAULT 'KZT',
+      received_at timestamptz NOT NULL DEFAULT now(),
+      raw_json jsonb,
+      UNIQUE (iban)
+    )
+  `);
+}
+
+async function saveForteBalance_(payload, fallbackIban) {
+  await ensureForteBalanceTable_();
+
+  const iban = String(payload?.accountNumber || fallbackIban || "")
+    .trim().replace(/\s+/g, "").toUpperCase();
+  const balance = bankAmount_(payload?.balance);
+
+  const q = await pool.query(`
+    INSERT INTO public.forte_account_balance (iban, balance, currency, received_at, raw_json)
+    VALUES ($1,$2,'KZT',now(),$3::jsonb)
+    ON CONFLICT (iban)
+    DO UPDATE SET
+      balance = EXCLUDED.balance,
+      currency = EXCLUDED.currency,
+      received_at = now(),
+      raw_json = EXCLUDED.raw_json
+    RETURNING *
+  `, [iban, balance, JSON.stringify(payload || {})]);
+
+  return q.rows[0];
+}
+
+app.get("/forte/balance", async (req, res) => {
+  try {
+    await ensureForteBalanceTable_();
+    const q = await pool.query(`
+      SELECT id, iban, balance, currency, received_at
+      FROM public.forte_account_balance
+      ORDER BY iban
+    `);
+
+    res.json({ success: true, rows: q.rows });
+  } catch (error) {
+    console.error("FORTE BALANCE LIST ERROR:", error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post("/forte/balance/sync", async (req, res) => {
+  try {
+    const accounts = forteConfiguredAccounts_();
+
+    // Пока IBAN Forte не добавлены — это нормальное состояние.
+    if (!accounts.length) {
+      return res.json({
+        success: true,
+        configured: false,
+        accountsFound: 0,
+        saved: 0,
+        failed: 0,
+        rows: [],
+        message: "Счета Forte пока не добавлены"
+      });
+    }
+
+    const result = [];
+
+    for (const iban of accounts) {
+      try {
+        const payload = await forteGet_("/fincore/account-balance", { accountNumber: iban });
+        const row = await saveForteBalance_(payload, iban);
+        result.push({ success: true, iban, row });
+      } catch (error) {
+        result.push({
+          success: false,
+          iban,
+          error: error.message,
+          bankResponse: error.bankResponse || null
+        });
+      }
+    }
+
+    const rows = result.filter(x => x.success && x.row).map(x => x.row);
+    const failedRows = result.filter(x => !x.success);
+
+    // Раньше даже если ВСЕ счета Forte завершались ошибкой,
+    // endpoint возвращал success:true. Из-за этого интерфейс молча
+    // показывал только Alatau. Теперь реальная ошибка будет видна.
+    if (!rows.length && failedRows.length) {
+      return res.status(502).json({
+        success: false,
+        configured: true,
+        accountsFound: accounts.length,
+        saved: 0,
+        failed: failedRows.length,
+        error: failedRows[0]?.error || "Forte: не удалось получить баланс ни по одному счету",
+        firstBankResponse: failedRows[0]?.bankResponse || null,
+        result
+      });
+    }
+
+    res.json({
+      success: true,
+      configured: true,
+      accountsFound: accounts.length,
+      saved: rows.length,
+      failed: failedRows.length,
+      rows,
+      result
+    });
+  } catch (error) {
+    console.error("FORTE BALANCE SYNC ERROR:", error);
+    res.status(error.status || 500).json({
+      success: false,
+      error: error.message,
+      bankResponse: error.bankResponse || null
+    });
+  }
+});
+
+// =====================================================
+// ЛЗК — создание нового лимита из интерфейса
+// Вставить в server.js ПОСЛЕ функций lzkText/lzkNum/nextLzkTextId
+// и ДО app.listen(...)
+// =====================================================
+
+app.get("/lzk/limit-create/refs", async (req, res) => {
+  try {
+    const [objects, constructives, groups, materials, units] =
+      await Promise.all([
+        pool.query(`
+          SELECT object_id, object_name
+          FROM lzk.spr_objects
+          ORDER BY object_name
+        `),
+
+        pool.query(`
+          SELECT constructive_id, constructive_name
+          FROM lzk.spr_constructive
+          ORDER BY constructive_name
+        `),
+
+        pool.query(`
+          SELECT group_id, group_name
+          FROM lzk.spr_material_groups
+          ORDER BY group_name
+        `),
+
+        pool.query(`
+          SELECT
+            m.material_id,
+            m.material_name,
+            m.unit_id,
+            u.unit_name
+          FROM lzk.spr_materials m
+          LEFT JOIN lzk.spr_units u
+            ON u.unit_id = m.unit_id
+          ORDER BY m.material_name
+        `),
+
+        pool.query(`
+          SELECT unit_id, unit_name
+          FROM lzk.spr_units
+          ORDER BY unit_name
+        `)
+      ]);
+
+    return res.json({
+      success: true,
+      objects: objects.rows,
+      constructives: constructives.rows,
+      groups: groups.rows,
+      materials: materials.rows,
+      units: units.rows
+    });
+
+  } catch (e) {
+    console.error("LZK LIMIT CREATE REFS ERROR:", e);
+
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
+
+app.post('/lzk/limit-create', async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const body = req.body || {};
+    const objectName = lzkText(body.object_name);
+    const constructiveName = lzkText(body.constructive_name);
+    const groupName = lzkText(body.group_name);
+    const materialName = lzkText(body.material_name);
+    const unitName = lzkText(body.unit_name);
+    const login = lzkText(body.login).toLowerCase();
+    const priceWithoutVat = lzkNum(body.price_without_vat);
+
+    if (!objectName) throw new Error('Объект не заполнен');
+    if (!constructiveName) throw new Error('Конструктив не заполнен');
+    if (!groupName) throw new Error('Группа не заполнена');
+    if (!materialName) throw new Error('ТМЦ по факту не заполнено');
+    if (!unitName) throw new Error('Ед.изм. не заполнена');
+    if (!login) throw new Error('Логин пользователя не передан');
+    if (priceWithoutVat === null || priceWithoutVat < 0) throw new Error('Цена без НДС заполнена неправильно');
+
+    // Роль определяем на сервере из public.users, а не доверяем роли из браузера.
+    const userRoleResult = await client.query(`
+      SELECT role_lzk
+      FROM public.users
+      WHERE lower(trim(login)) = $1
+      LIMIT 1
+    `, [login]);
+
+    if (!userRoleResult.rows.length) {
+      throw new Error('Пользователь не найден: ' + login);
+    }
+
+    const roleLzk = lzkText(userRoleResult.rows[0].role_lzk).toLowerCase();
+    const isInitiator = roleLzk === 'initiator' || roleLzk === 'инициатор';
+
+    // Инициатор может создать строку лимита, но план ему всегда сохраняем как 0.
+    // Для остальных ролей сохраняем введенное значение.
+    const planQty = isInitiator ? 0 : lzkNum(body.plan_qty);
+
+    if (planQty === null || planQty < 0) {
+      throw new Error('Кол-во по плану заполнено неправильно');
+    }
+
+    await client.query('BEGIN');
+
+    // Защищает одновременную выдачу одинаковых ID.
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext('lzk_limit_create'))`);
+
+    async function findByName(table, idCol, nameCol, name) {
+      const q = await client.query(
+        `SELECT ${idCol} AS id, ${nameCol} AS name
+           FROM ${table}
+          WHERE lower(trim(${nameCol})) = lower(trim($1))
+          ORDER BY ${idCol}
+          LIMIT 1`,
+        [name]
+      );
+      return q.rows[0] || null;
+    }
+
+    let objectRow = await findByName('lzk.spr_objects', 'object_id', 'object_name', objectName);
+    if (!objectRow) {
+      const q = await client.query(`
+        SELECT COALESCE(MAX(NULLIF(regexp_replace(object_id::text, '\\D', '', 'g'), '')::bigint), 100000000) + 1 AS next_id
+        FROM lzk.spr_objects
+      `);
+      const objectId = String(q.rows[0].next_id);
+      await client.query(
+        `INSERT INTO lzk.spr_objects (object_id, object_name) VALUES ($1, $2)`,
+        [objectId, objectName]
+      );
+      objectRow = { id: objectId, name: objectName };
+    }
+
+    let constructiveRow = await findByName('lzk.spr_constructive', 'constructive_id', 'constructive_name', constructiveName);
+    if (!constructiveRow) {
+      const id = await nextLzkTextId(client, 'lzk.spr_constructive', 'constructive_id', 'kt');
+      await client.query(
+        `INSERT INTO lzk.spr_constructive (constructive_id, constructive_name) VALUES ($1, $2)`,
+        [id, constructiveName]
+      );
+      constructiveRow = { id, name: constructiveName };
+    }
+
+    let groupRow = await findByName('lzk.spr_material_groups', 'group_id', 'group_name', groupName);
+    if (!groupRow) {
+      const id = await nextLzkTextId(client, 'lzk.spr_material_groups', 'group_id', 'gr');
+      await client.query(
+        `INSERT INTO lzk.spr_material_groups (group_id, group_name) VALUES ($1, $2)`,
+        [id, groupName]
+      );
+      groupRow = { id, name: groupName };
+    }
+
+    let unitRow = await findByName('lzk.spr_units', 'unit_id', 'unit_name', unitName);
+    if (!unitRow) {
+      const id = await nextLzkTextId(client, 'lzk.spr_units', 'unit_id', 'ed');
+      await client.query(
+        `INSERT INTO lzk.spr_units (unit_id, unit_name) VALUES ($1, $2)`,
+        [id, unitName]
+      );
+      unitRow = { id, name: unitName };
+    }
+
+    let materialRow = await findByName('lzk.spr_materials', 'material_id', 'material_name', materialName);
+    if (!materialRow) {
+      const id = await nextLzkTextId(client, 'lzk.spr_materials', 'material_id', 'NTMC');
+      await client.query(
+        `INSERT INTO lzk.spr_materials (material_id, material_name, unit_id)
+         VALUES ($1, $2, $3)`,
+        [id, materialName, unitRow.id]
+      );
+      materialRow = { id, name: materialName };
+    }
+
+    const importNoResult = await client.query(`
+      SELECT COALESCE(MAX(import_no), 0) + 1 AS next_no
+      FROM lzk.limits_import
+    `);
+    const importNo = Number(importNoResult.rows[0].next_no);
+
+    await client.query(`
+      INSERT INTO lzk.limits_import (
+        import_no,
+        object_name,
+        constructive_name,
+        group_name,
+        material_name,
+        unit_name,
+        plan_qty_text,
+        price_text
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+    `, [
+      importNo,
+      objectName,
+      constructiveName,
+      groupName,
+      materialName,
+      unitName,
+      String(planQty),
+      String(priceWithoutVat)
+    ]);
+
+    const idlzk = await nextLzkTextId(client, 'lzk.limits', 'idlzk', 'LZK');
+    const amount = Number((planQty * priceWithoutVat).toFixed(2));
+
+    await client.query(`
+      INSERT INTO lzk.limits (
+        idlzk,
+        object_id,
+        object_name,
+        constructive_id,
+        constructive_name,
+        group_id,
+        group_name,
+        material_id,
+        material_name,
+        unit_id,
+        unit_name,
+        plan_qty,
+        price_without_vat,
+        amount
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+    `, [
+      idlzk,
+      objectRow.id,
+      objectName,
+      constructiveRow.id,
+      constructiveName,
+      groupRow.id,
+      groupName,
+      materialRow.id,
+      materialName,
+      unitRow.id,
+      unitName,
+      planQty,
+      priceWithoutVat,
+      amount
+    ]);
+
+    await client.query('COMMIT');
+
+    res.json({
+      success: true,
+      idlzk,
+      import_no: importNo,
+      object_id: objectRow.id,
+      constructive_id: constructiveRow.id,
+      group_id: groupRow.id,
+      material_id: materialRow.id,
+      unit_id: unitRow.id,
+      amount
+    });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('LZK LIMIT CREATE ERROR:', e);
+    res.status(500).json({ success: false, error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+
+
+// =====================================================
+// ДО ФТ — экономное распознавание счетов через OpenAI
+// 1) Имя файла разбирается здесь, на backend, бесплатно.
+// 2) В OpenAI НЕ отправляется справочник контрагентов/объектов/ДДС.
+// 3) OpenAI только читает документ и возвращает короткий JSON.
+// 4) Контрагент сопоставляется со справочником здесь, бесплатно.
+// Render env: OPENAI_API_KEY
+// Опционально: OPENAI_MODEL (по умолчанию gpt-5-nano)
+// Опционально: OPENAI_IMAGE_DETAIL=low|high|auto (по умолчанию low)
+// =====================================================
+function doFtExtractOutputText_(json) {
+  if (!json) return "";
+  if (typeof json.output_text === "string" && json.output_text.trim()) return json.output_text.trim();
+  const out = Array.isArray(json.output) ? json.output : [];
+  for (const item of out) {
+    const content = Array.isArray(item && item.content) ? item.content : [];
+    for (const part of content) {
+      if (part && typeof part.text === "string" && part.text.trim()) return part.text.trim();
+    }
+  }
+  return "";
+}
+
+function doFtNorm_(v) {
+  return String(v || "")
+    .toLowerCase()
+    .replace(/[«»„“”"'`]/g, " ")
+    .replace(/поставщик/giu, " ")
+    .replace(/товарищество\s+с\s+ограниченной\s+ответственностью/giu, " ")
+    .replace(/индивидуальн(?:ый|ого)\s+предпринимател(?:ь|я)/giu, " ")
+    .replace(/(?:^|[^a-zа-яё0-9])(тоо|too|llp|ао|ao|ип|ip)(?=$|[^a-zа-яё0-9])/giu, " ")
+    .replace(/бин\s*\/?\s*иин/giu, " ")
+    .replace(/(?:бин|иин)/giu, " ")
+    .replace(/\d{12}/g, " ")
+    .replace(/[^a-zа-яё0-9]+/giu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+function doFtUniqueStrings_(arr) {
+  const seen = new Set();
+  const out = [];
+  for (const x of Array.isArray(arr) ? arr : []) {
+    const s = String(x || "").trim();
+    if (!s) continue;
+    const k = s.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(s);
+  }
+  return out;
+}
+
+function doFtParseFilenameBackend_(fileName, legalRows, objects, dds) {
+  const base = String(fileName || "")
+    .replace(/\.(pdf|png|jpe?g|webp)$/i, "")
+    .trim();
+
+  const p = base.split("-").map(x => String(x || "").trim());
+
+  function leadingDigits(v) {
+    const m = String(v || "").match(/^\s*(\d+)/);
+    return m ? m[1] : "";
+  }
+
+  // ВАЖНО:
+  // ЮрЛицо из имени файла НЕ определяем — оно приходит только из «Покупатель» в PDF.
+  //
+  // Формат имени файла:
+  // p[0] = Объект
+  // p[1] = Статья ДДС
+  // p[2] = Механизация (1 = Да, если сегмента нет — пусто)
+  //
+  // Примеры:
+  // 5-136.pdf   -> Объект 5, ДДС 136, Механизация пусто
+  // 5-136-1.pdf -> Объект 5, ДДС 136, Механизация Да
+  const objectCode = leadingDigits(p[0]);
+  const ddsCode    = leadingDigits(p[1]);
+  const mechCode   = leadingDigits(p[2]);
+
+  let object = "";
+  if (objectCode) {
+    const n = String(Number(objectCode));
+    object = (Array.isArray(objects) ? objects : []).find(v => {
+      const m = String(v || "").trim().match(/^(\d+)/);
+      return m && String(Number(m[1])) === n;
+    }) || "";
+  }
+
+  let ddsArticle = "";
+  if (ddsCode) {
+    const n = String(Number(ddsCode));
+    ddsArticle = (Array.isArray(dds) ? dds : []).find(v => {
+      const m = String(v || "").trim().match(/^(\d+)\s*\./);
+      return m && String(Number(m[1])) === n;
+    }) || "";
+  }
+
+  return {
+    // Заполняется ниже ТОЛЬКО из Покупателя внутри PDF.
+    legal_entity: "",
+    mechanization: mechCode === "1" ? "Да" : "",
+    object_code: objectCode,
+    object: object,
+    dds_code: ddsCode,
+    dds_article: ddsArticle
+  };
+}
+
+function doFtLegalMatchKey_(v) {
+  // GPT/скан иногда смешивает визуально одинаковые латинские и кириллические буквы:
+  // "CEpBИC HC" и "СЕрВИС НС". Приводим их к одному виду для сравнения.
+  const visualMap = {
+    a:"а", b:"в", c:"с", e:"е", h:"н", k:"к", m:"м",
+    o:"о", p:"р", t:"т", x:"х", y:"у"
+  };
+
+  const fixed = String(v || "")
+    .toLowerCase()
+    .replace(/[abcehkmoptxy]/g, ch => visualMap[ch] || ch);
+
+  return doFtNorm_(fixed);
+}
+
+function doFtMatchLegalEntityBackend_(buyerRaw, legalRows) {
+  const raw = String(buyerRaw || "")
+    .replace(/\u00A0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!raw) return "";
+
+  // Канонические значения из листа + резерв из интерфейса.
+  // Резерв нужен, чтобы ЮрЛицо не стало пустым, если в листе временно
+  // отсутствует код/строка или справочник загрузился не полностью.
+  const fallbackNames = [
+    "Сервис НС",
+    "СК Жилой дом",
+    "Sapa asphalt",
+    "Smart Estate"
+  ];
+
+  const names = [];
+  for (const x of (Array.isArray(legalRows) ? legalRows : [])) {
+    const name = String(x?.name || "").trim();
+    if (name && !names.some(v => v.toLowerCase() === name.toLowerCase())) {
+      names.push(name);
+    }
+  }
+  for (const name of fallbackNames) {
+    if (!names.some(v => v.toLowerCase() === name.toLowerCase())) {
+      names.push(name);
+    }
+  }
+
+  const canonical = wanted => {
+    const wantedKey = doFtLegalMatchKey_(wanted);
+    const found = names.find(name => doFtLegalMatchKey_(name) === wantedKey);
+    return found || wanted;
+  };
+
+  // БИН НЕ используем для определения ЮрЛицо.
+  // В разных документах БИН может отличаться, поэтому определяем ЮрЛицо
+  // только по названию Покупателя внутри PDF.
+  const rawKey = doFtLegalMatchKey_(raw);
+  if (!rawKey) return "";
+
+  const prepared = names
+    .map(name => ({ name, key: doFtLegalMatchKey_(name) }))
+    .filter(x => x.key);
+
+  // 1. Точное совпадение.
+  let found = prepared.find(x => x.key === rawKey);
+  if (found) return found.name;
+
+  // 2. Покупатель часто содержит БИН, адрес и телефон.
+  // Ищем название компании внутри всей строки Покупателя.
+  const candidates = prepared
+    .filter(x => rawKey.includes(x.key) || x.key.includes(rawKey))
+    .sort((a, b) => b.key.length - a.key.length);
+
+  if (candidates.length) return candidates[0].name;
+
+  // 3. Дополнительный резерв для смешения латиницы/кириллицы и OCR:
+  // сравниваем значимые слова названия, а не БИН.
+  const rawTokens = new Set(rawKey.split(/\s+/).filter(x => x.length >= 2));
+
+  const tokenMatches = prepared
+    .map(x => ({
+      ...x,
+      tokens: x.key.split(/\s+/).filter(t => t.length >= 2)
+    }))
+    .map(x => ({
+      ...x,
+      hits: x.tokens.filter(t => rawTokens.has(t)).length
+    }))
+    .filter(x => x.tokens.length && x.hits === x.tokens.length)
+    .sort((a, b) => b.tokens.length - a.tokens.length || b.key.length - a.key.length);
+
+  return tokenMatches.length ? tokenMatches[0].name : "";
+}
+function doFtMatchContractorBackend_(rawName, contractors) {
+  const source = doFtUniqueStrings_(contractors);
+  const raw = String(rawName || "").replace(/\s+/g, " ").trim();
+
+  if (!raw) return { contractor:"", matched:false, method:"empty" };
+
+  const bankWords = [
+    "банк центркредит", "bank centercredit", "fortebank", "forte bank",
+    "halyk bank", "народный банк", "kaspi bank", "bereke bank",
+    "евразийский банк", "altyn bank", "jusan bank"
+  ];
+  const rawBankKey = doFtNorm_(raw);
+  if (bankWords.some(x => rawBankKey.includes(doFtNorm_(x)))) {
+    return { contractor:"", matched:false, method:"bank_rejected" };
+  }
+
+  // Берём название из кавычек, если есть:
+  // Индивидуальный предприниматель "JSJ MART" -> JSJ MART
+  const quoted = raw.match(/[«"“”]([^«»"“”]+)[»"“”]/);
+  const core = quoted && quoted[1] ? quoted[1].trim() : raw;
+
+  const coreKey = doFtNorm_(core);
+  const rawKey = doFtNorm_(raw);
+
+  const prepared = source
+    .map(original => ({ original, key: doFtNorm_(original) }))
+    .filter(x => x.key);
+
+  let found = prepared.find(x => x.key === coreKey || x.key === rawKey);
+  if (found) return { contractor:found.original, matched:true, method:"exact_sheet" };
+
+  const candidates = prepared
+    .filter(x =>
+      (coreKey && (x.key.includes(coreKey) || coreKey.includes(x.key))) ||
+      (rawKey && (x.key.includes(rawKey) || rawKey.includes(x.key)))
+    )
+    .sort((a,b) => b.key.length - a.key.length);
+
+  if (candidates.length) {
+    return { contractor:candidates[0].original, matched:true, method:"contain_sheet" };
+  }
+
+  return { contractor:"", matched:false, method:"not_found" };
+}
+
+function doFtNormalizeContractNumberToken_(v) {
+  let raw = String(v || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[–—−]/g, "-")
+    .replace(/\s*([\/-])\s*/g, "$1");
+
+  if (!raw) return "";
+
+  // OpenAI/OCR иногда читает знак № как N / No и возвращает, например:
+  // "n-01-08/sc-39/2026". Для СОПОСТАВЛЕНИЯ убираем только этот служебный
+  // префикс. Финальное значение всё равно берём дословно из листа «Договоры».
+  raw = raw.replace(/^(?:№|n|no)[.\s:_-]*(?=\d)/iu, "");
+
+  // Для сравнения 01 == 1 и 08 == 8. Это только ключ поиска:
+  // отображаемое значение из листа не меняется и сохраняет ведущие нули/регистр.
+  return raw
+    .split(/([-/])/)
+    .map(part => {
+      if (part === "-" || part === "/") return part;
+      if (/^\d+$/.test(part)) return String(Number(part));
+      return part;
+    })
+    .join("");
+}
+
+function doFtExtractContractPartsBackend_(v) {
+  const text = String(v || "")
+    .replace(/\u00A0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  let number = "";
+
+  // Номер после № / No / Номер.
+  // Поддерживает:
+  // SNS26-MAT-P-20
+  // 160426/002
+  // 26-0001
+  // 020-08
+  let m = text.match(
+    /(?:№|no\.?|номер)\s*([A-Za-zА-Яа-я0-9]+(?:[-/][A-Za-zА-Яа-я0-9]+)*)/iu
+  );
+
+  if (!m) {
+    m = text.match(
+      /\b([A-Za-zА-Яа-я0-9]+(?:[-/][A-Za-zА-Яа-я0-9]+)+)\b/u
+    );
+  }
+
+  if (m && m[1]) {
+    number = doFtNormalizeContractNumberToken_(m[1]);
+  }
+
+  let date = "";
+  const dm = text.match(/(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{2,4})/u);
+
+  if (dm) {
+    let yyyy = String(dm[3]);
+
+    if (yyyy.length === 2) {
+      const yy = Number(yyyy);
+      yyyy = String(yy >= 70 ? 1900 + yy : 2000 + yy);
+    }
+
+    date =
+      String(dm[1]).padStart(2, "0") + "." +
+      String(dm[2]).padStart(2, "0") + "." +
+      yyyy;
+  }
+
+  return { number, date };
+}
+function doFtFormatContractFromPdf_(rawContract) {
+  // Это только fallback, если в листе «Договоры» ничего не найдено.
+  // Для отображения НЕ нормализуем номер: не убираем ведущие нули,
+  // не меняем регистр SC/sc и не превращаем № в N.
+  return String(rawContract || "")
+    .replace(/\u00A0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function doFtFindContractRowByRaw_(rawContract, contractRows, contractor) {
+  const raw = String(rawContract || "").trim();
+  const rows = Array.isArray(contractRows) ? contractRows : [];
+  if (!raw || !rows.length) return null;
+
+  const rawParts = doFtExtractContractPartsBackend_(raw);
+  if (!rawParts.number) return null;
+
+  const contractorKey = doFtNorm_(contractor || "");
+
+  // Сначала только зависимый список найденного контрагента.
+  let scoped = rows.filter(x => {
+    const c = String(x?.contractor || "").trim();
+    const no = String(x?.contract_no || "").trim();
+    if (!c || !no) return false;
+    if (contractorKey && doFtNorm_(c) !== contractorKey) return false;
+    return true;
+  });
+
+  // Главное правило — номер договора.
+  // Дата нужна только если у одного контрагента есть несколько строк
+  // с одинаковым номером договора.
+  let sameNumber = scoped.filter(x => {
+    const p = doFtExtractContractPartsBackend_(x.contract_no);
+    return p.number && p.number === rawParts.number;
+  });
+
+  if (sameNumber.length === 1) {
+    return sameNumber[0];
+  }
+
+  if (sameNumber.length > 1 && rawParts.date) {
+    const sameDate = sameNumber.filter(x => {
+      const p = doFtExtractContractPartsBackend_(x.contract_no);
+      return p.date && p.date === rawParts.date;
+    });
+
+    if (sameDate.length === 1) return sameDate[0];
+  }
+
+  // Если OCR слегка исказил номер (например № -> N), но контрагент уже найден
+  // и на эту дату у него есть ровно один договор — берём ТОЧНОЕ значение из листа.
+  // Это не подмена: дата пришла из текущего PDF, а финальный текст — из справочника.
+  if (!sameNumber.length && contractorKey && rawParts.date) {
+    const sameDateScoped = scoped.filter(x => {
+      const p = doFtExtractContractPartsBackend_(x.contract_no);
+      return p.date && p.date === rawParts.date;
+    });
+    if (sameDateScoped.length === 1) return sameDateScoped[0];
+  }
+
+  // Резерв: если GPT не определил контрагента, но по всему листу
+  // номер договора встречается ровно один раз — можно восстановить
+  // и договор, и контрагента из этой строки.
+  if (!contractorKey) {
+    sameNumber = rows.filter(x => {
+      const p = doFtExtractContractPartsBackend_(x?.contract_no);
+      return p.number && p.number === rawParts.number;
+    });
+
+    if (sameNumber.length === 1) return sameNumber[0];
+
+    if (sameNumber.length > 1 && rawParts.date) {
+      const sameDate = sameNumber.filter(x => {
+        const p = doFtExtractContractPartsBackend_(x?.contract_no);
+        return p.date && p.date === rawParts.date;
+      });
+      if (sameDate.length === 1) return sameDate[0];
+    }
+  }
+
+  return null;
+}
+function doFtExtractInvoiceNo_(v) {
+  const text = String(v || "")
+    .replace(/\u00A0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!text) return "";
+
+  // Примеры:
+  // "Счет на оплату № 00000001830" -> "00000001830"
+  // "Счет №937" -> "937"
+  // "Invoice No 123-45" -> "123-45"
+  let m = text.match(/(?:сч[её]т(?:\s+на\s+оплату)?|invoice)?\s*(?:№|no\.?|номер)\s*([A-Za-zА-Яа-я0-9][A-Za-zА-Яа-я0-9._\/-]*)/iu);
+
+  if (m && m[1]) {
+    return String(m[1]).trim();
+  }
+
+  // Если GPT уже вернул только номер — сохраняем как есть.
+  if (/^[A-Za-zА-Яа-я0-9][A-Za-zА-Яа-я0-9._\/-]*$/u.test(text)) {
+    return text;
+  }
+
+  // Последний резерв: длинный числовой/буквенно-цифровой токен.
+  m = text.match(/([A-Za-zА-Яа-я0-9][A-Za-zА-Яа-я0-9._\/-]{2,})/u);
+  return m && m[1] ? String(m[1]).trim() : "";
+}
+
+function doFtNormalizeInvoiceDateBackend_(v) {
+  const s = String(v || "")
+    .replace(/\u00A0/g, " ")
+    .replace(/,/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+
+  if (!s) return "";
+
+  const pad = n => String(Number(n)).padStart(2, "0");
+  const iso = (y, m, d) => {
+    y = Number(y); m = Number(m); d = Number(d);
+    if (!Number.isInteger(y) || !Number.isInteger(m) || !Number.isInteger(d)) return "";
+    if (y < 1900 || y > 2200 || m < 1 || m > 12 || d < 1 || d > 31) return "";
+    const dt = new Date(Date.UTC(y, m - 1, d));
+    if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== m - 1 || dt.getUTCDate() !== d) return "";
+    return `${String(y).padStart(4, "0")}-${pad(m)}-${pad(d)}`;
+  };
+
+  // Уже ISO / близкий к ISO формат.
+  let m = s.match(/(?:^|\D)(\d{4})[.\/-](\d{1,2})[.\/-](\d{1,2})(?:\D|$)/u);
+  if (m) return iso(m[1], m[2], m[3]);
+
+  // ДД.ММ.ГГГГ / ДД-ММ-ГГГГ / ДД/ММ/ГГГГ.
+  m = s.match(/(?:^|\D)(\d{1,2})[.\/-](\d{1,2})[.\/-](\d{2,4})(?:\D|$)/u);
+  if (m) {
+    let y = Number(m[3]);
+    if (y < 100) y += y >= 70 ? 1900 : 2000;
+    return iso(y, m[2], m[1]);
+  }
+
+  // Русская текстовая дата: "11 сентября 2026" -> "2026-09-11".
+  const months = {
+    "января":1,"январь":1,
+    "февраля":2,"февраль":2,
+    "марта":3,"март":3,
+    "апреля":4,"апрель":4,
+    "мая":5,"май":5,
+    "июня":6,"июнь":6,
+    "июля":7,"июль":7,
+    "августа":8,"август":8,
+    "сентября":9,"сентябрь":9,
+    "октября":10,"октябрь":10,
+    "ноября":11,"ноябрь":11,
+    "декабря":12,"декабрь":12
+  };
+  m = s.match(/(?:^|\s)(\d{1,2})\s+([а-яё]+)\s+(\d{4})(?:\s*г\.?|$)/iu);
+  if (m && months[m[2]]) return iso(m[3], months[m[2]], m[1]);
+
+  return "";
+}
+
+app.post("/do-ft/recognize", async (req, res) => {
+  try {
+    const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
+    if (!apiKey) {
+      return res.status(500).json({ success:false, error:"OPENAI_API_KEY_NOT_SET" });
+    }
+
+    const fileName = String(req.body?.file_name || "document").trim();
+    const mimeType = String(req.body?.mime_type || "application/pdf").trim().toLowerCase();
+    const base64 = String(req.body?.base64 || "").trim();
+    const contractors = doFtUniqueStrings_(req.body?.contractors);
+    const contractRows = Array.isArray(req.body?.contract_rows) ? req.body.contract_rows : [];
+    const filenameDicts = req.body?.filename_dicts || {};
+    const legalRows = Array.isArray(filenameDicts.legal) ? filenameDicts.legal : [];
+    const allowedLegalEntities = [
+      "Сервис НС",
+      "СК Жилой дом",
+      "Sapa asphalt",
+      "Smart Estate"
+    ];
+    const objects = doFtUniqueStrings_(filenameDicts.objects);
+    const dds = doFtUniqueStrings_(filenameDicts.dds);
+
+    if (!base64) return res.status(400).json({ success:false, error:"FILE_REQUIRED" });
+
+    const allowed = ["application/pdf", "image/png", "image/jpeg", "image/jpg", "image/webp"];
+    if (!allowed.includes(mimeType)) {
+      return res.status(400).json({ success:false, error:"UNSUPPORTED_FILE_TYPE", mime_type:mimeType });
+    }
+
+    // Из имени файла определяем только Объект / Статью ДДС / Механизацию.
+    // Формат: Объект-ДДС[-Механизация]. ЮрЛицо из имени файла полностью исключено.
+    const filenameInfo = doFtParseFilenameBackend_(fileName, legalRows, objects, dds);
+
+    // Короткий промпт: не передаем справочники в модель — это экономит входные токены.
+    const instruction = [
+      "Прочитай ТОЛЬКО содержимое PDF. Имя файла полностью игнорируй: оно может содержать служебные коды, номер счета, дату и любой произвольный текст.",
+      "Каждый запрос обрабатывай как НОВЫЙ независимый документ. Не переноси номер счета, дату, договор, сумму, поставщика или другие значения из предыдущего PDF.",
+      "Сначала определи is_invoice. is_invoice=true ТОЛЬКО если документ по смыслу является счетом/инвойсом на оплату. Слова 'Счет на оплату' могут отсутствовать.",
+      "is_invoice=false для договора, акта, накладной, доверенности, письма, банковских реквизитов, коммерческого предложения и любого другого документа, который не является счетом/инвойсом на оплату.",
+      "Если is_invoice=false, document_type кратко укажи тип документа, например 'Договор', 'Акт', 'Накладная', 'Не счет'.",
+      "contractor_raw: контрагент = именно ПОСТАВЩИК. В первую очередь найди строку 'Поставщик:' и верни название организации из этой строки.",
+      "Если в строке 'Поставщик:' написано, например, 'Товарищество с ограниченной ответственностью СтальЦинк' — contractor_raw должен быть 'СтальЦинк' или полное название поставщика.",
+      "Банк поставщика/бенефициара НЕ является контрагентом. Никогда не возвращай АО 'Банк ЦентрКредит', ForteBank, Halyk Bank и другие банки, если они указаны только как банк.",
+      "Только если отдельной строки 'Поставщик:' действительно нет — используй самого Бенефициара, но не его банк.",
+      "buyer_raw: ОБЯЗАТЕЛЬНО найди именно ПОКУПАТЕЛЯ внутри PDF. В первую очередь читай строку/блок 'Покупатель:'. Верни полное наименование покупателя вместе с юрформой. БИН, адрес и телефон можно оставить в buyer_raw.",
+      "legal_entity: по НАЗВАНИЮ Покупателя выбери РОВНО одно значение: 'Сервис НС', 'СК Жилой дом', 'Sapa asphalt', 'Smart Estate'. БИН для выбора ЮрЛицо НЕ используй. Если ни одно название не подходит — верни пустую строку.",
+      "buyer_raw и legal_entity НЕ бери из имени файла. Не путай Покупателя с Поставщиком, Бенефициаром, банком или получателем денег.",
+      "Если строка 'Покупатель:' визуально отделена от реквизитов переносом строки, всё равно свяжи реквизиты сразу после неё с Покупателем.",
+      "contract_no: ОБЯЗАТЕЛЬНО проверь строку 'Договор:' в счете. Если после неё указан договор — верни его номер И дату.",
+      "Если строка 'Договор:' заполнена, скопируй номер и дату именно из текущего PDF; не используй значения из инструкции или предыдущего документа.",
+      "contract_no также найди по смыслу, если рядом НЕТ точного слова 'Договор'.",
+      "Если это счет на оплату, но договор в документе НЕ указан, строка 'Договор:' пустая или номера договора нет — верни contract_no пустой строкой. Backend сам поставит финальное значение 'Без договора'.",
+      "Ищи варианты с маркерами 'Договор', 'Основание', 'No', '№', 'N', а также строки, где сразу указан номер вида букв/цифр с дефисами или слешами и рядом есть дата.",
+      "Верни ТОЛЬКО номер договора и дату из PDF, без описания услуги/товара.",
+      "Поддерживай номера с буквами, цифрами, дефисами и слешами: SNS26-MAT-P-20, 160426/002, 26-0001, 020-08.",
+      "Пример: 'No 160426/002 от 16.04.2026 Хостинг' -> contract_no='160426/002 от 16.04.2026г.'.",
+      "Пример: 'Договор поставки товара No 26-0001 от 09.01.2026г.' -> contract_no='26-0001 от 09.01.2026г.'.",
+      "Пример: 'Договор №020-08 техническое обслуживание и ремонта автомобилей от 20.08.25 г.' -> contract_no='020-08 от 20.08.25 г.'.",
+      "Пример: 'Договор SNS26-MAT-P-20 от 13.05.2026' -> contract_no='SNS26-MAT-P-20 от 13.05.2026г.'.",
+      "Если строка выглядит просто как 'SNS26-MAT-P-20 от 13.05.2026' без слова Договор — тоже верни 'SNS26-MAT-P-20 от 13.05.2026г.'.",
+      "invoice_no: найди именно ЗАГОЛОВОК ТЕКУЩЕГО счета. Обычно он выглядит как 'Счет на оплату № <номер> от <дата>'.",
+      "Скопируй invoice_no ТОЧНО из текущего PDF: только значение сразу после №/No и до слова 'от' или даты.",
+      "НИКОГДА не используй номер из примеров/инструкции и не переноси номер из другого документа.",
+      "Не добавляй к номеру год, дату или другие цифры. Если в PDF написано № 664 — invoice_no должен быть ровно '664'.",
+      "Не бери invoice_no из договора, таблицы товаров, кода товара, БИН, ИИК, КБе, суммы, цены или количества.",
+      "invoice_date: бери дату именно из заголовка ТЕКУЩЕГО счета и верни YYYY-MM-DD. Не используй дату договора.",
+      "sum_ft: бери ТОЛЬКО итоговую сумму к оплате из 'Итого', 'Всего', 'Всего к оплате', 'Total'. Не бери НДС, цену позиции или сумму одной строки.",
+      "pay_purpose: сформируй деловое Назначение платежа на русском языке по содержимому документа.",
+      "Сначала определи характер операции по документу/договору: поставка товаров, услуги, работы, аренда и т.п.",
+      "Если в документе написано 'Договор поставки' или счет содержит товары — начинай назначение со слова 'Поставка'.",
+      "После этого перечисли наименования материалов/товаров из таблицы. Одинаковые модели и размеры объединяй в общую группу.",
+      "Если разных групп немного (до 5) — перечисли все основные группы. Если позиций много или они однотипные — дай понятное общее название без потери смысла.",
+      "Пример для позиций 'Секция балки СБ-1', 'Секция балки СБ', 'Стойка дорожная СД-4', 'элемент световозвращающий ЭС': pay_purpose='Поставка секций балок, дорожных стоек и световозвращающих элементов'.",
+      "Не пиши 'и др.', 'позиции из таблицы', 'товары по счету', 'согласно счету'. Не добавляй номер счета, договор, количество, цену или сумму.",
+      "Для услуг используй формулировку 'Оплата услуг ...', для работ — 'Выполнение работ ...', для аренды — 'Аренда ...', если это прямо следует из документа.",
+      "Если поле реально невозможно прочитать — верни пустую строку. Не пиши 'Not specified clearly' и не придумывай значения."
+    ].join("\n");
+
+    const imageDetailRaw = String(process.env.OPENAI_IMAGE_DETAIL || "low").trim().toLowerCase();
+    const imageDetail = ["low","high","auto"].includes(imageDetailRaw) ? imageDetailRaw : "low";
+
+    const filePart = mimeType === "application/pdf"
+      ? { type:"input_file", filename:"document.pdf", file_data:`data:${mimeType};base64,${base64}` }
+      : { type:"input_image", image_url:`data:${mimeType};base64,${base64}`, detail:imageDetail };
+
+    const model = String(process.env.OPENAI_MODEL || "gpt-5-nano").trim();
+
+    const response = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model,
+        store:false,
+        reasoning:{ effort:"minimal" },
+        max_output_tokens:500,
+        input:[{
+          role:"user",
+          content:[
+            { type:"input_text", text:instruction },
+            filePart
+          ]
+        }],
+        text:{
+          format:{
+            type:"json_schema",
+            name:"do_ft_invoice",
+            strict:true,
+            schema:{
+              type:"object",
+              additionalProperties:false,
+              properties:{
+                status:{type:"string",enum:["ok","needs_clarification","error"]},
+                is_invoice:{type:"boolean"},
+                document_type:{type:"string"},
+                contractor_raw:{type:"string"},
+                buyer_raw:{type:"string"},
+                legal_entity:{
+                  type:"string",
+                  enum:["","Сервис НС","СК Жилой дом","Sapa asphalt","Smart Estate"]
+                },
+                pay_purpose:{type:"string"},
+                contract_no:{type:"string"},
+                invoice_no:{type:"string"},
+                invoice_date:{type:"string"},
+                sum_ft:{type:["number","null"]},
+                reason:{type:"string"}
+              },
+              required:["status","is_invoice","document_type","contractor_raw","buyer_raw","legal_entity","pay_purpose","contract_no","invoice_no","invoice_date","sum_ft","reason"]
+            }
+          }
+        }
+      })
+    });
+
+    const raw = await response.text();
+    let openai;
+    try { openai = JSON.parse(raw); } catch (_) { openai = null; }
+
+    if (!response.ok) {
+      console.error("OpenAI /do-ft/recognize error:", response.status, raw);
+      return res.status(502).json({
+        success:false,
+        error:"OPENAI_ERROR",
+        status:response.status,
+        message:openai?.error?.message || raw.slice(0,1000)
+      });
+    }
+
+    const outputText = doFtExtractOutputText_(openai);
+    let extracted;
+    try { extracted = JSON.parse(outputText); }
+    catch (_) {
+      return res.status(502).json({ success:false, error:"OPENAI_BAD_JSON", raw:outputText.slice(0,1000) });
+    }
+
+    // ЮрЛицо определяем ТОЛЬКО по Покупателю из PDF.
+    let buyerRaw = String(extracted.buyer_raw || "").trim();
+    let legalEntity = allowedLegalEntities.includes(String(extracted.legal_entity || "").trim())
+      ? String(extracted.legal_entity || "").trim()
+      : "";
+
+    if (!legalEntity) {
+      legalEntity = doFtMatchLegalEntityBackend_(buyerRaw, legalRows);
+    }
+
+    let extractedContractorRaw = String(extracted.contractor_raw || "").trim();
+    let extractedContract = String(extracted.contract_no || "").trim();
+    let extractedInvoiceNo = doFtExtractInvoiceNo_(extracted.invoice_no);
+    let extractedInvoiceDate = doFtNormalizeInvoiceDateBackend_(extracted.invoice_date);
+    let extractedPayPurpose = String(extracted.pay_purpose || "").trim();
+
+    // Поставщика, Покупателя, договор, счет и Назначение платежа
+    // проверяем отдельным focused-pass ВСЕГДА.
+    // Это нужно, чтобы пустую строку "Договор:" не перепутать
+    // с суммами/ценами/кодами из таблицы.
+    {
+      try {
+        const focusInstruction = [
+          "Посмотри на счет на оплату и извлеки Поставщика, Покупателя, Договор, номер/дату счета и сформируй Назначение платежа.",
+          "Работай только с текущим PDF. Не используй значения из предыдущих документов и не повторяй числа из инструкции.",
+          "СНАЧАЛА найди строку 'Поставщик:'. contractor_raw = название организации именно из этой строки.",
+          "Например: 'Поставщик: БИН ..., Товарищество с ограниченной ответственностью СтальЦинк, ...' -> contractor_raw='СтальЦинк'.",
+          "Не путай Поставщика с его банком. Строки 'Банк поставщика', 'Банк бенефициара', БИК, ИИК не являются контрагентом.",
+          "АО 'Банк ЦентрКредит', ForteBank, Halyk Bank и другие банки нельзя возвращать как contractor_raw, если они указаны только как банк.",
+          "Только если строки 'Поставщик:' нет — используй самого Бенефициара, но НЕ банк бенефициара.",
+          "Найди строку 'Покупатель:'. legal_entity выбери ТОЛЬКО по названию Покупателя, БИН игнорируй.",
+          "Допустимые legal_entity: Сервис НС; СК Жилой дом; Sapa asphalt; Smart Estate.",
+          "Если видишь ТОО/товарищество 'СЕрВИС НС' — legal_entity='Сервис НС'.",
+          "Найди именно строку/поле 'Договор:' или 'Основание:'.",
+          "Если после 'Договор:' указаны номер и/или дата договора — contract_present=true и contract_no верни как 'номер от ДД.ММ.ГГГГг.'.",
+          "Если договор заполнен, скопируй его номер и дату именно из текущего PDF; не используй значения из инструкции или предыдущего документа.",
+          "ВАЖНО: если поле 'Договор:' ПУСТОЕ — contract_present=false и contract_no=''.",
+          "При пустом поле Договор НЕ бери числа из таблицы товаров, цены, суммы, количество, коды товаров, номер счета, ИИК, БИН или телефон.",
+          "Найди ЗАГОЛОВОК именно ТЕКУЩЕГО счета. Номер счета — это значение сразу после №/No в заголовке 'Счет на оплату'.",
+          "Скопируй номер буквально из PDF. Если в текущем документе стоит № 664, верни invoice_no='664'.",
+          "Не копируй номера и даты из текста инструкции, другого PDF или предыдущего распознавания.",
+          "invoice_no верни без слова Счет, без №, без даты и без года.",
+          "invoice_date возьми из того же заголовка текущего счета, а не из строки Договор. Верни строго YYYY-MM-DD только цифрами, например 2026-09-11.",
+          "Теперь сформируй pay_purpose по типу договора/операции и строкам Наименование.",
+          "Если указано 'Договор поставки' или в таблице перечислены товары — pay_purpose обязательно начинай со слова 'Поставка'.",
+          "Объединяй одинаковые товары разных размеров/моделей в общие группы и убирай размеры, коды, количество и цену.",
+          "Если основных групп до 5 — перечисли их все. Если позиций много и они однотипные — используй понятное общее название.",
+          "Для этого типа таблицы: 'Секция балки СБ-1', 'Секция балки СБ-1820', 'Секция балки СБ', 'Стойка дорожная СД-4', 'элемент световозвращающий ЭС' -> pay_purpose='Поставка секций балок, дорожных стоек и световозвращающих элементов'.",
+          "Не используй формулировки 'и др.', 'позиции из таблицы', 'товары по счету', 'согласно счету'.",
+          "Если это услуги — 'Оплата услуг ...'; работы — 'Выполнение работ ...'; аренда — 'Аренда ...', только если это видно из документа.",
+          "Не придумывай значения. Не используй имя файла."
+        ].join("\n");
+
+        const focusResponse = await fetch("https://api.openai.com/v1/responses", {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${apiKey}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            model,
+            store:false,
+            reasoning:{ effort:"minimal" },
+            max_output_tokens:220,
+            input:[{
+              role:"user",
+              content:[
+                { type:"input_text", text:focusInstruction },
+                filePart
+              ]
+            }],
+            text:{
+              format:{
+                type:"json_schema",
+                name:"do_ft_buyer_contract_focus",
+                strict:true,
+                schema:{
+                  type:"object",
+                  additionalProperties:false,
+                  properties:{
+                    contractor_raw:{type:"string"},
+                    buyer_raw:{type:"string"},
+                    legal_entity:{
+                      type:"string",
+                      enum:["","Сервис НС","СК Жилой дом","Sapa asphalt","Smart Estate"]
+                    },
+                    contract_present:{type:"boolean"},
+                    contract_no:{type:"string"},
+                    invoice_no:{type:"string"},
+                    invoice_date:{type:"string"},
+                    pay_purpose:{type:"string"}
+                  },
+                  required:["contractor_raw","buyer_raw","legal_entity","contract_present","contract_no","invoice_no","invoice_date","pay_purpose"]
+                }
+              }
+            }
+          })
+        });
+
+        if (focusResponse.ok) {
+          const focusRaw = await focusResponse.text();
+          let focusOpenAi = null;
+          try { focusOpenAi = JSON.parse(focusRaw); } catch (_) {}
+
+          const focusText = doFtExtractOutputText_(focusOpenAi);
+          let focus = null;
+          try { focus = JSON.parse(focusText); } catch (_) {}
+
+          if (focus) {
+            const focusContractorRaw = String(focus.contractor_raw || "").trim();
+            const focusBuyer = String(focus.buyer_raw || "").trim();
+            const focusLegal = String(focus.legal_entity || "").trim();
+            const focusContract = String(focus.contract_no || "").trim();
+            const focusInvoiceNo = doFtExtractInvoiceNo_(focus.invoice_no);
+            const focusInvoiceDate = doFtNormalizeInvoiceDateBackend_(focus.invoice_date);
+            const focusPayPurpose = String(focus.pay_purpose || "").trim();
+
+            // Focused-pass является окончательной проверкой Поставщика.
+            // Это не дает банку поставщика попасть в поле Контрагент.
+            if (focusContractorRaw) {
+              extractedContractorRaw = focusContractorRaw;
+            }
+
+            if (!buyerRaw && focusBuyer) buyerRaw = focusBuyer;
+
+            if (!legalEntity && allowedLegalEntities.includes(focusLegal)) {
+              legalEntity = focusLegal;
+            }
+            if (!legalEntity && focusBuyer) {
+              legalEntity = doFtMatchLegalEntityBackend_(focusBuyer, legalRows);
+            }
+
+            // Focused-pass является окончательной проверкой договора.
+            // Если поле "Договор:" пустое, стираем ошибочно найденные
+            // в первом проходе суммы/числа — далее backend поставит "Без договора".
+            if (focus.contract_present === true && focusContract) {
+              extractedContract = focusContract;
+            } else if (focus.contract_present === false) {
+              extractedContract = "";
+            }
+
+            // Focused-pass является окончательной проверкой номера и даты счета.
+            // Берём только значение из заголовка "Счет на оплату № ...".
+            if (focusInvoiceNo) {
+              extractedInvoiceNo = focusInvoiceNo;
+            }
+            if (focusInvoiceDate) {
+              extractedInvoiceDate = focusInvoiceDate;
+            }
+
+            // Для Назначения платежа focused-pass имеет приоритет,
+            // потому что он специально анализирует тип операции и весь список товаров/услуг.
+            if (focusPayPurpose) {
+              extractedPayPurpose = focusPayPurpose;
+            }
+          }
+        } else {
+          console.error(
+            "OpenAI focused buyer/contract pass error:",
+            focusResponse.status,
+            await focusResponse.text()
+          );
+        }
+      } catch (focusErr) {
+        console.error("Focused buyer/contract recognition error:", focusErr);
+      }
+    }
+
+    // 1) Контрагент = Поставщик из PDF.
+    // Используем результат focused-pass, который специально отделяет поставщика от его банка.
+    let contractorMatch = doFtMatchContractorBackend_(extractedContractorRaw, contractors);
+
+    // 2) Договор ищем по номеру + дате.
+    // Если договор однозначно найден в листе «Договоры»,
+    // его строка также является надежным источником контрагента.
+    let contractRow = doFtFindContractRowByRaw_(
+      extractedContract,
+      contractRows,
+      contractorMatch.contractor
+    );
+
+    // 3) Договор может восстановить контрагента ТОЛЬКО если Поставщик
+    // вообще не был найден по строке "Поставщик:".
+    // Если Поставщик уже найден, договор не имеет права заменить его банком
+    // или другим контрагентом из справочника.
+    if (contractRow && !contractorMatch.matched) {
+      contractorMatch = {
+        contractor: String(contractRow.contractor || "").trim(),
+        matched: true,
+        method: "contract_row_sheet_fallback"
+      };
+    }
+
+    // 4) После восстановления контрагента еще раз ищем договор только
+    // среди договоров этого контрагента.
+    if (!contractRow && contractorMatch.matched) {
+      contractRow = doFtFindContractRowByRaw_(
+        extractedContract,
+        contractRows,
+        contractorMatch.contractor
+      );
+    }
+
+    const data = {
+      ...filenameInfo,
+      // Перезаписываем пустое filenameInfo.legal_entity значением из Покупателя PDF.
+      legal_entity: legalEntity,
+      buyer_raw: buyerRaw,
+      legal_match_source: legalEntity ? "buyer_pdf" : "",
+      status: String(extracted.status || "ok"),
+      is_invoice: extracted.is_invoice === true,
+      document_type: String(extracted.document_type || "").trim(),
+      contractor_raw: extractedContractorRaw,
+      contractor: contractorMatch.contractor || "",
+      contractor_matched: !!contractorMatch.matched,
+      contractor_match_method: contractorMatch.method || "",
+      pay_purpose: extractedPayPurpose,
+
+      // raw = то, что модель прочитала из PDF, включая focused-pass.
+      contract_no_raw: extractedContract,
+
+      // Финальный договор:
+      // 1) найден в листе «Договоры» -> точное значение из листа;
+      // 2) есть в PDF, но нет точного совпадения в листе -> сохраняем договор из PDF;
+      // 3) Если focused-pass подтвердил, что поле "Договор:" пустое,
+      //    extractedContract = "" и здесь строго получаем "Без договора".
+      contract_no: contractRow
+        ? String(contractRow.contract_no || "").trim()
+        : (doFtFormatContractFromPdf_(extractedContract) || "Без договора"),
+      contract_matched: !!contractRow,
+      contract_match_method: contractRow
+        ? "number_date_sheet"
+        : (extractedContract ? "pdf" : "no_contract"),
+
+      invoice_no: extractedInvoiceNo,
+      invoice_date: extractedInvoiceDate,
+      sum_ft: extracted.sum_ft == null ? null : Number(extracted.sum_ft),
+      reason: String(extracted.reason || "").trim()
+    };
+
+    if (data.is_invoice && !data.legal_entity) {
+      data.status = "needs_clarification";
+      data.reason = [data.reason, "ЮрЛицо не найдено по Покупателю из PDF"].filter(Boolean).join("; ");
+    }
+
+    if (data.is_invoice && !data.contractor) {
+      data.status = "needs_clarification";
+      data.reason = [data.reason, "Контрагент не найден в листе Договоры"].filter(Boolean).join("; ");
+    }
+
+    if (!data.is_invoice) {
+      data.status = "ok";
+      data.legal_entity = "";
+      data.buyer_raw = "";
+      data.contractor = "";
+      data.contractor_matched = false;
+      data.contract_no = "";
+      data.contract_matched = false;
+    }
+    return res.json({ success:true, model, image_detail:imageDetail, data });
+  } catch (e) {
+    console.error("/do-ft/recognize:", e);
+    return res.status(500).json({ success:false, error:"DO_FT_RECOGNIZE_ERROR", message:e.message || String(e) });
+  }
+});
+
+// =====================================================
+// КОНТРАКТЫ / АРХИТЕКТУРА
+// =====================================================
+
+
+// -----------------------------------------------------
+// ОБЪЕКТЫ
+// GET /contracts/objects
+// -----------------------------------------------------
+
+// =====================================================
+// СПИСОК ОБЪЕКТОВ
+// ИСТОЧНИК: architecture.v_architecture_join
+// =====================================================
+
+app.get("/contracts/objects", async (req, res) => {
+  try {
+
+    const result = await pool.query(`
+      SELECT DISTINCT ON (ob_id)
+
+        ob_id,
+        object_no,
+        division,
+        region,
+        customer_type,
+
+        object_name,
+        object_location,
+        object_description,
+        customer_name,
+
+        start_date,
+        end_date,
+
+        google_map_link,
+
+        contract_no,
+        contract_date,
+        contract_link
+
+      FROM architecture.v_architecture_join
+
+      WHERE ob_id IS NOT NULL
+
+      ORDER BY
+        ob_id,
+        object_no NULLS LAST
+    `);
+
+    result.rows.sort((a, b) => {
+      return Number(a.object_no || 0) -
+             Number(b.object_no || 0);
+    });
+
+    return res.json({
+      success: true,
+      rows: result.rows
+    });
+
+  } catch (error) {
+
+    console.error(
+      "CONTRACT OBJECTS GET ERROR:",
+      error
+    );
+
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+
+// -----------------------------------------------------
+// СОЗДАТЬ ОБЪЕКТ
+// POST /contracts/objects
+// -----------------------------------------------------
+
+app.post("/contracts/objects", async (req, res) => {
+
+  const client = await pool.connect();
+
+
+  try {
+
+    const body = req.body || {};
+
+
+    const text = value => {
+
+      const s =
+        String(
+          value === null ||
+          value === undefined
+            ? ""
+            : value
+        ).trim();
+
+
+      return s || null;
+
+    };
+
+
+    const number = value => {
+
+      if (
+        value === null ||
+        value === undefined ||
+        value === ""
+      ) {
+        return null;
+      }
+
+
+      const n =
+        Number(
+          String(value)
+            .replace(/\s/g, "")
+            .replace(",", ".")
+        );
+
+
+      return Number.isFinite(n)
+        ? n
+        : null;
+
+    };
+
+
+    const objectName =
+      text(body.object_name);
+
+
+    if (!objectName) {
+
+      return res.status(400).json({
+        success: false,
+        error: "Объект не заполнен"
+      });
+
+    }
+
+
+    await client.query("BEGIN");
+
+
+    /*
+     * Чтобы два пользователя одновременно
+     * не получили одинаковый OB.
+     */
+
+    await client.query(`
+      SELECT pg_advisory_xact_lock(
+        hashtext('architecture_objects_ob_id')
+      )
+    `);
+
+
+    const nextResult =
+      await client.query(`
+        SELECT
+          COALESCE(
+            MAX(
+              NULLIF(
+                regexp_replace(
+                  ob_id,
+                  '\\D',
+                  '',
+                  'g'
+                ),
+                ''
+              )::bigint
+            ),
+            0
+          ) + 1 AS next_no
+
+        FROM architecture.objects
+      `);
+
+
+    const nextNo =
+      Number(
+        nextResult.rows[0].next_no
+      );
+
+
+    const obId =
+      "OB" + nextNo;
+
+
+    const result =
+      await client.query(
+        `
+        INSERT INTO architecture.objects (
+
+          ob_id,
+          object_no,
+          division,
+          region,
+          customer_type,
+
+          object_name,
+          object_location,
+          object_description,
+          customer_name,
+
+          start_date,
+          end_date,
+
+          google_map_link,
+
+          contract_no,
+          contract_date,
+          contract_link,
+          contract_sum
+
+        )
+        VALUES (
+
+          $1,$2,$3,$4,$5,
+          $6,$7,$8,$9,
+          $10,$11,$12,
+          $13,$14,$15,$16
+
+        )
+
+        RETURNING *
+        `,
+        [
+
+          obId,
+
+          number(body.object_no),
+
+          text(body.division),
+
+          text(body.region),
+
+          text(body.customer_type),
+
+          objectName,
+
+          text(body.object_location),
+
+          text(body.object_description),
+
+          text(body.customer_name),
+
+          text(body.start_date),
+
+          text(body.end_date),
+
+          text(body.google_map_link),
+
+          text(body.contract_no),
+
+          text(body.contract_date),
+
+          text(body.contract_link),
+
+          number(body.contract_sum)
+
+        ]
+      );
+
+
+    await client.query("COMMIT");
+
+
+    return res.json({
+      success: true,
+      row: result.rows[0]
+    });
+
+
+  } catch (error) {
+
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {}
+
+
+    console.error(
+      "CONTRACT OBJECT CREATE ERROR:",
+      error
+    );
+
+
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+
+
+  } finally {
+
+    client.release();
+
+  }
+
+});
+
+
+
+// -----------------------------------------------------
+// ВСЕ ДАННЫЕ ОДНОГО ОБЪЕКТА
+//
+// OB -> documents
+// DS -> year_amounts
+// DS -> guarantees
+//
+// OB -> object_status
+// OB -> commissioning_acts
+// OB -> subcontracts
+//
+// GET /contracts/object/OB1
+// -----------------------------------------------------
+ 
+
+app.get("/contracts/debug-db", async (req, res) => {
+  try {
+    const info = await pool.query(`
+      SELECT
+        current_database() AS database_name,
+        current_user AS user_name,
+        inet_server_addr() AS server_ip,
+        inet_server_port() AS server_port
+    `);
+
+    const columns = await pool.query(`
+      SELECT
+        ordinal_position,
+        column_name,
+        data_type
+      FROM information_schema.columns
+      WHERE table_schema = 'architecture'
+        AND table_name = 'v_architecture_join'
+      ORDER BY ordinal_position
+    `);
+
+    res.json({
+      success: true,
+      database: info.rows[0],
+      columns: columns.rows
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// =====================================================
+// ДАННЫЕ ОДНОГО ОБЪЕКТА
+// ИСТОЧНИК: architecture.v_architecture_join
+// =====================================================
+
+app.get(
+  "/contracts/object/:obId",
+
+  async (req, res) => {
+    try {
+
+      const obId =
+        String(req.params.obId || "").trim();
+
+      if (!obId) {
+        return res.status(400).json({
+          success: false,
+          error: "obId пустой"
+        });
+      }
+
+
+      const result = await pool.query(
+        `
+        SELECT *
+        FROM architecture.v_architecture_join
+        WHERE ob_id = $1
+        ORDER BY
+          ds_id NULLS LAST,
+          amount_year NULLS LAST,
+          sg_id NULLS LAST,
+          bg_id NULLS LAST,
+          st_id NULLS LAST,
+          akt_id NULLS LAST,
+          sp_id NULLS LAST
+        `,
+        [obId]
+      );
+
+
+      const rows = result.rows || [];
+
+      if (!rows.length) {
+        return res.status(404).json({
+          success: false,
+          error: "Объект не найден"
+        });
+      }
+
+
+      // -------------------------
+      // УНИКАЛЬНЫЕ СТРОКИ
+      // -------------------------
+
+      function uniqueBy(list, key) {
+
+        const map = new Map();
+
+        for (const row of list) {
+
+          const value = row[key];
+
+          if (
+            value === null ||
+            value === undefined ||
+            value === ""
+          ) {
+            continue;
+          }
+
+          if (!map.has(String(value))) {
+            map.set(String(value), row);
+          }
+        }
+
+        return Array.from(map.values());
+      }
+
+
+      // -------------------------
+      // ОБЪЕКТ
+      // -------------------------
+
+      const first = rows[0];
+
+      const object = {
+        ob_id: first.ob_id,
+        object_no: first.object_no,
+        division: first.division,
+        region: first.region,
+        customer_type: first.customer_type,
+
+        object_name: first.object_name,
+        object_location: first.object_location,
+        object_description: first.object_description,
+        customer_name: first.customer_name,
+
+        start_date: first.start_date,
+        end_date: first.end_date,
+
+        google_map_link: first.google_map_link,
+
+        contract_no: first.contract_no,
+        contract_date: first.contract_date,
+        contract_link: first.contract_link,
+        contract_sum: first.contract_sum
+      };
+
+
+      // -------------------------
+      // ДОПИКИ
+      // -------------------------
+
+      const documents =
+        uniqueBy(rows, "ds_id")
+          .map(r => ({
+            ds_id: r.ds_id,
+            ob_id: r.ob_id,
+
+            addendum_no: r.addendum_no,
+            addendum_date: r.addendum_date,
+            addendum_link: r.addendum_link,
+
+            document_type: r.document_type,
+            is_actual_amount: r.is_actual_amount
+          }));
+
+
+      // -------------------------
+      // ГОД / СУММА
+      // -------------------------
+
+      const year_amounts =
+        uniqueBy(rows, "sg_id")
+          .map(r => ({
+            sg_id: r.sg_id,
+            ds_id: r.ds_id,
+
+            amount_year: r.amount_year,
+            amount: r.amount
+          }));
+
+
+      // -------------------------
+      // ГАРАНТИИ
+      // -------------------------
+
+      const guarantees =
+        uniqueBy(rows, "bg_id")
+          .map(r => ({
+            bg_id: r.bg_id,
+            ds_id: r.ds_id,
+
+            security_subject:
+              r.security_subject ?? r["Предмет обеспечения"],
+
+            rate:
+              r.rate ?? r["Ставка"],
+
+            amount:
+              r.security_amount ?? r["Сумма обеспечения"],
+
+            guarantee_type:
+              r.guarantee_type ?? r["Вид обеспечения"] ?? r["Вид"],
+
+            premium:
+              r.premium ?? r["Премия"],
+
+            security_status:
+              r.security_status ?? r["Статус Обеспечения"],
+
+            effective_date:
+              r.effective_date ?? r["Дата вступления в силу"],
+
+            term_workdays:
+              r.term_workdays ?? r["Срок, раб.дней"],
+
+            deadline_date:
+              r.deadline_date ?? r["Дедлайн Дата"],
+
+            deadline_days:
+              r.deadline_days ?? r["Дедлайн Дней"],
+
+            guarantor:
+              r.guarantor ?? r["Гарант"],
+
+            pdf_link:
+              r.pdf_link ?? r["PDF"],
+
+            actual_security_date:
+              r.actual_security_date ?? r["Факт дата обеспеч"] ?? r["Факт дата"],
+
+            security_days_delta:
+              r.security_days_delta ?? r["Обеспечено (+)раньше/(-)позже"] ?? r["Обеспечено"],
+
+            comments:
+              r.comments ?? r["Комменты"] ?? r["Комментарий"]
+          }));
+
+
+      // -------------------------
+      // СТАТУС
+      // -------------------------
+
+      const object_status =
+        uniqueBy(rows, "st_id")
+          .map(r => ({
+            st_id: r.st_id,
+            ob_id: r.ob_id,
+
+            status: r.status,
+            project_manager: r.project_manager,
+            pto_engineer: r.pto_engineer,
+            has_subcontract: r.has_subcontract,
+
+            psd_link: r.psd_link,
+            approved_vdc_estimate:
+              r.approved_vdc_estimate,
+
+            expert_conclusion:
+              r.expert_conclusion,
+
+            approved_gpr_gp:
+              r.approved_gpr_gp,
+
+            approved_ppr:
+              r.approved_ppr,
+
+            responsible_order:
+              r.responsible_order,
+
+            construction_ticket:
+              r.construction_ticket,
+
+            work_permit:
+              r.work_permit,
+
+            avr_accumulator_gp:
+              r.avr_accumulator_gp,
+
+            changed_date:
+              r.changed_date
+          }));
+
+
+      // -------------------------
+      // АКТ ВВОДА
+      // -------------------------
+
+      const commissioning_acts =
+        uniqueBy(rows, "akt_id")
+          .map(r => ({
+            akt_id: r.akt_id,
+            ob_id: r.ob_id,
+
+            commissioning_status:
+              r.commissioning_status,
+
+            commissioning_act:
+              r.commissioning_act,
+
+            in_depository:
+              r.in_depository
+          }));
+
+
+      // -------------------------
+      // СУБПОДРЯД
+      // -------------------------
+
+      const subcontracts =
+        uniqueBy(rows, "sp_id")
+          .map(r => ({
+            sp_id: r.sp_id,
+            ob_id: r.ob_id,
+
+            subcontractor:
+              r.subcontractor,
+
+            contract_no:
+              r.contract_no_sp,
+
+            contract_date:
+              r.contract_date_sp,
+
+            contract_link:
+              r.contract_link_sp,
+
+            estimate:
+              r.estimate,
+
+            general_contractor_pct:
+              r.general_contractor_pct,
+
+            contract_sum:
+              r.contract_sum_sp,
+
+            approved_gpr_sp:
+              r.approved_gpr_sp,
+
+            avr_accumulator_sp:
+              r.avr_accumulator_sp,
+
+            role_name:
+              r.role_name,
+
+            group_name:
+              r.group_name,
+
+            subcontract_contract_1:
+              r.subcontract_contract_1,
+
+            subcontract_contract_2:
+              r.subcontract_contract_2,
+
+            subcontract_contract_3:
+              r.subcontract_contract_3
+          }));
+
+
+      return res.json({
+        success: true,
+
+        object,
+        documents,
+        year_amounts,
+        guarantees,
+        object_status,
+        commissioning_acts,
+        subcontracts,
+
+        // полный JOIN тоже оставляем,
+        // если потом понадобится
+        rows
+      });
+
+
+    } catch (error) {
+
+      console.error(
+        "CONTRACT OBJECT DETAIL ERROR:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        error: error.message
+      });
+    }
+  }
+);
+
+// -----------------------------------------------------
+// ОТЧЕТ
+// ТОЛЬКО v_big_table
+// -----------------------------------------------------
+
+// =====================================================
+// ОТЧЕТ
+// ИСТОЧНИК: architecture.v_architecture_join
+// =====================================================
+
+app.get("/contracts/report", async (req, res) => {
+  try {
+
+    const result = await pool.query(`
+      SELECT *
+      FROM architecture.v_architecture_join
+    `);
+
+    return res.json({
+      success: true,
+      rows: result.rows
+    });
+
+  } catch (error) {
+
+    console.error(
+      "CONTRACT REPORT ERROR:",
+      error
+    );
+
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// =====================================================
+// ЛЗК — страница "Заявка на ТМЦ"
+// ДОБАВИТЬ В server.js ПЕРЕД app.listen(...)
+// =====================================================
+
+
+// -----------------------------------------------------
+// 1. Справочники для страницы:
+//    - список объектов
+//    - список сотрудников ПТО
+// -----------------------------------------------------
+app.get("/lzk/request-print/refs", async (req, res) => {
+  try {
+    const [objectsQ, ptoQ] = await Promise.all([
+
+      pool.query(`
+        SELECT DISTINCT object_name
+        FROM lzk.limits
+        WHERE COALESCE(trim(object_name), '') <> ''
+        ORDER BY object_name
+      `),
+
+      pool.query(`
+        SELECT
+          login,
+          trim(
+            concat_ws(
+              ' ',
+              NULLIF(trim(last_name), ''),
+              NULLIF(trim(first_name), ''),
+              NULLIF(trim(middle_name), '')
+            )
+          ) AS full_name
+        FROM public.users
+        WHERE COALESCE(is_active, true) = true
+          AND lower(trim(COALESCE(role_lzk, ''))) IN ('pto', 'пто')
+        ORDER BY last_name, first_name, middle_name, login
+      `)
+
+    ]);
+
+    return res.json({
+      success: true,
+      objects: objectsQ.rows.map(r => r.object_name),
+      pto: ptoQ.rows
+    });
+
+  } catch (e) {
+    console.error("LZK REQUEST PRINT REFS ERROR:", e);
+
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
+
+
+// -----------------------------------------------------
+// 2. Данные таблицы печатной заявки
+//
+// ОСНОВНАЯ СТРОКА = IDLZK
+//
+// Одобрено без ЛЗК
+// = lzk.limits.fact_received
+// = ваше поле "Фактически одобрено склад"
+//
+// Одобрено через ЛЗК до выбранной даты
+// = сумма fact_qty всех согласованных ZLZK
+//   по этому IDLZK, где pto_date <= выбранной даты
+// -----------------------------------------------------
+app.get("/lzk/request-print/data", async (req, res) => {
+  try {
+    const objectName = lzkText(req.query.object);
+    const dateFrom = lzkText(req.query.date_from);
+    const dateTo = lzkText(req.query.date_to);
+
+    if (!objectName) {
+      return res.status(400).json({
+        success: false,
+        error: "Не выбран проект"
+      });
+    }
+
+    if (!dateFrom || !dateTo) {
+      return res.status(400).json({
+        success: false,
+        error: "Не указан период"
+      });
+    }
+
+    const q = await pool.query(`
+      SELECT
+        l.idlzk,
+        l.object_name AS object,
+        l.constructive_name AS constructive,
+        l.material_name AS tmc_name,
+        l.unit_name AS unit,
+
+        COALESCE(l.plan_qty, 0) AS plan,
+
+        -- 1. Одобрено без ЛЗК:
+        -- текущее ручное поле "Фактически одобрено склад"
+        COALESCE(l.fact_received, 0) AS approved_without_lzk,
+
+        -- 2. Одобрено через ЛЗК ДО даты "с".
+        -- Например при date_from = 01.09:
+        -- берем все согласованные заявки, где pto_date < 01.09 00:00.
+        COALESCE(
+          SUM(
+            CASE
+              WHEN lower(trim(COALESCE(r.pto_status, '')))
+                   IN ('согласован', 'согласовано')
+               AND r.pto_date < $2::date
+              THEN COALESCE(r.fact_qty, 0)
+              ELSE 0
+            END
+          ),
+          0
+        ) AS approved_via_lzk,
+
+        -- 3. Одобрено ЛЗК ЗА ПЕРИОД.
+        -- date_from включительно, date_to включительно.
+        COALESCE(
+          SUM(
+            CASE
+              WHEN lower(trim(COALESCE(r.pto_status, '')))
+                   IN ('согласован', 'согласовано')
+               AND r.pto_date >= $2::date
+               AND r.pto_date < ($3::date + INTERVAL '1 day')
+              THEN COALESCE(r.fact_qty, 0)
+              ELSE 0
+            END
+          ),
+          0
+        ) AS approved_via_lzk_period,
+
+        -- 4. Остаток на конец выбранного периода:
+        -- План - Без ЛЗК - Через ЛЗК до периода - ЛЗК за период.
+        (
+          COALESCE(l.plan_qty, 0)
+          - COALESCE(l.fact_received, 0)
+          - COALESCE(
+              SUM(
+                CASE
+                  WHEN lower(trim(COALESCE(r.pto_status, '')))
+                       IN ('согласован', 'согласовано')
+                   AND r.pto_date < $2::date
+                  THEN COALESCE(r.fact_qty, 0)
+                  ELSE 0
+                END
+              ),
+              0
+            )
+          - COALESCE(
+              SUM(
+                CASE
+                  WHEN lower(trim(COALESCE(r.pto_status, '')))
+                       IN ('согласован', 'согласовано')
+                   AND r.pto_date >= $2::date
+                   AND r.pto_date < ($3::date + INTERVAL '1 day')
+                  THEN COALESCE(r.fact_qty, 0)
+                  ELSE 0
+                END
+              ),
+              0
+            )
+        ) AS remaining
+
+      FROM lzk.limits l
+
+      LEFT JOIN lzk.requests r
+        ON r.idlzk = l.idlzk
+
+      WHERE lower(trim(l.object_name)) = lower(trim($1))
+
+      GROUP BY
+        l.idlzk,
+        l.object_name,
+        l.constructive_name,
+        l.material_name,
+        l.unit_name,
+        l.plan_qty,
+        l.fact_received
+
+      ORDER BY
+        NULLIF(regexp_replace(l.idlzk, '\\D', '', 'g'), '')::bigint,
+        l.idlzk
+    `, [
+      objectName,
+      dateFrom,
+      dateTo
+    ]);
+
+    return res.json({
+      success: true,
+      rows: q.rows
+    });
+
+  } catch (e) {
+    console.error("LZK REQUEST PRINT DATA ERROR:", e);
+
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
+
+app.get("/draft-funding-pools", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT *
+      FROM public.draft_funding_pool
+      WHERE is_active = true
+      ORDER BY legal_entity, source_name, money_type, object_name
+    `);
+
+    res.json({
+      success: true,
+      rows: result.rows
+    });
+
+  } catch (e) {
+    console.error("DRAFT FUNDING POOLS ERROR:", e);
+
+    res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
+
+
+
+// =====================================================
+// ПУЛЫ ДЛЯ ВЫБОРА В ФИНАНСОВОЙ ТАБЛИЦЕ
+// Фильтр: ЮрЛицо + Объект.
+// Возвращаются только реально распределённые дочерние пулы.
+// =====================================================
+
+app.get("/draft-funding-pools/options", async (req, res) => {
+  try {
+    const legalEntity = String(req.query.legal_entity || "").trim();
+    const objectName = String(req.query.object || "").trim();
+    const login = String(req.query.login || "").trim();
+    const rowId = Number(req.query.zvk_row_id || 0) || null;
+
+    if (!legalEntity || !objectName || !login) {
+      return res.json({ success:true, rows:[] });
+    }
+
+    const q = await pool.query(`
+      SELECT
+        p.id,
+        p.parent_pool_id,
+        p.legal_entity,
+        p.source_name,
+        p.money_type,
+        p.object_name,
+        p.beneficiary_login,
+        p.amount::numeric AS amount,
+
+        COALESCE((
+          SELECT SUM(a.amount)
+          FROM public.zvk_funding_pool_allocations a
+          WHERE a.funding_pool_id = p.id
+            AND ($3::bigint IS NULL OR a.zvk_row_id <> $3::bigint)
+        ), 0)::numeric AS used_other,
+
+        GREATEST(
+          p.amount
+          - COALESCE((
+              SELECT SUM(a.amount)
+              FROM public.zvk_funding_pool_allocations a
+              WHERE a.funding_pool_id = p.id
+                AND ($3::bigint IS NULL OR a.zvk_row_id <> $3::bigint)
+            ), 0),
+          0
+        )::numeric AS available_amount,
+
+        COALESCE((
+          SELECT a.amount
+          FROM public.zvk_funding_pool_allocations a
+          WHERE a.funding_pool_id = p.id
+            AND a.zvk_row_id = $3::bigint
+          LIMIT 1
+        ), 0)::numeric AS current_amount,
+
+        EXISTS(
+          SELECT 1
+          FROM public.zvk_funding_pool_allocations a
+          WHERE a.funding_pool_id = p.id
+            AND a.zvk_row_id = $3::bigint
+        ) AS is_selected
+
+      FROM public.draft_funding_pool p
+      WHERE p.is_active = true
+        AND p.parent_pool_id IS NOT NULL
+        AND lower(trim(COALESCE(p.legal_entity, ''))) = lower(trim($1))
+        AND lower(trim(COALESCE(p.object_name, ''))) = lower(trim($2))
+        AND lower(trim(COALESCE(p.beneficiary_login, ''))) = lower(trim($4))
+      ORDER BY p.amount ASC, p.source_name, p.money_type, p.id
+    `, [legalEntity, objectName, rowId, login]);
+
+    return res.json({ success:true, rows:q.rows });
+  } catch (e) {
+    console.error("DRAFT FUNDING OPTIONS ERROR:", e);
+    return res.status(500).json({ success:false, error:e.message });
+  }
+});
+
+// Сохраняет распределение одной строки ZFT по нескольким пулам.
+// Пользователь только отмечает пулы. Система сама берёт сначала меньший остаток
+// полностью, а последний пул использует частично.
+app.post("/zvk-funding-pools/save", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const rid = Number(req.body?.zvk_row_id || 0);
+    const actor = String(req.body?.login || "").trim();
+    const requestedIds = Array.isArray(req.body?.pool_ids)
+      ? [...new Set(req.body.pool_ids.map(Number).filter(x => Number.isInteger(x) && x > 0))]
+      : [];
+
+    if (!rid) {
+      return res.status(400).json({ success:false, error:"zvk_row_id required" });
+    }
+
+    if (!actor) {
+      return res.status(400).json({ success:false, error:"login required" });
+    }
+
+    const adminOk =
+      isTruthy(req.body?.is_admin) ||
+      isTruthy(req.body?.is_all) ||
+      isTruthy(req.body?.can_edit_all) ||
+      ["b_erkin", "s_zhasulan", "a_zaitova", "t_serik"].includes(actor.toLowerCase());
+
+    if (!adminOk) {
+      const ok = await canEditRowByLogin(client, rid, actor);
+      if (!ok) {
+        return res.status(403).json({ success:false, error:"NO_RIGHTS_THIS_ROW" });
+      }
+    }
+
+    await client.query("BEGIN");
+
+    const rowQ = await client.query(`
+      SELECT
+        z.id,
+        z.to_pay,
+        z.request_flag,
+        f.legal_entity,
+        f."object" AS object_name
+      FROM public.zvk z
+      JOIN public.ft f ON f.id_ft = z.id_ft
+      WHERE z.id = $1
+      FOR UPDATE
+    `, [rid]);
+
+    if (!rowQ.rowCount) {
+      throw new Error("ZVK_ROW_NOT_FOUND");
+    }
+
+    const ftRow = rowQ.rows[0];
+    const requestFlag = String(ftRow.request_flag || "").trim();
+    const toPay = Number(ftRow.to_pay || 0);
+
+    // Заявка выключена/обнулена — освобождаем все пулы.
+    if (requestFlag !== "Да" || toPay <= 0) {
+      await client.query(
+        `DELETE FROM public.zvk_funding_pool_allocations WHERE zvk_row_id = $1`,
+        [rid]
+      );
+      await client.query("COMMIT");
+      return res.json({ success:true, rows:[], allocated_total:0 });
+    }
+
+    if (!requestedIds.length) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        success:false,
+        error:"Выберите хотя бы один денежный пул"
+      });
+    }
+
+    const poolsQ = await client.query(`
+      SELECT
+        p.id,
+        p.legal_entity,
+        p.source_name,
+        p.money_type,
+        p.object_name,
+        p.beneficiary_login,
+        p.amount::numeric AS pool_amount,
+
+        GREATEST(
+          p.amount
+          - COALESCE((
+              SELECT SUM(a.amount)
+              FROM public.zvk_funding_pool_allocations a
+              WHERE a.funding_pool_id = p.id
+                AND a.zvk_row_id <> $2
+            ), 0),
+          0
+        )::numeric AS available_amount
+
+      FROM public.draft_funding_pool p
+      WHERE p.id = ANY($1::bigint[])
+        AND p.is_active = true
+        AND p.parent_pool_id IS NOT NULL
+      ORDER BY p.amount ASC, p.id ASC
+      FOR UPDATE
+    `, [requestedIds, rid]);
+
+    if (poolsQ.rowCount !== requestedIds.length) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        success:false,
+        error:"Один из выбранных пулов не найден или уже не активен"
+      });
+    }
+
+    const legalKey = String(ftRow.legal_entity || "").trim().toLowerCase();
+    const objectKey = String(ftRow.object_name || "").trim().toLowerCase();
+
+    for (const p of poolsQ.rows) {
+      if (
+        String(p.legal_entity || "").trim().toLowerCase() !== legalKey ||
+        String(p.object_name || "").trim().toLowerCase() !== objectKey ||
+        String(p.beneficiary_login || "").trim().toLowerCase() !== actor.toLowerCase()
+      ) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          success:false,
+          error:"Выбранный пул не соответствует ЮрЛицу, Объекту или логину инициатора"
+        });
+      }
+    }
+
+    // Сначала используем меньшие доступные суммы полностью.
+    const poolsSorted = [...poolsQ.rows].sort((a,b) => {
+      const av = Number(a.available_amount || 0);
+      const bv = Number(b.available_amount || 0);
+      if (av !== bv) return av - bv;
+      return Number(a.id) - Number(b.id);
+    });
+
+    const totalAvailable = poolsSorted.reduce(
+      (s,p) => s + Number(p.available_amount || 0),
+      0
+    );
+
+    if (totalAvailable + 0.000001 < toPay) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        success:false,
+        error:
+          "Недостаточно суммы в выбранных пулах. Доступно: " +
+          totalAvailable.toLocaleString("ru-RU", {
+            minimumFractionDigits:2,
+            maximumFractionDigits:2
+          })
+      });
+    }
+
+    let remaining = toPay;
+    const allocations = [];
+
+    for (const p of poolsSorted) {
+      if (remaining <= 0.000001) break;
+
+      const available = Number(p.available_amount || 0);
+      const take = Math.min(available, remaining);
+
+      if (take > 0.000001) {
+        allocations.push({
+          funding_pool_id: Number(p.id),
+          source_name: p.source_name,
+          money_type: p.money_type,
+          amount: Math.round((take + Number.EPSILON) * 100) / 100
+        });
+
+        remaining -= take;
+      }
+    }
+
+    if (remaining > 0.009) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        success:false,
+        error:"Не удалось полностью распределить сумму К оплате"
+      });
+    }
+
+    await client.query(
+      `DELETE FROM public.zvk_funding_pool_allocations WHERE zvk_row_id = $1`,
+      [rid]
+    );
+
+    for (const a of allocations) {
+      await client.query(`
+        INSERT INTO public.zvk_funding_pool_allocations
+          (zvk_row_id, funding_pool_id, amount, created_by, created_at, updated_at)
+        VALUES
+          ($1, $2, $3, $4, NOW(), NOW())
+      `, [rid, a.funding_pool_id, a.amount, actor]);
+    }
+
+    // Источник Объект и Тип сохраняем отдельно.
+    const actualSourceNames = [
+      ...new Set(
+        allocations
+          .map(a => String(a.source_name || "").trim())
+          .filter(Boolean)
+      )
+    ];
+
+    const actualMoneyTypes = [
+      ...new Set(
+        allocations
+          .map(a => String(a.money_type || "").trim())
+          .filter(Boolean)
+      )
+    ];
+
+    const sourceObjectValue = actualSourceNames.length
+      ? actualSourceNames.join(" + ")
+      : null;
+
+    const moneyTypeValue = actualMoneyTypes.length
+      ? actualMoneyTypes.join(" + ")
+      : null;
+
+    await client.query(`
+      INSERT INTO public.zvk_status
+        (zvk_row_id, status_time, src_d, src_o, money_type)
+      VALUES
+        ($1, NOW(), $2, $3, $4)
+      ON CONFLICT (zvk_row_id)
+      DO UPDATE SET
+        status_time = NOW(),
+        src_d = EXCLUDED.src_d,
+        src_o = EXCLUDED.src_o,
+        money_type = EXCLUDED.money_type
+    `, [
+      rid,
+      String(ftRow.legal_entity || "").trim() || null,
+      sourceObjectValue,
+      moneyTypeValue
+    ]);
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success:true,
+      allocated_total:toPay,
+      rows:allocations
+    });
+
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+    console.error("ZVK FUNDING POOLS SAVE ERROR:", e);
+    return res.status(500).json({ success:false, error:e.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/draft-funding-summary", async (req, res) => {
+  try {
+
+    const result = await pool.query(`
+      SELECT
+        p.id,
+        p.legal_entity,
+        p.source_name,
+        p.money_type,
+        p.object_name,
+        p.beneficiary_login,
+        p.amount AS pool_amount,
+
+        COALESCE((
+          SELECT SUM(a.amount)
+          FROM public.zvk_funding_pool_allocations a
+          JOIN public.ft_zvk_current_v2 cur
+            ON cur.zvk_row_id = a.zvk_row_id
+          WHERE a.funding_pool_id = p.id
+            AND lower(trim(COALESCE(cur.request_flag, ''))) <> lower('Обнуление')
+        ), 0)::numeric AS ft_amount,
+
+        (
+          p.amount
+          - COALESCE((
+              SELECT SUM(a.amount)
+              FROM public.zvk_funding_pool_allocations a
+              JOIN public.ft_zvk_current_v2 cur
+                ON cur.zvk_row_id = a.zvk_row_id
+              WHERE a.funding_pool_id = p.id
+                AND lower(trim(COALESCE(cur.request_flag, ''))) <> lower('Обнуление')
+            ), 0)
+        )::numeric AS ft_balance,
+
+        COALESCE((
+          SELECT SUM(a.amount)
+          FROM public.zvk_funding_pool_allocations a
+          JOIN public.ft_zvk_current_v2 cur
+            ON cur.zvk_row_id = a.zvk_row_id
+          WHERE a.funding_pool_id = p.id
+            AND trim(COALESCE(cur.is_paid, '')) = 'Да'
+            AND lower(trim(COALESCE(cur.request_flag, ''))) <> lower('Обнуление')
+        ), 0)::numeric AS paid_since_launch,
+
+        COALESCE((
+          SELECT SUM(a.amount)
+          FROM public.zvk_funding_pool_allocations a
+          JOIN public.ft_zvk_current_v2 cur
+            ON cur.zvk_row_id = a.zvk_row_id
+          WHERE a.funding_pool_id = p.id
+            AND trim(COALESCE(cur.registry_flag, '')) = 'Да'
+            AND trim(COALESCE(cur.is_paid, '')) <> 'Да'
+            AND lower(trim(COALESCE(cur.request_flag, ''))) <> lower('Обнуление')
+        ), 0)::numeric AS registry_amount,
+
+        COALESCE((
+          SELECT SUM(a.amount)
+          FROM public.zvk_funding_pool_allocations a
+          JOIN public.ft_zvk_current_v2 cur
+            ON cur.zvk_row_id = a.zvk_row_id
+          WHERE a.funding_pool_id = p.id
+            AND trim(COALESCE(cur.request_flag, '')) = 'Да'
+            AND trim(COALESCE(cur.registry_flag, '')) <> 'Да'
+            AND trim(COALESCE(cur.is_paid, '')) <> 'Да'
+        ), 0)::numeric AS request_amount,
+
+        COALESCE(SUM(
+          CASE
+            WHEN o.operation_type = 'RESERVE'
+              THEN o.amount
+            ELSE 0
+          END
+        ), 0) AS reserved_amount,
+
+        COALESCE(SUM(
+          CASE
+            WHEN o.operation_type = 'PAYMENT'
+              THEN o.amount
+            ELSE 0
+          END
+        ), 0) AS paid_amount,
+
+        COALESCE(SUM(
+          CASE
+            WHEN o.operation_type = 'RELEASE'
+              THEN o.amount
+            ELSE 0
+          END
+        ), 0) AS released_amount,
+
+        COALESCE(SUM(
+          CASE
+            WHEN o.operation_type = 'IN'
+              THEN o.amount
+            ELSE 0
+          END
+        ), 0) AS incoming_amount,
+
+        COALESCE(SUM(
+          CASE
+            WHEN o.operation_type = 'ADJUST'
+              THEN o.amount
+            ELSE 0
+          END
+        ), 0) AS adjust_amount,
+
+        (
+          p.amount
+
+          + COALESCE(SUM(
+              CASE
+                WHEN o.operation_type = 'IN'
+                  THEN o.amount
+                ELSE 0
+              END
+            ), 0)
+
+          + COALESCE(SUM(
+              CASE
+                WHEN o.operation_type = 'ADJUST'
+                  THEN o.amount
+                ELSE 0
+              END
+            ), 0)
+
+          + COALESCE(SUM(
+              CASE
+                WHEN o.operation_type = 'RELEASE'
+                  THEN o.amount
+                ELSE 0
+              END
+            ), 0)
+
+          - COALESCE(SUM(
+              CASE
+                WHEN o.operation_type = 'RESERVE'
+                  THEN o.amount
+                ELSE 0
+              END
+            ), 0)
+
+          - COALESCE(SUM(
+              CASE
+                WHEN o.operation_type = 'PAYMENT'
+                  THEN o.amount
+                ELSE 0
+              END
+            ), 0)
+
+        ) AS available_amount
+
+      FROM public.draft_funding_pool p
+
+      LEFT JOIN public.draft_funding_operation o
+        ON o.pool_id = p.id
+
+      WHERE p.is_active = true
+
+      GROUP BY
+        p.id,
+        p.legal_entity,
+        p.source_name,
+        p.money_type,
+        p.object_name,
+        p.beneficiary_login,
+        p.amount
+
+      ORDER BY
+        p.legal_entity,
+        p.source_name,
+        p.money_type,
+        p.object_name
+    `);
+
+
+    return res.json({
+      success: true,
+      rows: result.rows
+    });
+
+
+  } catch (e) {
+
+    console.error(
+      "DRAFT FUNDING SUMMARY ERROR:",
+      e
+    );
+
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
+
+app.get("/draft-funding-objects", async (req, res) => {
+  try {
+
+    const result = await pool.query(`
+      SELECT
+        p.object_name,
+
+        SUM(
+          p.amount
+
+          + COALESCE((
+              SELECT SUM(
+                CASE
+                  WHEN o.operation_type = 'IN'
+                    THEN o.amount
+
+                  WHEN o.operation_type = 'ADJUST'
+                    THEN o.amount
+
+                  WHEN o.operation_type = 'RELEASE'
+                    THEN o.amount
+
+                  WHEN o.operation_type = 'RESERVE'
+                    THEN -o.amount
+
+                  WHEN o.operation_type = 'PAYMENT'
+                    THEN -o.amount
+
+                  ELSE 0
+                END
+              )
+              FROM public.draft_funding_operation o
+              WHERE o.pool_id = p.id
+            ), 0)
+
+        ) AS available_amount
+
+      FROM public.draft_funding_pool p
+
+      WHERE p.is_active = true
+
+      GROUP BY p.object_name
+
+      HAVING SUM(
+        p.amount
+
+        + COALESCE((
+            SELECT SUM(
+              CASE
+                WHEN o.operation_type = 'IN'
+                  THEN o.amount
+
+                WHEN o.operation_type = 'ADJUST'
+                  THEN o.amount
+
+                WHEN o.operation_type = 'RELEASE'
+                  THEN o.amount
+
+                WHEN o.operation_type = 'RESERVE'
+                  THEN -o.amount
+
+                WHEN o.operation_type = 'PAYMENT'
+                  THEN -o.amount
+
+                ELSE 0
+              END
+            )
+            FROM public.draft_funding_operation o
+            WHERE o.pool_id = p.id
+          ), 0)
+
+      ) > 0
+
+      ORDER BY p.object_name
+    `);
+
+    return res.json({
+      success: true,
+      rows: result.rows
+    });
+
+  } catch (e) {
+
+    console.error("DRAFT FUNDING OBJECTS ERROR:", e);
+
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
+
+
+// =====================================================
+// DRAFT FUNDING — СОЗДАНИЕ ОБЩИХ ПУЛОВ И РАСПРЕДЕЛЕНИЕ
+// =====================================================
+
+
+// =====================================================
+// ЛОГИНЫ ДЛЯ РАСПРЕДЕЛЕНИЯ ДЕНЕЖНЫХ ПУЛОВ
+// Источник: public.users.login
+// =====================================================
+app.get("/draft-funding-logins", async (req, res) => {
+  try {
+    const q = await pool.query(`
+      SELECT DISTINCT trim(login) AS login
+      FROM public.users
+      WHERE COALESCE(is_active, true) = true
+        AND login IS NOT NULL
+        AND trim(login) <> ''
+      ORDER BY trim(login)
+    `);
+
+    return res.json({
+      success: true,
+      rows: q.rows
+    });
+  } catch (e) {
+    console.error("DRAFT FUNDING LOGINS ERROR:", e);
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
+
+app.get("/draft-funding-pools/manage", async (req, res) => {
+  try {
+    const q = await pool.query(`
+      SELECT
+        p.id,
+        p.legal_entity,
+        p.source_name,
+        p.money_type,
+        p.amount AS total_amount,
+        COALESCE(SUM(CASE WHEN c.is_active = true THEN c.amount ELSE 0 END), 0) AS allocated_amount,
+        (
+          p.amount
+          - COALESCE(SUM(CASE WHEN c.is_active = true THEN c.amount ELSE 0 END), 0)
+        ) AS unallocated_amount,
+        p.created_at
+      FROM public.draft_funding_pool p
+      LEFT JOIN public.draft_funding_pool c
+        ON c.parent_pool_id = p.id
+      WHERE p.is_active = true
+        AND p.parent_pool_id IS NULL
+        AND COALESCE(trim(p.object_name), '') = ''
+      GROUP BY
+        p.id,
+        p.legal_entity,
+        p.source_name,
+        p.money_type,
+        p.amount,
+        p.created_at
+      ORDER BY p.created_at DESC, p.id DESC
+    `);
+
+    return res.json({ success: true, rows: q.rows });
+  } catch (e) {
+    console.error("DRAFT FUNDING MANAGE ERROR:", e);
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.post("/draft-funding-pools/create", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const body = req.body || {};
+
+    const legalEntity = String(body.legal_entity || "").trim();
+    const sourceName = String(body.source_name || "").trim();
+    const moneyType = String(body.money_type || body.source_type || "").trim();
+    const createdBy = String(body.created_by || body.login || "").trim();
+    const amount = Number(body.amount);
+
+    if (!legalEntity) {
+      return res.status(400).json({ success: false, error: "ЮрЛицо не заполнено" });
+    }
+    if (!sourceName) {
+      return res.status(400).json({ success: false, error: "Источник не заполнен" });
+    }
+    if (!moneyType) {
+      return res.status(400).json({ success: false, error: "Тип не заполнен" });
+    }
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ success: false, error: "Сумма должна быть больше 0" });
+    }
+
+    await client.query("BEGIN");
+
+    // Один общий пул на комбинацию:
+    // ЮрЛицо + Источник + Тип.
+    // Если такой пул уже есть, новую сумму ДОБАВЛЯЕМ к нему,
+    // а не создаём вторую одинаковую строку.
+    const existing = await client.query(`
+      SELECT id, amount
+      FROM public.draft_funding_pool
+      WHERE parent_pool_id IS NULL
+        AND is_active = true
+        AND COALESCE(trim(object_name), '') = ''
+        AND lower(trim(legal_entity)) = lower(trim($1))
+        AND lower(trim(source_name)) = lower(trim($2))
+        AND lower(trim(money_type)) = lower(trim($3))
+      ORDER BY id
+      LIMIT 1
+      FOR UPDATE
+    `, [legalEntity, sourceName, moneyType]);
+
+    let row;
+
+    if (existing.rowCount) {
+      const poolId = Number(existing.rows[0].id);
+
+      const upd = await client.query(`
+        UPDATE public.draft_funding_pool
+        SET
+          amount = COALESCE(amount, 0) + $2,
+          created_by = COALESCE(NULLIF($3, ''), created_by)
+        WHERE id = $1
+        RETURNING *
+      `, [poolId, amount, createdBy]);
+
+      row = upd.rows[0];
+    } else {
+      const ins = await client.query(`
+        INSERT INTO public.draft_funding_pool (
+          legal_entity,
+          source_name,
+          money_type,
+          object_name,
+          amount,
+          parent_pool_id,
+          is_active,
+          created_by,
+          created_at
+        )
+        VALUES (
+          $1, $2, $3, '', $4, NULL, true, NULLIF($5, ''), NOW()
+        )
+        RETURNING *
+      `, [legalEntity, sourceName, moneyType, amount, createdBy]);
+
+      row = ins.rows[0];
+    }
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success: true,
+      row,
+      merged_with_existing: !!existing.rowCount
+    });
+
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+    console.error("DRAFT FUNDING CREATE ERROR:", e);
+    return res.status(500).json({ success: false, error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+
+// Изменение общего денежного пула.
+// Доступ: b_erkin, s_zhasulan, k_ermek.
+app.put("/draft-funding-pools/:poolId", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const poolId = Number(req.params.poolId);
+    const body = req.body || {};
+    const login = String(body.login || body.created_by || "").trim().toLowerCase();
+    const allowed = ["b_erkin", "s_zhasulan", "k_ermek"];
+
+    if (!allowed.includes(login)) {
+      return res.status(403).json({ success:false, error:"Нет доступа к изменению пула" });
+    }
+
+    if (!Number.isInteger(poolId) || poolId <= 0) {
+      return res.status(400).json({ success:false, error:"Неверный pool_id" });
+    }
+
+    const legalEntity = String(body.legal_entity || "").trim();
+    const sourceName = String(body.source_name || "").trim();
+    const moneyType = String(body.money_type || body.source_type || "").trim();
+    const amount = Number(body.amount);
+
+    if (!legalEntity || !sourceName || !moneyType) {
+      return res.status(400).json({ success:false, error:"Заполните ЮрЛицо, Источник и Тип" });
+    }
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ success:false, error:"Сумма должна быть больше 0" });
+    }
+
+    await client.query("BEGIN");
+
+    const parentQ = await client.query(`
+      SELECT id
+      FROM public.draft_funding_pool
+      WHERE id = $1
+        AND parent_pool_id IS NULL
+        AND is_active = true
+      FOR UPDATE
+    `, [poolId]);
+
+    if (!parentQ.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success:false, error:"Общий пул не найден" });
+    }
+
+    const allocatedQ = await client.query(`
+      SELECT COALESCE(SUM(amount), 0)::numeric AS allocated_amount
+      FROM public.draft_funding_pool
+      WHERE parent_pool_id = $1
+        AND is_active = true
+    `, [poolId]);
+
+    const allocated = Number(allocatedQ.rows[0]?.allocated_amount || 0);
+
+    if (amount + 0.000001 < allocated) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        success:false,
+        error:
+          "Общая сумма не может быть меньше уже распределенной суммы: " +
+          allocated.toLocaleString("ru-RU", {
+            minimumFractionDigits:2,
+            maximumFractionDigits:2
+          })
+      });
+    }
+
+    const upd = await client.query(`
+      UPDATE public.draft_funding_pool
+      SET
+        legal_entity = $2,
+        source_name = $3,
+        money_type = $4,
+        amount = $5
+      WHERE id = $1
+      RETURNING *
+    `, [poolId, legalEntity, sourceName, moneyType, amount]);
+
+    // Дочерние распределения принадлежат этому же общему пулу,
+    // поэтому справочные поля синхронизируем с родителем.
+    await client.query(`
+      UPDATE public.draft_funding_pool
+      SET
+        legal_entity = $2,
+        source_name = $3,
+        money_type = $4
+      WHERE parent_pool_id = $1
+    `, [poolId, legalEntity, sourceName, moneyType]);
+
+    await client.query("COMMIT");
+    return res.json({ success:true, row:upd.rows[0] });
+
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+    console.error("DRAFT FUNDING UPDATE ERROR:", e);
+    return res.status(500).json({ success:false, error:e.message });
+  } finally {
+    client.release();
+  }
+});
+
+// Полное удаление общего денежного пула.
+// Удаляются родитель, дочерние распределения и связи этих пулов с ZFT.
+app.delete("/draft-funding-pools/:poolId", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const poolId = Number(req.params.poolId);
+    const login = String(req.body?.login || "").trim().toLowerCase();
+    const allowed = ["b_erkin", "s_zhasulan", "k_ermek"];
+
+    if (!allowed.includes(login)) {
+      return res.status(403).json({ success:false, error:"Нет доступа к удалению пула" });
+    }
+
+    if (!Number.isInteger(poolId) || poolId <= 0) {
+      return res.status(400).json({ success:false, error:"Неверный pool_id" });
+    }
+
+    await client.query("BEGIN");
+
+    const parentQ = await client.query(`
+      SELECT id
+      FROM public.draft_funding_pool
+      WHERE id = $1
+        AND parent_pool_id IS NULL
+      FOR UPDATE
+    `, [poolId]);
+
+    if (!parentQ.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success:false, error:"Общий пул не найден" });
+    }
+
+    const childQ = await client.query(`
+      SELECT id
+      FROM public.draft_funding_pool
+      WHERE parent_pool_id = $1
+    `, [poolId]);
+
+    const childIds = childQ.rows.map(r => Number(r.id)).filter(Boolean);
+    const allIds = [poolId, ...childIds];
+
+    // Удаляем связи ZFT с дочерними пулами.
+    await client.query(`
+      DELETE FROM public.zvk_funding_pool_allocations
+      WHERE funding_pool_id = ANY($1::bigint[])
+    `, [allIds]);
+
+    // Старое одиночное поле funding_pool_id больше не должно ссылаться на удаленный пул.
+    await client.query(`
+      UPDATE public.zvk_status
+      SET funding_pool_id = NULL
+      WHERE funding_pool_id = ANY($1::bigint[])
+    `, [allIds]);
+
+    // Если есть старые операции по этим пулам — удаляем их тоже.
+    await client.query(`
+      DELETE FROM public.draft_funding_operation
+      WHERE pool_id = ANY($1::bigint[])
+    `, [allIds]);
+
+    await client.query(`
+      DELETE FROM public.draft_funding_pool
+      WHERE parent_pool_id = $1
+    `, [poolId]);
+
+    await client.query(`
+      DELETE FROM public.draft_funding_pool
+      WHERE id = $1
+    `, [poolId]);
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success:true,
+      deleted_pool_id:poolId,
+      deleted_child_pools:childIds.length
+    });
+
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+    console.error("DRAFT FUNDING DELETE ERROR:", e);
+    return res.status(500).json({ success:false, error:e.message });
+  } finally {
+    client.release();
+  }
+});
+
+
+
+// Вернуть свободную сумму дочернего пула обратно в общий родительский пул.
+// Фактически уменьшаем amount дочернего пула.
+// Общая сумма родителя не меняется, поэтому его "Не распределено" автоматически увеличивается.
+app.post("/draft-funding-pools/:poolId/return", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const poolId = Number(req.params.poolId);
+    const amount = Number(req.body?.amount);
+    const login = String(req.body?.login || "").trim().toLowerCase();
+    const allowed = ["b_erkin", "s_zhasulan", "k_ermek"];
+
+    if (!allowed.includes(login)) {
+      return res.status(403).json({
+        success:false,
+        error:"Нет доступа к возврату суммы"
+      });
+    }
+
+    if (!Number.isInteger(poolId) || poolId <= 0) {
+      return res.status(400).json({
+        success:false,
+        error:"Неверный pool_id"
+      });
+    }
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({
+        success:false,
+        error:"Сумма возврата должна быть больше 0"
+      });
+    }
+
+    await client.query("BEGIN");
+
+    const childQ = await client.query(`
+      SELECT
+        id,
+        parent_pool_id,
+        amount
+      FROM public.draft_funding_pool
+      WHERE id = $1
+        AND parent_pool_id IS NOT NULL
+        AND is_active = true
+      FOR UPDATE
+    `, [poolId]);
+
+    if (!childQ.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({
+        success:false,
+        error:"Распределенный пул не найден"
+      });
+    }
+
+    const child = childQ.rows[0];
+    const childAmount = Number(child.amount || 0);
+
+    // Использовано в ФТ: считаем только действующие распределения,
+    // точно так же как в сводке пулов.
+    const usedQ = await client.query(`
+      SELECT COALESCE(SUM(a.amount), 0)::numeric AS used_amount
+      FROM public.zvk_funding_pool_allocations a
+      LEFT JOIN public.ft_zvk_current_v2 cur
+        ON cur.zvk_row_id = a.zvk_row_id
+      WHERE a.funding_pool_id = $1
+        AND (
+          cur.zvk_row_id IS NULL
+          OR lower(trim(COALESCE(cur.request_flag, ''))) <> lower('Обнуление')
+        )
+    `, [poolId]);
+
+    const usedAmount = Number(usedQ.rows[0]?.used_amount || 0);
+    const freeAmount = Math.max(0, childAmount - usedAmount);
+
+    if (amount > freeAmount + 0.009) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        success:false,
+        error:
+          "Можно вернуть не больше свободного остатка: " +
+          freeAmount.toLocaleString("ru-RU", {
+            minimumFractionDigits:2,
+            maximumFractionDigits:2
+          })
+      });
+    }
+
+    const newAmount = Math.max(0, childAmount - amount);
+
+    if (newAmount <= 0.009 && usedAmount <= 0.009) {
+      // Полный возврат неиспользованного дочернего пула:
+      // удаляем строку распределения целиком.
+      await client.query(`
+        DELETE FROM public.draft_funding_pool
+        WHERE id = $1
+      `, [poolId]);
+    } else {
+      await client.query(`
+        UPDATE public.draft_funding_pool
+        SET amount = $2
+        WHERE id = $1
+      `, [poolId, newAmount]);
+    }
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success:true,
+      pool_id:poolId,
+      returned_amount:amount,
+      old_amount:childAmount,
+      used_amount:usedAmount,
+      new_amount:newAmount,
+      parent_pool_id:Number(child.parent_pool_id)
+    });
+
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+    console.error("DRAFT FUNDING RETURN ERROR:", e);
+    return res.status(500).json({
+      success:false,
+      error:e.message
+    });
+  } finally {
+    client.release();
+  }
+});
+
+
+app.get("/draft-funding-pools/:poolId/allocations", async (req, res) => {
+  try {
+    const poolId = Number(req.params.poolId);
+
+    if (!Number.isInteger(poolId) || poolId <= 0) {
+      return res.status(400).json({ success: false, error: "Неверный pool_id" });
+    }
+
+    const parentQ = await pool.query(`
+      SELECT
+        p.id,
+        p.legal_entity,
+        p.source_name,
+        p.money_type,
+        p.amount AS total_amount,
+        COALESCE((
+          SELECT SUM(c.amount)
+          FROM public.draft_funding_pool c
+          WHERE c.parent_pool_id = p.id
+            AND c.is_active = true
+        ), 0) AS allocated_amount,
+        (
+          p.amount
+          - COALESCE((
+              SELECT SUM(c.amount)
+              FROM public.draft_funding_pool c
+              WHERE c.parent_pool_id = p.id
+                AND c.is_active = true
+            ), 0)
+        ) AS unallocated_amount
+      FROM public.draft_funding_pool p
+      WHERE p.id = $1
+        AND p.is_active = true
+        AND p.parent_pool_id IS NULL
+      LIMIT 1
+    `, [poolId]);
+
+    if (!parentQ.rows.length) {
+      return res.status(404).json({ success: false, error: "Общий пул не найден" });
+    }
+
+    const rowsQ = await pool.query(`
+      SELECT
+        c.id,
+        c.parent_pool_id,
+        c.legal_entity,
+        c.source_name,
+        c.money_type,
+        c.object_name,
+        c.beneficiary_login,
+        c.amount,
+        c.created_by,
+        c.created_at
+      FROM public.draft_funding_pool c
+      WHERE c.parent_pool_id = $1
+        AND c.is_active = true
+      ORDER BY c.created_at, c.id
+    `, [poolId]);
+
+    return res.json({
+      success: true,
+      pool: parentQ.rows[0],
+      rows: rowsQ.rows
+    });
+  } catch (e) {
+    console.error("DRAFT FUNDING ALLOCATIONS ERROR:", e);
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.post("/draft-funding-pools/:poolId/allocate", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const poolId = Number(req.params.poolId);
+    const body = req.body || {};
+
+    const objectName = String(body.object_name || body.object || "").trim();
+    const beneficiaryLogin = String(body.beneficiary_login || "").trim();
+    const createdBy = String(body.created_by || body.login || "").trim();
+    const amount = Number(body.amount);
+
+    const allocatorLogin = createdBy.toLowerCase();
+    const allowedAllocators = ["b_erkin", "s_zhasulan", "k_ermek"];
+
+    if (!allowedAllocators.includes(allocatorLogin)) {
+      return res.status(403).json({
+        success: false,
+        error: "Нет доступа к распределению сумм"
+      });
+    }
+
+    if (!Number.isInteger(poolId) || poolId <= 0) {
+      return res.status(400).json({ success: false, error: "Неверный pool_id" });
+    }
+    if (!objectName) {
+      return res.status(400).json({ success: false, error: "Объект не выбран" });
+    }
+    if (!beneficiaryLogin) {
+      return res.status(400).json({
+        success: false,
+        error: "Выберите логин инициатора"
+      });
+    }
+
+    const userQ = await pool.query(`
+      SELECT trim(login) AS login
+      FROM public.users
+      WHERE COALESCE(is_active, true) = true
+        AND lower(trim(login)) = lower(trim($1))
+      LIMIT 1
+    `, [beneficiaryLogin]);
+
+    if (!userQ.rows.length) {
+      return res.status(400).json({
+        success: false,
+        error: "Логин не найден в public.users"
+      });
+    }
+
+    const normalizedBeneficiaryLogin = String(userQ.rows[0].login || "").trim();
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: "Сумма распределения должна быть больше 0"
+      });
+    }
+
+    await client.query("BEGIN");
+
+    const parentQ = await client.query(`
+      SELECT
+        id,
+        legal_entity,
+        source_name,
+        money_type,
+        amount
+      FROM public.draft_funding_pool
+      WHERE id = $1
+        AND is_active = true
+        AND parent_pool_id IS NULL
+      FOR UPDATE
+    `, [poolId]);
+
+    if (!parentQ.rows.length) {
+      throw new Error("Общий пул не найден");
+    }
+
+    const parent = parentQ.rows[0];
+
+    const allocatedQ = await client.query(`
+      SELECT COALESCE(SUM(amount), 0) AS allocated_amount
+      FROM public.draft_funding_pool
+      WHERE parent_pool_id = $1
+        AND is_active = true
+    `, [poolId]);
+
+    const totalAmount = Number(parent.amount || 0);
+    const allocatedAmount = Number(allocatedQ.rows[0].allocated_amount || 0);
+    const unallocatedAmount = totalAmount - allocatedAmount;
+
+    if (amount > unallocatedAmount) {
+      await client.query("ROLLBACK");
+
+      return res.status(400).json({
+        success: false,
+        error:
+          "Нельзя распределить больше остатка. Доступно: " +
+          unallocatedAmount.toLocaleString("ru-RU")
+      });
+    }
+
+    const insertQ = await client.query(`
+      INSERT INTO public.draft_funding_pool (
+        legal_entity,
+        source_name,
+        money_type,
+        object_name,
+        beneficiary_login,
+        amount,
+        parent_pool_id,
+        is_active,
+        created_by,
+        created_at
+      )
+      VALUES (
+        $1, $2, $3, $4, $5, $6, $7, true, NULLIF($8, ''), NOW()
+      )
+      RETURNING *
+    `, [
+      parent.legal_entity,
+      parent.source_name,
+      parent.money_type,
+      objectName,
+      normalizedBeneficiaryLogin,
+      amount,
+      poolId,
+      createdBy
+    ]);
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success: true,
+      row: insertQ.rows[0],
+      total_amount: totalAmount,
+      allocated_amount: allocatedAmount + amount,
+      unallocated_amount: unallocatedAmount - amount
+    });
+
+  } catch (e) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {}
+
+    console.error("DRAFT FUNDING ALLOCATE ERROR:", e);
+    return res.status(500).json({ success: false, error: e.message });
+
+  } finally {
+    client.release();
+  }
+});
+
+// =====================================================
+// ДО РЕЕСТР
+// Гулнур -> Ермек -> Жасулан
+// =====================================================
+
+function normalizeLogin_(v) {
+  return String(v || "").trim().toLowerCase();
+}
+
+function isPreRegistryAdmin_(login) {
+  return ["r_gulnur", "k_ermek", "s_zhasulan"].includes(
+    normalizeLogin_(login)
+  );
+}
+
+
+// =====================================================
+// 1. СОХРАНИТЬ ПРЕДВАРИТЕЛЬНУЮ СУММУ В ФТ
+// НЕ МЕНЯЕТ:
+// request_flag
+// to_pay
+// src_o
+// =====================================================
+app.post("/pre-registry/amount-save", async (req, res) => {
+  try {
+    const {
+      zvk_row_id,
+      amount,
+      login
+    } = req.body || {};
+
+    const rowId = Number(zvk_row_id);
+    const actor = normalizeLogin_(login);
+
+    if (!rowId) {
+      return res.status(400).json({
+        success: false,
+        error: "zvk_row_id required"
+      });
+    }
+
+    if (actor !== "r_gulnur") {
+      return res.status(403).json({
+        success: false,
+        error: "NO_RIGHTS"
+      });
+    }
+
+    const amountNum = Number(
+      String(amount ?? "")
+        .replace(/\s/g, "")
+        .replace(",", ".")
+    );
+
+    if (!Number.isFinite(amountNum) || amountNum < 0) {
+      return res.status(400).json({
+        success: false,
+        error: "INVALID_AMOUNT"
+      });
+    }
+
+    // Проверяем, существует ли строка ZFT.
+    const qRow = await pool.query(`
+      SELECT
+        z.id,
+        z.id_ft,
+        z.id_zvk,
+        z.request_flag,
+        z.to_pay,
+        f.sum_ft
+      FROM public.zvk z
+      JOIN public.ft f
+        ON f.id_ft = z.id_ft
+      WHERE z.id = $1
+      LIMIT 1
+    `, [rowId]);
+
+    if (!qRow.rows.length) {
+      return res.status(404).json({
+        success: false,
+        error: "ZVK_ROW_NOT_FOUND"
+      });
+    }
+
+    const row = qRow.rows[0];
+
+    // Предварительная сумма не должна быть больше доступного остатка FT.
+    const balance = await getFtAvailableAmount(
+      pool,
+      row.id_ft,
+      rowId
+    );
+
+    if (
+      amountNum > 0 &&
+      balance.exists &&
+      amountNum > Number(balance.available || 0) + 0.000001
+    ) {
+      return res.status(400).json({
+        success: false,
+        error: "PRE_REGISTRY_AMOUNT_EXCEEDS_REMAINING",
+        message: "Сумма ДоРеестра больше остатка FT",
+        remaining: balance.available,
+        requested: amountNum
+      });
+    }
+
+    const upd = await pool.query(`
+      UPDATE public.zvk
+      SET pre_registry_amount =
+        CASE
+          WHEN $1::numeric = 0 THEN NULL
+          ELSE $1::numeric
+        END
+      WHERE id = $2
+      RETURNING
+        id,
+        id_ft,
+        id_zvk,
+        pre_registry_amount
+    `, [
+      amountNum,
+      rowId
+    ]);
+
+    return res.json({
+      success: true,
+      row: upd.rows[0]
+    });
+
+  } catch (e) {
+    console.error("PRE REGISTRY AMOUNT SAVE ERROR:", e);
+
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
+
+
+// =====================================================
+// 2. СОЗДАТЬ ДО РЕЕСТР
+// Только r_gulnur.
+// Берём сумму из zvk.pre_registry_amount.
+// Заявка остаётся как есть.
+// =====================================================
+app.post("/pre-registry/create", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const {
+      row_ids,
+      login
+    } = req.body || {};
+
+    const actor = normalizeLogin_(login);
+
+    const ids = Array.isArray(row_ids)
+      ? [...new Set(
+          row_ids.map(Number).filter(Boolean)
+        )]
+      : [];
+
+    if (actor !== "r_gulnur") {
+      return res.status(403).json({
+        success: false,
+        error: "NO_RIGHTS"
+      });
+    }
+
+    if (!ids.length) {
+      return res.status(400).json({
+        success: false,
+        error: "row_ids required"
+      });
+    }
+
+    await client.query("BEGIN");
+
+    // Проверяем выбранные ZFT.
+    const rowsQ = await client.query(`
+      SELECT
+        z.id AS zvk_row_id,
+        z.id_ft,
+        z.id_zvk,
+        z.pre_registry_amount,
+
+        f."object" AS object,
+        f.contractor,
+        f.pay_purpose
+
+      FROM public.zvk z
+
+      JOIN public.ft f
+        ON f.id_ft = z.id_ft
+
+      WHERE z.id = ANY($1::bigint[])
+    `, [ids]);
+
+    if (rowsQ.rows.length !== ids.length) {
+      throw new Error("Некоторые выбранные строки ZFT не найдены");
+    }
+
+    for (const row of rowsQ.rows) {
+      const amount = Number(row.pre_registry_amount || 0);
+
+      if (!(amount > 0)) {
+        throw new Error(
+          `${row.id_zvk || row.id_ft}: не заполнена сумма ДоРеестра`
+        );
+      }
+    }
+
+    // Нельзя одну и ту же ZFT второй раз отправлять
+    // в незавершенный ДоРеестр.
+    const existsQ = await client.query(`
+      SELECT
+        i.zvk_row_id,
+        z.id_zvk
+      FROM public.pre_registry_items i
+
+      LEFT JOIN public.zvk z
+        ON z.id = i.zvk_row_id
+
+      WHERE i.zvk_row_id = ANY($1::bigint[])
+        AND COALESCE(i.approval_status, '') NOT IN (
+          'Отменено',
+          'Отклонено'
+        )
+    `, [ids]);
+
+    if (existsQ.rows.length) {
+      const names = existsQ.rows
+        .map(r => r.id_zvk || r.zvk_row_id)
+        .join(", ");
+
+      throw new Error(
+        "Уже находятся в ДоРеестре: " + names
+      );
+    }
+
+    // Создаём шапку.
+    const headQ = await client.query(`
+      INSERT INTO public.pre_registry_head
+        (
+          created_by,
+          status,
+          created_at
+        )
+      VALUES
+        ($1, 'На согласовании', NOW())
+
+      RETURNING
+        id,
+        created_by,
+        status,
+        created_at
+    `, [actor]);
+
+    const preRegistryId = headQ.rows[0].id;
+
+    // Копируем строки.
+    const insertedQ = await client.query(`
+      INSERT INTO public.pre_registry_items
+      (
+        pre_registry_id,
+        zvk_row_id,
+        proposed_amount,
+        approved_amount,
+        approval_status,
+        approved_by,
+        approved_at,
+        distributed_by,
+        distributed_at,
+        created_by,
+        created_at,
+        updated_at
+      )
+
+      SELECT
+        $1,
+        z.id,
+        z.pre_registry_amount,
+        NULL,
+        'Ожидает',
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        $2,
+        NOW(),
+        NOW()
+
+      FROM public.zvk z
+
+      WHERE z.id = ANY($3::bigint[])
+
+      RETURNING *
+    `, [
+      preRegistryId,
+      actor,
+      ids
+    ]);
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success: true,
+      pre_registry_id: preRegistryId,
+      count: insertedQ.rows.length,
+      items: insertedQ.rows
+    });
+
+  } catch (e) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {}
+
+    console.error("PRE REGISTRY CREATE ERROR:", e);
+
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+
+  } finally {
+    client.release();
+  }
+});
+
+
+// =====================================================
+// 3. ПОЛУЧИТЬ ВСЕ СТРОКИ ДО РЕЕСТРА
+// r_gulnur
+// k_ermek
+// s_zhasulan
+// =====================================================
+app.get("/pre-registry", async (req, res) => {
+  try {
+    const login = normalizeLogin_(req.query.login);
+
+    if (!isPreRegistryAdmin_(login)) {
+      return res.status(403).json({
+        success: false,
+        error: "NO_RIGHTS"
+      });
+    }
+
+    const q = await pool.query(`
+      SELECT
+        i.id AS item_id,
+        i.pre_registry_id,
+        i.zvk_row_id,
+
+        z.id_ft,
+        z.id_zvk,
+
+        f."object" AS object,
+        f.contractor,
+        f.pay_purpose,
+
+        i.proposed_amount,
+        i.approved_amount,
+        i.approval_status,
+
+        i.approved_by,
+        i.approved_at,
+
+        i.distributed_by,
+        i.distributed_at,
+
+        i.created_by,
+        i.created_at,
+
+        h.status AS pre_registry_status
+
+      FROM public.pre_registry_items i
+
+      JOIN public.pre_registry_head h
+        ON h.id = i.pre_registry_id
+
+      JOIN public.zvk z
+        ON z.id = i.zvk_row_id
+
+      JOIN public.ft f
+        ON f.id_ft = z.id_ft
+
+      ORDER BY
+        i.created_at DESC,
+        i.id DESC
+    `);
+
+    return res.json({
+      success: true,
+      rows: q.rows
+    });
+
+  } catch (e) {
+    console.error("PRE REGISTRY LIST ERROR:", e);
+
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
+
+
+// =====================================================
+// 4. ЕРМЕК СОХРАНЯЕТ СУММУ
+// Пока НЕ утвердил — может менять сколько угодно.
+// =====================================================
+app.post("/pre-registry/save-approval-amount", async (req, res) => {
+  try {
+    const {
+      item_id,
+      amount,
+      login
+    } = req.body || {};
+
+    const actor = normalizeLogin_(login);
+    const itemId = Number(item_id);
+
+    if (actor !== "k_ermek") {
+      return res.status(403).json({
+        success: false,
+        error: "ONLY_K_ERMEK"
+      });
+    }
+
+    if (!itemId) {
+      return res.status(400).json({
+        success: false,
+        error: "item_id required"
+      });
+    }
+
+    const amountNum = Number(
+      String(amount ?? "")
+        .replace(/\s/g, "")
+        .replace(",", ".")
+    );
+
+    if (!Number.isFinite(amountNum) || amountNum < 0) {
+      return res.status(400).json({
+        success: false,
+        error: "INVALID_AMOUNT"
+      });
+    }
+
+    const oldQ = await pool.query(`
+      SELECT *
+      FROM public.pre_registry_items
+      WHERE id = $1
+      LIMIT 1
+    `, [itemId]);
+
+    if (!oldQ.rows.length) {
+      return res.status(404).json({
+        success: false,
+        error: "ITEM_NOT_FOUND"
+      });
+    }
+
+    const oldRow = oldQ.rows[0];
+
+    if (oldRow.approval_status === "Утверждено") {
+      return res.status(400).json({
+        success: false,
+        error: "ALREADY_APPROVED"
+      });
+    }
+
+    if (
+      amountNum >
+      Number(oldRow.proposed_amount || 0) + 0.000001
+    ) {
+      return res.status(400).json({
+        success: false,
+        error: "APPROVED_AMOUNT_EXCEEDS_PROPOSED",
+        message:
+          "Сумма Ермека не может быть больше суммы, отправленной Гулнур"
+      });
+    }
+
+    const upd = await pool.query(`
+      UPDATE public.pre_registry_items
+
+      SET
+        approved_amount = $1,
+        approval_status = 'Ожидает',
+        updated_at = NOW()
+
+      WHERE id = $2
+
+      RETURNING *
+    `, [
+      amountNum,
+      itemId
+    ]);
+
+    return res.json({
+      success: true,
+      row: upd.rows[0]
+    });
+
+  } catch (e) {
+    console.error("PRE REGISTRY SAVE AMOUNT ERROR:", e);
+
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
+
+
+// =====================================================
+// 5. ЕРМЕК УТВЕРЖДАЕТ
+//
+// ВАЖНО:
+// НЕ меняем request_flag.
+// НЕ меняем zvk.to_pay.
+// НЕ меняем Источник.
+// =====================================================
+app.post("/pre-registry/approve", async (req, res) => {
+  try {
+    const {
+      item_id,
+      login
+    } = req.body || {};
+
+    const actor = normalizeLogin_(login);
+    const itemId = Number(item_id);
+
+    if (actor !== "k_ermek") {
+      return res.status(403).json({
+        success: false,
+        error: "ONLY_K_ERMEK"
+      });
+    }
+
+    if (!itemId) {
+      return res.status(400).json({
+        success: false,
+        error: "item_id required"
+      });
+    }
+
+    const q = await pool.query(`
+      SELECT *
+      FROM public.pre_registry_items
+      WHERE id = $1
+      LIMIT 1
+    `, [itemId]);
+
+    if (!q.rows.length) {
+      return res.status(404).json({
+        success: false,
+        error: "ITEM_NOT_FOUND"
+      });
+    }
+
+    const row = q.rows[0];
+
+    if (!(Number(row.approved_amount || 0) > 0)) {
+      return res.status(400).json({
+        success: false,
+        error: "APPROVED_AMOUNT_REQUIRED",
+        message: "Сначала укажите сумму"
+      });
+    }
+
+    const upd = await pool.query(`
+      UPDATE public.pre_registry_items
+
+      SET
+        approval_status = 'Утверждено',
+        approved_by = $1,
+        approved_at = NOW(),
+        updated_at = NOW()
+
+      WHERE id = $2
+
+      RETURNING *
+    `, [
+      actor,
+      itemId
+    ]);
+
+    return res.json({
+      success: true,
+      row: upd.rows[0]
+    });
+
+  } catch (e) {
+    console.error("PRE REGISTRY APPROVE ERROR:", e);
+
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
+
+
+// =====================================================
+// 6. ЖАСУЛАН: ОТМЕТИТЬ ЧТО РАСПРЕДЕЛЕНИЕ ВЫПОЛНЕНО
+//
+// Пока только статус.
+// На следующем этапе подключим реальные денежные пулы.
+// =====================================================
+app.post("/pre-registry/distributed", async (req, res) => {
+  try {
+    const {
+      item_id,
+      login
+    } = req.body || {};
+
+    const actor = normalizeLogin_(login);
+    const itemId = Number(item_id);
+
+    if (actor !== "s_zhasulan") {
+      return res.status(403).json({
+        success: false,
+        error: "ONLY_S_ZHASULAN"
+      });
+    }
+
+    if (!itemId) {
+      return res.status(400).json({
+        success: false,
+        error: "item_id required"
+      });
+    }
+
+    const q = await pool.query(`
+      SELECT *
+      FROM public.pre_registry_items
+      WHERE id = $1
+      LIMIT 1
+    `, [itemId]);
+
+    if (!q.rows.length) {
+      return res.status(404).json({
+        success: false,
+        error: "ITEM_NOT_FOUND"
+      });
+    }
+
+    if (q.rows[0].approval_status !== "Утверждено") {
+      return res.status(400).json({
+        success: false,
+        error: "NOT_APPROVED_BY_ERMEK",
+        message: "Сначала сумму должен утвердить Ермек"
+      });
+    }
+
+    const upd = await pool.query(`
+      UPDATE public.pre_registry_items
+
+      SET
+        distributed_by = $1,
+        distributed_at = NOW(),
+        updated_at = NOW()
+
+      WHERE id = $2
+
+      RETURNING *
+    `, [
+      actor,
+      itemId
+    ]);
+
+    return res.json({
+      success: true,
+      row: upd.rows[0]
+    });
+
+  } catch (e) {
+    console.error("PRE REGISTRY DISTRIBUTED ERROR:", e);
+
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
+
+app.listen(PORT, () => console.log("Server started on port " + PORT));
+// =====================================================
+// Модуль отдельного сайта «Реестр платежей» удалён.
+// Сохранена общая FT-логика registry_flag для оплаты и обнуления.
+// =====================================================
+
+require("dotenv").config();
+
+const express = require("express");
+const cors = require("cors");
+const path = require("path");
+const { Pool } = require("pg");
+const app = express();
+const nodemailer = require("nodemailer");
+
+// =====================================================
+// CORS: поддержка Google Apps Script, Safari и iPad
+// =====================================================
+const corsOptions = {
+  origin: true, // отражает Origin клиента, включая script.google.com/googleusercontent.com
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept"],
+  exposedHeaders: ["Content-Type"],
+  credentials: false,
+  optionsSuccessStatus: 204,
+  maxAge: 86400
+};
+
+app.use(cors(corsOptions));
+
+// Safari/iPad перед JSON POST может сначала отправлять OPTIONS.
+app.options(/.*/, cors(corsOptions));
+
+app.use(express.json({ limit: "20mb", type: ["application/json", "application/*+json"] }));
+app.use(express.urlencoded({ extended: true, limit: "20mb" }));
+app.use((err, req, res, next) => {
+  if (err) {
+    console.error("❌ JSON parse error:", err.message);
+    return res.status(400).json({ success:false, error:"BAD_JSON", message: err.message });
+  }
+  next();
+});
+
+app.get("/ping", (req, res) => {
+  res.set("Cache-Control", "no-store");
+  res.json({ ok: true, ts: Date.now(), service: "Service-NS API" });
+});
+
+// Проверка доступности API и CORS без обращения к базе данных.
+app.get("/api-health", (req, res) => {
+  res.set("Cache-Control", "no-store");
+  res.json({
+    ok: true,
+    origin: req.get("origin") || null,
+    userAgent: req.get("user-agent") || null,
+    ts: Date.now()
+  });
+});
+
+
+// 🔥 СТАТИКА (гарантированный путь)
+app.use("/public", express.static(process.cwd() + "/public"));
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL?.includes('render.com') 
+    ? { rejectUnauthorized: false }  // SSL только для Render
+    : false                          // без SSL для локальной БД
+});
+
+const MAIL_USER = process.env.MAIL_USER;
+const MAIL_PASS = process.env.MAIL_PASS;
+
+const mailTransporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: MAIL_USER,
+    pass: MAIL_PASS
+  }
+});
+
+function normalizeEmail(v) {
+  return String(v || "").trim().toLowerCase();
+}
+
+function generateTempPassword(length = 8) {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+  let result = "";
+  for (let i = 0; i < length; i++) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return result;
+}
+
+
+// =====================================================
+// INIT DB + МИГРАЦИИ
+// =====================================================
+async function initDb()  {
+  // sequences
+  await pool.query(`CREATE SEQUENCE IF NOT EXISTS ft_id_seq START 1;`);
+  await pool.query(`CREATE SEQUENCE IF NOT EXISTS zvk_id_seq START 1;`);
+
+  // FT
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ft (
+      id_ft text PRIMARY KEY,
+      input_date timestamptz,
+      input_name text,
+      legal_entity text,
+mechanization text,
+      "object" text,
+      contractor text,
+      invoice_no text,
+      invoice_date date,
+      invoice_pdf text,
+      sum_ft numeric,
+      source_file_id text
+    );
+  `);
+
+  await pool.query(`ALTER TABLE public.ft ADD COLUMN IF NOT EXISTS pay_purpose text;`);
+  await pool.query(`ALTER TABLE public.ft ADD COLUMN IF NOT EXISTS dds_article text;`);
+  await pool.query(`ALTER TABLE public.ft ADD COLUMN IF NOT EXISTS contract_no text;`);
+  await pool.query(`ALTER TABLE public.ft ADD COLUMN IF NOT EXISTS contract_date date;`);
+
+  // Один исходный PDF Drive может создать только одну запись FT.
+  // Старые строки остаются с NULL и не конфликтуют между собой.
+  await pool.query(`ALTER TABLE public.ft ADD COLUMN IF NOT EXISTS source_file_id text;`);
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS ft_source_file_id_uq
+    ON public.ft (source_file_id)
+    WHERE source_file_id IS NOT NULL AND btrim(source_file_id) <> '';
+  `);
+
+  // ✅ СИНХРОНИЗИРУЕМ ft_id_seq (чтобы после FT334 пошло FT335)
+  await pool.query(`
+    SELECT setval(
+      'public.ft_id_seq',
+      COALESCE((SELECT MAX((regexp_replace(id_ft, '\\D','','g'))::bigint) FROM public.ft), 0)
+    );
+  `);
+
+  // ZVK (история строк)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS zvk (
+      id_zvk text,
+      id_ft text,
+      zvk_date timestamptz,
+      zvk_name text,
+      to_pay numeric,
+      request_flag text
+    );
+  `);
+
+  // ✅ технический PK id (bigserial)
+  await pool.query(`ALTER TABLE public.zvk ADD COLUMN IF NOT EXISTS id bigserial;`);
+  // ЭСК: плановая сумма возврата, которую инициатор может менять в ФТ.
+  await pool.query(`ALTER TABLE public.zvk ADD COLUMN IF NOT EXISTS return_amount numeric(18,2) DEFAULT 0;`);
+  // Необязательный признак: платеж должен быть возвращён по ЭСК.
+  await pool.query(`ALTER TABLE public.zvk ADD COLUMN IF NOT EXISTS esk_return boolean DEFAULT false;`);
+  // ДоРеестр: предварительная сумма Гулнур. Не связана с обычным to_pay.
+  await pool.query(`ALTER TABLE public.zvk ADD COLUMN IF NOT EXISTS pre_registry_amount numeric(18,2);`);
+
+  await pool.query(`ALTER TABLE public.zvk DROP CONSTRAINT IF EXISTS zvk_pkey;`);
+  await pool.query(`ALTER TABLE public.zvk ADD CONSTRAINT zvk_pkey PRIMARY KEY (id);`);
+
+  // ✅ СИНХРОНИЗИРУЕМ sequence bigserial для zvk.id (исправляет duplicate zvk_pkey)
+  await pool.query(`
+    SELECT setval(
+      pg_get_serial_sequence('public.zvk','id'),
+      COALESCE((SELECT MAX(id) FROM public.zvk), 0)
+    );
+  `);
+
+  // ✅ СИНХРОНИЗИРУЕМ zvk_id_seq (чтобы ZFT продолжался дальше)
+  await pool.query(`
+    SELECT setval(
+      'public.zvk_id_seq',
+      COALESCE((SELECT MAX((regexp_replace(id_zvk, '\\D','','g'))::bigint) FROM public.zvk), 0)
+    );
+  `);
+
+  // ✅ Источник по строке истории (zvk_row_id UNIQUE)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS zvk_status (
+      zvk_row_id bigint,
+      status_time timestamptz,
+      src_d text,
+      src_o text
+    );
+  `);
+
+await pool.query(`
+  ALTER TABLE public.zvk_status
+  ADD COLUMN IF NOT EXISTS status_comment text;
+`);
+
+await pool.query(`
+  ALTER TABLE public.zvk_status
+  ADD COLUMN IF NOT EXISTS idlzk text;
+`);
+
+await pool.query(`
+  ALTER TABLE public.zvk_status
+  ADD COLUMN IF NOT EXISTS funding_pool_id bigint;
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS zvk_status_funding_pool_idx
+  ON public.zvk_status (funding_pool_id);
+`);
+
+// Одна ZFT может расходоваться из нескольких денежных пулов.
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS public.zvk_funding_pool_allocations (
+    id bigserial PRIMARY KEY,
+    zvk_row_id bigint NOT NULL,
+    funding_pool_id bigint NOT NULL,
+    amount numeric(18,2) NOT NULL CHECK (amount >= 0),
+    created_by text,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+    UNIQUE (zvk_row_id, funding_pool_id)
+  );
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS zvk_funding_alloc_row_idx
+  ON public.zvk_funding_pool_allocations (zvk_row_id);
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS zvk_funding_alloc_pool_idx
+  ON public.zvk_funding_pool_allocations (funding_pool_id);
+`);
+
+
+// Логин инициатора, которому выделена сумма дочернего денежного пула.
+// Для старых распределений поле остаётся NULL и ничего не ломает.
+await pool.query(`
+  ALTER TABLE public.draft_funding_pool
+  ADD COLUMN IF NOT EXISTS beneficiary_login text;
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS draft_funding_pool_beneficiary_login_idx
+  ON public.draft_funding_pool (lower(trim(beneficiary_login)))
+  WHERE beneficiary_login IS NOT NULL AND trim(beneficiary_login) <> '';
+`);
+
+await pool.query(`
+  ALTER TABLE public.zvk_status
+  ADD COLUMN IF NOT EXISTS money_type text;
+`);
+
+await pool.query(`
+  ALTER TABLE public.zvk_status
+  ADD COLUMN IF NOT EXISTS chief_approved text;
+`);
+
+
+
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS zvk_status_row_uq
+    ON zvk_status (zvk_row_id);
+  `);
+
+
+  // ✅ Оплата по строке истории (zvk_row_id PK)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS zvk_pay (
+      zvk_row_id bigint PRIMARY KEY,
+      registry_flag text,
+      aray_paid text,
+      aray_pay_time timestamptz,
+      aray_paid_by text,
+      is_paid text,
+      agree_time timestamptz,
+      pay_time timestamptz
+    );
+  `);
+
+  await pool.query(`ALTER TABLE public.zvk_pay ADD COLUMN IF NOT EXISTS aray_paid text;`);
+  await pool.query(`ALTER TABLE public.zvk_pay ADD COLUMN IF NOT EXISTS aray_pay_time timestamptz;`);
+  await pool.query(`ALTER TABLE public.zvk_pay ADD COLUMN IF NOT EXISTS aray_paid_by text;`);
+
+  // ЭСК: фактический возврат Арай.
+  await pool.query(`ALTER TABLE public.zvk_pay ADD COLUMN IF NOT EXISTS returned_amount numeric(18,2) DEFAULT 0;`);
+  await pool.query(`ALTER TABLE public.zvk_pay ADD COLUMN IF NOT EXISTS return_status text;`);
+  await pool.query(`ALTER TABLE public.zvk_pay ADD COLUMN IF NOT EXISTS return_time timestamptz;`);
+  await pool.query(`ALTER TABLE public.zvk_pay ADD COLUMN IF NOT EXISTS return_by text;`);
+
+  // (опционально) согласование по id_zvk
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS zvk_agree (
+      id_zvk text PRIMARY KEY,
+      agree_name text,
+      agree_time timestamptz
+    );
+  `);
+
+
+  // индексы
+  await pool.query(`CREATE INDEX IF NOT EXISTS zvk_idx_ft_date ON zvk (id_ft, zvk_date DESC);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS zvk_idx_zvk_date ON zvk (id_zvk, zvk_date DESC);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS zvk_idx_id ON zvk (id);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS zvk_status_row_idx ON zvk_status (zvk_row_id);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS zvk_pay_row_idx ON zvk_pay (zvk_row_id);`);
+
+
+
+  // ✅ VIEW: ИСТОРИЯ
+  await pool.query(`
+    CREATE OR REPLACE VIEW ft_zvk_history_v2 AS
+    SELECT
+      f.id_ft,
+      f.input_date,
+      f.input_name,
+     f.legal_entity,
+      f."object" AS object,
+      f.contractor,
+
+      f.pay_purpose,
+      f.dds_article,
+      f.contract_no,
+      f.contract_date,
+
+      f.invoice_no,
+      f.invoice_date,
+      f.invoice_pdf,
+      f.sum_ft,
+
+      z.id_zvk,
+      z.zvk_date,
+      z.zvk_name,
+      z.to_pay,
+      z.esk_return,
+      z.request_flag,
+
+      z.id AS zvk_row_id,
+
+s.status_time,
+s.src_d,
+s.src_o,
+s.money_type,
+s.status_comment,
+s.idlzk,
+
+      p.agree_time,
+      p.registry_flag,
+      p.pay_time,
+      p.is_paid,
+      f.mechanization,
+      z.return_amount,
+      COALESCE(p.returned_amount, 0) AS returned_amount,
+      p.return_status,
+      p.return_time,
+      p.return_by,
+      z.pre_registry_amount
+
+    FROM ft f
+    LEFT JOIN zvk z ON z.id_ft = f.id_ft
+
+    LEFT JOIN LATERAL (
+      SELECT s.*
+      FROM zvk_status s
+      WHERE s.zvk_row_id = z.id
+      ORDER BY s.status_time DESC NULLS LAST
+      LIMIT 1
+    ) s ON TRUE
+
+    LEFT JOIN zvk_pay p ON p.zvk_row_id = z.id;
+  `);
+
+  // ✅ VIEW: ТЕКУЩЕЕ
+  await pool.query(`
+    CREATE OR REPLACE VIEW ft_zvk_current_v2 AS
+    WITH ranked AS (
+      SELECT
+        v.*,
+        ROW_NUMBER() OVER (
+          PARTITION BY v.id_ft, v.id_zvk
+          ORDER BY v.zvk_date DESC NULLS LAST, v.zvk_row_id DESC
+        ) AS rn
+      FROM ft_zvk_history_v2 v
+    )
+    SELECT *
+    FROM ranked
+    WHERE rn = 1
+  `);
+
+
+  
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS public.users (
+    id bigserial PRIMARY KEY,
+    email text UNIQUE NOT NULL,
+    password text NOT NULL,
+    phone text,
+    last_name text,
+    first_name text,
+    middle_name text,
+    organization_name text,
+    is_active boolean DEFAULT true,
+    created_at timestamptz DEFAULT now()
+  );
+`);
+
+await pool.query(`
+  CREATE SCHEMA IF NOT EXISTS onec;
+`);
+
+// =====================================================
+// ИНТЕГРАЦИЯ С 1С
+// Таблицы заранее создаются при запуске сервера
+// =====================================================
+
+// 1. Шапка документа поступления
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS onec.doc_receipts (
+    document_id text PRIMARY KEY,
+    base_id text,
+    document_number text,
+    document_posted boolean,
+    document_date timestamptz,
+
+    organization_bin text,
+    organization_name text,
+
+    warehouse_id text,
+    warehouse_name text,
+
+    counterparty_id text,
+    counterparty_bin text,
+    counterparty_name text,
+
+    contract_id text,
+    contract_name text,
+
+    currency_name text,
+    income_kpn text,
+    settlement_account text,
+    advance_account text,
+
+    vat_enable boolean,
+    vat_mode text,
+
+    document_sum numeric(18,2),
+    document_commentary text,
+    document_author_name text,
+    document_type text,
+
+    advance_withheld numeric(18,2),
+    guarantee_withheld numeric(18,2),
+    penalty_withheld numeric(18,2),
+    other_withheld numeric(18,2),
+
+    target_entity text,
+action_required text,
+is_executed text,
+is_managerial text,
+
+    id_dov text,
+    dov_name text,
+    deleted boolean DEFAULT false,
+
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now()
+  );
+`);
+
+// 2. Товары документа
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS onec.doc_receipts_items (
+    document_id text NOT NULL,
+    line_no integer NOT NULL,
+    item_id text,
+
+    item_name text,
+    quantity numeric(18,6),
+    price numeric(18,2),
+    amount numeric(18,2),
+
+    vat_percent numeric(10,4),
+    vat_amount numeric(18,2),
+    amount_with_vat numeric(18,2),
+
+    vat_account text,
+    turnover_type text,
+    receipt_type_name text,
+
+cost_account_bu text,
+cost_account_nu text,
+
+project_id text,
+project_name text,
+
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+
+    PRIMARY KEY (document_id, line_no),
+
+    CONSTRAINT doc_items_document_fk
+      FOREIGN KEY (document_id)
+      REFERENCES onec.doc_receipts(document_id)
+      ON DELETE CASCADE
+  );
+`);
+
+// 3. Услуги документа
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS onec.doc_receipts_services (
+    document_id text NOT NULL,
+    line_no integer NOT NULL,
+    service_id text,
+
+    service_name text,
+    service_content text,
+
+    quantity numeric(18,6),
+    price numeric(18,2),
+    amount numeric(18,2),
+
+    vat_percent numeric(10,4),
+    vat_amount numeric(18,2),
+    amount_with_vat numeric(18,2),
+
+    vat_account text,
+    turnover_type text,
+    receipt_type_name text,
+
+    cost_account_bu text,
+    cost_account_nu text,
+
+    project_id text,
+    project_name text,
+
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+
+    PRIMARY KEY (document_id, line_no),
+
+    CONSTRAINT doc_services_document_fk
+      FOREIGN KEY (document_id)
+      REFERENCES onec.doc_receipts(document_id)
+      ON DELETE CASCADE
+  );
+`);
+
+// 4. Контрагенты
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS onec.ref_counterparties (
+    counterparty_id text PRIMARY KEY,
+    counterparty_name text,
+    individual_or_legal text,
+    group_name text,
+    counterparty_bin text,
+    counterparty_kbe text,
+    is_government_institution boolean,
+    is_small_retail_outlet boolean,
+    residence_country text,
+    vat_series text,
+    vat_number text,
+    vat_date date,
+    bank_account text,
+    bank_name text,
+    counterparty_comment text,
+    deleted boolean DEFAULT false,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now()
+  );
+`);
+
+// 5. Склады
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS onec.ref_warehouses (
+    warehouse_id text PRIMARY KEY,
+    warehouse_name text,
+    warehouse_comment text,
+    deleted boolean DEFAULT false,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now()
+  );
+`);
+
+// 6. Товары и услуги
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS onec.ref_products (
+    product_id text PRIMARY KEY,
+    product_code text,
+    product_name text,
+    is_group boolean,
+    is_service boolean,
+    article text,
+    unit text,
+    vat_percent numeric(10,4),
+    tnvd_code text,
+    kpvd_code text,
+    nkt_code text,
+    product_type text,
+    product_group text,
+    product_comment text,
+    deleted boolean DEFAULT false,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now()
+  );
+`);
+
+// 7. Договоры контрагентов
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS onec.ref_counterparties_contracts (
+    contract_id text PRIMARY KEY,
+    contract_number text,
+    contract_date date,
+    contract_name text,
+    contract_type text,
+    organization_name text,
+    organization_bin text,
+    counterparty_id text,
+    counterparty_bin text,
+    counterparty_name text,
+    deleted boolean DEFAULT false,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now()
+  );
+`);
+
+// 8. Проекты
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS onec.ref_project_groups (
+    project_id text PRIMARY KEY,
+    project_name text,
+    deleted boolean DEFAULT false,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now()
+  );
+`);
+
+// =====================================================
+// ДОПОЛНИТЕЛЬНЫЕ ИНДЕКСЫ ДЛЯ ПОИСКА
+// =====================================================
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS doc_receipts_document_date_idx
+  ON onec.doc_receipts (document_date);
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS doc_receipts_counterparty_id_idx
+  ON onec.doc_receipts (counterparty_id);
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS doc_receipts_warehouse_id_idx
+  ON onec.doc_receipts (warehouse_id);
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS doc_receipts_contract_id_idx
+  ON onec.doc_receipts (contract_id);
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS doc_receipts_items_item_id_idx
+  ON onec.doc_receipts_items (item_id);
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS doc_receipts_items_project_id_idx
+  ON onec.doc_receipts_items (project_id);
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS doc_receipts_services_service_id_idx
+  ON onec.doc_receipts_services (service_id);
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS doc_receipts_services_project_id_idx
+  ON onec.doc_receipts_services (project_id);
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS ref_contracts_counterparty_id_idx
+  ON onec.ref_counterparties_contracts (counterparty_id);
+`);
+
+await pool.query(`
+  ALTER TABLE public.users 
+  ADD COLUMN IF NOT EXISTS login text;
+`);
+
+await pool.query(`
+  ALTER TABLE public.users
+  ADD COLUMN IF NOT EXISTS role_ft text;
+`);
+
+await pool.query(`
+  ALTER TABLE public.users
+  ADD COLUMN IF NOT EXISTS role_hr text;
+`);
+
+await pool.query(`
+  CREATE UNIQUE INDEX IF NOT EXISTS users_login_idx 
+  ON public.users (lower(trim(login)));
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS users_email_idx
+  ON public.users (lower(trim(email)));
+`);
+
+
+
+
+
+
+
+
+
+  // =========================
+  // REQUEST HEAD
+  // =========================
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.request_head (
+      id bigserial PRIMARY KEY,
+      request_no bigint,
+      request_date date DEFAULT CURRENT_DATE,
+      created_by text,
+      total_amount numeric(18,2) DEFAULT 0,
+      items_count integer DEFAULT 0,
+      workflow_stage text DEFAULT 'Главный бухгалтер',
+      agree_status text DEFAULT 'На согласовании',
+      archive_flag text DEFAULT 'Нет',
+      pdf_url text,
+      created_at timestamptz DEFAULT now()
+    );
+  `);
+
+
+
+  await pool.query(`
+    CREATE SEQUENCE IF NOT EXISTS public.request_no_seq START 1;
+  `);
+
+  await pool.query(`
+    SELECT setval(
+      'public.request_no_seq',
+      COALESCE((SELECT MAX(request_no) FROM public.request_head), 0)
+    );
+  `);
+
+  await pool.query(`
+    ALTER TABLE public.request_head
+    ALTER COLUMN request_no SET DEFAULT nextval('public.request_no_seq');
+  `);
+
+  // =========================
+  // REQUEST ITEMS
+  // =========================
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.request_items (
+      id bigserial PRIMARY KEY,
+      request_id bigint NOT NULL,
+      zvk_row_id bigint,
+      id_ft text,
+      id_zvk text,
+      object text,
+      input_name text,
+      contractor text,
+      pay_purpose text,
+      dds_article text,
+      contract_no text,
+      invoice_no text,
+      invoice_date date,
+      invoice_pdf text,
+      src_d text,
+      src_o text,
+      money_type text,
+      idlzk text,
+      to_pay numeric(18,2) DEFAULT 0
+    );
+  `);
+
+  await pool.query(`
+    ALTER TABLE public.request_items
+    ADD COLUMN IF NOT EXISTS idlzk text;
+  `);
+
+  await pool.query(`
+    ALTER TABLE public.request_items
+    ADD COLUMN IF NOT EXISTS printed_at timestamptz;
+  `);
+
+  await pool.query(`
+    ALTER TABLE public.request_items
+    ADD COLUMN IF NOT EXISTS printed_by text;
+  `);
+
+  // Оплачено Арай хранится только в отправленной заявке, не в FT/zvk_pay.
+  await pool.query(`ALTER TABLE public.request_items ADD COLUMN IF NOT EXISTS aray_paid text;`);
+  await pool.query(`ALTER TABLE public.request_items ADD COLUMN IF NOT EXISTS aray_pay_time timestamptz;`);
+  await pool.query(`ALTER TABLE public.request_items ADD COLUMN IF NOT EXISTS aray_paid_by text;`);
+  // Фиксируем признак «Возврат ЭСК» в строке созданного Реестра.
+  await pool.query(`ALTER TABLE public.request_items ADD COLUMN IF NOT EXISTS money_type text;`);
+  await pool.query(`ALTER TABLE public.request_items ADD COLUMN IF NOT EXISTS esk_return boolean DEFAULT false;`);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS request_items_printed_at_idx
+    ON public.request_items (printed_at);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS request_items_request_id_idx
+    ON public.request_items (request_id);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS request_items_zvk_row_id_idx
+    ON public.request_items (zvk_row_id);
+  `);
+
+
+  // =====================================================
+  // АВТОСИНХРОНИЗАЦИЯ ФТ -> РЕЕСТР
+  // request_items хранит данные заявки отдельной копией. Поэтому без этой
+  // синхронизации изменения в ft / zvk / zvk_status оставались только в ФТ.
+  // Синхронизируются все бизнес-поля, которые реально существуют в request_items.
+  // legal_entity в request_items не создаётся: он читается напрямую из FT/current view.
+  // Связь выполняется по стабильному ключу zvk_row_id.
+  // =====================================================
+  await pool.query(`
+    CREATE OR REPLACE FUNCTION public.sync_request_items_from_current(
+      p_zvk_row_id bigint DEFAULT NULL,
+      p_id_ft text DEFAULT NULL
+    )
+    RETURNS integer
+    LANGUAGE plpgsql
+    AS $$
+    DECLARE
+      v_request_ids bigint[] := ARRAY[]::bigint[];
+      v_updated_count integer := 0;
+    BEGIN
+      WITH changed AS (
+        UPDATE public.request_items i
+        SET
+          id_ft        = cur.id_ft,
+          id_zvk       = cur.id_zvk,
+          object       = cur.object,
+          input_name   = cur.input_name,
+          contractor   = cur.contractor,
+          pay_purpose  = cur.pay_purpose,
+          dds_article  = cur.dds_article,
+          contract_no  = cur.contract_no,
+          invoice_no   = cur.invoice_no,
+          invoice_date = cur.invoice_date,
+          invoice_pdf  = cur.invoice_pdf,
+          src_d        = cur.src_d,
+          src_o        = cur.src_o,
+          money_type   = cur.money_type,
+          idlzk        = cur.idlzk,
+          to_pay       = cur.to_pay,
+          esk_return   = COALESCE(cur.esk_return, false)
+        FROM public.ft_zvk_current_v2 cur
+        WHERE i.zvk_row_id = cur.zvk_row_id
+          AND (p_zvk_row_id IS NULL OR cur.zvk_row_id = p_zvk_row_id)
+          AND (p_id_ft IS NULL OR cur.id_ft = p_id_ft)
+          AND ROW(
+            i.id_ft,
+            i.id_zvk,
+            i.object,
+            i.input_name,
+            i.contractor,
+            i.pay_purpose,
+            i.dds_article,
+            i.contract_no,
+            i.invoice_no,
+            i.invoice_date,
+            i.invoice_pdf,
+            i.src_d,
+            i.src_o,
+            i.money_type,
+            i.idlzk,
+            i.to_pay,
+            i.esk_return
+          ) IS DISTINCT FROM ROW(
+            cur.id_ft,
+            cur.id_zvk,
+            cur.object,
+            cur.input_name,
+            cur.contractor,
+            cur.pay_purpose,
+            cur.dds_article,
+            cur.contract_no,
+            cur.invoice_no,
+            cur.invoice_date,
+            cur.invoice_pdf,
+            cur.src_d,
+            cur.src_o,
+            cur.money_type,
+            cur.idlzk,
+            cur.to_pay,
+            COALESCE(cur.esk_return, false)
+          )
+        RETURNING i.request_id
+      )
+      SELECT
+        COALESCE(array_agg(DISTINCT request_id), ARRAY[]::bigint[]),
+        COUNT(*)::integer
+      INTO v_request_ids, v_updated_count
+      FROM changed;
+
+      -- Если изменилось поле «К оплате», синхронизируем также итог шапки.
+      IF cardinality(v_request_ids) > 0 THEN
+        UPDATE public.request_head h
+        SET
+          total_amount = totals.total_amount,
+          items_count = totals.items_count
+        FROM (
+          SELECT
+            i.request_id,
+            COALESCE(SUM(i.to_pay), 0)::numeric(18,2) AS total_amount,
+            COUNT(*)::integer AS items_count
+          FROM public.request_items i
+          WHERE i.request_id = ANY(v_request_ids)
+          GROUP BY i.request_id
+        ) totals
+        WHERE h.id = totals.request_id;
+      END IF;
+
+      RETURN v_updated_count;
+    END;
+    $$;
+  `);
+
+  await pool.query(`
+    CREATE OR REPLACE FUNCTION public.trg_sync_request_items_by_ft()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+      PERFORM public.sync_request_items_from_current(NULL, NEW.id_ft);
+      RETURN NEW;
+    END;
+    $$;
+  `);
+
+  await pool.query(`
+    CREATE OR REPLACE FUNCTION public.trg_sync_request_items_by_zvk()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+      PERFORM public.sync_request_items_from_current(NEW.id, NULL);
+      RETURN NEW;
+    END;
+    $$;
+  `);
+
+  await pool.query(`
+    CREATE OR REPLACE FUNCTION public.trg_sync_request_items_by_status()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    DECLARE
+      v_zvk_row_id bigint;
+    BEGIN
+      IF TG_OP = 'DELETE' THEN
+        v_zvk_row_id := OLD.zvk_row_id;
+      ELSE
+        v_zvk_row_id := NEW.zvk_row_id;
+      END IF;
+
+      PERFORM public.sync_request_items_from_current(v_zvk_row_id, NULL);
+
+      IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+      END IF;
+
+      RETURN NEW;
+    END;
+    $$;
+  `);
+
+  await pool.query(`
+    DROP TRIGGER IF EXISTS ft_sync_request_items_trg ON public.ft;
+    CREATE TRIGGER ft_sync_request_items_trg
+AFTER UPDATE OF
+  input_name,
+  legal_entity,
+  mechanization,
+  "object",
+      contractor,
+      pay_purpose,
+      dds_article,
+      contract_no,
+      invoice_no,
+      invoice_date,
+      invoice_pdf
+    ON public.ft
+    FOR EACH ROW
+    EXECUTE FUNCTION public.trg_sync_request_items_by_ft();
+  `);
+
+  await pool.query(`
+    DROP TRIGGER IF EXISTS zvk_sync_request_items_insert_trg ON public.zvk;
+    CREATE TRIGGER zvk_sync_request_items_insert_trg
+    AFTER INSERT ON public.zvk
+    FOR EACH ROW
+    EXECUTE FUNCTION public.trg_sync_request_items_by_zvk();
+  `);
+
+  await pool.query(`
+    DROP TRIGGER IF EXISTS zvk_sync_request_items_update_trg ON public.zvk;
+    CREATE TRIGGER zvk_sync_request_items_update_trg
+    AFTER UPDATE OF id_ft, id_zvk, to_pay, esk_return
+    ON public.zvk
+    FOR EACH ROW
+    EXECUTE FUNCTION public.trg_sync_request_items_by_zvk();
+  `);
+
+  await pool.query(`
+    DROP TRIGGER IF EXISTS zvk_status_sync_request_items_insert_trg ON public.zvk_status;
+    CREATE TRIGGER zvk_status_sync_request_items_insert_trg
+    AFTER INSERT ON public.zvk_status
+    FOR EACH ROW
+    EXECUTE FUNCTION public.trg_sync_request_items_by_status();
+  `);
+
+  await pool.query(`
+    DROP TRIGGER IF EXISTS zvk_status_sync_request_items_update_trg ON public.zvk_status;
+    CREATE TRIGGER zvk_status_sync_request_items_update_trg
+    AFTER UPDATE OF src_d, src_o, money_type, idlzk
+    ON public.zvk_status
+    FOR EACH ROW
+    EXECUTE FUNCTION public.trg_sync_request_items_by_status();
+  `);
+
+  await pool.query(`
+    DROP TRIGGER IF EXISTS zvk_status_sync_request_items_delete_trg ON public.zvk_status;
+    CREATE TRIGGER zvk_status_sync_request_items_delete_trg
+    AFTER DELETE ON public.zvk_status
+    FOR EACH ROW
+    EXECUTE FUNCTION public.trg_sync_request_items_by_status();
+  `);
+
+  // Исправление уже созданных строк. Благодаря IS DISTINCT FROM
+  // повторные запуски сервера не переписывают строки без изменений.
+  await pool.query(`
+    SELECT public.sync_request_items_from_current(NULL, NULL);
+  `);
+
+  // =========================
+  // REQUEST APPROVE LOG
+  // =========================
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.request_approve_log (
+      id bigserial PRIMARY KEY,
+      request_id bigint NOT NULL,
+      stage_name text NOT NULL,
+      approver_login text,
+      approver_name text,
+      action_type text NOT NULL,
+      comment_text text,
+      created_at timestamptz DEFAULT now()
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS request_approve_log_request_id_idx
+    ON public.request_approve_log (request_id);
+  `);
+
+  // =========================
+  // REQUEST APPROVAL COLUMNS
+  // =========================
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_marat_name text;`);
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_marat_status text;`);
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_marat_time timestamptz;`);
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_marat_comment text;`);
+
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zhasulan_name text;`);
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zhasulan_status text;`);
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zhasulan_time timestamptz;`);
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zhasulan_comment text;`);
+
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zaitova_name text;`);
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zaitova_status text;`);
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zaitova_time timestamptz;`);
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zaitova_comment text;`);
+
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zhas_name text;`);
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zhas_status text;`);
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zhas_time timestamptz;`);
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_zhas_comment text;`);
+
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_shevchenko_name text;`);
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_shevchenko_status text;`);
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_shevchenko_time timestamptz;`);
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_shevchenko_comment text;`);
+
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_ermek_name text;`);
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_ermek_status text;`);
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_ermek_time timestamptz;`);
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS acc_ermek_comment text;`);
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS approve_ermek_name text;`);
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS approve_ermek_status text;`);
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS approve_ermek_time timestamptz;`);
+await pool.query(`ALTER TABLE public.request_head ADD COLUMN IF NOT EXISTS approve_ermek_comment text;`);
+
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS public.io_history (
+    id bigserial PRIMARY KEY,
+    created_at timestamptz DEFAULT now(),
+    input_date_text text,
+    sum_value numeric(18,2),
+    object_name text,
+    div_in text,
+    dds_in text,
+    div_out text,
+    dds_out text
+  );
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS io_history_created_at_idx
+  ON public.io_history (created_at DESC);
+`);
+
+await pool.query(`
+  ALTER TABLE public.prihod6
+  ADD COLUMN IF NOT EXISTS io_history_id bigint;
+`);
+
+await pool.query(`
+  ALTER TABLE public.perevod7
+  ADD COLUMN IF NOT EXISTS io_history_id bigint;
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS prihod6_io_history_id_idx
+  ON public.prihod6 (io_history_id);
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS perevod7_io_history_id_idx
+  ON public.perevod7 (io_history_id);
+`);
+
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS public.user_role_history (
+    id bigserial PRIMARY KEY,
+    login text NOT NULL,
+    old_role_ft text,
+    new_role_ft text,
+    old_role_hr text,
+    new_role_hr text,
+    changed_at timestamptz DEFAULT now()
+  );
+`);
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS public.notifications (
+    id bigserial PRIMARY KEY,
+    user_login text NOT NULL,
+    type text NOT NULL,              -- request / registry
+    title text NOT NULL,
+    message text,
+    entity_id bigint,
+    entity_page text,                -- request_card / registry_card
+    is_read boolean DEFAULT false,
+    created_at timestamptz DEFAULT now()
+  );
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS notifications_user_login_idx
+  ON public.notifications (lower(trim(user_login)), is_read, created_at DESC);
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS user_role_history_login_idx
+  ON public.user_role_history (lower(trim(login)));
+`);
+
+// =====================================================
+// 1С: ПЛАТЕЖНОЕ ПОРУЧЕНИЕ ИСХОДЯЩЕЕ
+// doc_outgoingpaymentorder + 10 табличных частей
+// =====================================================
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS onec.doc_outgoingpaymentorder (
+    document_id text PRIMARY KEY,
+    document_number text,
+    document_date timestamptz,
+    document_posted boolean,
+
+    bank_intermediary text,
+    bank_intermediary_account text,
+    tax_type text,
+    payment_type text,
+    include_bank_commission boolean,
+
+    value_date date,
+    statement_date date,
+    date_receipt_goods date,
+
+    code_bk text,
+    code_purpose_of_payment text,
+    document_commentary text,
+
+    rnn_payer text,
+    rnn_recipient text,
+    text_payer text,
+    text_recipient text,
+
+    percent_commission numeric(10,4),
+    amount_commission numeric(18,2),
+
+    fact_payer text,
+
+    organization_bin text,
+    organization_name text,
+
+    paid boolean,
+    document_author_name text,
+    responsible text,
+    operation_type text,
+    currency_name text,
+    document_sum numeric(18,2),
+
+    cash_flow_item text,
+    bank_account text,
+    counterparty_account text,
+    organization_account text,
+    purpose_of_payment text,
+
+    incoming_doc_date date,
+    incoming_doc_number text,
+
+    advance text,
+    target_entity text,
+    action_required text,
+    is_executed boolean,
+    ft_idzft text,
+
+    counterparty_id text,
+    counterparty_bin text,
+    counterparty_name text,
+
+    deleted boolean DEFAULT false,
+
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now()
+  );
+`);
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS onec.doc_outgoingpaymentorder_payment_transcript (
+    document_id text NOT NULL,
+    line_no integer NOT NULL,
+
+    contract_id text,
+    contract_name text,
+    doc_deal text,
+    settlement_rate numeric(18,6),
+    payment_amount numeric(18,2),
+    frequency_settlements numeric(18,6),
+    settlement_amount numeric(18,2),
+    vat_percent numeric(10,4),
+    vat_amount numeric(18,2),
+    cash_flow_item text,
+    project_id text,
+    project_name text,
+
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+
+    PRIMARY KEY (document_id, line_no),
+    CONSTRAINT outgoingpaymentorder_transcript_fk
+      FOREIGN KEY (document_id)
+      REFERENCES onec.doc_outgoingpaymentorder(document_id)
+      ON DELETE CASCADE
+  );
+`);
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS onec.doc_outgoingpaymentorder_payment_transfer_salary (
+    document_id text NOT NULL,
+    line_no integer NOT NULL,
+    project_id text,
+    project_name text,
+    transfer_sum numeric(18,2),
+    doc_transfer text,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+    PRIMARY KEY (document_id, line_no),
+    CONSTRAINT outgoingpaymentorder_salary_fk
+      FOREIGN KEY (document_id)
+      REFERENCES onec.doc_outgoingpaymentorder(document_id)
+      ON DELETE CASCADE
+  );
+`);
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS onec.doc_outgoingpaymentorder_payment_transfer_pension (
+    document_id text NOT NULL,
+    line_no integer NOT NULL,
+    project_id text,
+    project_name text,
+    transfer_sum numeric(18,2),
+    doc_transfer text,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+    PRIMARY KEY (document_id, line_no),
+    CONSTRAINT outgoingpaymentorder_pension_fk
+      FOREIGN KEY (document_id)
+      REFERENCES onec.doc_outgoingpaymentorder(document_id)
+      ON DELETE CASCADE
+  );
+`);
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS onec.doc_outgoingpaymentorder_payment_transfer_social (
+    document_id text NOT NULL,
+    line_no integer NOT NULL,
+    project_id text,
+    project_name text,
+    transfer_sum numeric(18,2),
+    doc_transfer text,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+    PRIMARY KEY (document_id, line_no),
+    CONSTRAINT outgoingpaymentorder_social_fk
+      FOREIGN KEY (document_id)
+      REFERENCES onec.doc_outgoingpaymentorder(document_id)
+      ON DELETE CASCADE
+  );
+`);
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS onec.doc_outgoingpaymentorder_payment_transfer_execution (
+    document_id text NOT NULL,
+    line_no integer NOT NULL,
+    project_id text,
+    project_name text,
+    transfer_sum numeric(18,2),
+    transfer_sum_payment numeric(18,2),
+    transfer_sum_fees numeric(18,2),
+    doc_transfer text,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+    PRIMARY KEY (document_id, line_no),
+    CONSTRAINT outgoingpaymentorder_execution_fk
+      FOREIGN KEY (document_id)
+      REFERENCES onec.doc_outgoingpaymentorder(document_id)
+      ON DELETE CASCADE
+  );
+`);
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS onec.doc_outgoingpaymentorder_payment_transfer_vat (
+    document_id text NOT NULL,
+    line_no integer NOT NULL,
+    project_id text,
+    project_name text,
+    contract_id text,
+    contract_name text,
+    counterparty_id text,
+    counterparty_bin text,
+    counterparty_name text,
+    type_receipt_vat text,
+    type_turnover_vat text,
+    vat_percent numeric(10,4),
+    term_of_payment date,
+    sum_of_payment numeric(18,2),
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+    PRIMARY KEY (document_id, line_no),
+    CONSTRAINT outgoingpaymentorder_vat_fk
+      FOREIGN KEY (document_id)
+      REFERENCES onec.doc_outgoingpaymentorder(document_id)
+      ON DELETE CASCADE
+  );
+`);
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS onec.doc_outgoingpaymentorder_payment_transfer_report (
+    document_id text NOT NULL,
+    line_no integer NOT NULL,
+    project_id text,
+    project_name text,
+    individual text,
+    number_card_account text,
+    type_of_debt text,
+    sum_of_payment numeric(18,2),
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+    PRIMARY KEY (document_id, line_no),
+    CONSTRAINT outgoingpaymentorder_report_fk
+      FOREIGN KEY (document_id)
+      REFERENCES onec.doc_outgoingpaymentorder(document_id)
+      ON DELETE CASCADE
+  );
+`);
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS onec.doc_outgoingpaymentorder_payment_transfer_single (
+    document_id text NOT NULL,
+    line_no integer NOT NULL,
+    project_id text,
+    project_name text,
+    transfer_sum numeric(18,2),
+    doc_transfer text,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+    PRIMARY KEY (document_id, line_no),
+    CONSTRAINT outgoingpaymentorder_single_fk
+      FOREIGN KEY (document_id)
+      REFERENCES onec.doc_outgoingpaymentorder(document_id)
+      ON DELETE CASCADE
+  );
+`);
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS onec.doc_outgoingpaymentorder_payment_transfer_other (
+    document_id text NOT NULL,
+    line_no integer NOT NULL,
+    transfer_sum numeric(18,2),
+    doc_transfer text,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+    PRIMARY KEY (document_id, line_no),
+    CONSTRAINT outgoingpaymentorder_other_fk
+      FOREIGN KEY (document_id)
+      REFERENCES onec.doc_outgoingpaymentorder(document_id)
+      ON DELETE CASCADE
+  );
+`);
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS onec.doc_outgoingpaymentorder_payment_transfer_other_income (
+    document_id text NOT NULL,
+    line_no integer NOT NULL,
+    transfer_sum numeric(18,2),
+    doc_transfer text,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+    PRIMARY KEY (document_id, line_no),
+    CONSTRAINT outgoingpaymentorder_other_income_fk
+      FOREIGN KEY (document_id)
+      REFERENCES onec.doc_outgoingpaymentorder(document_id)
+      ON DELETE CASCADE
+  );
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS outgoingpaymentorder_document_date_idx
+  ON onec.doc_outgoingpaymentorder(document_date);
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS outgoingpaymentorder_counterparty_id_idx
+  ON onec.doc_outgoingpaymentorder(counterparty_id);
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS outgoingpaymentorder_ft_idzft_idx
+  ON onec.doc_outgoingpaymentorder(ft_idzft);
+`);
+
+
+
+// =====================================================
+// 1С: ДОП. МИГРАЦИИ ДЛЯ ВСЕХ ТАБЛИЧНЫХ ЧАСТЕЙ
+// Логика API: шапка ON CONFLICT, табличные части DELETE + INSERT
+// =====================================================
+
+// ВАЖНО:
+// service_id/item_id могут повторяться в одном документе.
+// Поэтому первичный ключ табличных частей делаем по document_id + line_no.
+// При каждом новом JSON старые строки документа удаляются и вставляются заново.
+await pool.query(`
+DO $$
+BEGIN
+  IF to_regclass('onec.doc_receipts_items') IS NOT NULL THEN
+    ALTER TABLE onec.doc_receipts_items ADD COLUMN IF NOT EXISTS line_no integer;
+    WITH x AS (
+      SELECT ctid, ROW_NUMBER() OVER (PARTITION BY document_id ORDER BY created_at, item_id, ctid) AS rn
+      FROM onec.doc_receipts_items
+      WHERE line_no IS NULL
+    )
+    UPDATE onec.doc_receipts_items t
+    SET line_no = x.rn
+    FROM x
+    WHERE t.ctid = x.ctid;
+
+    ALTER TABLE onec.doc_receipts_items DROP CONSTRAINT IF EXISTS doc_items_pkey;
+    ALTER TABLE onec.doc_receipts_items DROP CONSTRAINT IF EXISTS doc_receipts_items_pkey;
+    ALTER TABLE onec.doc_receipts_items ALTER COLUMN line_no SET NOT NULL;
+
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_constraint
+      WHERE conname = 'doc_receipts_items_pkey'
+        AND conrelid = 'onec.doc_receipts_items'::regclass
+    ) THEN
+      ALTER TABLE onec.doc_receipts_items
+      ADD CONSTRAINT doc_receipts_items_pkey PRIMARY KEY (document_id, line_no);
+    END IF;
+  END IF;
+
+  IF to_regclass('onec.doc_receipts_services') IS NOT NULL THEN
+    ALTER TABLE onec.doc_receipts_services ADD COLUMN IF NOT EXISTS line_no integer;
+    WITH x AS (
+      SELECT ctid, ROW_NUMBER() OVER (PARTITION BY document_id ORDER BY created_at, service_id, ctid) AS rn
+      FROM onec.doc_receipts_services
+      WHERE line_no IS NULL
+    )
+    UPDATE onec.doc_receipts_services t
+    SET line_no = x.rn
+    FROM x
+    WHERE t.ctid = x.ctid;
+
+    ALTER TABLE onec.doc_receipts_services DROP CONSTRAINT IF EXISTS doc_services_pkey;
+    ALTER TABLE onec.doc_receipts_services DROP CONSTRAINT IF EXISTS doc_receipts_services_pkey;
+    ALTER TABLE onec.doc_receipts_services ALTER COLUMN line_no SET NOT NULL;
+
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_constraint
+      WHERE conname = 'doc_receipts_services_pkey'
+        AND conrelid = 'onec.doc_receipts_services'::regclass
+    ) THEN
+      ALTER TABLE onec.doc_receipts_services
+      ADD CONSTRAINT doc_receipts_services_pkey PRIMARY KEY (document_id, line_no);
+    END IF;
+  END IF;
+END $$;
+`);
+
+// =====================================================
+// 1С: РЕАЛИЗАЦИЯ doc_sales + doc_items/doc_services
+// =====================================================
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS onec.doc_sales (
+    document_id text PRIMARY KEY,
+    document_number text,
+    document_posted boolean,
+    document_date timestamptz,
+    organization_bin text,
+    organization_name text,
+    warehouse_id text,
+    warehouse_name text,
+    counterparty_id text,
+    counterparty_bin text,
+    counterparty_name text,
+    contract_id text,
+    contract_name text,
+    currency_name text,
+    income_kpn text,
+    settlement_account text,
+    advance_account text,
+    vat_enable boolean,
+    vat_mode text,
+    document_sum numeric(18,2),
+    document_commentary text,
+    document_author_name text,
+    document_type text,
+    advance_withheld numeric(18,2),
+    guarantee_withheld numeric(18,2),
+    penalty_withheld numeric(18,2),
+    other_withheld numeric(18,2),
+    target_entity text,
+    action_required text,
+    is_executed text,
+    is_managerial text,
+    id_dov text,
+    dov_name text,
+    deleted boolean DEFAULT false,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now()
+  );
+`);
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS onec.doc_sales_items (
+    document_id text NOT NULL,
+    line_no integer NOT NULL,
+    item_id text,
+    item_name text,
+    quantity numeric(18,6),
+    price numeric(18,2),
+    amount numeric(18,2),
+    vat_percent numeric(10,4),
+    vat_amount numeric(18,2),
+    amount_with_vat numeric(18,2),
+    vat_account text,
+    cost_account_bu text,
+    cost_account_nu text,
+    project_id text,
+    project_name text,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+    PRIMARY KEY (document_id, line_no),
+    CONSTRAINT doc_sales_items_document_fk
+      FOREIGN KEY (document_id)
+      REFERENCES onec.doc_sales(document_id)
+      ON DELETE CASCADE
+  );
+`);
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS onec.doc_sales_services (
+    document_id text NOT NULL,
+    line_no integer NOT NULL,
+    service_id text,
+    service_name text,
+    service_content text,
+    quantity numeric(18,6),
+    price numeric(18,2),
+    amount numeric(18,2),
+    vat_percent numeric(10,4),
+    vat_amount numeric(18,2),
+    amount_with_vat numeric(18,2),
+    vat_account text,
+    cost_account_bu text,
+    cost_account_nu text,
+    project_id text,
+    project_name text,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+    PRIMARY KEY (document_id, line_no),
+    CONSTRAINT doc_sales_services_document_fk
+      FOREIGN KEY (document_id)
+      REFERENCES onec.doc_sales(document_id)
+      ON DELETE CASCADE
+  );
+`);
+
+await pool.query(`
+DO $$
+BEGIN
+  IF to_regclass('onec.doc_sales_items') IS NOT NULL THEN
+    ALTER TABLE onec.doc_sales_items ADD COLUMN IF NOT EXISTS line_no integer;
+    WITH x AS (
+      SELECT ctid, ROW_NUMBER() OVER (PARTITION BY document_id ORDER BY created_at, item_id, ctid) AS rn
+      FROM onec.doc_sales_items
+      WHERE line_no IS NULL
+    )
+    UPDATE onec.doc_sales_items t
+    SET line_no = x.rn
+    FROM x
+    WHERE t.ctid = x.ctid;
+
+    ALTER TABLE onec.doc_sales_items DROP CONSTRAINT IF EXISTS doc_sales_items_pkey;
+    ALTER TABLE onec.doc_sales_items ALTER COLUMN line_no SET NOT NULL;
+
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_constraint
+      WHERE conname = 'doc_sales_items_pkey'
+        AND conrelid = 'onec.doc_sales_items'::regclass
+    ) THEN
+      ALTER TABLE onec.doc_sales_items
+      ADD CONSTRAINT doc_sales_items_pkey PRIMARY KEY (document_id, line_no);
+    END IF;
+  END IF;
+
+  IF to_regclass('onec.doc_sales_services') IS NOT NULL THEN
+    ALTER TABLE onec.doc_sales_services ADD COLUMN IF NOT EXISTS line_no integer;
+    WITH x AS (
+      SELECT ctid, ROW_NUMBER() OVER (PARTITION BY document_id ORDER BY created_at, service_id, ctid) AS rn
+      FROM onec.doc_sales_services
+      WHERE line_no IS NULL
+    )
+    UPDATE onec.doc_sales_services t
+    SET line_no = x.rn
+    FROM x
+    WHERE t.ctid = x.ctid;
+
+    ALTER TABLE onec.doc_sales_services DROP CONSTRAINT IF EXISTS doc_sales_services_pkey;
+    ALTER TABLE onec.doc_sales_services ALTER COLUMN line_no SET NOT NULL;
+
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_constraint
+      WHERE conname = 'doc_sales_services_pkey'
+        AND conrelid = 'onec.doc_sales_services'::regclass
+    ) THEN
+      ALTER TABLE onec.doc_sales_services
+      ADD CONSTRAINT doc_sales_services_pkey PRIMARY KEY (document_id, line_no);
+    END IF;
+  END IF;
+END $$;
+`);
+
+// =====================================================
+// 1С: ПЛАТЕЖНОЕ ПОРУЧЕНИЕ ВХОДЯЩЕЕ + payment_transcript
+// =====================================================
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS onec.doc_incomingpaymentorder (
+    document_id text PRIMARY KEY,
+    document_number text,
+    document_posted boolean,
+    document_date timestamptz,
+    organization_bin text,
+    organization_name text,
+    paid boolean,
+    document_author_name text,
+    responsible text,
+    operation_type text,
+    currency_name text,
+    document_commentary text,
+    statement_date date,
+    document_sum numeric(18,2),
+    cash_flow_item text,
+    bank_account text,
+    counterparty_account text,
+    organization_account text,
+    purpose_of_payment text,
+    incoming_doc_date date,
+    incoming_doc_number text,
+    advance text,
+    counterparty_id text,
+    counterparty_bin text,
+    counterparty_name text,
+    deleted boolean DEFAULT false,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now()
+  );
+`);
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS onec.doc_incomingpaymentorder_payment_transcript (
+    document_id text NOT NULL,
+    line_no integer NOT NULL,
+    contract_id text,
+    contract_name text,
+    doc_deal text,
+    settlement_rate numeric(18,6),
+    payment_amount numeric(18,2),
+    frequency_settlements numeric(18,6),
+    settlement_amount numeric(18,2),
+    vat_percent numeric(10,4),
+    vat_amount numeric(18,2),
+    cash_flow_item text,
+    project_id text,
+    project_name text,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+    PRIMARY KEY (document_id, line_no),
+    CONSTRAINT incomingpaymentorder_transcript_fk
+      FOREIGN KEY (document_id)
+      REFERENCES onec.doc_incomingpaymentorder(document_id)
+      ON DELETE CASCADE
+  );
+`);
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS onec.doc_incomingpaymentorder_payment_return_other (
+    document_id text NOT NULL,
+    line_no integer NOT NULL,
+    return_sum numeric(18,2),
+    doc_return text,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+    PRIMARY KEY (document_id, line_no),
+    CONSTRAINT incomingpaymentorder_return_other_fk
+      FOREIGN KEY (document_id)
+      REFERENCES onec.doc_incomingpaymentorder(document_id)
+      ON DELETE CASCADE
+  );
+`);
+
+// =====================================================
+// 1С: КОРРЕКТИРОВКА ДОЛГА doc_debt_adjustment + debt_amounts
+// =====================================================
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS onec.doc_debt_adjustment (
+    document_id text PRIMARY KEY,
+    document_number text,
+    document_date timestamptz,
+    document_posted boolean,
+    currency_name text,
+    counterparty_id text,
+    counterparty_bin text,
+    counterparty_name text,
+    document_commentary text,
+    counterparty_id_debitor text,
+    counterparty_bin_debitor text,
+    counterparty_name_debitor text,
+    counterparty_id_creditor text,
+    counterparty_bin_creditor text,
+    counterparty_name_creditor text,
+    multiplicity numeric(18,6),
+    rate_of_document numeric(18,6),
+    organization_bin text,
+    organization_name text,
+    responsible text,
+    consider_kpn boolean,
+    management_act text,
+    deleted boolean DEFAULT false,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now()
+  );
+`);
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS onec.doc_debt_adjustment_debt_amounts (
+    document_id text NOT NULL,
+    line_no integer NOT NULL,
+    contract_id text,
+    contract_name text,
+    deal text,
+    sum numeric(18,2),
+    settlement_amount numeric(18,2),
+    settlement_rate numeric(18,6),
+    frequency_settlements numeric(18,6),
+    type_of_debt text,
+    sum_of_nu numeric(18,2),
+    project_id text,
+    project_name text,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),
+    PRIMARY KEY (document_id, line_no),
+    CONSTRAINT debt_adjustment_amounts_fk
+      FOREIGN KEY (document_id)
+      REFERENCES onec.doc_debt_adjustment(document_id)
+      ON DELETE CASCADE
+  );
+`);
+
+// Индексы для новых таблиц и сортировки по новым данным сверху
+await pool.query(`ALTER TABLE onec.doc_receipts ADD COLUMN IF NOT EXISTS dov_name text;`);
+await pool.query(`ALTER TABLE onec.doc_sales ADD COLUMN IF NOT EXISTS dov_name text;`);
+
+await pool.query(`CREATE INDEX IF NOT EXISTS doc_sales_created_at_idx ON onec.doc_sales (created_at DESC);`);
+await pool.query(`CREATE INDEX IF NOT EXISTS doc_incomingpaymentorder_created_at_idx ON onec.doc_incomingpaymentorder (created_at DESC);`);
+await pool.query(`CREATE INDEX IF NOT EXISTS doc_outgoingpaymentorder_created_at_idx ON onec.doc_outgoingpaymentorder (created_at DESC);`);
+await pool.query(`CREATE INDEX IF NOT EXISTS doc_debt_adjustment_created_at_idx ON onec.doc_debt_adjustment (created_at DESC);`);
+await pool.query(`CREATE INDEX IF NOT EXISTS doc_receipts_created_at_idx ON onec.doc_receipts (created_at DESC);`);
+
+
+// =====================================================
+// LZK: последовательные IDPLXK и служебные поля ПТО
+// =====================================================
+await pool.query(`
+  CREATE SEQUENCE IF NOT EXISTS lzk.plxk_seq START 1;
+`);
+
+  await pool.query(`
+    ALTER TABLE lzk.supply
+    ADD COLUMN IF NOT EXISTS ordered_qty numeric(18,6) DEFAULT 0;
+  `);
+
+  await pool.query(`
+    ALTER TABLE lzk.supply
+    ADD COLUMN IF NOT EXISTS received_qty numeric(18,6) DEFAULT 0;
+  `);
+
+  await pool.query(`
+    ALTER TABLE lzk.limits
+    ADD COLUMN IF NOT EXISTS fact_received numeric(18,6) DEFAULT 0;
+  `);
+
+
+await pool.query(`
+  ALTER TABLE lzk.requests
+  ADD COLUMN IF NOT EXISTS pto_date timestamptz;
+`);
+
+await pool.query(`
+  ALTER TABLE lzk.requests
+  ADD COLUMN IF NOT EXISTS updated_at timestamptz DEFAULT NOW();
+`);
+
+await pool.query(`
+  SELECT setval(
+    'lzk.plxk_seq',
+    GREATEST(
+      COALESCE(
+        (
+          SELECT MAX(
+            NULLIF(regexp_replace(idplxk, '\\D', '', 'g'), '')::bigint
+          )
+          FROM lzk.supply
+          WHERE COALESCE(trim(idplxk), '') <> ''
+        ),
+        0
+      ),
+      1
+    ),
+    COALESCE(
+      (
+        SELECT MAX(
+          NULLIF(regexp_replace(idplxk, '\\D', '', 'g'), '')::bigint
+        )
+        FROM lzk.supply
+        WHERE COALESCE(trim(idplxk), '') <> ''
+      ),
+      0
+    ) > 0
+  );
+`);
+
+
+
+// =====================================================
+// ALATAU CITY BANK: САЛЬДО СЧЕТОВ
+// =====================================================
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS public.account_saldo (
+    id bigserial PRIMARY KEY,
+    company_id text NOT NULL,
+    iban text NOT NULL,
+    account_type text,
+    account_status text,
+    date_from date NOT NULL,
+    date_to date NOT NULL,
+    statement_date timestamptz,
+    balance_in numeric(24,2),
+    balance_in_currency text,
+    balance_out numeric(24,2),
+    balance_out_currency text,
+    balance_in_lcy numeric(24,2),
+    balance_in_lcy_currency text,
+    balance_out_lcy numeric(24,2),
+    balance_out_lcy_currency text,
+    received_at timestamptz NOT NULL DEFAULT now(),
+    raw_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+    UNIQUE (company_id, iban, date_from, date_to)
+  );
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS account_saldo_date_idx
+  ON public.account_saldo (date_to DESC, iban);
+`);
+
+   console.log("DB init OK ✅");
+}
+
+initDb().catch((e) => console.error("DB init error:", e));
+
+// =====================================================
+// Health
+// =====================================================
+app.get("/", (req, res) => res.send("Service-NS API работает 🚀 v-fixed-full-2"));
+
+app.get("/db-ping", async (req, res) => {
+  try {
+    const r = await pool.query("SELECT NOW() as now");
+    res.json({ ok: true, now: r.rows[0].now });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post("/register", async (req, res) => {
+  try {
+    const {
+      email,
+      login,
+      password,
+      phone,
+      last_name,
+      first_name,
+      middle_name
+    } = req.body || {};
+
+    const emailNorm = normalizeEmail(email);
+    const loginNorm = String(login || "").trim().toLowerCase();
+const loginOriginal = String(login || "").trim();
+
+if (/[А-Яа-яЁё]/.test(loginOriginal)) {
+  return res.status(400).json({
+    success: false,
+    message: "В логине нельзя использовать русские буквы"
+  });
+}
+
+if (!/^[A-Za-z]_[A-Za-z]+$/.test(loginOriginal)) {
+  return res.status(400).json({
+    success: false,
+    message:
+      "Логин должен быть в формате A_Sagyndyk: первая буква фамилии, затем _ и имя"
+  });
+}
+    const pass = String(password || "").trim();
+
+    if (!emailNorm) {
+      return res.status(400).json({ success:false, message:"Почта обязательна" });
+    }
+
+    if (!loginNorm) {
+      return res.status(400).json({ success:false, message:"Логин обязателен" });
+    }
+
+    if (!pass) {
+      return res.status(400).json({ success:false, message:"Пароль обязателен" });
+    }
+
+    if (!first_name || !last_name) {
+      return res.status(400).json({ success:false, message:"Имя и фамилия обязательны" });
+    }
+
+    const emailExists = await pool.query(
+      `SELECT id FROM public.users WHERE lower(trim(email)) = $1 LIMIT 1`,
+      [emailNorm]
+    );
+
+    if (emailExists.rowCount > 0) {
+      return res.status(400).json({
+        success:false,
+        message:"Пользователь с такой почтой уже существует"
+      });
+    }
+
+    const loginExists = await pool.query(
+      `SELECT id FROM public.users WHERE lower(trim(login)) = $1 LIMIT 1`,
+      [loginNorm]
+    );
+
+    if (loginExists.rowCount > 0) {
+      return res.status(400).json({
+        success:false,
+        message:"Пользователь с таким логином уже существует"
+      });
+    }
+
+const r = await pool.query(`
+  INSERT INTO public.users (
+    email,
+    login,
+    password,
+    phone,
+    last_name,
+    first_name,
+    middle_name,
+    role_ft,
+    role_hr,
+    is_active
+  )
+  VALUES ($1,$2,$3,$4,$5,$6,$7,NULL,NULL,true)
+  RETURNING id, email, login, role_ft, role_hr, first_name, last_name
+`, [
+      emailNorm,
+      loginNorm,
+      pass,
+      phone ? String(phone).trim() : null,
+      last_name ? String(last_name).trim() : null,
+      first_name ? String(first_name).trim() : null,
+      middle_name ? String(middle_name).trim() : null
+    ]);
+
+    return res.json({
+      success:true,
+      user:r.rows[0]
+    });
+
+  } catch (e) {
+    console.error("REGISTER ERROR:", e);
+    return res.status(500).json({
+      success:false,
+      message:"Ошибка сервера"
+    });
+  }
+});
+
+
+app.post("/login", async (req, res) => {
+  try {
+    const { login, password } = req.body || {};
+
+    if (!login || !password) {
+      return res.status(400).json({
+        success: false,
+        message: "Логин и пароль обязательны"
+      });
+    }
+
+    const q = `
+      SELECT *
+      FROM public.users
+      WHERE lower(trim(login)) = lower(trim($1))
+        AND is_active = true
+      LIMIT 1
+    `;
+
+    const r = await pool.query(q, [login]);
+
+    if (!r.rows.length) {
+      return res.json({
+        success: false,
+        message: "Пользователь не найден"
+      });
+    }
+
+    const user = r.rows[0];
+
+    if (user.password !== password) {
+      return res.json({
+        success: false,
+        message: "Неверный пароль"
+      });
+    }
+
+return res.json({
+  success: true,
+  user: {
+    login: user.login,
+    email: user.email,
+    role_ft: user.role_ft,
+    role_hr: user.role_hr,
+    role_lzk: user.role_lzk,
+    first_name: user.first_name,
+    last_name: user.last_name
+  }
+});
+
+  } catch (e) {
+    console.error("LOGIN ERROR:", e);
+    res.status(500).json({
+      success: false,
+      message: "Ошибка сервера"
+    });
+  }
+});
+app.get("/profile", async (req, res) => {
+  try {
+    const login = String(req.query.login || "").trim();
+
+    if (!login) {
+      return res.status(400).json({
+        success: false,
+        message: "Логин не передан"
+      });
+    }
+
+    const q = await pool.query(`
+SELECT
+  id,
+  login,
+  email,
+  phone,
+  role_ft,
+  role_hr,
+  role_lzk,
+  first_name,
+  last_name,
+  middle_name,
+  is_active
+FROM public.users
+      WHERE lower(trim(login)) = lower(trim($1))
+      LIMIT 1
+    `, [login]);
+
+    if (!q.rows.length) {
+      return res.status(404).json({
+        success: false,
+        message: "Пользователь не найден"
+      });
+    }
+
+    return res.json({
+      success: true,
+      user: q.rows[0]
+    });
+
+  } catch (e) {
+    console.error("PROFILE ERROR:", e);
+    return res.status(500).json({
+      success: false,
+      message: "Ошибка сервера"
+    });
+  }
+});
+
+
+app.get("/employees", async (req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT
+        id,
+        email,
+        phone,
+        last_name,
+        first_name,
+        middle_name,
+        organization_name,
+        role_ft,
+        role_hr,
+        role_lzk,
+        is_active,
+        created_at,
+        login
+      FROM public.users
+      ORDER BY id ASC;
+    `);
+
+    return res.json({
+      success: true,
+      rows: r.rows
+    });
+
+  } catch (e) {
+    console.error("EMPLOYEES ERROR:", e);
+    return res.status(500).json({
+      success: false,
+      message: "Ошибка сервера"
+    });
+  }
+});
+
+app.post("/update-user-roles", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const { login, role_ft, role_hr, role_lzk, actor_login } = req.body || {};
+
+    const loginNorm = String(login || "").trim();
+    const actorLoginNorm = String(actor_login || "").trim();
+
+    const newRoleFt = String(role_ft || "").trim().toLowerCase();
+    const newRoleHr = String(role_hr || "").trim().toLowerCase();
+    const newRoleLzk = String(role_lzk || "").trim().toLowerCase();
+
+    const allowedRoles = [
+  "initiator",
+  "operator",
+  "supervisor",
+  "admin",
+  "pto",
+  "editor",
+  "supplier"
+];
+
+    if (!loginNorm) {
+      return res.status(400).json({
+        success: false,
+        message: "Не передан login"
+      });
+    }
+
+    if (!actorLoginNorm) {
+      return res.status(400).json({
+        success: false,
+        message: "Не передан actor_login"
+      });
+    }
+
+    if (
+      (newRoleFt && !allowedRoles.includes(newRoleFt)) ||
+      (newRoleHr && !allowedRoles.includes(newRoleHr)) ||
+      (newRoleLzk && !allowedRoles.includes(newRoleLzk))
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Недопустимая роль"
+      });
+    }
+
+    await client.query("BEGIN");
+
+    const actorRes = await client.query(`
+      SELECT id, login, role_ft, role_hr, role_lzk
+      FROM public.users
+      WHERE lower(trim(login)) = lower(trim($1))
+      LIMIT 1
+    `, [actorLoginNorm]);
+
+    if (!actorRes.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({
+        success: false,
+        message: "Текущий пользователь не найден"
+      });
+    }
+
+    const actor = actorRes.rows[0];
+    const isMainAdmin = String(actor.login || "").trim().toLowerCase() === "admin";
+
+    if (!isMainAdmin) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({
+        success: false,
+        message: "Только пользователь admin может изменять роли"
+      });
+    }
+
+    const userRes = await client.query(`
+      SELECT id, login, role_ft, role_hr, role_lzk
+      FROM public.users
+      WHERE lower(trim(login)) = lower(trim($1))
+      LIMIT 1
+    `, [loginNorm]);
+
+    if (!userRes.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({
+        success: false,
+        message: "Пользователь не найден"
+      });
+    }
+
+    const user = userRes.rows[0];
+
+    const oldRoleFt = String(user.role_ft || "").trim().toLowerCase();
+    const oldRoleHr = String(user.role_hr || "").trim().toLowerCase();
+    const oldRoleLzk = String(user.role_lzk || "").trim().toLowerCase();
+
+    if (
+      oldRoleFt === newRoleFt &&
+      oldRoleHr === newRoleHr &&
+      oldRoleLzk === newRoleLzk
+    ) {
+      await client.query("ROLLBACK");
+      return res.json({
+        success: true,
+        message: "Изменений нет",
+        row: {
+          id: user.id,
+          login: user.login,
+          role_ft: user.role_ft,
+          role_hr: user.role_hr,
+          role_lzk: user.role_lzk
+        }
+      });
+    }
+
+    const updRes = await client.query(`
+      UPDATE public.users
+      SET role_ft = NULLIF($1, ''),
+          role_hr = NULLIF($2, ''),
+          role_lzk = NULLIF($3, '')
+      WHERE lower(trim(login)) = lower(trim($4))
+      RETURNING id, login, role_ft, role_hr, role_lzk
+    `, [newRoleFt, newRoleHr, newRoleLzk, loginNorm]);
+
+    await client.query(`
+      INSERT INTO public.user_role_history
+      (
+        login,
+        old_role_ft,
+        new_role_ft,
+        old_role_hr,
+        new_role_hr,
+        old_role_lzk,
+        new_role_lzk,
+        changed_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+    `, [
+      user.login,
+      oldRoleFt || null,
+      newRoleFt,
+      oldRoleHr || null,
+      newRoleHr,
+      oldRoleLzk || null,
+      newRoleLzk
+    ]);
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success: true,
+      message: "Роли успешно обновлены",
+      row: updRes.rows[0]
+    });
+
+  } catch (e) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {}
+
+    console.error("update-user-roles error:", e);
+
+    return res.status(500).json({
+      success: false,
+      message: "Ошибка сервера"
+    });
+
+  } finally {
+    client.release();
+  }
+});
+
+
+app.get("/user-role-history", async (req, res) => {
+  try {
+    const login = String(req.query.login || "").trim();
+
+    if (!login) {
+      return res.status(400).json({
+        success: false,
+        message: "login required"
+      });
+    }
+
+const r = await pool.query(
+  `
+  SELECT
+    id,
+    login,
+    old_role_ft,
+    new_role_ft,
+    old_role_hr,
+    new_role_hr,
+    old_role_lzk,
+    new_role_lzk,
+    changed_at
+  FROM public.user_role_history
+  WHERE lower(trim(login)) = lower(trim($1))
+  ORDER BY changed_at DESC, id DESC
+  `,
+  [login]
+);
+
+    return res.json({
+      success: true,
+      rows: r.rows
+    });
+  } catch (e) {
+    console.error("USER-ROLE-HISTORY ERROR:", e);
+    return res.status(500).json({
+      success: false,
+      message: "Ошибка сервера"
+    });
+  }
+});
+
+app.post("/forgot-password", async (req, res) => {
+  try {
+    const { email } = req.body || {};
+    const emailNorm = normalizeEmail(email);
+
+    if (!emailNorm) {
+      return res.status(400).json({
+        success: false,
+        message: "Укажите почту"
+      });
+    }
+
+    const userRes = await pool.query(`
+      SELECT id, email, first_name
+      FROM public.users
+      WHERE lower(trim(email)) = $1
+      LIMIT 1
+    `, [emailNorm]);
+
+    if (!userRes.rowCount) {
+      return res.status(404).json({
+        success: false,
+        message: "Пользователь с такой почтой не найден"
+      });
+    }
+
+    const user = userRes.rows[0];
+    const tempPassword = generateTempPassword(8);
+
+    await pool.query(`
+      UPDATE public.users
+      SET password = $2
+      WHERE id = $1
+    `, [user.id, tempPassword]);
+
+    await mailTransporter.sendMail({
+      from: `"Service NS" <${MAIL_USER}>`,
+      to: user.email,
+      subject: "Сброс пароля — Service NS",
+      text:
+        `Здравствуйте${user.first_name ? ", " + user.first_name : ""}!\n\n` +
+        `Ваш временный пароль: ${tempPassword}\n\n` +
+        `Используйте его для входа в систему.\n` +
+        `После входа рекомендуется сменить пароль.\n\n` +
+        `Service NS`,
+      html:
+        `<p>Здравствуйте${user.first_name ? ", " + user.first_name : ""}!</p>` +
+        `<p>Ваш временный пароль: <b>${tempPassword}</b></p>` +
+        `<p>Используйте его для входа в систему.</p>` +
+        `<p>После входа рекомендуется сменить пароль.</p>` +
+        `<p><b>Service NS</b></p>`
+    });
+
+    return res.json({
+      success: true,
+      message: "Новый пароль отправлен на почту"
+    });
+
+  } catch (e) {
+    console.error("FORGOT-PASSWORD ERROR:", e);
+    return res.status(500).json({
+      success: false,
+      message: "Не удалось отправить письмо"
+    });
+  }
+});
+// =====================================================
+// GET FT
+// =====================================================
+app.get("/ft", async (req, res) => {
+  try {
+    const limit = Math.min(Number(req.query.limit || 500), 500);
+    const login = String(req.query.login || "").trim();
+    const isAdmin = String(req.query.is_admin || "0") === "1";
+    const isAll   = String(req.query.is_all   || "0") === "1"; // ✅ НОВОЕ
+    if (!login) return res.status(400).json({ success: false, error: "login is required" });
+
+    const qAdmin = `
+      SELECT f.*
+      FROM ft f
+      ORDER BY COALESCE(NULLIF(substring(f.id_ft from '\\d+'), ''), '0')::int DESC
+      LIMIT $1
+    `;
+
+    const qUser = `
+      SELECT f.*
+      FROM ft f
+      WHERE lower(trim(f.input_name)) = lower(trim($2))
+      ORDER BY COALESCE(NULLIF(substring(f.id_ft from '\\d+'), ''), '0')::int DESC
+      LIMIT $1
+    `;
+
+     const r = (isAdmin || isAll)
+      ? await pool.query(qAdmin, [limit])
+      : await pool.query(qUser, [limit, login]);
+
+    res.json({ success: true, rows: r.rows, admin: isAdmin });
+  } catch (e) {
+    console.error("GET FT ERROR:", e);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// =====================================================
+// ✅ b_erkin, s_zhasulan и a_zaitova могут менять основные поля FT
+// POST /ft-update-main
+// =====================================================
+app.post("/ft-update-main", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const actor = String(body.login || "").trim().toLowerCase();
+    const idFt = String(body.id_ft || "").trim();
+
+    if (!idFt) {
+      return res.status(400).json({ success:false, error:"id_ft required" });
+    }
+
+    // Доступ только b_erkin, s_zhasulan и a_zaitova.
+    if (!["b_erkin", "s_zhasulan", "a_zaitova"].includes(actor)) {
+      return res.status(403).json({ success:false, error:"NO_RIGHTS" });
+    }
+
+    /*
+     * ЗАЩИТА ОТ ОЧИСТКИ СТРОКИ:
+     * массовое изменение Реестр/Оплачено не должно обновлять основные поля FT.
+     * Даже если старый клиент повторно отправит пустую карточку, пустые строки
+     * здесь НЕ заменят существующие значения в базе.
+     */
+    const textOrNull = (name) => {
+      if (!Object.prototype.hasOwnProperty.call(body, name)) return null;
+      const value = String(body[name] ?? "").trim();
+      return value === "" ? null : value;
+    };
+
+    let sumValue = null;
+    if (Object.prototype.hasOwnProperty.call(body, "sum_ft")) {
+      const raw = String(body.sum_ft ?? "")
+        .replace(/\s/g, "")
+        .replace(",", ".")
+        .trim();
+
+      if (raw !== "") {
+        const parsed = Number(raw);
+        if (!Number.isFinite(parsed)) {
+          return res.status(400).json({ success:false, error:"sum_ft must be number" });
+        }
+        sumValue = parsed;
+      }
+    }
+
+    const r = await pool.query(`
+      UPDATE public.ft
+      SET
+        legal_entity    = COALESCE($2, legal_entity),
+        "object"    = COALESCE($3, "object"),
+        contractor  = COALESCE($4, contractor),
+        pay_purpose = COALESCE($5, pay_purpose),
+        dds_article = COALESCE($6, dds_article),
+        contract_no = COALESCE($7, contract_no),
+        invoice_no  = COALESCE($8, invoice_no),
+        sum_ft      = COALESCE($9, sum_ft)
+      WHERE id_ft = $1
+      RETURNING *
+    `, [
+      idFt,
+      textOrNull("legal_entity"),
+      textOrNull("object"),
+      textOrNull("contractor"),
+      textOrNull("pay_purpose"),
+      textOrNull("dds_article"),
+      textOrNull("contract_no"),
+      textOrNull("invoice_no"),
+      sumValue
+    ]);
+
+    if (!r.rowCount) {
+      return res.status(404).json({ success:false, error:"FT_NOT_FOUND" });
+    }
+
+    // При изменении Дивизиона Источник Див синхронизируется автоматически.
+    await pool.query(
+      `
+      INSERT INTO public.zvk_status
+        (zvk_row_id, status_time, src_d)
+      SELECT
+        z.id,
+        NOW(),
+        f.legal_entity
+      FROM public.zvk z
+      JOIN public.ft f ON f.id_ft = z.id_ft
+      WHERE z.id_ft = $1
+      ON CONFLICT (zvk_row_id)
+      DO UPDATE SET
+        status_time = NOW(),
+        src_d = EXCLUDED.src_d
+      `,
+      [idFt]
+    );
+
+    return res.json({ success:true, row:r.rows[0] });
+
+  } catch (e) {
+    console.error("FT-UPDATE-MAIN ERROR:", e);
+    return res.status(500).json({ success:false, error:e.message });
+  }
+});
+
+// =====================================================
+// SAVE (история) — /zvk-save
+// ✅ Пока ПОСЛЕДНЯЯ строка цикла НЕ оплачена -> пишем в тот же id_zvk
+// ✅ Если ПОСЛЕДНЯЯ строка оплачена -> создаём новый id_zvk
+// ✅ Возвращает zvk_row_id (это zvk.id)
+// =====================================================
+// =====================================================
+// SAVE (история) — /zvk-save
+// ✅ Права:
+//    - Админ / is_all (R_Kasymkhan) → может создавать/менять всем
+//    - Инициатор / Оператор → может создавать/менять ТОЛЬКО свои FT (ft.input_name == login)
+// ✅ Пока ПОСЛЕДНЯЯ строка цикла НЕ оплачена -> пишем в тот же id_zvk
+// ✅ Если ПОСЛЕДНЯЯ строка оплачена -> создаём новый id_zvk
+// ✅ Возвращает zvk_row_id (это zvk.id)
+// =====================================================
+
+// helpers (если их ещё нет выше по файлу)
+function isTruthy(v){
+  return v === true || v === 1 || v === "1" || String(v).toLowerCase() === "true";
+}
+function normLogin(v){
+  return String(v || "").trim().toLowerCase();
+}
+async function canEditFtByLogin(poolOrClient, id_ft, login){
+  const ft = String(id_ft || "").trim();
+  const lg = normLogin(login);
+  if (!ft || !lg) return false;
+
+  const r = await poolOrClient.query(
+    `
+    SELECT 1
+    FROM public.ft f
+    LEFT JOIN public.users u
+      ON lower(trim(u.login)) = $2
+    WHERE f.id_ft = $1
+      AND (
+        lower(trim(f.input_name)) = $2
+
+        OR lower(
+          regexp_replace(trim(f.input_name), '\\s+', ' ', 'g')
+        ) = lower(
+          regexp_replace(
+            trim(concat_ws(' ', u.last_name, u.first_name, u.middle_name)),
+            '\\s+',
+            ' ',
+            'g'
+          )
+        )
+
+        OR lower(
+          regexp_replace(trim(f.input_name), '\\s+', ' ', 'g')
+        ) = lower(
+          regexp_replace(
+            trim(concat_ws(' ', u.first_name, u.last_name, u.middle_name)),
+            '\\s+',
+            ' ',
+            'g'
+          )
+        )
+
+        OR lower(trim(f.input_name)) = lower(trim(COALESCE(u.email, '')))
+      )
+    LIMIT 1
+    `,
+    [ft, lg]
+  );
+
+  return r.rowCount > 0;
+}
+
+function getDivisionPayRule(login) {
+  const lg = String(login || "").trim().toLowerCase();
+
+  if (lg === "s_zhasulan") {
+    return {
+      mode: "only",
+      divisions: ["СК Жилой дом", "Smart Estate", "Sapa asphalt"]
+    };
+  }
+
+  if (lg === "k_arailym") {
+    return {
+      mode: "except",
+      divisions: ["СК Жилой дом", "Smart Estate", "Sapa asphalt"]
+    };
+  }
+
+  return null;
+}
+
+function canSetPaid(login, roleFt) {
+  const lg = String(login || "").trim().toLowerCase();
+  const role = String(roleFt || "").trim().toLowerCase();
+
+  return (
+    lg === "s_zhasulan" ||
+    lg === "k_arailym"
+  );
+}
+
+async function canEditRowByLogin(poolOrClient, zvk_row_id, login) {
+  const rid = Number(zvk_row_id);
+  const lg = normLogin(login);
+
+  if (!rid || Number.isNaN(rid) || !lg) return false;
+
+  const r = await poolOrClient.query(
+    `
+    SELECT 1
+    FROM public.zvk z
+    JOIN public.ft f
+      ON f.id_ft = z.id_ft
+    LEFT JOIN public.users u
+      ON lower(trim(u.login)) = $2
+    WHERE z.id = $1
+      AND (
+        lower(trim(f.input_name)) = $2
+
+        OR lower(
+          regexp_replace(trim(f.input_name), '\\s+', ' ', 'g')
+        ) = lower(
+          regexp_replace(
+            trim(concat_ws(' ', u.last_name, u.first_name, u.middle_name)),
+            '\\s+',
+            ' ',
+            'g'
+          )
+        )
+
+        OR lower(
+          regexp_replace(trim(f.input_name), '\\s+', ' ', 'g')
+        ) = lower(
+          regexp_replace(
+            trim(concat_ws(' ', u.first_name, u.last_name, u.middle_name)),
+            '\\s+',
+            ' ',
+            'g'
+          )
+        )
+
+        OR lower(trim(f.input_name)) = lower(trim(COALESCE(u.email, '')))
+      )
+    LIMIT 1
+    `,
+    [rid, lg]
+  );
+
+  return r.rowCount > 0;
+}
+
+const ISMAGULOV_LOGIN = "z_karlygash";
+
+// Исмагулов участвует в согласовании только для этих дивизионов.
+// Проверка выполняется первой: Дивизион -> Объект -> Статья ДДС.
+const ISMAGULOV_DIVISIONS = new Set([
+  "Мост",
+  "Сети",
+  "Механизация"
+]);
+
+function normalizeRequestDivision(value) {
+  return String(value || "")
+    .replace(/\u00A0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function divisionNeedsIsmagulov(value) {
+  return ISMAGULOV_DIVISIONS.has(normalizeRequestDivision(value));
+}
+
+const ISMAGULOV_OBJECTS = new Set([
+  "05-М-Акм. Есиль",
+  "32-М-АлмО. Подкова Алматы",
+  "34-Д-Акм. Акколь",
+  "46-М-Жет. Алмалы 145+950км",
+  "47-М-Жет. Коктерек 2+708км",
+  "48-М-Жет. Тюгельбай 5+250км",
+  "49-М-Жет. Кабанбай 23+850км",
+  "50-М-Жет. Койлык 6+890км",
+  "51-М-Жет. Молалы 64+870км",
+  "52-М-Жет. Карабулак 54+411км",
+  "53-М-Жет. Тастобе 3+462км",
+  "55-М-Жет. Сарыозек Обход",
+  "57-Д-Акм. Макинск",
+  "58-Д-Аст. Улица 37",
+  "61-Д-Акм. Жалтырколь",
+  "63-Д-Аст. Оренбургская",
+  "64-Д-Жет. Хоргос",
+  "67-М-Акт. Жем",
+  "75-М-Крг. Шилы",
+  "76-М-Крг. Шат",
+  "77-М-Акт. Кауылжыр",
+  "78-Д-Аст. Уркер"
+]);
+
+function normalizeRequestObject(value) {
+  return String(value || "")
+    .replace(/\u00A0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function objectNeedsIsmagulov(value) {
+  return ISMAGULOV_OBJECTS.has(normalizeRequestObject(value));
+}
+
+// Справочник Google Sheets:
+// лист «Статья ДДС»
+// столбец B = Статья ДДС
+// столбец G = «Да», если согласует Исмагулов
+const ISMAGULOV_DDS_SPREADSHEET_ID =
+  process.env.ISMAGULOV_DDS_SPREADSHEET_ID ||
+  "1nfp0EGfhEgLMJqR2GezKDApMuUTDSX6KCR5gmTmmaFg";
+
+const ISMAGULOV_DDS_SHEET_NAME =
+  process.env.ISMAGULOV_DDS_SHEET_NAME ||
+  "Статья ДДС";
+
+let ismagulovDdsCache = {
+  loadedAt: 0,
+  articles: new Set()
+};
+
+function normalizeRequestDds(value) {
+  return String(value || "")
+    .replace(/\u00A0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function parseSimpleCsv(text) {
+  const rows = [];
+  let row = [];
+  let cell = "";
+  let quoted = false;
+
+  const input = String(text || "");
+
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+
+    if (quoted) {
+      if (ch === '"') {
+        if (input[i + 1] === '"') {
+          cell += '"';
+          i++;
+        } else {
+          quoted = false;
+        }
+      } else {
+        cell += ch;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      quoted = true;
+    } else if (ch === ",") {
+      row.push(cell);
+      cell = "";
+    } else if (ch === "\n") {
+      row.push(cell.replace(/\r$/, ""));
+      rows.push(row);
+      row = [];
+      cell = "";
+    } else {
+      cell += ch;
+    }
+  }
+
+  row.push(cell.replace(/\r$/, ""));
+  if (row.some(v => String(v || "").trim() !== "")) {
+    rows.push(row);
+  }
+
+  return rows;
+}
+
+async function loadIsmagulovDdsArticles() {
+  const now = Date.now();
+
+  if (now - ismagulovDdsCache.loadedAt < 5 * 60 * 1000) {
+    return ismagulovDdsCache.articles;
+  }
+
+  const url =
+    "https://docs.google.com/spreadsheets/d/" +
+    ISMAGULOV_DDS_SPREADSHEET_ID +
+    "/gviz/tq?tqx=out:csv&sheet=" +
+    encodeURIComponent(ISMAGULOV_DDS_SHEET_NAME);
+
+  try {
+    const response = await fetch(url);
+
+    if (!response.ok) {
+      throw new Error("Google Sheets HTTP " + response.status);
+    }
+
+    const rows = parseSimpleCsv(await response.text());
+    const articles = new Set();
+
+    for (const row of rows) {
+      const article = normalizeRequestDds(row[1]); // B
+      const flag = String(row[6] || "").trim().toLowerCase(); // G
+
+      if (article && flag === "да") {
+        articles.add(article);
+      }
+    }
+
+    ismagulovDdsCache = {
+      loadedAt: now,
+      articles
+    };
+
+    return articles;
+  } catch (e) {
+    console.error("ISMAGULOV DDS ERROR:", e.message);
+
+    // Если лист недоступен, строка идёт Сулейменову.
+    ismagulovDdsCache = {
+      loadedAt: now,
+      articles: new Set()
+    };
+
+    return ismagulovDdsCache.articles;
+  }
+}
+
+function getRequestDdsCode(value) {
+  const normalized = normalizeRequestDds(value);
+
+  // Например:
+  // «84. Расчеты с бюджетом...» -> «84»
+  // Это защищает от небольших различий в тексте статьи.
+  const match = normalized.match(/^\s*(\d+(?:\.\d+)*)\s*[.\-–—)]?/);
+  return match ? match[1] : "";
+}
+
+async function rowNeedsIsmagulov(row) {
+  // Карлыгаш согласует ТОЛЬКО по Статье ДДС.
+  // Дивизион, объект и ЮрЛицо больше не участвуют в определении маршрута.
+  const allowed = await loadIsmagulovDdsArticles();
+  const currentArticle = normalizeRequestDds(row?.dds_article);
+
+  if (allowed.has(currentArticle)) {
+    return true;
+  }
+
+  const currentCode = getRequestDdsCode(currentArticle);
+  if (!currentCode) {
+    return false;
+  }
+
+  for (const allowedArticle of allowed) {
+    if (getRequestDdsCode(allowedArticle) === currentCode) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+async function requestNeedsIsmagulov(client, requestId) {
+  const result = await client.query(`
+    SELECT
+      COALESCE(
+        NULLIF(trim(cur.legal_entity), ''),
+        NULLIF(trim(i.src_d), ''),
+        ''
+      ) AS legal_entity,
+      COALESCE(
+        NULLIF(trim(cur.object), ''),
+        NULLIF(trim(i.object), ''),
+        ''
+      ) AS object,
+      COALESCE(
+        NULLIF(trim(cur.dds_article), ''),
+        NULLIF(trim(i.dds_article), ''),
+        ''
+      ) AS dds_article
+    FROM public.request_items i
+    LEFT JOIN public.ft_zvk_current_v2 cur
+      ON cur.zvk_row_id = i.zvk_row_id
+    WHERE i.request_id = $1
+  `, [Number(requestId)]);
+
+  for (const row of result.rows) {
+    if (await rowNeedsIsmagulov(row)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+async function requestIsServiceNs(client, requestId) {
+  const result = await client.query(`
+    SELECT EXISTS (
+      SELECT 1
+      FROM public.request_items i
+      LEFT JOIN public.ft_zvk_current_v2 cur
+        ON cur.zvk_row_id = i.zvk_row_id
+      WHERE i.request_id = $1
+        AND lower(trim(
+          COALESCE(
+            NULLIF(cur.legal_entity, ''),
+            NULLIF(i.src_d, ''),
+            ''
+          )
+        )) = lower('Сервис НС')
+    ) AS is_service_ns
+  `, [Number(requestId)]);
+
+  return result.rows[0]?.is_service_ns === true;
+}
+
+
+app.post("/create-request", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const { row_ids, login } = req.body || {};
+
+    const ids = Array.isArray(row_ids)
+      ? row_ids.map(x => Number(x)).filter(Boolean)
+      : [];
+
+    if (!ids.length) {
+      return res.status(400).json({
+        success: false,
+        error: "row_ids required"
+      });
+    }
+
+    if (!login) {
+      return res.status(400).json({
+        success: false,
+        error: "login required"
+      });
+    }
+
+    await client.query("BEGIN");
+
+    const createdRequests = [];
+
+    for (const oneRowId of ids) {
+      const head = await client.query(`
+        INSERT INTO public.request_head (created_by)
+        VALUES ($1)
+        RETURNING id, request_no
+      `, [
+        String(login || "").trim()
+      ]);
+
+      const request_id = head.rows[0].id;
+      const request_no = head.rows[0].request_no;
+
+      const items = await client.query(`
+        INSERT INTO public.request_items
+        (
+          request_id,
+          zvk_row_id,
+          id_ft,
+          id_zvk,
+          object,
+          input_name,
+          contractor,
+          pay_purpose,
+          dds_article,
+          contract_no,
+          invoice_no,
+          invoice_date,
+          invoice_pdf,
+          src_d,
+          src_o,
+          money_type,
+          idlzk,
+          to_pay,
+          esk_return
+        )
+        SELECT
+          $1,
+          v.zvk_row_id,
+          v.id_ft,
+          v.id_zvk,
+          v.object,
+          v.input_name,
+          v.contractor,
+          v.pay_purpose,
+          v.dds_article,
+          v.contract_no,
+          v.invoice_no,
+          v.invoice_date,
+          v.invoice_pdf,
+          v.src_d,
+          v.src_o,
+          v.money_type,
+          v.idlzk,
+          v.to_pay,
+          COALESCE(v.esk_return, false)
+        FROM public.ft_zvk_current_v2 v
+        WHERE v.zvk_row_id = $2
+        RETURNING to_pay
+      `, [request_id, oneRowId]);
+
+      const total = items.rows.reduce((s, r) => s + Number(r.to_pay || 0), 0);
+      const count = items.rows.length;
+      const needsIsmagulovForNewRequest =
+        await requestNeedsIsmagulov(client, request_id);
+      const isServiceNsForNewRequest =
+        await requestIsServiceNs(client, request_id);
+
+      await client.query(`
+        UPDATE public.request_head
+        SET
+          total_amount = $1,
+          items_count = $2,
+
+acc_zhasulan_name = 'Сулейменов Жасулан',
+acc_zhasulan_status = CASE
+  WHEN $5::boolean = true THEN 'Не требуется'
+  ELSE 'Ожидает'
+END,
+acc_zhasulan_time = NULL,
+acc_zhasulan_comment = NULL,
+
+acc_zhas_name = 'Жаркымбаева Карлыгаш ',
+acc_zhas_status = CASE
+  WHEN $4::boolean = true THEN 'Ожидает'
+  ELSE 'Не требуется'
+END,
+acc_zhas_time = NULL,
+acc_zhas_comment = NULL,
+
+acc_zaitova_name = 'Заитова Алия',
+acc_zaitova_status = CASE
+  WHEN $5::boolean = true THEN 'Ожидает'
+  ELSE 'Не требуется'
+END,
+acc_zaitova_time = NULL,
+acc_zaitova_comment = NULL,
+
+acc_shevchenko_name = 'Шевченко Владимир',
+          acc_shevchenko_status = 'Ожидает',
+          acc_shevchenko_time = NULL,
+          acc_shevchenko_comment = NULL,
+
+          acc_marat_name = 'Койлибаев Марат',
+          acc_marat_status = 'Ожидает',
+          acc_marat_time = NULL,
+          acc_marat_comment = NULL,
+
+          acc_ermek_name = 'Касенов Ермек',
+          acc_ermek_status = 'Ожидает',
+          acc_ermek_time = NULL,
+          acc_ermek_comment = NULL,
+
+          approve_ermek_name = 'Касенов Ермек',
+          approve_ermek_status = 'Ожидает',
+          approve_ermek_time = NULL,
+          approve_ermek_comment = NULL
+        WHERE id = $3
+     `, [
+  total,
+  count,
+  request_id,
+  needsIsmagulovForNewRequest,
+  isServiceNsForNewRequest
+]);
+
+await client.query(`
+  INSERT INTO public.request_approve_log
+    (request_id, stage_name, approver_login, approver_name, action_type, comment_text)
+  VALUES ($1, $2, $3, $4, 'create', $5)
+`, [
+  request_id,
+  'Инициация',
+  String(login || ""),
+  String(login || ""),
+  'Заявка создана'
+]);
+
+// ✅ Уведомление согласующим, когда заявка попала в "Отправленные заявки"
+const notifyUsers = needsIsmagulovForNewRequest
+  ? [ISMAGULOV_LOGIN]
+  : (isServiceNsForNewRequest ? ["a_zaitova"] : ["s_zhasulan"]);
+
+for (const userLogin of notifyUsers) {
+  await client.query(`
+    INSERT INTO public.notifications
+      (
+        user_login,
+        type,
+        title,
+        message,
+        entity_id,
+        entity_page,
+        is_read,
+        created_at
+      )
+    VALUES
+      ($1, 'request', $2, $3, $4, 'request_card', false, NOW())
+  `, [
+    userLogin,
+    `Заявка №${request_no} создана`,
+    `Заявка попала в отправленные заявки. Сумма: ${Number(total || 0).toLocaleString("ru-RU")} ₸`,
+    request_id
+  ]);
+}
+
+createdRequests.push({
+  request_id,
+  request_no,
+  row_id: oneRowId,
+  total_amount: total,
+  items_count: count
+});
+    }
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success: true,
+      count: createdRequests.length,
+      requests: createdRequests,
+      request_id: createdRequests[0]?.request_id || null,
+      request_no: createdRequests[0]?.request_no || null
+    });
+
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+
+    console.error("CREATE-REQUEST ERROR:", e);
+
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/create-registry", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const { row_ids, login } = req.body || {};
+
+    const ids = Array.isArray(row_ids)
+      ? row_ids.map(x => Number(x)).filter(Boolean)
+      : [];
+
+    if (!ids.length) {
+      return res.status(400).json({
+        success: false,
+        error: "row_ids required"
+      });
+    }
+
+    if (!login) {
+      return res.status(400).json({
+        success: false,
+        error: "login required"
+      });
+    }
+
+    await client.query("BEGIN");
+
+    const head = await client.query(`
+      INSERT INTO public.registry_head
+        (created_by, workflow_stage, agree_status, archive_flag)
+      VALUES
+        ($1, 'Инициация', 'Черновик', 'Нет')
+      RETURNING id, registry_no
+    `, [
+      String(login || "").trim()
+    ]);
+
+    const registry_id = head.rows[0].id;
+    const registry_no = head.rows[0].registry_no;
+
+    const items = await client.query(`
+      INSERT INTO public.registry_items
+      (
+        registry_id,
+        zvk_row_id,
+        id_ft,
+        id_zvk,
+        object,
+        contractor,
+        pay_purpose,
+        dds_article,
+        contract_no,
+        invoice_no,
+        invoice_date,
+        invoice_pdf,
+        src_d,
+        src_o,
+        to_pay
+      )
+      SELECT
+        $1,
+        v.zvk_row_id,
+        v.id_ft,
+        v.id_zvk,
+        v.object,
+        v.contractor,
+        v.pay_purpose,
+        v.dds_article,
+        v.contract_no,
+        v.invoice_no,
+        v.invoice_date,
+        v.invoice_pdf,
+        v.src_d,
+        v.src_o,
+        v.to_pay
+      FROM public.ft_zvk_current_v2 v
+      WHERE v.zvk_row_id = ANY($2::bigint[])
+      RETURNING to_pay, zvk_row_id
+    `, [registry_id, ids]);
+
+    if (!items.rowCount) {
+      throw new Error("Строки для реестра не найдены");
+    }
+
+    const total = items.rows.reduce((s, r) => s + Number(r.to_pay || 0), 0);
+    const count = items.rows.length;
+
+    await client.query(`
+      UPDATE public.registry_head
+      SET
+        total_amount = $1,
+        items_count = $2
+      WHERE id = $3
+    `, [total, count, registry_id]);
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success: true,
+      registry_id,
+      registry_no,
+      total_amount: total,
+      items_count: count
+    });
+
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+
+    console.error("CREATE-REGISTRY ERROR:", e);
+
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/registry-card", async (req, res) => {
+  try {
+    const id = Number(req.query.id);
+
+    if (!id) {
+      return res.status(400).json({
+        success: false,
+        error: "id required"
+      });
+    }
+
+    const headRes = await pool.query(`
+      SELECT
+        id,
+        registry_no,
+        registry_date,
+        created_by,
+        division,
+        total_amount,
+        items_count,
+        workflow_stage,
+        agree_status,
+        execution_status,
+        archive_flag,
+        pdf_url,
+        pay_account,
+        chat_map,
+        registry_mode
+      FROM public.registry_head
+      WHERE id = $1
+      LIMIT 1
+    `, [id]);
+
+    if (!headRes.rowCount) {
+      return res.status(404).json({
+        success: false,
+        error: "Реестр не найден"
+      });
+    }
+
+    const itemsRes = await pool.query(`
+      SELECT
+        i.registry_id,
+        i.zvk_row_id,
+        i.id_ft,
+        i.id_zvk,
+
+        COALESCE(cur.object, i.object) AS object,
+        COALESCE(cur.input_name, i.input_name) AS input_name,
+        COALESCE(cur.contractor, i.contractor) AS contractor,
+        COALESCE(cur.pay_purpose, i.pay_purpose) AS pay_purpose,
+        COALESCE(cur.dds_article, i.dds_article) AS dds_article,
+        COALESCE(cur.contract_no, i.contract_no) AS contract_no,
+        COALESCE(cur.invoice_no, i.invoice_no) AS invoice_no,
+        COALESCE(cur.invoice_date, i.invoice_date) AS invoice_date,
+        COALESCE(cur.invoice_pdf, i.invoice_pdf) AS invoice_pdf,
+        COALESCE(cur.src_d, i.src_d) AS src_d,
+        COALESCE(cur.src_o, i.src_o) AS src_o,
+        COALESCE(cur.money_type, i.money_type) AS money_type,
+        COALESCE(cur.to_pay, i.to_pay) AS to_pay,
+
+        COALESCE(cur.request_flag, '') AS request_flag,
+        COALESCE(cur.registry_flag, '') AS registry_flag,
+        COALESCE(cur.is_paid, '') AS is_paid
+
+      FROM public.registry_items i
+
+      LEFT JOIN public.ft_zvk_current_v2 cur
+        ON cur.zvk_row_id = i.zvk_row_id
+
+      WHERE i.registry_id = $1
+
+      ORDER BY i.id
+    `, [id]);
+
+    return res.json({
+      success: true,
+      head: headRes.rows[0],
+      items: itemsRes.rows,
+      transfers: []
+    });
+
+  } catch (e) {
+    console.error("REGISTRY-CARD ERROR:", e);
+
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
+
+app.post("/request-created-bulk", async (req, res) => {
+  try {
+    const rowIds = Array.isArray(req.body.row_ids)
+      ? req.body.row_ids.map(Number).filter(Boolean)
+      : [];
+
+    const login = String(req.body.login || "")
+      .trim()
+      .toLowerCase();
+
+    // Важно: пустое значение нельзя заменять на "Да"
+    const rawValue =
+      req.body.value === null || req.body.value === undefined
+        ? ""
+        : String(req.body.value).trim();
+
+    const value = rawValue === "" ? null : rawValue;
+
+    if (!rowIds.length) {
+      return res.status(400).json({
+        success: false,
+        error: "row_ids required"
+      });
+    }
+
+    if (!login) {
+      return res.status(400).json({
+        success: false,
+        error: "login required"
+      });
+    }
+
+    if (value !== null && value !== "Да") {
+      return res.status(400).json({
+        success: false,
+        error: "Разрешены только пустое значение или Да"
+      });
+    }
+
+    const isBerkinOrZhasulan = ["b_erkin", "s_zhasulan", "a_zaitova", "t_serik"].includes(login);
+
+    /*
+      Пустое значение вручную могут устанавливать b_erkin, s_zhasulan и a_zaitova.
+
+      Значение "Да":
+      - b_erkin, s_zhasulan и a_zaitova могут ставить для любой строки;
+      - supervisor/admin/editor могут создавать заявку по доступной строке;
+      - инициатор может ставить только на своей строке.
+    */
+    if (value === null && !isBerkinOrZhasulan) {
+      return res.status(403).json({
+        success: false,
+        error: "Нет доступа к очистке ЗаявкаСоздано"
+      });
+    }
+
+    const userResult = await pool.query(
+      `
+      SELECT LOWER(TRIM(COALESCE(role_ft, ''))) AS role_ft
+      FROM public.users
+      WHERE LOWER(TRIM(login)) = $1
+      LIMIT 1
+      `,
+      [login]
+    );
+
+    const roleFt = String(
+      userResult.rows[0]?.role_ft || ""
+    ).trim().toLowerCase();
+
+    const canManageAll =
+      isBerkinOrZhasulan ||
+      roleFt === "admin" ||
+      roleFt === "админ" ||
+      roleFt === "администратор" ||
+      roleFt === "supervisor" ||
+      roleFt === "супервайзер" ||
+      roleFt === "editor" ||
+      roleFt === "редактор";
+
+    let allowedRows;
+
+    if (canManageAll) {
+      allowedRows = await pool.query(
+        `
+        SELECT z.id
+        FROM public.zvk z
+        WHERE z.id = ANY($1::bigint[])
+        `,
+        [rowIds]
+      );
+    } else {
+      allowedRows = await pool.query(
+        `
+        SELECT z.id
+        FROM public.zvk z
+        JOIN public.ft f
+          ON f.id_ft = z.id_ft
+        WHERE z.id = ANY($1::bigint[])
+          AND LOWER(TRIM(COALESCE(f.input_name, ''))) = $2
+        `,
+        [rowIds, login]
+      );
+    }
+
+    const allowedIds = allowedRows.rows
+      .map(row => Number(row.id))
+      .filter(Boolean);
+
+    if (!allowedIds.length) {
+      return res.status(403).json({
+        success: false,
+        error: "Нет доступа к выбранным строкам"
+      });
+    }
+
+    // Создаём zvk_status, если строки там ещё нет
+    await pool.query(
+      `
+      INSERT INTO public.zvk_status
+      (
+        zvk_row_id,
+        status_time,
+        chief_approved
+      )
+      SELECT
+        row_id,
+        NOW(),
+        $1
+      FROM UNNEST($2::bigint[]) AS row_id
+      ON CONFLICT (zvk_row_id)
+      DO UPDATE SET
+        chief_approved = EXCLUDED.chief_approved,
+        status_time = NOW()
+      `,
+      [value, allowedIds]
+    );
+
+    return res.json({
+      success: true,
+      updated: allowedIds.length,
+      value: value
+    });
+
+  } catch (e) {
+    console.error("request-created-bulk error:", e);
+
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
+
+app.post("/registry-save", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const registry_id = Number(req.body?.registry_id);
+    const login = String(req.body?.login || "").trim();
+    const transfers = Array.isArray(req.body?.transfers)
+      ? req.body.transfers
+      : [];
+
+    if (!registry_id) {
+      return res.status(400).json({
+        success: false,
+        error: "registry_id required"
+      });
+    }
+
+    await client.query("BEGIN");
+
+    const exists = await client.query(`
+      SELECT id
+      FROM public.registry_head
+      WHERE id = $1
+      LIMIT 1
+    `, [registry_id]);
+
+    if (!exists.rowCount) {
+      throw new Error("Реестр не найден");
+    }
+
+    await client.query(`
+      DELETE FROM public.registry_transfers
+      WHERE registry_id = $1
+    `, [registry_id]);
+
+    for (const t of transfers) {
+      const amount = Number(
+        String(t.amount || 0)
+          .replace(/\s/g, "")
+          .replace(",", ".")
+      ) || 0;
+
+      await client.query(`
+        INSERT INTO public.registry_transfers
+        (
+          registry_id,
+          src_o,
+          debit_account,
+          debit_dds,
+          credit_account,
+          credit_dds,
+          amount
+        )
+        VALUES ($1,$2,$3,$4,$5,$6,$7)
+      `, [
+        registry_id,
+        String(t.src_o || "").trim(),
+        String(t.debit_account || "").trim(),
+        String(t.debit_dds || "").trim(),
+        String(t.credit_account || "").trim(),
+        String(t.credit_dds || "").trim(),
+        amount
+      ]);
+    }
+
+    await client.query(`
+      UPDATE public.registry_head
+      SET
+        workflow_stage = COALESCE(workflow_stage, 'Инициация'),
+        agree_status = COALESCE(agree_status, 'Черновик')
+      WHERE id = $1
+    `, [registry_id]);
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success: true,
+      registry_id,
+      saved: true,
+      transfers_count: transfers.length
+    });
+
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+
+    console.error("REGISTRY-SAVE ERROR:", e);
+
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+
+  } finally {
+    client.release();
+  }
+});
+
+async function resetExpiredZhasulanRequests() {
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const expired = await client.query(`
+      SELECT
+        h.id AS request_id,
+        h.request_no,
+        ARRAY_AGG(i.zvk_row_id) AS row_ids
+      FROM public.request_head h
+      JOIN public.request_items i
+        ON i.request_id = h.id
+      WHERE COALESCE(h.acc_zhasulan_status, '') = 'Согласовано'
+        AND COALESCE(h.approve_ermek_status, '') NOT IN ('Согласовано', 'Утверждено', 'Да')
+        AND h.acc_zhasulan_time IS NOT NULL
+        AND (NOW() AT TIME ZONE 'Asia/Almaty') >=
+            (
+              ((h.acc_zhasulan_time AT TIME ZONE 'Asia/Almaty')::date + INTERVAL '2 days')
+              + TIME '18:00'
+            )
+      GROUP BY h.id, h.request_no
+    `);
+
+    for (const row of expired.rows) {
+      const requestId = Number(row.request_id);
+      const rowIds = (row.row_ids || []).map(Number).filter(Boolean);
+
+      if (!requestId || !rowIds.length) continue;
+
+      // Заявка = пусто
+      await client.query(`
+        UPDATE public.zvk
+        SET request_flag = NULL
+        WHERE id = ANY($1::bigint[])
+      `, [rowIds]);
+
+      // Реестр = пусто
+      await client.query(`
+        UPDATE public.zvk_pay
+        SET
+          registry_flag = NULL,
+          agree_time = NULL
+        WHERE zvk_row_id = ANY($1::bigint[])
+      `, [rowIds]);
+
+      // Источник Объект = пусто
+      await client.query(`
+        INSERT INTO public.zvk_status (zvk_row_id, status_time, src_o, money_type)
+        SELECT x, NOW(), '', NULL
+        FROM unnest($1::bigint[]) AS x
+        ON CONFLICT (zvk_row_id)
+        DO UPDATE SET
+          src_o = '',
+          money_type = NULL,
+          status_time = NOW()
+      `, [rowIds]);
+
+      // РеестрСоздано = пусто, если колонка chief_approved есть
+      const hasChiefApproved = await client.query(`
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'zvk_status'
+          AND column_name = 'chief_approved'
+        LIMIT 1
+      `);
+
+      if (hasChiefApproved.rowCount) {
+        await client.query(`
+          UPDATE public.zvk_status
+          SET chief_approved = NULL
+          WHERE zvk_row_id = ANY($1::bigint[])
+        `, [rowIds]);
+      }
+
+      // Освобождаем денежные пулы при автообнулении D+2.
+      await client.query(`
+        DELETE FROM public.zvk_funding_pool_allocations
+        WHERE zvk_row_id = ANY($1::bigint[])
+      `, [rowIds]);
+
+      await client.query(`
+        UPDATE public.zvk_status
+        SET
+          funding_pool_id = NULL,
+          money_type = NULL
+        WHERE zvk_row_id = ANY($1::bigint[])
+      `, [rowIds]);
+
+      // Удаляем отправленную заявку, чтобы инициатор создал заново
+      await client.query(`
+        DELETE FROM public.request_approve_log
+        WHERE request_id = $1
+      `, [requestId]);
+
+      await client.query(`
+        DELETE FROM public.request_items
+        WHERE request_id = $1
+      `, [requestId]);
+
+      await client.query(`
+        DELETE FROM public.request_head
+        WHERE id = $1
+      `, [requestId]);
+
+      // Пересобираем хвост FT
+      for (const rid of rowIds) {
+        if (typeof rebuildFtTail === "function") {
+          await rebuildFtTail(client, rid);
+        }
+      }
+    }
+
+    await client.query("COMMIT");
+
+    return {
+      success: true,
+      reset_count: expired.rows.length
+    };
+
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+
+    console.error("resetExpiredZhasulanRequests error:", e);
+
+    return {
+      success: false,
+      error: e.message
+    };
+
+  } finally {
+    client.release();
+  }
+}
+
+app.get("/request-list", async (req, res) => {
+  try {
+    // Автоматическое удаление/сброс строк Реестра отключено.
+    // resetExpiredZhasulanRequests() больше не вызывается автоматически.
+
+    const login = String(req.query.login || "")
+      .trim()
+      .toLowerCase();
+
+    const roleFt = String(
+      req.query.role_ft ||
+      req.query.role ||
+      ""
+    ).trim().toLowerCase();
+
+    if (!login) {
+      return res.status(400).json({
+        success: false,
+        error: "login required"
+      });
+    }
+
+    let whereSql = "";
+    const params = [];
+
+    if (login === "a_zaitova") {
+      // Заитова Алия видит только заявки ЮрЛицо = Сервис НС.
+      params.push("Сервис НС");
+      whereSql = `
+        WHERE EXISTS (
+          SELECT 1
+          FROM public.request_items ri
+          LEFT JOIN public.ft_zvk_current_v2 cur
+            ON cur.zvk_row_id = ri.zvk_row_id
+          WHERE ri.request_id = request_head.id
+            AND lower(trim(
+              COALESCE(
+                NULLIF(cur.legal_entity, ''),
+                NULLIF(ri.src_d, ''),
+                ''
+              )
+            )) = lower($1)
+        )
+      `;
+
+} else if (login === "s_zhasulan") {
+  // Сулейменов видит ВСЕ реестры,
+  // включая Сервис НС до согласования Заитовой.
+  // Право согласования определяется отдельно.
+  whereSql = "";
+    } else if (login === ISMAGULOV_LOGIN) {
+      /*
+       * Карлыгаш заменяет старого согласующего zhas.
+       * Для уже созданных реестров маршрут уже сохранён в acc_zhas_status.
+       * Поэтому при открытии Реестра НЕ пересчитываем заново Дивизион/Объект/ДДС,
+       * а показываем все заявки, где этот этап был назначен.
+       */
+      whereSql = `
+        WHERE COALESCE(trim(acc_zhas_status), '') <> ''
+          AND lower(trim(COALESCE(acc_zhas_status, ''))) <> 'не требуется'
+      `;
+
+    } else if (
+      login === "v_shevchenko" ||
+      login === "k_marat" ||
+      login === "k_ermek"
+    ) {
+      // Видят все реестры сразу, но действия сервер проверяет по этапам.
+      whereSql = "";
+
+} else if (login === "o_bakytzhan") {
+  // Бакытжан видит только реестры,
+  // где ВводИмя = r_gulnur.
+  params.push("r_gulnur");
+
+  whereSql = `
+    WHERE id IN (
+      SELECT DISTINCT request_id
+      FROM public.request_items
+      WHERE lower(trim(input_name)) = $1
+    )
+  `;
+
+
+    } else if (
+      login === "admin" ||
+      login === "b_erkin" ||
+      login === "t_serik" ||
+      login === "k_arailym" ||
+      login === "zh_elena" ||
+      roleFt === "admin" ||
+      roleFt === "админ" ||
+      roleFt === "administrator"
+    ) {
+      // Операторы оплаты получают заявки.
+      // На клиенте список распределяется по дивизионам.
+      whereSql = "";
+
+    } else {
+      params.push(login);
+
+      whereSql = `
+        WHERE lower(trim(created_by)) = $1
+           OR id IN (
+             SELECT request_id
+             FROM public.request_items
+             WHERE lower(trim(input_name)) = $1
+           )
+      `;
+    }
+
+    const result = await pool.query(`
+      SELECT
+        id,
+        request_no,
+        request_date,
+        created_by,
+        total_amount,
+        items_count,
+        created_at,
+
+        acc_zhasulan_name,
+        acc_zhasulan_status,
+        acc_zhasulan_time,
+        acc_zhasulan_comment,
+
+        acc_zaitova_name,
+        acc_zaitova_status,
+        acc_zaitova_time,
+        acc_zaitova_comment,
+
+        acc_zhas_name,
+        acc_zhas_status,
+        acc_zhas_time,
+        acc_zhas_comment,
+
+        acc_shevchenko_name,
+        acc_shevchenko_status,
+        acc_shevchenko_time,
+        acc_shevchenko_comment,
+
+        acc_marat_name,
+        acc_marat_status,
+        acc_marat_time,
+        acc_marat_comment,
+
+        acc_ermek_name,
+        acc_ermek_status,
+        acc_ermek_time,
+        acc_ermek_comment,
+
+        approve_ermek_name,
+        approve_ermek_status,
+        approve_ermek_time,
+        approve_ermek_comment
+
+      FROM public.request_head
+      ${whereSql}
+      ORDER BY id DESC
+    `, params);
+
+    let requestRows = result.rows;
+
+    // Для Карлыгаш маршрут уже зафиксирован в request_head.acc_zhas_status
+    // при создании заявки. Повторная фильтрация здесь не нужна.
+
+    const wantsFlat =
+      String(req.query.flat || "").trim() === "1";
+
+    if (!wantsFlat) {
+      return res.json({
+        success: true,
+        rows: requestRows
+      });
+    }
+
+    const requestIds = requestRows
+      .map(row => Number(row.id))
+      .filter(Boolean);
+
+    if (!requestIds.length) {
+      return res.json({
+        success: true,
+        rows: requestRows,
+        flat_rows: []
+      });
+    }
+
+    /*
+     * Быстрая загрузка реестра:
+     * все строки разрешённых пользователю заявок получаем одним SQL.
+     * Это заменяет десятки/сотни последовательных /request-card.
+     */
+    const flatResult = await pool.query(`
+      SELECT
+        i.id AS request_item_id,
+        i.id,
+        i.request_id,
+        i.zvk_row_id,
+        i.id_ft,
+        i.id_zvk,
+        i.object,
+
+        COALESCE(
+          NULLIF(trim(cur.legal_entity), ''),
+          NULLIF(trim(i.src_d), ''),
+          ''
+        ) AS legal_entity,
+
+        i.input_name,
+        i.contractor,
+        i.pay_purpose,
+        i.dds_article,
+        i.contract_no,
+        i.invoice_no,
+        i.invoice_date,
+        i.invoice_pdf,
+        i.src_d,
+        i.src_o,
+        COALESCE(
+          NULLIF(trim(cur.money_type), ''),
+          NULLIF(trim(i.money_type), ''),
+          ''
+        ) AS money_type,
+
+        COALESCE(
+          NULLIF(trim(i.idlzk), ''),
+          cur.idlzk,
+          ''
+        ) AS idlzk,
+
+        COALESCE(cur.to_pay, i.to_pay) AS to_pay,
+        COALESCE(cur.esk_return, i.esk_return, false) AS esk_return,
+        COALESCE(cur.return_amount, 0) AS return_amount,
+        COALESCE(cur.returned_amount, 0) AS returned_amount,
+        COALESCE(cur.return_status, '') AS return_status,
+        cur.return_time,
+        COALESCE(cur.return_by, '') AS return_by,
+
+        COALESCE(cur.request_flag, '') AS request_flag,
+        COALESCE(cur.registry_flag, '') AS registry_flag,
+        COALESCE(i.aray_paid, '') AS aray_paid,
+        COALESCE(cur.is_paid, '') AS is_paid,
+
+        h.request_no,
+        h.request_date,
+        h.created_by,
+        h.created_at,
+
+        COALESCE(h.acc_zhasulan_status, 'Ожидает')
+          AS acc_zhasulan_status,
+        COALESCE(h.acc_zaitova_status, 'Ожидает')
+          AS acc_zaitova_status,
+        COALESCE(h.acc_zhas_status, 'Ожидает')
+          AS acc_zhas_status,
+        COALESCE(h.acc_shevchenko_status, 'Ожидает')
+          AS acc_shevchenko_status,
+        COALESCE(h.acc_marat_status, 'Ожидает')
+          AS acc_marat_status,
+        COALESCE(h.acc_ermek_status, 'Ожидает')
+          AS acc_ermek_status,
+        COALESCE(h.approve_ermek_status, 'Ожидает')
+          AS approve_ermek_status,
+
+        h.acc_zhasulan_time,
+        h.acc_zaitova_time,
+        h.acc_zhas_time,
+        h.acc_shevchenko_time,
+        h.acc_marat_time,
+        h.acc_ermek_time,
+        h.approve_ermek_time,
+
+        COALESCE(h.acc_zhasulan_comment, '')
+          AS acc_zhasulan_comment,
+        COALESCE(h.acc_zaitova_comment, '')
+          AS acc_zaitova_comment,
+        COALESCE(h.acc_zhas_comment, '')
+          AS acc_zhas_comment,
+        COALESCE(h.acc_shevchenko_comment, '')
+          AS acc_shevchenko_comment,
+        COALESCE(h.acc_marat_comment, '')
+          AS acc_marat_comment,
+        COALESCE(h.acc_ermek_comment, '')
+          AS acc_ermek_comment,
+        COALESCE(h.approve_ermek_comment, '')
+          AS approve_ermek_comment
+
+      FROM public.request_items i
+
+      JOIN public.request_head h
+        ON h.id = i.request_id
+
+      LEFT JOIN public.ft_zvk_current_v2 cur
+        ON cur.zvk_row_id = i.zvk_row_id
+
+      WHERE i.request_id = ANY($1::bigint[])
+        AND lower(
+          trim(
+            COALESCE(cur.registry_flag, '')
+          )
+        ) <> 'обнуление'
+
+      ORDER BY h.id DESC, i.id ASC
+    `, [requestIds]);
+
+    const flatRowsWithRoute = [];
+
+    for (const item of flatResult.rows) {
+      const savedKarlygashStatus = String(item.acc_zhas_status || '').trim().toLowerCase();
+
+      flatRowsWithRoute.push({
+        ...item,
+        // Для Реестра используем сохранённый маршрут согласования.
+        // Это гарантирует, что z_karlygash увидит те же заявки, которые раньше видел zhas.
+        needs_ismagulov:
+          savedKarlygashStatus !== '' &&
+          savedKarlygashStatus !== 'не требуется'
+      });
+    }
+
+    return res.json({
+      success: true,
+      rows: requestRows,
+      flat_rows: flatRowsWithRoute
+    });
+
+  } catch (e) {
+    console.error("REQUEST-LIST ERROR:", e);
+
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
+
+
+// =====================================================
+// ФАКТИЧЕСКИЙ ОСТАТОК FT
+// Считает по всей истории ZFT, включая уже оплаченные/скрытые строки.
+// excludeRowId нужен при редактировании существующей строки:
+// её старая сумма временно исключается, чтобы пользователь мог изменить её.
+// =====================================================
+async function getFtAvailableAmount(client, idFt, excludeRowId = null) {
+  const ft = String(idFt || "").trim();
+
+  const r = await client.query(
+    `
+    WITH last_reset AS (
+      SELECT MAX(z.id)::bigint AS reset_row_id
+      FROM public.zvk z
+      LEFT JOIN public.zvk_pay p
+        ON p.zvk_row_id = z.id
+      WHERE z.id_ft = $1
+        AND (
+          COALESCE(z.request_flag, '') = 'Обнуление'
+          OR COALESCE(p.registry_flag, '') = 'Обнуление'
+        )
+    )
+    SELECT
+      COALESCE(f.sum_ft, 0)::numeric AS sum_ft,
+
+      COALESCE((
+        SELECT SUM(COALESCE(z.to_pay, 0))
+        FROM public.zvk z
+        CROSS JOIN last_reset lr
+        WHERE z.id_ft = f.id_ft
+          AND z.request_flag = 'Да'
+          AND z.id > COALESCE(lr.reset_row_id, 0)
+          AND ($2::bigint IS NULL OR z.id <> $2::bigint)
+      ), 0)::numeric AS used_sum,
+
+      COALESCE((SELECT reset_row_id FROM last_reset), 0)::bigint AS last_reset_row_id
+
+    FROM public.ft f
+    WHERE f.id_ft = $1
+    LIMIT 1
+    `,
+    [ft, excludeRowId ? Number(excludeRowId) : null]
+  );
+
+  if (!r.rowCount) {
+    return {
+      exists: false,
+      sum_ft: 0,
+      used_sum: 0,
+      available: 0,
+      last_reset_row_id: 0
+    };
+  }
+
+  const sumFt = Number(r.rows[0].sum_ft || 0);
+  const usedSum = Number(r.rows[0].used_sum || 0);
+  const lastResetRowId = Number(r.rows[0].last_reset_row_id || 0);
+
+  return {
+    exists: true,
+    sum_ft: sumFt,
+    used_sum: usedSum,
+    available: Math.max(sumFt - usedSum, 0),
+    last_reset_row_id: lastResetRowId
+  };
+}
+
+app.post("/zvk-save", async (req, res) => {
+  try {
+    const {
+      id_ft,
+      zvk_row_id,
+      user_name,
+      to_pay,
+      return_amount,
+      esk_return,
+      request_flag,
+      login,
+      is_admin,
+      is_all,
+      can_edit_all
+    } = req.body || {};
+
+    if (!id_ft) {
+      return res.status(400).json({ success:false, error:"id_ft is required" });
+    }
+
+    const actor = String(login || user_name || "").trim();
+    if (!actor) {
+      return res.status(400).json({ success:false, error:"login required" });
+    }
+
+    const adminOk =
+      isTruthy(is_admin) ||
+      isTruthy(is_all) ||
+      isTruthy(can_edit_all) ||
+      ["b_erkin", "s_zhasulan", "a_zaitova", "t_serik"].includes(actor.toLowerCase());
+
+    const ft = String(id_ft).trim();
+   let flag = String(request_flag || "Нет").trim();
+
+if (!["Да", "Нет", "Обнуление"].includes(flag)) {
+  flag = "Нет";
+}
+
+// ✅ ЖЁСТКО: если пришло Нет — сумма 0 и имя СИСТЕМА
+const isNoRequest = flag === "Нет";
+
+const toPayNum = isNoRequest
+  ? 0
+  : (
+      to_pay === "" || to_pay === undefined || to_pay === null
+        ? 0
+        : Number(to_pay)
+    );
+
+    if (Number.isNaN(toPayNum)) {
+      return res.status(400).json({ success:false, error:"to_pay must be number" });
+    }
+
+    const returnAmountNum =
+      return_amount === "" || return_amount === undefined || return_amount === null
+        ? 0
+        : Number(return_amount);
+
+    if (Number.isNaN(returnAmountNum) || returnAmountNum < 0) {
+      return res.status(400).json({ success:false, error:"return_amount must be a non-negative number" });
+    }
+
+    const eskReturnBool =
+      esk_return === true ||
+      esk_return === 1 ||
+      String(esk_return || "").trim().toLowerCase() === "true" ||
+      String(esk_return || "").trim().toLowerCase() === "да";
+
+    // ✅ ГЛАВНОЕ: если пришёл zvk_row_id — обновляем выбранную строку, не создаём новую
+    if (zvk_row_id) {
+      const rid = Number(zvk_row_id);
+
+      if (!rid || Number.isNaN(rid)) {
+        return res.status(400).json({ success:false, error:"bad zvk_row_id" });
+      }
+
+      if (!adminOk) {
+        const ok = await canEditRowByLogin(pool, rid, actor);
+        if (!ok) {
+          return res.status(403).json({ success:false, error:"NO_RIGHTS_THIS_ROW" });
+        }
+      }
+
+      const finalName = flag === "Нет"
+        ? "СИСТЕМА"
+        : String(user_name || actor || "СИСТЕМА").trim();
+
+      // Серверная защита от превышения остатка.
+      // Считаем по ВСЕЙ истории FT, а текущую редактируемую строку исключаем.
+      if (flag === "Да") {
+        const balance = await getFtAvailableAmount(pool, ft, rid);
+
+        if (!balance.exists) {
+          return res.status(404).json({ success:false, error:"FT_NOT_FOUND" });
+        }
+
+        if (toPayNum > balance.available + 0.000001) {
+          return res.status(400).json({
+            success:false,
+            error:"TO_PAY_EXCEEDS_REMAINING",
+            message:"Сумма к оплате больше остатка",
+            remaining: balance.available,
+            requested: toPayNum
+          });
+        }
+      }
+
+      const upd = await pool.query(`
+        UPDATE public.zvk
+           SET request_flag = $1,
+               to_pay       = $2,
+               return_amount = $3,
+               esk_return   = $4,
+               zvk_name     = $5,
+               zvk_date     = NOW()
+         WHERE id = $6
+         RETURNING id, id_zvk, id_ft, zvk_date, zvk_name, to_pay, return_amount, esk_return, request_flag
+      `, [
+        flag,
+        toPayNum,
+        returnAmountNum,
+        flag === "Нет" ? false : eskReturnBool,
+        finalName,
+        rid
+      ]);
+
+      if (!upd.rows.length) {
+        return res.status(404).json({
+          success:false,
+          error:"zvk_row_id not found"
+        });
+      }
+
+      // ✅ если Заявка = Нет:
+      // 1) НЕ пересоздаём ID ZFT;
+      // 2) очищаем Источник Объект;
+      // 3) очищаем РеестрСоздано.
+      if (flag === "Нет") {
+        await pool.query(`
+          INSERT INTO public.zvk_status (zvk_row_id, src_o, chief_approved, status_time)
+          VALUES ($1, '', NULL, NOW())
+          ON CONFLICT (zvk_row_id)
+          DO UPDATE SET
+            src_o = '',
+            chief_approved = NULL,
+            status_time = NOW()
+        `, [rid]);
+      }
+
+      // ВАЖНО:
+      // rebuildFtTail удаляет открытые системные хвосты и создаёт новый ZFT.
+      // Поэтому при Заявка=Нет его запускать нельзя, иначе ZFT3200 станет ZFT3344.
+      const rebuild = flag === "Да"
+        ? await rebuildFtTail(pool, rid)
+        : null;
+
+      return res.json({
+        success: true,
+        updated: true,
+        row: upd.rows[0],
+        id_zvk: upd.rows[0].id_zvk,
+        zvk_row_id: upd.rows[0].id,
+        rebuild
+      });
+    }
+
+    // ✅ если zvk_row_id не пришёл, но админ/система ставит Заявка=Нет,
+    // обновляем последнюю строку этого id_ft и НЕ создаём новый ZFT.
+    if (flag === "Нет") {
+      const lastExisting = await pool.query(
+        `
+        SELECT z.id
+        FROM public.zvk z
+        WHERE z.id_ft = $1
+        ORDER BY
+          z.zvk_date DESC NULLS LAST,
+          z.id DESC
+        LIMIT 1
+        `,
+        [ft]
+      );
+
+      const lastRid = Number(lastExisting.rows[0]?.id || 0);
+
+      if (lastRid) {
+        if (!adminOk) {
+          const ok = await canEditRowByLogin(pool, lastRid, actor);
+          if (!ok) {
+            return res.status(403).json({ success:false, error:"NO_RIGHTS_THIS_ROW" });
+          }
+        }
+
+        const updNoId = await pool.query(`
+          UPDATE public.zvk
+             SET request_flag = 'Нет',
+                 to_pay       = 0,
+                 return_amount = 0,
+                 esk_return   = false,
+                 zvk_name     = 'СИСТЕМА',
+                 zvk_date     = NOW()
+           WHERE id = $1
+           RETURNING id, id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag
+        `, [lastRid]);
+
+        await pool.query(`
+          INSERT INTO public.zvk_status (zvk_row_id, src_o, chief_approved, status_time)
+          VALUES ($1, '', NULL, NOW())
+          ON CONFLICT (zvk_row_id)
+          DO UPDATE SET
+            src_o = '',
+            chief_approved = NULL,
+            status_time = NOW()
+        `, [lastRid]);
+
+        return res.json({
+          success: true,
+          updated: true,
+          no_recreate: true,
+          row: updNoId.rows[0],
+          id_zvk: updNoId.rows[0].id_zvk,
+          zvk_row_id: updNoId.rows[0].id,
+          rebuild: null
+        });
+      }
+    }
+
+    // ✅ ниже старая логика создания новой строки, если zvk_row_id не пришёл
+    if (!adminOk) {
+      const ok = await canEditFtByLogin(pool, id_ft, actor);
+      if (!ok) {
+        return res.status(403).json({ success:false, error:"NO_RIGHTS_THIS_FT" });
+      }
+    }
+
+    const exists = await pool.query(
+      `SELECT 1 FROM public.zvk WHERE id_ft = $1 LIMIT 1`,
+      [ft]
+    );
+
+    const isFirst = exists.rowCount === 0;
+
+    let finalName;
+    let finalToPay;
+    let finalFlag;
+
+    if (isFirst) {
+      finalName = "СИСТЕМА";
+      finalToPay = 0;
+      finalFlag = "Нет";
+    } else if (flag === "Нет") {
+      finalName = "СИСТЕМА";
+      finalToPay = 0;
+      finalFlag = "Нет";
+    } else {
+      finalName = String(user_name || actor || "СИСТЕМА").trim();
+      finalToPay = toPayNum;
+      finalFlag = flag;
+    }
+
+    const lastCycle = await pool.query(
+      `
+      SELECT z.id_zvk
+      FROM public.zvk z
+      WHERE z.id_ft = $1
+      ORDER BY
+        COALESCE(NULLIF(substring(z.id_zvk from '\\d+'), ''), '0')::int DESC,
+        z.zvk_date DESC NULLS LAST,
+        z.id DESC
+      LIMIT 1
+      `,
+      [ft]
+    );
+
+    let id_zvk = lastCycle.rows[0]?.id_zvk || null;
+
+    if (id_zvk) {
+      const lastRow = await pool.query(
+        `
+        SELECT z.id
+        FROM public.zvk z
+        WHERE z.id_zvk = $1
+        ORDER BY z.zvk_date DESC NULLS LAST, z.id DESC
+        LIMIT 1
+        `,
+        [id_zvk]
+      );
+
+      const lastRowId = lastRow.rows[0]?.id || null;
+
+      if (lastRowId) {
+        const paid = await pool.query(
+          `SELECT is_paid FROM public.zvk_pay WHERE zvk_row_id = $1`,
+          [Number(lastRowId)]
+        );
+
+        if (paid.rows[0]?.is_paid === "Да") {
+          id_zvk = null;
+        }
+      }
+    }
+
+    if (!id_zvk) {
+      const created = await pool.query(
+        `SELECT 'ZFT' || nextval('public.zvk_id_seq')::text AS id_zvk`
+      );
+      id_zvk = created.rows[0].id_zvk;
+    }
+
+    if (finalFlag === "Да") {
+      const balance = await getFtAvailableAmount(pool, ft, null);
+
+      if (!balance.exists) {
+        return res.status(404).json({ success:false, error:"FT_NOT_FOUND" });
+      }
+
+      if (finalToPay > balance.available + 0.000001) {
+        return res.status(400).json({
+          success:false,
+          error:"TO_PAY_EXCEEDS_REMAINING",
+          message:"Сумма к оплате больше остатка",
+          remaining: balance.available,
+          requested: finalToPay
+        });
+      }
+    }
+
+    const r = await pool.query(
+      `
+      INSERT INTO public.zvk
+        (id_zvk, id_ft, zvk_date, zvk_name, to_pay, return_amount, esk_return, request_flag)
+      VALUES
+        ($1, $2, NOW(), $3, $4, $5, $6, $7)
+      RETURNING id, id_zvk, id_ft, zvk_date, zvk_name, to_pay, return_amount, esk_return, request_flag
+      `,
+      [
+        id_zvk,
+        ft,
+        finalName,
+        finalToPay,
+        finalFlag === "Нет" ? 0 : returnAmountNum,
+        finalFlag === "Нет" ? false : eskReturnBool,
+        finalFlag
+      ]
+    );
+
+    let rebuild = null;
+
+    if (finalFlag === "Да") {
+      rebuild = await rebuildFtTail(pool, Number(r.rows[0].id));
+    }
+
+    return res.json({
+      success: true,
+      row: r.rows[0],
+      id_zvk,
+      zvk_row_id: r.rows[0].id,
+      rebuild
+    });
+
+  } catch (e) {
+    console.error("ZVK-SAVE ERROR:", e);
+    return res.status(500).json({ success:false, error:e.message });
+  }
+});
+app.post("/zvk-bulk-request-flag", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const { row_ids, request_flag, login, is_admin, is_all, can_edit_all } = req.body || {};
+
+    const ids = Array.isArray(row_ids)
+      ? row_ids.map(x => Number(x)).filter(Boolean)
+      : [];
+
+    const actor = String(login || "").trim();
+    const flag = String(request_flag || "").trim();
+
+    if (!ids.length) {
+      return res.status(400).json({ success:false, error:"row_ids required" });
+    }
+
+    if (!actor) {
+      return res.status(400).json({ success:false, error:"login required" });
+    }
+
+    if (!["Да", "Нет", "Обнуление"].includes(flag)) {
+      return res.status(400).json({ success:false, error:"bad request_flag" });
+    }
+
+    const adminOk =
+      isTruthy(is_admin) ||
+      isTruthy(is_all) ||
+      isTruthy(can_edit_all) ||
+      ["b_erkin", "s_zhasulan", "a_zaitova", "t_serik"].includes(actor.toLowerCase());
+
+    if (!adminOk) {
+      return res.status(403).json({ success:false, error:"NO_RIGHTS" });
+    }
+
+    await client.query("BEGIN");
+
+    await client.query(`
+      UPDATE public.zvk
+      SET
+        request_flag = $2,
+        zvk_name = CASE
+          WHEN $2 = 'Нет' THEN 'СИСТЕМА'
+          ELSE $3
+        END,
+        to_pay = CASE
+          WHEN $2 = 'Нет' THEN 0
+          ELSE to_pay
+        END,
+        zvk_date = NOW()
+      WHERE id = ANY($1::bigint[])
+    `, [ids, flag, actor]);
+
+    await client.query(`
+      INSERT INTO public.zvk_status (zvk_row_id, src_o, chief_approved, status_time)
+      SELECT
+        x,
+        CASE WHEN $2 = 'Нет' THEN '' ELSE COALESCE(s.src_o, '') END,
+        CASE WHEN $2 = 'Нет' THEN NULL ELSE s.chief_approved END,
+        NOW()
+      FROM unnest($1::bigint[]) AS x
+      LEFT JOIN public.zvk_status s ON s.zvk_row_id = x
+      ON CONFLICT (zvk_row_id)
+      DO UPDATE SET
+        src_o = CASE WHEN $2 = 'Нет' THEN '' ELSE public.zvk_status.src_o END,
+        chief_approved = CASE WHEN $2 = 'Нет' THEN NULL ELSE public.zvk_status.chief_approved END,
+        status_time = NOW()
+    `, [ids, flag]);
+
+    const rebuild = [];
+
+    // При Заявка=Нет НЕ запускаем rebuildFtTail,
+    // чтобы старый ZFT не удалялся и не создавался новый.
+    if (flag === "Да") {
+      for (const rid of ids) {
+        rebuild.push(await rebuildFtTail(client, rid));
+      }
+    }
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success:true,
+      updated: ids.length,
+      request_flag: flag,
+      rebuild
+    });
+
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+    console.error("zvk-bulk-request-flag error:", e);
+    return res.status(500).json({ success:false, error:e.message });
+  } finally {
+    client.release();
+  }
+});
+
+// =====================================================
+// ✅ Источник по строке истории
+// POST /zvk-status-row  { zvk_row_id, src_d, src_o }
+// =====================================================
+
+// =====================================================
+// ЭСК — инициатор может менять плановую "Сумму возврата"
+// даже после отправки строки в Реестр.
+// =====================================================
+app.post("/zvk-return-amount", async (req, res) => {
+  try {
+    const rid = Number(req.body?.zvk_row_id);
+    const login = String(req.body?.login || "").trim().toLowerCase();
+    const amount = Number(req.body?.return_amount ?? 0);
+
+    if (!rid) {
+      return res.status(400).json({ success:false, error:"zvk_row_id required" });
+    }
+    if (!login) {
+      return res.status(400).json({ success:false, error:"login required" });
+    }
+    if (!Number.isFinite(amount) || amount < 0) {
+      return res.status(400).json({ success:false, error:"Сумма возврата должна быть 0 или больше" });
+    }
+
+    const rowRes = await pool.query(`
+      SELECT
+        z.id,
+        COALESCE(s.src_o, '') AS src_o,
+        COALESCE(s.money_type, '') AS money_type,
+        COALESCE(p.return_status, '') AS return_status
+      FROM public.zvk z
+      LEFT JOIN public.zvk_status s ON s.zvk_row_id = z.id
+      LEFT JOIN public.zvk_pay p ON p.zvk_row_id = z.id
+      WHERE z.id = $1
+      LIMIT 1
+    `, [rid]);
+
+    if (!rowRes.rowCount) {
+      return res.status(404).json({ success:false, error:"ZVK_ROW_NOT_FOUND" });
+    }
+
+    const row = rowRes.rows[0];
+    if (!String(row.money_type || "").toUpperCase().includes("ЭСК")) {
+      return res.status(400).json({ success:false, error:"Сумма возврата доступна только для Источник Объект с ЭСК" });
+    }
+
+    if (String(row.return_status || "").trim().toLowerCase() === "полностью возвращено") {
+      return res.status(409).json({ success:false, error:"Возврат уже закрыт как «Полностью возвращено»" });
+    }
+
+    const adminOk = ["b_erkin", "s_zhasulan", "admin", "a_zaitova"].includes(login);
+    if (!adminOk) {
+      const ownerOk = await canEditRowByLogin(pool, rid, login);
+      if (!ownerOk) {
+        return res.status(403).json({ success:false, error:"NO_RIGHTS_THIS_ROW" });
+      }
+    }
+
+    const upd = await pool.query(`
+      UPDATE public.zvk
+      SET return_amount = $2,
+          zvk_date = NOW()
+      WHERE id = $1
+      RETURNING id, id_zvk, id_ft, return_amount
+    `, [rid, amount]);
+
+    return res.json({ success:true, row:upd.rows[0] });
+  } catch (e) {
+    console.error("ZVK-RETURN-AMOUNT ERROR:", e);
+    return res.status(500).json({ success:false, error:e.message });
+  }
+});
+
+app.post("/zvk-status-row", async (req, res) => {
+  try {
+    const {
+      zvk_row_id,
+      src_o,
+      money_type,
+      funding_pool_id,
+      idlzk,
+      status_comment,
+      login,
+      is_admin,
+      can_edit_all,
+      is_all
+    } = req.body;
+
+    const rid = Number(zvk_row_id);
+    if (isNaN(rid)) {
+      return res.status(400).json({ success: false, error: "zvk_row_id must be a number" });
+    }
+
+    // Проверка прав
+    const actor = String(login || "").trim();
+    const adminOk =
+      isTruthy(is_admin) ||
+      isTruthy(can_edit_all) ||
+      String(is_all || "0") === "1" ||
+      ["b_erkin", "s_zhasulan", "a_zaitova"].includes(actor.toLowerCase());
+
+    if (!adminOk) {
+      const ok = await canEditRowByLogin(pool, rid, actor);
+      if (!ok) {
+        return res.status(403).json({ success: false, error: "NO_RIGHTS_THIS_ROW" });
+      }
+    }
+
+    const isSerikActor = actor.toLowerCase() === "t_serik";
+    const hasStatusComment =
+      !isSerikActor &&
+      Object.prototype.hasOwnProperty.call(req.body, "status_comment");
+    const hasIdlzk =
+      !isSerikActor &&
+      Object.prototype.hasOwnProperty.call(req.body, "idlzk");
+
+    const hasFundingPoolId =
+      Object.prototype.hasOwnProperty.call(req.body, "funding_pool_id");
+
+    // Всегда берём ЮрЛицо и Объект напрямую из FT.
+    const ftResult = await pool.query(
+      `
+      SELECT
+        f.legal_entity,
+        f."object" AS object_name,
+        z.to_pay,
+        z.request_flag
+      FROM public.zvk z
+      JOIN public.ft f ON f.id_ft = z.id_ft
+      WHERE z.id = $1
+      LIMIT 1
+      `,
+      [rid]
+    );
+
+    if (!ftResult.rowCount) {
+      return res.status(404).json({ success:false, error:"ZVK_ROW_NOT_FOUND" });
+    }
+
+    const ftRow = ftResult.rows[0];
+    const autoSrcD = String(ftRow.legal_entity || "").trim() || null;
+    const ftObject = String(ftRow.object_name || "").trim();
+
+    let poolId = null;
+    let autoSrcO = src_o ?? null;
+
+    if (hasFundingPoolId && funding_pool_id !== null && funding_pool_id !== "") {
+      poolId = Number(funding_pool_id);
+
+      if (!Number.isInteger(poolId) || poolId <= 0) {
+        return res.status(400).json({
+          success:false,
+          error:"Некорректный денежный пул"
+        });
+      }
+
+      // Пул должен быть дочерним распределением, активным,
+      // а его ЮрЛицо + Объект должны совпасть со строкой ФТ.
+      const poolRes = await pool.query(
+        `
+        SELECT
+          p.id,
+          p.legal_entity,
+          p.source_name,
+          p.money_type,
+          p.object_name,
+          p.amount,
+
+          COALESCE((
+            SELECT SUM(COALESCE(cur.to_pay, 0))
+            FROM public.zvk_status zs
+            JOIN public.ft_zvk_current_v2 cur
+              ON cur.zvk_row_id = zs.zvk_row_id
+            WHERE zs.funding_pool_id = p.id
+              AND cur.zvk_row_id <> $2
+              AND lower(trim(COALESCE(cur.request_flag, ''))) <> lower('Обнуление')
+          ), 0)::numeric AS used_other
+
+        FROM public.draft_funding_pool p
+        WHERE p.id = $1
+          AND p.is_active = true
+          AND p.parent_pool_id IS NOT NULL
+          AND lower(trim(COALESCE(p.legal_entity, '')))
+              = lower(trim(COALESCE($3, '')))
+          AND lower(trim(COALESCE(p.object_name, '')))
+              = lower(trim(COALESCE($4, '')))
+        LIMIT 1
+        `,
+        [poolId, rid, autoSrcD, ftObject]
+      );
+
+      if (!poolRes.rowCount) {
+        return res.status(400).json({
+          success:false,
+          error:"Выбранный пул не соответствует ЮрЛицу и Объекту этой строки ФТ"
+        });
+      }
+
+      const selectedPool = poolRes.rows[0];
+      const usedOther = Number(selectedPool.used_other || 0);
+      const currentToPay =
+        String(ftRow.request_flag || "").trim().toLowerCase() === "обнуление"
+          ? 0
+          : Number(ftRow.to_pay || 0);
+
+      const poolAmount = Number(selectedPool.amount || 0);
+
+      if (usedOther + currentToPay > poolAmount + 0.000001) {
+        return res.status(400).json({
+          success:false,
+          error:
+            "Недостаточно остатка в пуле. Доступно: " +
+            Math.max(0, poolAmount - usedOther).toLocaleString("ru-RU", {
+              minimumFractionDigits: 2,
+              maximumFractionDigits: 2
+            })
+        });
+      }
+
+      // Старое поле src_o сохраняем для совместимости старой логики:
+      // в нём остаётся объект, а конкретный пул хранится в funding_pool_id.
+      autoSrcO = String(selectedPool.object_name || "").trim() || null;
+    } else if (hasFundingPoolId) {
+      // Явное очищение выбора пула.
+      poolId = null;
+      autoSrcO = null;
+    }
+
+    const result = await pool.query(
+      `
+      INSERT INTO zvk_status
+        (
+          zvk_row_id,
+          status_time,
+          src_d,
+          src_o,
+          funding_pool_id,
+          status_comment,
+          idlzk
+        )
+      VALUES
+        ($1, NOW(), $2, $3, $4, $5, $7)
+
+      ON CONFLICT (zvk_row_id)
+      DO UPDATE SET
+        status_time = NOW(),
+        src_d = EXCLUDED.src_d,
+
+        src_o = CASE
+                  WHEN $8 THEN EXCLUDED.src_o
+                  WHEN EXCLUDED.src_o IS NULL THEN NULL
+                  ELSE COALESCE(EXCLUDED.src_o, zvk_status.src_o)
+                END,
+
+        funding_pool_id = CASE
+                            WHEN $8 THEN EXCLUDED.funding_pool_id
+                            ELSE zvk_status.funding_pool_id
+                          END,
+
+        status_comment = CASE
+                           WHEN $6 THEN EXCLUDED.status_comment
+                           ELSE zvk_status.status_comment
+                         END,
+
+        idlzk = CASE
+                  WHEN $9 THEN EXCLUDED.idlzk
+                  ELSE zvk_status.idlzk
+                END
+
+      RETURNING *
+      `,
+      [
+        rid,                                             // $1
+        autoSrcD,                                        // $2
+        autoSrcO,                                        // $3
+        poolId,                                          // $4
+        hasStatusComment ? String(status_comment || "") : null, // $5
+        hasStatusComment,                                // $6
+        hasIdlzk ? String(idlzk || "").trim() : null,    // $7
+        hasFundingPoolId,                                // $8
+        hasIdlzk                                         // $9
+      ]
+    );
+
+    res.json({ success: true, row: result.rows[0] });
+
+  } catch (e) {
+    console.error("ZVK-STATUS-ROW ERROR:", e);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// =====================================================
+// ✅ Оплата/Реестр — ПО СТРОКЕ истории (zvk_row_id)
+// POST /zvk-pay-row  { is_admin, zvk_row_id, registry_flag, is_paid }
+// Новая ZFT создаётся при Заявка = Да, а не при Реестр = Да
+// ✅ FIX: авто-строка СИСТЕМА создаётся с is_paid=NULL (пусто), а НЕ "Нет"
+// =====================================================
+
+async function rebuildFtTail(client, zvk_row_id) {
+  const zr = await client.query(
+    `
+    SELECT id_ft
+    FROM zvk
+    WHERE id = $1
+    LIMIT 1
+    `,
+    [Number(zvk_row_id)]
+  );
+
+  const ft = String(zr.rows[0]?.id_ft || "").trim();
+  if (!ft) {
+    return { success:false, reason:"FT_NOT_FOUND" };
+  }
+
+const hasReset = await client.query(
+  `
+  SELECT 1
+  FROM zvk z
+  JOIN zvk_pay p ON p.zvk_row_id = z.id
+  WHERE z.id_ft = $1
+    AND p.registry_flag = 'Обнуление'
+    AND lower(trim(COALESCE(z.zvk_name,''))) <> 'система'
+  LIMIT 1
+  `,
+  [ft]
+);
+
+if (hasReset.rowCount > 0) {
+  return {
+    success: true,
+    ft,
+    remaining: 0,
+    created: false,
+    reason: "HAS_OBNULENIE"
+  };
+}
+
+  // 1. сумма FT
+  const ftRes = await client.query(
+    `
+    SELECT COALESCE(sum_ft, 0) AS sum_ft
+    FROM ft
+    WHERE id_ft = $1
+    LIMIT 1
+    `,
+    [ft]
+  );
+
+  const ftSum = Number(ftRes.rows[0]?.sum_ft || 0);
+
+  // 2. сколько уже поставлено в Заявка = Да по обычным строкам
+  const usedRes = await client.query(
+    `
+    SELECT COALESCE(SUM(COALESCE(z.to_pay,0)),0) AS used_sum
+    FROM public.zvk z
+    WHERE z.id_ft = $1
+      AND z.request_flag = 'Да'
+      AND lower(trim(COALESCE(z.zvk_name,''))) <> 'система'
+    `,
+    [ft]
+  );
+
+  const usedSum = Number(usedRes.rows[0]?.used_sum || 0);
+  const remaining = Math.max(ftSum - usedSum, 0);
+
+  // 3. удалить ВСЕ открытые системные хвосты по этому FT
+  const tails = await client.query(
+    `
+    SELECT z.id
+    FROM zvk z
+    LEFT JOIN zvk_pay p ON p.zvk_row_id = z.id
+    WHERE z.id_ft = $1
+      AND lower(trim(COALESCE(z.zvk_name,''))) = 'система'
+      AND COALESCE(z.request_flag,'') = 'Нет'
+      AND COALESCE(p.registry_flag,'') <> 'Да'
+      AND COALESCE(p.is_paid,'') <> 'Да'
+    `,
+    [ft]
+  );
+
+  for (const row of tails.rows) {
+    const rid = Number(row.id);
+    await client.query(`DELETE FROM zvk_pay WHERE zvk_row_id = $1`, [rid]);
+    await client.query(`DELETE FROM zvk_status WHERE zvk_row_id = $1`, [rid]);
+    await client.query(`DELETE FROM zvk WHERE id = $1`, [rid]);
+  }
+
+  // 4. если остаток есть -> создать только ОДИН хвост
+  if (remaining > 0) {
+    const created = await client.query(
+      `SELECT 'ZFT' || nextval('zvk_id_seq')::text AS id_zvk`
+    );
+    const newIdZvk = created.rows[0].id_zvk;
+
+    const ins = await client.query(
+      `
+      INSERT INTO zvk (id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag)
+      VALUES ($1, $2, NOW(), 'СИСТЕМА', 0, 'Нет')
+      RETURNING id, id_zvk
+      `,
+      [newIdZvk, ft]
+    );
+
+    const newRowId = Number(ins.rows[0].id);
+
+    await client.query(
+      `
+      INSERT INTO zvk_pay (zvk_row_id, registry_flag, is_paid, pay_time, agree_time)
+      VALUES ($1, NULL, NULL, NULL, NULL)
+      ON CONFLICT (zvk_row_id) DO NOTHING
+      `,
+      [newRowId]
+    );
+
+    return {
+      success:true,
+      ft,
+      remaining,
+      created:true,
+      id_zvk:newIdZvk,
+      zvk_row_id:newRowId
+    };
+  }
+
+  return {
+    success:true,
+    ft,
+    remaining:0,
+    created:false
+  };
+}
+
+app.post("/zvk-pay-row", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const { is_admin, zvk_row_id, registry_flag, is_paid, login } = req.body;
+
+    const actor = String(login || "").trim().toLowerCase();
+
+    const adminOk =
+      is_admin === true || is_admin === 1 || is_admin === "1" ||
+      String(is_admin).toLowerCase() === "true";
+
+    const payOk = adminOk || ["b_erkin", "s_zhasulan", "a_zaitova"].includes(actor);
+
+    if (!payOk) {
+      return res.status(403).json({ success:false, error:"only b_erkin/s_zhasulan/a_zaitova/admin allowed" });
+    }
+
+    if (!zvk_row_id) {
+      return res.status(400).json({ success:false, error:"zvk_row_id required" });
+    }
+
+    await client.query("BEGIN");
+
+    const rawReg =
+      registry_flag === undefined || registry_flag === null
+        ? ""
+        : String(registry_flag).trim();
+
+    const reg =
+      rawReg === "" || rawReg === "-" || rawReg === "—"
+        ? null
+        : rawReg;
+
+    const rawPaid =
+      is_paid === undefined || is_paid === null
+        ? ""
+        : String(is_paid).trim();
+
+    const paid =
+      rawPaid === "" || rawPaid === "-" || rawPaid === "—"
+        ? null
+        : rawPaid;
+
+    const r = await client.query(
+      `
+      INSERT INTO zvk_pay (zvk_row_id, registry_flag, is_paid, pay_time, agree_time)
+      VALUES (
+        $1,
+        $2,
+        $3,
+        CASE WHEN $3 = 'Да' THEN NOW() ELSE NULL END,
+        CASE WHEN $2 IN ('Да','Обнуление') THEN NOW() ELSE NULL END
+      )
+      ON CONFLICT (zvk_row_id)
+      DO UPDATE SET
+        registry_flag = EXCLUDED.registry_flag,
+
+        agree_time = CASE
+          WHEN EXCLUDED.registry_flag IN ('Да','Обнуление')
+            THEN COALESCE(zvk_pay.agree_time, NOW())
+          WHEN COALESCE(EXCLUDED.registry_flag,'') = ''
+            THEN NULL
+          ELSE zvk_pay.agree_time
+        END,
+
+        is_paid = EXCLUDED.is_paid,
+
+        pay_time = CASE
+          WHEN EXCLUDED.is_paid = 'Да'
+            THEN COALESCE(zvk_pay.pay_time, NOW())
+          WHEN COALESCE(EXCLUDED.is_paid,'') <> 'Да'
+            THEN NULL
+          ELSE zvk_pay.pay_time
+        END
+      RETURNING *;
+      `,
+      [Number(zvk_row_id), reg, paid]
+    );
+
+    let rebuild = null;
+    let deletedTail = null;
+
+    // Реестр больше не создаёт и не удаляет новую ZFT.
+    if (reg === "Обнуление") {
+      await client.query(`
+        INSERT INTO public.zvk_status (zvk_row_id, src_o, status_time)
+        VALUES ($1, '', NOW())
+        ON CONFLICT (zvk_row_id)
+        DO UPDATE SET
+          src_o = '',
+          status_time = NOW()
+      `, [Number(zvk_row_id)]);
+    }
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success: true,
+      row: r.rows[0],
+      rebuild,
+      deletedTail
+    });
+
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("ZVK-PAY-ROW ERROR:", e);
+    return res.status(500).json({ success:false, error:e.message });
+  } finally {
+    client.release();
+  }
+});
+
+async function deleteLastAutoTailByFt(client, zvk_row_id) {
+  const zr = await client.query(
+    `
+    SELECT id_ft, id_zvk
+    FROM zvk
+    WHERE id = $1
+    LIMIT 1
+    `,
+    [Number(zvk_row_id)]
+  );
+
+  const row = zr.rows[0];
+  if (!row) return { success:false, reason:"ROW_NOT_FOUND" };
+
+  const ft = String(row.id_ft || "").trim();
+  const currentIdZvk = String(row.id_zvk || "").trim();
+
+  if (!ft) return { success:false, reason:"FT_NOT_FOUND" };
+
+  // ищем самый последний авто-хвост СИСТЕМА/Нет, но не текущий цикл
+  const tailRes = await client.query(
+    `
+    SELECT z.id, z.id_zvk
+    FROM zvk z
+    LEFT JOIN zvk_pay p ON p.zvk_row_id = z.id
+    WHERE z.id_ft = $1
+      AND z.id_zvk <> $2
+      AND lower(trim(COALESCE(z.zvk_name,''))) = 'система'
+      AND COALESCE(z.request_flag,'') = 'Нет'
+      AND COALESCE(p.registry_flag,'') = ''
+      AND COALESCE(p.is_paid,'') = ''
+    ORDER BY
+      COALESCE(NULLIF(substring(z.id_zvk from '\\d+'), ''), '0')::int DESC,
+      z.id DESC
+    LIMIT 1
+    `,
+    [ft, currentIdZvk]
+  );
+
+  if (!tailRes.rowCount) {
+    return { success:true, deleted:false, reason:"NO_TAIL_FOUND" };
+  }
+
+  const tailId = Number(tailRes.rows[0].id);
+
+  await client.query(`DELETE FROM zvk_pay WHERE zvk_row_id = $1`, [tailId]);
+  await client.query(`DELETE FROM zvk_status WHERE zvk_row_id = $1`, [tailId]);
+  await client.query(`DELETE FROM zvk WHERE id = $1`, [tailId]);
+
+  return {
+    success:true,
+    deleted:true,
+    deleted_row_id: tailId,
+    deleted_id_zvk: tailRes.rows[0].id_zvk
+  };
+}
+
+async function resetFtToInitialState(client, id_ft) {
+  // 1. найти самый первый ZFT/системную строку
+  const firstRes = await client.query(
+    `
+    SELECT z.id, z.id_zvk
+    FROM zvk z
+    WHERE z.id_ft = $1
+      AND lower(trim(COALESCE(z.zvk_name,''))) = 'система'
+    ORDER BY
+      COALESCE(NULLIF(substring(z.id_zvk from '\\d+'), ''), '0')::int ASC,
+      z.id ASC
+    LIMIT 1
+    `,
+    [id_ft]
+  );
+
+  const firstRow = firstRes.rows[0];
+  if (!firstRow) return { success:false, reason:"FIRST_SYSTEM_NOT_FOUND" };
+
+  const keepRowId = Number(firstRow.id);
+
+  // 2. удалить все остальные строки этого FT
+  const allRows = await client.query(
+    `
+    SELECT id
+    FROM zvk
+    WHERE id_ft = $1
+      AND id <> $2
+    `,
+    [id_ft, keepRowId]
+  );
+
+  for (const row of allRows.rows) {
+    const rid = Number(row.id);
+    await client.query(`DELETE FROM zvk_pay WHERE zvk_row_id = $1`, [rid]);
+    await client.query(`DELETE FROM zvk_status WHERE zvk_row_id = $1`, [rid]);
+    await client.query(`DELETE FROM zvk WHERE id = $1`, [rid]);
+  }
+
+  // 3. у первой системной строки вернуть начальные значения
+  await client.query(
+    `
+UPDATE zvk z
+SET
+  zvk_name = 'СИСТЕМА',
+  to_pay = COALESCE(f.sum_ft, 0),
+  request_flag = 'Нет',
+  zvk_date = NOW()
+FROM ft f
+WHERE z.id = $1
+  AND f.id_ft = z.id_ft
+    `,
+    [keepRowId]
+  );
+
+  await client.query(
+    `
+    DELETE FROM zvk_pay
+    WHERE zvk_row_id = $1
+    `,
+    [keepRowId]
+  );
+
+  await client.query(
+    `
+    DELETE FROM zvk_status
+    WHERE zvk_row_id = $1
+    `,
+    [keepRowId]
+  );
+
+  await client.query(
+    `
+    INSERT INTO zvk_pay (zvk_row_id, registry_flag, is_paid, pay_time, agree_time)
+    VALUES ($1, NULL, NULL, NULL, NULL)
+    ON CONFLICT (zvk_row_id) DO UPDATE SET
+      registry_flag = NULL,
+      is_paid = NULL,
+      pay_time = NULL,
+      agree_time = NULL
+    `,
+    [keepRowId]
+  );
+
+  return { success:true, reset:true, keep_row_id: keepRowId, id_zvk: firstRow.id_zvk };
+}
+// =====================================================
+// JOIN: читаем из VIEW ft_zvk_current_v2
+// =====================================================
+
+app.get("/ft-zvk-join", async (req, res) => {
+  try {
+    const login = String(req.query.login || "").trim();
+    const loginNorm = login.toLowerCase();
+
+    const isAdmin    = String(req.query.is_admin || "0") === "1";
+    const isAll      = String(req.query.is_all || "0") === "1";
+    const isOperator = String(req.query.is_operator || "0") === "1";
+
+    // active = без оплаченных
+    // paid = только оплаченные
+    // all = все
+    const paidMode = String(req.query.paid || "active").trim();
+
+    if (!login) {
+      return res.status(400).json({ success:false, error:"login is required" });
+    }
+
+    const where = [];
+    const params = [];
+
+// ✅ Разделение оплаченных только для Админа
+if (isAdmin || isAll) {
+  if (paidMode === "paid") {
+    // ✅ Оплаченные: только Оплачено = Да
+    // ❌ Реестр = Обнуление сюда НЕ входит
+    where.push(`(
+      COALESCE(v.is_paid, '') = 'Да'
+      AND COALESCE(v.registry_flag, '') <> 'Обнуление'
+    )`);
+} else if (paidMode === "reset") {
+
+  // Обнуленные:
+  // показываем только строки, где Реестр = Обнуление
+  where.push(`
+    COALESCE(TRIM(v.registry_flag), '') = 'Обнуление'
+  `);
+
+} else {
+
+  // Обычная таблица:
+  // показываем неоплаченные строки,
+  // где Реестр не равен Обнуление
+  where.push(`(
+    COALESCE(TRIM(v.is_paid), '') <> 'Да'
+    AND COALESCE(TRIM(v.registry_flag), '') <> 'Обнуление'
+  )`);
+}
+}
+
+// ✅ Для инициатора/оператора НЕ фильтруем оплаченные вообще
+
+    if (!(isAdmin || isAll || isOperator)) {
+      if (loginNorm === "a_zaitova") {
+        // Заитова видит:
+        // 1) все свои строки;
+        // 2) строки любых инициаторов только для
+        //    ЮрЛицо = Сервис НС + Статья ДДС = 103.Командировочные.
+        params.push(login);
+        const loginParam = `$${params.length}`;
+
+        where.push(`(
+          lower(trim(v.input_name)) = lower(trim(${loginParam}))
+          OR (
+            lower(trim(COALESCE(v.legal_entity, v.src_d, ''))) = lower('Сервис НС')
+            AND lower(regexp_replace(COALESCE(v.dds_article, ''), '\\s+', '', 'g'))
+                = lower('103.Командировочные')
+          )
+        )`);
+      } else {
+        params.push(login);
+        where.push(`lower(trim(v.input_name)) = lower(trim($${params.length}))`);
+      }
+    }
+
+
+    const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+const query = `
+  WITH balance_rows AS (
+    SELECT
+      v.*,
+
+      GREATEST(
+        COALESCE(v.sum_ft, 0)
+        - COALESCE(b.used_before, 0),
+        0
+      )::numeric AS base_balance,
+
+      CASE
+        WHEN COALESCE(b.has_reset_to_here, false) THEN 0::numeric
+        ELSE GREATEST(
+          COALESCE(v.sum_ft, 0)
+          - COALESCE(b.used_before, 0)
+          - CASE
+              WHEN COALESCE(v.request_flag, '') = 'Да'
+                THEN COALESCE(v.to_pay, 0)
+              ELSE 0
+            END,
+          0
+        )::numeric
+      END AS ostatok_calc
+
+    FROM public.ft_zvk_current_v2 v
+
+    LEFT JOIN LATERAL (
+      SELECT
+        COALESCE(
+          SUM(COALESCE(z2.to_pay, 0))
+            FILTER (
+              WHERE z2.id < v.zvk_row_id
+                AND COALESCE(z2.request_flag, '') = 'Да'
+            ),
+          0
+        )::numeric AS used_before,
+
+        COALESCE(
+          BOOL_OR(
+            z2.id <= v.zvk_row_id
+            AND (
+              COALESCE(z2.request_flag, '') = 'Обнуление'
+              OR COALESCE(p2.registry_flag, '') = 'Обнуление'
+            )
+          ),
+          false
+        ) AS has_reset_to_here
+
+      FROM public.zvk z2
+      LEFT JOIN public.zvk_pay p2
+        ON p2.zvk_row_id = z2.id
+      WHERE z2.id_ft = v.id_ft
+        AND z2.id <= v.zvk_row_id
+    ) b ON TRUE
+  )
+
+  SELECT
+    v.*,
+
+    -- Берём сумму ДоРеестра напрямую из живой строки public.zvk.
+    -- Так отображение не зависит от того, успел ли пересоздаться VIEW.
+    zlive.pre_registry_amount AS pre_registry_amount_live,
+
+    COALESCE(
+      NULLIF(trim(zs.money_type), ''),
+      pool_type.money_type,
+      ''
+    ) AS money_type,
+
+    zs.funding_pool_id,
+
+    EXISTS (
+      SELECT 1
+      FROM public.pre_registry_items pri
+      WHERE pri.zvk_row_id = v.zvk_row_id
+        AND COALESCE(pri.approval_status, '') NOT IN ('Отменено', 'Отклонено')
+    ) AS pre_registry_sent
+
+  FROM balance_rows v
+
+  LEFT JOIN public.zvk zlive
+    ON zlive.id = v.zvk_row_id
+
+  LEFT JOIN public.zvk_status zs
+    ON zs.zvk_row_id = v.zvk_row_id
+  LEFT JOIN LATERAL (
+    SELECT string_agg(
+      DISTINCT NULLIF(trim(p.money_type), ''),
+      ' + '
+      ORDER BY NULLIF(trim(p.money_type), '')
+    ) AS money_type
+    FROM public.zvk_funding_pool_allocations a
+    JOIN public.draft_funding_pool p
+      ON p.id = a.funding_pool_id
+    WHERE a.zvk_row_id = v.zvk_row_id
+  ) pool_type ON TRUE
+  ${whereSql}
+  ORDER BY
+    COALESCE(NULLIF(substring(v.id_ft from '\\d+'), ''), '0')::int DESC,
+    v.zvk_date DESC NULLS LAST,
+    v.zvk_row_id DESC
+`;
+
+    const r = await pool.query(query, params);
+
+    return res.json({
+      success: true,
+      rows: r.rows,
+      paidMode
+    });
+
+  } catch (e) {
+    console.error("FT-ZVK-JOIN ERROR:", e);
+    return res.status(500).json({ success:false, error:e.message });
+  }
+});
+
+// =====================================================
+// SAVE FT (создать FT + авто ZFT + строка СИСТЕМА)
+// =====================================================
+app.post("/save-ft", async (req, res) => {
+  const client = await pool.connect();
+  let sourceFileId = "";
+
+  const findExistingBySourceFileId = async (db, fileId) => {
+    if (!fileId) return null;
+
+    const existing = await db.query(
+      `
+      SELECT
+        f.id_ft,
+        z.id_zvk
+      FROM public.ft f
+      LEFT JOIN LATERAL (
+        SELECT id_zvk
+        FROM public.zvk
+        WHERE id_ft = f.id_ft
+        ORDER BY zvk_date DESC NULLS LAST, id DESC
+        LIMIT 1
+      ) z ON TRUE
+      WHERE f.source_file_id = $1
+      LIMIT 1
+      `,
+      [fileId]
+    );
+
+    return existing.rows[0] || null;
+  };
+
+  try {
+    const {
+      input_date,
+      input_name,
+      legal_entity,
+      mechanization,
+      object,
+      contractor,
+
+      pay_purpose,
+      dds_article,
+      contract_no,
+      contract_date,
+
+      invoice_no,
+      invoice_date,
+      invoice_pdf,
+      sum_ft,
+      source_file_id
+    } = req.body || {};
+
+    sourceFileId = String(source_file_id || "").trim();
+
+    if (!input_name) {
+      return res.status(400).json({ success:false, error:"input_name is required" });
+    }
+    if (!legal_entity || !object) {
+      return res.status(400).json({ success:false, error:"legal_entity/object required" });
+    }
+    if (!contractor) {
+      return res.status(400).json({ success:false, error:"contractor required" });
+    }
+    if (!invoice_no) {
+      return res.status(400).json({ success:false, error:"invoice_no required" });
+    }
+    if (!invoice_date) {
+      return res.status(400).json({ success:false, error:"invoice_date required" });
+    }
+
+    const invoiceDateNormalized = doFtNormalizeInvoiceDateBackend_(invoice_date);
+    if (!invoiceDateNormalized) {
+      return res.status(400).json({
+        success:false,
+        error:"invoice_date must be YYYY-MM-DD",
+        received:String(invoice_date || "")
+      });
+    }
+
+    const sumNum =
+      (sum_ft === "" || sum_ft === null || sum_ft === undefined)
+        ? 0
+        : Number(sum_ft);
+
+    if (Number.isNaN(sumNum)) {
+      return res.status(400).json({ success:false, error:"sum_ft must be number" });
+    }
+
+    await client.query("BEGIN");
+
+    // Первая проверка идемпотентности:
+    // если этот Google Drive PDF уже отправлялся — просто возвращаем прежние ID.
+    if (sourceFileId) {
+      const existing = await findExistingBySourceFileId(client, sourceFileId);
+
+      if (existing) {
+        await client.query("COMMIT");
+        return res.json({
+          success:true,
+          already_exists:true,
+          message:"Этот PDF уже был отправлен. Повторная запись не создана.",
+          id_ft:String(existing.id_ft || ""),
+          id_zvk:String(existing.id_zvk || "")
+        });
+      }
+    }
+
+    const idRow = await client.query(
+      `SELECT 'FT' || nextval('ft_id_seq')::text AS id_ft`
+    );
+    const id_ft = idRow.rows[0].id_ft;
+
+    let inputDateFormatted = input_date;
+    if (input_date && typeof input_date === "string") {
+      inputDateFormatted = new Date(input_date);
+    }
+
+    const r = await client.query(
+      `
+      INSERT INTO public.ft
+        (
+          id_ft,
+          input_date,
+          input_name,
+          legal_entity,
+          mechanization,
+          "object",
+          contractor,
+          pay_purpose,
+          dds_article,
+          contract_no,
+          contract_date,
+          invoice_no,
+          invoice_date,
+          invoice_pdf,
+          sum_ft,
+          source_file_id
+        )
+      VALUES
+        (
+          $1,$2,$3,$4,$5,$6,$7,
+          $8,$9,$10,$11,
+          $12,$13,$14,$15,$16
+        )
+      RETURNING id_ft
+      `,
+      [
+        id_ft,
+        inputDateFormatted,
+        String(input_name).trim(),
+        String(legal_entity).trim(),
+        mechanization ? String(mechanization).trim() : null,
+        String(object).trim(),
+        String(contractor).trim(),
+
+        pay_purpose ? String(pay_purpose).trim() : null,
+        dds_article ? String(dds_article).trim() : null,
+        contract_no ? String(contract_no).trim() : null,
+        contract_date ? contract_date : null,
+
+        String(invoice_no).trim(),
+        invoiceDateNormalized,
+        invoice_pdf ? String(invoice_pdf).trim() : null,
+        sumNum,
+        sourceFileId || null
+      ]
+    );
+
+    const zftRow = await client.query(
+      `SELECT 'ZFT' || nextval('zvk_id_seq')::text AS id_zvk`
+    );
+    const id_zvk = zftRow.rows[0].id_zvk;
+
+    const newZvk = await client.query(
+      `
+      INSERT INTO public.zvk
+        (id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag)
+      VALUES
+        ($1, $2, NOW(), 'СИСТЕМА', 0, 'Нет')
+      RETURNING id
+      `,
+      [id_zvk, id_ft]
+    );
+
+    // Источник Див всегда равен выбранному ЮрЛицо/дивизиону.
+    await client.query(
+      `
+      INSERT INTO public.zvk_status
+        (zvk_row_id, status_time, src_d)
+      VALUES
+        ($1, NOW(), $2)
+      ON CONFLICT (zvk_row_id)
+      DO UPDATE SET
+        status_time = NOW(),
+        src_d = EXCLUDED.src_d
+      `,
+      [newZvk.rows[0].id, String(legal_entity).trim()]
+    );
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success:true,
+      already_exists:false,
+      id_ft:r.rows[0].id_ft,
+      id_zvk
+    });
+
+  } catch (e) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {}
+
+    // Вторая, обязательная защита от гонки:
+    // два запроса могли одновременно пройти первую проверку.
+    // UNIQUE(source_file_id) пропустит только один.
+    if (e && e.code === "23505" && sourceFileId) {
+      try {
+        const existing = await findExistingBySourceFileId(pool, sourceFileId);
+
+        if (existing) {
+          return res.json({
+            success:true,
+            already_exists:true,
+            message:"Этот PDF уже был отправлен. Повторная запись не создана.",
+            id_ft:String(existing.id_ft || ""),
+            id_zvk:String(existing.id_zvk || "")
+          });
+        }
+      } catch (lookupErr) {
+        console.error("SAVE-FT duplicate lookup error:", lookupErr);
+      }
+    }
+
+    console.error("SAVE-FT ERROR:", e);
+    return res.status(500).json({
+      success:false,
+      error:e && e.message ? e.message : String(e)
+    });
+
+  } finally {
+    client.release();
+  }
+});
+
+// =====================================================
+// СОЗДАНИЕ ВХ / ИСХ + ИСТОРИЯ
+// =====================================================
+app.post("/io-save", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+
+    if (!rows.length) {
+      return res.status(400).json({
+        success: false,
+        error: "rows required"
+      });
+    }
+
+    await client.query("BEGIN");
+
+    let inserted = 0;
+
+    for (const row of rows) {
+      const inputDate = String(row?.input_date || "").trim();
+      const objectName = String(row?.object || "").trim();
+      const divIn = String(row?.div_in || "").trim();
+      const dds = String(row?.dds || row?.dds_in || row?.dds_out || "").trim();
+      const divOut = String(row?.div_out || "").trim();
+      const ddsIn = dds;
+      const ddsOut = dds;
+
+      const sumValue = Number(
+        String(row?.sum || "")
+          .replace(/\s/g, "")
+          .replace(",", ".")
+      );
+
+      if (!Number.isFinite(sumValue) || sumValue === 0) {
+        throw new Error("Введите правильную сумму");
+      }
+
+      if (!objectName) {
+        throw new Error("Источник Объект не указан");
+      }
+
+      if (!divIn) {
+        throw new Error("Дивизион Вх не указан");
+      }
+
+      if (!dds) {
+        throw new Error("ДДС не указан");
+      }
+
+      if (!divOut) {
+        throw new Error("Дивизион Исх не указан");
+      }
+
+
+      // 1. Сначала создаём историю
+      const historyResult = await client.query(
+        `
+        INSERT INTO public.io_history
+        (
+          input_date_text,
+          sum_value,
+          object_name,
+          div_in,
+          dds_in,
+          div_out,
+          dds_out
+        )
+        VALUES ($1,$2,$3,$4,$5,$6,$7)
+        RETURNING id
+        `,
+        [
+          inputDate,
+          sumValue,
+          objectName,
+          divIn,
+          ddsIn,
+          divOut,
+          ddsOut
+        ]
+      );
+
+      const historyId = Number(historyResult.rows[0].id);
+
+      // 2. Создаём ВХ
+      await client.query(
+        `
+        INSERT INTO public.prihod6
+        (
+          amount_in,
+          object_name,
+          division_in,
+          dds_in,
+          io_history_id
+        )
+        VALUES ($1,$2,$3,$4,$5)
+        `,
+        [
+          sumValue,
+          objectName,
+          divIn,
+          ddsIn,
+          historyId
+        ]
+      );
+
+      // 3. Создаём ИСХ
+      await client.query(
+        `
+        INSERT INTO public.perevod7
+        (
+          amount_out,
+          object_name,
+          division_out,
+          dds_out,
+          io_history_id
+        )
+        VALUES ($1,$2,$3,$4,$5)
+        `,
+        [
+          sumValue,
+          objectName,
+          divOut,
+          ddsOut,
+          historyId
+        ]
+      );
+
+      inserted++;
+    }
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success: true,
+      inserted
+    });
+
+  } catch (e) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {}
+
+    console.error("IO-SAVE ERROR:", e);
+
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+
+  } finally {
+    client.release();
+  }
+});
+
+
+app.get("/io-history", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const limit = Math.min(Number(req.query.limit || 200), 500);
+
+    const r = await client.query(`
+      SELECT
+        id,
+        input_date_text,
+        sum_value,
+        object_name,
+        div_in,
+        dds_in,
+        div_out,
+        dds_out
+      FROM public.io_history
+      ORDER BY id DESC
+      LIMIT $1
+    `, [limit]);
+
+    res.json({
+      success: true,
+      rows: r.rows
+    });
+  } catch (e) {
+    console.error("IO-HISTORY ERROR:", e);
+    res.status(500).json({ success:false, error:e.message });
+  } finally {
+    client.release();
+  }
+});
+
+// =====================================================
+// ИЗМЕНЕНИЕ ВХ / ИСХ ИЗ ИСТОРИИ
+// Работает и для новых, и для старых записей
+// =====================================================
+app.put("/io-history/:id", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const historyId = Number(req.params.id);
+    const login = String(req.body?.login || "").trim();
+
+    if (!Number.isInteger(historyId) || historyId <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: "Некорректный ID записи"
+      });
+    }
+
+    if (!login) {
+      return res.status(400).json({
+        success: false,
+        error: "Логин не передан"
+      });
+    }
+
+    const userResult = await client.query(
+      `
+      SELECT login, role_ft, is_active
+      FROM public.users
+      WHERE lower(trim(login)) = lower(trim($1))
+      LIMIT 1
+      `,
+      [login]
+    );
+
+    if (!userResult.rows.length) {
+      return res.status(404).json({
+        success: false,
+        error: "Пользователь не найден"
+      });
+    }
+
+    const user = userResult.rows[0];
+
+    if (user.is_active === false) {
+      return res.status(403).json({
+        success: false,
+        error: "Пользователь отключён"
+      });
+    }
+
+    const role = String(user.role_ft || "")
+      .trim()
+      .toLowerCase();
+
+    const actorLogin = String(user.login || "")
+      .trim()
+      .toLowerCase();
+
+    const canEdit =
+      role === "admin" ||
+      role === "админ" ||
+      role === "администратор" ||
+      ["b_erkin", "s_zhasulan"].includes(actorLogin);
+
+    if (!canEdit) {
+      return res.status(403).json({
+        success: false,
+        error: "Нет доступа на изменение"
+      });
+    }
+
+    const inputDate = String(req.body?.input_date || "").trim();
+    const objectName = String(req.body?.object || "").trim();
+    const divIn = String(req.body?.div_in || "").trim();
+    const ddsIn = String(req.body?.dds_in || "").trim();
+    const divOut = String(req.body?.div_out || "").trim();
+    const ddsOut = String(req.body?.dds_out || "").trim();
+
+    const sumValue = Number(
+      String(req.body?.sum || "")
+        .replace(/\s/g, "")
+        .replace(",", ".")
+    );
+
+    if (!Number.isFinite(sumValue) || sumValue === 0) {
+      return res.status(400).json({
+        success: false,
+        error: "Введите правильную сумму"
+      });
+    }
+
+    if (!objectName) {
+      return res.status(400).json({
+        success: false,
+        error: "Источник Объект не указан"
+      });
+    }
+
+    if (!divIn || !ddsIn || !divOut || !ddsOut) {
+      return res.status(400).json({
+        success: false,
+        error: "Заполните все поля"
+      });
+    }
+
+    await client.query("BEGIN");
+
+    // Берём старые значения до изменения
+    const oldResult = await client.query(
+      `
+      SELECT
+        id,
+        created_at,
+        input_date_text,
+        sum_value,
+        object_name,
+        div_in,
+        dds_in,
+        div_out,
+        dds_out
+      FROM public.io_history
+      WHERE id = $1
+      LIMIT 1
+      `,
+      [historyId]
+    );
+
+    if (!oldResult.rows.length) {
+      await client.query("ROLLBACK");
+
+      return res.status(404).json({
+        success: false,
+        error: "Запись истории не найдена"
+      });
+    }
+
+    const old = oldResult.rows[0];
+
+    // =================================================
+    // 1. ПРИХОД
+    // Сначала пробуем по io_history_id
+    // =================================================
+    let prihodResult = await client.query(
+      `
+      UPDATE public.prihod6
+      SET
+        amount_in = $1,
+        object_name = $2,
+        division_in = $3,
+        dds_in = $4
+      WHERE io_history_id = $5
+      `,
+      [
+        sumValue,
+        objectName,
+        divIn,
+        ddsIn,
+        historyId
+      ]
+    );
+
+    // Если старая запись и io_history_id пустой
+    if (prihodResult.rowCount === 0) {
+      prihodResult = await client.query(
+        `
+        UPDATE public.prihod6
+        SET
+          amount_in = $1,
+          object_name = $2,
+          division_in = $3,
+          dds_in = $4,
+          io_history_id = $5
+        WHERE ctid = (
+          SELECT ctid
+          FROM public.prihod6
+          WHERE io_history_id IS NULL
+            AND COALESCE(amount_in, 0) = COALESCE($6::numeric, 0)
+            AND trim(COALESCE(object_name, '')) =
+                trim(COALESCE($7::text, ''))
+            AND trim(COALESCE(division_in, '')) =
+                trim(COALESCE($8::text, ''))
+            AND trim(COALESCE(dds_in, '')) =
+                trim(COALESCE($9::text, ''))
+          ORDER BY
+            ABS(
+              EXTRACT(
+                EPOCH FROM (
+                  doc_time - COALESCE($10::timestamptz, doc_time)
+                )
+              )
+            ) ASC,
+            doc_time DESC
+          LIMIT 1
+        )
+        `,
+        [
+          sumValue,
+          objectName,
+          divIn,
+          ddsIn,
+          historyId,
+
+          old.sum_value,
+          old.object_name,
+          old.div_in,
+          old.dds_in,
+          old.created_at
+        ]
+      );
+    }
+
+    // =================================================
+    // 2. ПЕРЕВОД
+    // Сначала пробуем по io_history_id
+    // =================================================
+    let perevodResult = await client.query(
+      `
+      UPDATE public.perevod7
+      SET
+        amount_out = $1,
+        object_name = $2,
+        division_out = $3,
+        dds_out = $4
+      WHERE io_history_id = $5
+      `,
+      [
+        sumValue,
+        objectName,
+        divOut,
+        ddsOut,
+        historyId
+      ]
+    );
+
+    // Если старая запись и io_history_id пустой
+    if (perevodResult.rowCount === 0) {
+      perevodResult = await client.query(
+        `
+        UPDATE public.perevod7
+        SET
+          amount_out = $1,
+          object_name = $2,
+          division_out = $3,
+          dds_out = $4,
+          io_history_id = $5
+        WHERE ctid = (
+          SELECT ctid
+          FROM public.perevod7
+          WHERE io_history_id IS NULL
+            AND COALESCE(amount_out, 0) = COALESCE($6::numeric, 0)
+            AND trim(COALESCE(object_name, '')) =
+                trim(COALESCE($7::text, ''))
+            AND trim(COALESCE(division_out, '')) =
+                trim(COALESCE($8::text, ''))
+            AND trim(COALESCE(dds_out, '')) =
+                trim(COALESCE($9::text, ''))
+          ORDER BY
+            ABS(
+              EXTRACT(
+                EPOCH FROM (
+                  doc_time - COALESCE($10::timestamptz, doc_time)
+                )
+              )
+            ) ASC,
+            doc_time DESC
+          LIMIT 1
+        )
+        `,
+        [
+          sumValue,
+          objectName,
+          divOut,
+          ddsOut,
+          historyId,
+
+          old.sum_value,
+          old.object_name,
+          old.div_out,
+          old.dds_out,
+          old.created_at
+        ]
+      );
+    }
+
+    if (
+      prihodResult.rowCount === 0 ||
+      perevodResult.rowCount === 0
+    ) {
+      await client.query("ROLLBACK");
+
+      return res.status(404).json({
+        success: false,
+        error:
+          "Связанные строки в prihod6 или perevod7 не найдены. " +
+          "История и база не были изменены.",
+        updated: {
+          prihod: prihodResult.rowCount,
+          perevod: perevodResult.rowCount
+        }
+      });
+    }
+
+    // Историю меняем только после успешного изменения базы
+    await client.query(
+      `
+      UPDATE public.io_history
+      SET
+        input_date_text = $1,
+        sum_value = $2,
+        object_name = $3,
+        div_in = $4,
+        dds_in = $5,
+        div_out = $6,
+        dds_out = $7
+      WHERE id = $8
+      `,
+      [
+        inputDate,
+        sumValue,
+        objectName,
+        divIn,
+        ddsIn,
+        divOut,
+        ddsOut,
+        historyId
+      ]
+    );
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success: true,
+      message: "История и база обновлены",
+      updated: {
+        history: 1,
+        prihod: prihodResult.rowCount,
+        perevod: perevodResult.rowCount
+      }
+    });
+
+  } catch (e) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {}
+
+    console.error("IO-HISTORY UPDATE ERROR:", e);
+
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/division-svod", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const r = await client.query(`
+      SELECT
+        division_dds,
+        amount_in,
+        amount_out,
+        to_pay_paid,
+        balance,
+        to_pay_registry,
+        balance_after_registry
+      FROM public.division_svod_web_v1
+      ORDER BY division_dds
+    `);
+
+    res.json({ ok: true, rows: r.rows });
+
+  } catch (e) {
+    console.error("DIVISION-SVOD ERROR:", e);
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  } finally {
+    client.release();
+  }
+});
+
+// =====================================================
+// САЛЬДО ПО ИСТОЧНИКАМ ЗА ВЫБРАННЫЙ ПЕРИОД
+// =====================================================
+app.get("/division-saldo-period", async (req, res) => {
+  try {
+    const dateFrom = String(req.query.dateFrom || "").trim();
+    const dateTo = String(req.query.dateTo || "").trim();
+
+    if (
+      !/^\d{4}-\d{2}-\d{2}$/.test(dateFrom) ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(dateTo)
+    ) {
+      return res.status(400).json({
+        success: false,
+        error: "dateFrom и dateTo обязательны в формате YYYY-MM-DD"
+      });
+    }
+
+    if (dateFrom > dateTo) {
+      return res.status(400).json({
+        success: false,
+        error: "Дата начала не может быть позже даты окончания"
+      });
+    }
+
+    const result = await pool.query(
+      `
+      SELECT
+        division_dds,
+        opening_balance,
+        period_amount_in,
+        period_amount_out,
+        period_to_pay_paid,
+        period_result,
+        closing_balance
+      FROM public.get_division_saldo(
+        $1::date,
+        $2::date
+      )
+      ORDER BY division_dds
+      `,
+      [dateFrom, dateTo]
+    );
+
+    return res.json({
+      success: true,
+      dateFrom,
+      dateTo,
+      rows: result.rows
+    });
+
+  } catch (error) {
+    console.error("DIVISION SALDO PERIOD ERROR:", error);
+
+    return res.status(500).json({
+      success: false,
+      error: error.message || String(error)
+    });
+  }
+});
+
+// Эндпоинт для получения конкретной записи по ID
+app.get("/data/:number", async (req, res) => {
+  try {
+    const number = String(req.params.number || "").trim();
+
+    const result = await pool.query(
+      `
+      SELECT *
+      FROM public.docs_from_1c
+      WHERE doc_number = $1
+      `,
+      [number]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: "Запись не найдена"
+      });
+    }
+
+    res.json({
+      success: true,
+      row: result.rows[0]
+    });
+  } catch (error) {
+    console.error("❌ Ошибка в /data/:number:", error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+
+app.get("/svod-object", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const r = await client.query(`
+      SELECT
+        object_name,
+
+        amount AS amount_in,
+        to_pay_paid AS to_pay,
+        balance,
+
+        ft_kasenov,
+        balance_kasenov,
+
+        to_pay_registry AS registry,
+        balance_after_registry AS balance_registry,
+
+        ft_zayavka,
+        balance_zayavka
+
+      FROM public.svod_object_v1
+      ORDER BY object_name
+    `);
+
+    res.json({
+      ok: true,
+      rows: r.rows
+    });
+
+  } catch (e) {
+    console.error("SVOD-OBJECT ERROR:", e);
+
+    res.status(500).json({
+      ok: false,
+      error: String(e.message || e)
+    });
+
+  } finally {
+    client.release();
+  }
+});
+
+
+
+
+
+async function createNotification({
+  userLogin,
+  type,
+  title,
+  message,
+  entityId,
+  entityPage
+}) {
+  try {
+    if (!userLogin) return;
+
+    await pool.query(`
+      INSERT INTO public.notifications
+      (
+        user_login,
+        type,
+        title,
+        message,
+        entity_id,
+        entity_page
+      )
+      VALUES ($1,$2,$3,$4,$5,$6)
+    `, [
+      String(userLogin || "").trim(),
+      String(type || "").trim(),
+      String(title || "").trim(),
+      String(message || "").trim(),
+      entityId ? Number(entityId) : null,
+      entityPage ? String(entityPage).trim() : null
+    ]);
+
+  } catch (e) {
+    console.error("createNotification error:", e);
+  }
+}
+
+
+app.post("/change-password", async (req, res) => {
+  try {
+    const { email, old_password, new_password } = req.body || {};
+
+    const emailNorm = normalizeEmail(email);
+    const oldPass = String(old_password || "").trim();
+    const newPass = String(new_password || "").trim();
+
+    if (!emailNorm || !oldPass || !newPass) {
+      return res.status(400).json({
+        success: false,
+        message: "Заполните все поля"
+      });
+    }
+
+    if (newPass.length < 6) {
+      return res.status(400).json({
+        success: false,
+        message: "Новый пароль должен быть не менее 6 символов"
+      });
+    }
+
+    const userRes = await pool.query(`
+      SELECT id, password
+      FROM public.users
+      WHERE lower(trim(email)) = $1
+      LIMIT 1
+    `, [emailNorm]);
+
+    if (!userRes.rows.length) {
+      return res.status(404).json({
+        success: false,
+        message: "Пользователь не найден"
+      });
+    }
+
+    const user = userRes.rows[0];
+
+    if (String(user.password || "") !== oldPass) {
+      return res.status(400).json({
+        success: false,
+        message: "Старый пароль неверный"
+      });
+    }
+
+    await pool.query(`
+      UPDATE public.users
+      SET password = $1
+      WHERE id = $2
+    `, [newPass, user.id]);
+
+    res.json({ success: true });
+
+  } catch (e) {
+    console.error("CHANGE PASSWORD ERROR:", e);
+    res.status(500).json({
+      success: false,
+      message: "Ошибка сервера"
+    });
+  }
+});
+
+async function setRequestRegistryYes(client, request_id) {
+  await client.query(`
+    INSERT INTO public.zvk_pay (zvk_row_id, registry_flag, agree_time)
+    SELECT
+      i.zvk_row_id,
+      'Да',
+      NOW()
+    FROM public.request_items i
+    WHERE i.request_id = $1
+      AND i.zvk_row_id IS NOT NULL
+    ON CONFLICT (zvk_row_id)
+    DO UPDATE SET
+      registry_flag = 'Да',
+      agree_time = COALESCE(public.zvk_pay.agree_time, NOW())
+  `, [request_id]);
+
+  // Реестр Согласовано = Да здесь только меняет статус.
+  // Новая ZFT с остатком создаётся при Заявка = Да.
+
+}
+
+// =====================================================
+// ПЕЧАТЬ НОВЫХ СТРОК, УТВЕРЖДЁННЫХ КАСЕНОВЫМ ЕРМЕКОМ
+// =====================================================
+app.get("/request-print-pending", async (req, res) => {
+  try {
+    const rows = await pool.query(`
+      SELECT
+        i.id AS request_item_id,
+        i.object,
+        COALESCE(NULLIF(trim(i.src_d), ''), '') AS legal_entity,
+        i.input_name,
+        i.id_zvk,
+        i.contractor,
+        i.pay_purpose,
+        i.dds_article,
+        i.contract_no,
+        i.invoice_no,
+        i.invoice_date,
+        i.src_o,
+        i.to_pay
+      FROM public.request_items i
+      JOIN public.request_head h
+        ON h.id = i.request_id
+      WHERE lower(trim(COALESCE(h.approve_ermek_status, ''))) IN
+            ('утверждено', 'согласовано', 'да')
+        AND i.printed_at IS NULL
+      ORDER BY h.approve_ermek_time ASC NULLS LAST, i.id ASC
+    `);
+
+    return res.json({
+      success: true,
+      count: rows.rowCount,
+      rows: rows.rows
+    });
+  } catch (e) {
+    console.error("REQUEST PRINT PENDING ERROR:", e);
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.post("/request-print-mark", async (req, res) => {
+  try {
+    const login = String(req.body?.login || "").trim();
+    const itemIds = Array.isArray(req.body?.item_ids)
+      ? [...new Set(req.body.item_ids.map(Number).filter(Boolean))]
+      : [];
+
+    if (!login) {
+      return res.status(400).json({ success: false, error: "login required" });
+    }
+    if (!itemIds.length) {
+      return res.status(400).json({ success: false, error: "item_ids required" });
+    }
+
+    const updated = await pool.query(`
+      UPDATE public.request_items i
+      SET printed_at = NOW(),
+          printed_by = $2
+      FROM public.request_head h
+      WHERE h.id = i.request_id
+        AND i.id = ANY($1::bigint[])
+        AND i.printed_at IS NULL
+        AND lower(trim(COALESCE(h.approve_ermek_status, ''))) IN
+            ('утверждено', 'согласовано', 'да')
+      RETURNING i.id, i.printed_at, i.printed_by
+    `, [itemIds, login]);
+
+    return res.json({
+      success: true,
+      updated_count: updated.rowCount,
+      rows: updated.rows
+    });
+  } catch (e) {
+    console.error("REQUEST PRINT MARK ERROR:", e);
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.get("/request-card", async (req, res) => {
+  try {
+    const id = Number(req.query.id);
+
+    if (!id) {
+      return res.status(400).json({
+        success: false,
+        error: "id required"
+      });
+    }
+
+    const headRes = await pool.query(`
+      SELECT
+        id,
+        request_no,
+        request_date,
+        created_by,
+        total_amount,
+        items_count,
+        created_at,
+
+        acc_zhasulan_status,
+        acc_zhasulan_time,
+        acc_zhasulan_comment,
+
+        acc_zaitova_status,
+        acc_zaitova_time,
+        acc_zaitova_comment,
+
+        acc_zhas_status,
+        acc_zhas_time,
+        acc_zhas_comment,
+
+        acc_shevchenko_status,
+        acc_shevchenko_time,
+        acc_shevchenko_comment,
+
+        acc_marat_status,
+        acc_marat_time,
+        acc_marat_comment,
+
+        acc_ermek_status,
+        acc_ermek_time,
+        acc_ermek_comment,
+
+        approve_ermek_status,
+        approve_ermek_time,
+        approve_ermek_comment
+      FROM public.request_head
+      WHERE id = $1
+      LIMIT 1
+    `, [id]);
+
+    if (!headRes.rowCount) {
+      return res.status(404).json({
+        success: false,
+        error: "Заявка не найдена"
+      });
+    }
+
+    const itemsRes = await pool.query(`
+      SELECT
+        i.id,
+        i.request_id,
+        i.zvk_row_id,
+        i.id_ft,
+        i.id_zvk,
+        i.object,
+        COALESCE(NULLIF(trim(cur.legal_entity), ''), NULLIF(trim(i.src_d), ''), '') AS legal_entity,
+        i.input_name,
+        i.contractor,
+        i.pay_purpose,
+        i.dds_article,
+        i.contract_no,
+        i.invoice_no,
+        i.invoice_date,
+        i.invoice_pdf,
+        i.src_d,
+        i.src_o,
+        COALESCE(
+          NULLIF(trim(cur.money_type), ''),
+          NULLIF(trim(i.money_type), ''),
+          ''
+        ) AS money_type,
+        COALESCE(NULLIF(i.idlzk, ''), cur.idlzk, '') AS idlzk,
+        COALESCE(cur.to_pay, i.to_pay) AS to_pay,
+        COALESCE(cur.esk_return, i.esk_return, false) AS esk_return,
+        COALESCE(cur.return_amount, 0) AS return_amount,
+        COALESCE(cur.returned_amount, 0) AS returned_amount,
+        COALESCE(cur.return_status, '') AS return_status,
+        cur.return_time,
+        COALESCE(cur.return_by, '') AS return_by,
+
+        COALESCE(cur.request_flag, '') AS request_flag,
+        COALESCE(cur.registry_flag, '') AS registry_flag,
+        COALESCE(i.aray_paid, '') AS aray_paid,
+        COALESCE(cur.is_paid, '') AS is_paid
+      FROM public.request_items i
+      LEFT JOIN public.ft_zvk_current_v2 cur
+        ON cur.zvk_row_id = i.zvk_row_id
+      WHERE i.request_id = $1
+      ORDER BY i.id ASC
+    `, [id]);
+
+    const itemsWithRoute = [];
+
+    for (const item of itemsRes.rows) {
+      itemsWithRoute.push({
+        ...item,
+        needs_ismagulov: await rowNeedsIsmagulov(item)
+      });
+    }
+
+    return res.json({
+      success: true,
+      head: headRes.rows[0],
+      items: itemsWithRoute
+    });
+
+  } catch (e) {
+    console.error("REQUEST-CARD ERROR:", e);
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
+
+app.post("/approve-rows", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const requestId = Number(
+      req.body?.request_id ||
+      req.body?.id
+    );
+
+    const login = String(req.body?.login || "")
+      .trim()
+      .toLowerCase();
+
+    const action = String(req.body?.action || "agree")
+      .trim()
+      .toLowerCase();
+
+    const comment = String(req.body?.comment || "").trim();
+
+    if (!requestId) {
+      return res.status(400).json({
+        success: false,
+        error: "request_id required"
+      });
+    }
+
+    if (!login) {
+      return res.status(400).json({
+        success: false,
+        error: "login required"
+      });
+    }
+
+    const agreeApprovers = {
+      s_zhasulan: {
+        title: "Сулейменов Жасулан",
+        nameCol: "acc_zhasulan_name",
+        statusCol: "acc_zhasulan_status",
+        timeCol: "acc_zhasulan_time",
+        commentCol: "acc_zhasulan_comment"
+      },
+
+z_karlygash: {
+  title: "Жаркымбаева Карлыгаш ",
+  nameCol: "acc_zhas_name",
+  statusCol: "acc_zhas_status",
+  timeCol: "acc_zhas_time",
+  commentCol: "acc_zhas_comment"
+},
+
+      a_zaitova: {
+        title: "Заитова Алия",
+        nameCol: "acc_zaitova_name",
+        statusCol: "acc_zaitova_status",
+        timeCol: "acc_zaitova_time",
+        commentCol: "acc_zaitova_comment"
+      },
+
+      v_shevchenko: {
+        title: "Шевченко Владимир",
+        nameCol: "acc_shevchenko_name",
+        statusCol: "acc_shevchenko_status",
+        timeCol: "acc_shevchenko_time",
+        commentCol: "acc_shevchenko_comment"
+      },
+
+      k_marat: {
+        title: "Койлибаев Марат",
+        nameCol: "acc_marat_name",
+        statusCol: "acc_marat_status",
+        timeCol: "acc_marat_time",
+        commentCol: "acc_marat_comment"
+      },
+
+      k_ermek: {
+        title: "Касенов Ермек",
+        nameCol: "acc_ermek_name",
+        statusCol: "acc_ermek_status",
+        timeCol: "acc_ermek_time",
+        commentCol: "acc_ermek_comment"
+      }
+    };
+
+    const approveApprovers = {
+      k_ermek: {
+        title: "Касенов Ермек",
+        nameCol: "approve_ermek_name",
+        statusCol: "approve_ermek_status",
+        timeCol: "approve_ermek_time",
+        commentCol: "approve_ermek_comment"
+      }
+    };
+
+    let approver = null;
+    let stageName = "";
+
+    if (
+      action === "agree" ||
+      action === "reject_agree"
+    ) {
+      approver = agreeApprovers[login];
+      stageName = "Согласование";
+    }
+
+    // Только Касенов Ермек может вернуть своё выполненное согласование
+    // из «Согласовано» обратно в «Ожидает».
+    if (action === "reset_agree") {
+      approver = login === "k_ermek" ? agreeApprovers.k_ermek : null;
+      stageName = "Согласование";
+    }
+
+    if (
+      action === "approve" ||
+      action === "reject_approve"
+    ) {
+      approver = approveApprovers[login];
+      stageName = "Утверждение";
+    }
+
+    if (!approver) {
+      return res.status(403).json({
+        success: false,
+        error: "Нет прав на это действие"
+      });
+    }
+
+    await client.query("BEGIN");
+
+    const headResult = await client.query(`
+      SELECT
+        id,
+        request_no,
+        total_amount,
+
+        acc_zhasulan_status,
+        acc_zhas_status,
+        acc_zaitova_status,
+
+        acc_shevchenko_status,
+        acc_marat_status,
+        acc_ermek_status,
+        approve_ermek_status
+
+      FROM public.request_head
+      WHERE id = $1
+      LIMIT 1
+      FOR UPDATE
+    `, [requestId]);
+
+    if (!headResult.rowCount) {
+      throw new Error("Заявка не найдена");
+    }
+
+    const head = headResult.rows[0];
+
+    // Касенов Ермек может снять только своё собственное согласование.
+    // Финальное утверждение approve_ermek_status и остальные этапы не меняем.
+    if (action === "reset_agree") {
+      const currentStatus = String(head.acc_ermek_status || "").trim().toLowerCase();
+
+      if (!["согласовано", "согласован", "да", "утверждено"].includes(currentStatus)) {
+        const err = new Error("Согласование Касенова Ермека уже находится в статусе «Ожидает»");
+        err.statusCode = 409;
+        throw err;
+      }
+
+      await client.query(`
+        UPDATE public.request_head
+        SET
+          acc_ermek_name = 'Касенов Ермек',
+          acc_ermek_status = 'Ожидает',
+          acc_ermek_time = NULL,
+          acc_ermek_comment = NULL
+        WHERE id = $1
+      `, [requestId]);
+
+      await client.query(`
+        INSERT INTO public.request_approve_log
+        (
+          request_id,
+          stage_name,
+          approver_login,
+          approver_name,
+          action_type,
+          comment_text
+        )
+        VALUES ($1, $2, $3, $4, $5, $6)
+      `, [
+        requestId,
+        "Согласование",
+        login,
+        "Касенов Ермек",
+        "reset_agree",
+        "Возвращено в Ожидает"
+      ]);
+
+      await client.query("COMMIT");
+
+      return res.json({
+        success: true,
+        request_id: requestId,
+        login,
+        action: "reset_agree",
+        status: "Ожидает"
+      });
+    }
+
+    const needsIsmagulov = await requestNeedsIsmagulov(
+      client,
+      requestId
+    );
+    const isServiceNs = await requestIsServiceNs(
+      client,
+      requestId
+    );
+
+    /*
+     * КАСЕНОВ ЕРМЕК — ЗАЩИТА ОСТАТКА ПО ИСТОЧНИКУ ОБЪЕКТА.
+     *
+     * 1) На action="agree" текущая заявка ЕЩЁ не входит в «ФТ Касенов Е.Е».
+     *    Поэтому считаем прогноз:
+     *      текущий balance_kasenov - сумма текущей заявки по Источник Объект.
+     *    Если прогноз < 0 — согласование запрещаем.
+     *
+     * 2) На action="approve" заявка уже должна входить в «ФТ Касенов Е.Е».
+     *    Поэтому повторно сумму заявки не вычитаем, а просто запрещаем
+     *    утверждение, если готовый balance_kasenov уже меньше нуля.
+     *
+     * Advisory lock не даёт двум параллельным действиям по одному
+     * Источник Объект одновременно пройти проверку на старом остатке.
+     */
+    if (
+      login === "k_ermek" &&
+      (action === "agree" || action === "approve")
+    ) {
+      await client.query(`
+        SELECT pg_advisory_xact_lock(hashtext(x.object_key))
+        FROM (
+          SELECT DISTINCT lower(trim(i.src_o)) AS object_key
+          FROM public.request_items i
+          WHERE i.request_id = $1
+            AND NULLIF(trim(i.src_o), '') IS NOT NULL
+          ORDER BY lower(trim(i.src_o))
+        ) x
+      `, [requestId]);
+    }
+
+    if (login === "k_ermek" && action === "agree") {
+      const currentErmekAgreeStatus =
+        String(head.acc_ermek_status || "").trim().toLowerCase();
+
+      if (
+        ["согласовано", "согласован", "да", "утверждено"]
+          .includes(currentErmekAgreeStatus)
+      ) {
+        const err = new Error(
+          "Касенов Ермек уже согласовал эту заявку. " +
+          "Сначала верните его согласование в «Ожидает»."
+        );
+        err.statusCode = 409;
+        err.errorCode = "ERMEK_AGREE_ALREADY_DONE";
+        throw err;
+      }
+
+      // Проверка отрицательного остатка при согласовании отключена.
+      // Согласование Ермека больше не блокируется по этому условию.
+    }
+
+    // Проверка отрицательного остатка при финальном утверждении отключена.
+    // Ермек может утвердить заявку независимо от balance_kasenov.
+
+    // Для Сервис НС Жасулан не участвует — после Карлыгаш идёт Алия.
+    // Карлыгаш может участвовать и в Сервис НС, если Статья ДДС требует её согласования.
+    if (
+      isServiceNs &&
+      login === "s_zhasulan"
+    ) {
+      throw new Error(
+        "Для ЮрЛицо «Сервис НС» после Карлыгаш согласует Заитова Алия"
+      );
+    }
+
+    if (login === "a_zaitova" && !isServiceNs) {
+      throw new Error(
+        "Заитова Алия согласует только заявки ЮрЛицо «Сервис НС»"
+      );
+    }
+
+    /*
+     * 1. Жаркымбаева Карлыгаш согласует первым ТОЛЬКО по Статье ДДС.
+     * Объект, Дивизион и ЮрЛицо на необходимость её этапа больше не влияют.
+     */
+    if (
+      login === ISMAGULOV_LOGIN &&
+      !needsIsmagulov
+    ) {
+      throw new Error(
+        "Для этой Статьи ДДС согласование Жаркымбаевой Карлыгаш не требуется"
+      );
+    }
+
+    /*
+     * Этапность:
+     * 1) Карлыгаш — если Статья ДДС требует её согласования.
+     * 2) Затем либо Жасулан (обычные ЮрЛицо), либо Алия (Сервис НС).
+     * 3) Шевченко.
+     * 4) Марат.
+     * 5) Согласование Ермека.
+     *
+     * Исключение: action="approve" Касенова Ермека НЕ ждёт ни один этап —
+     * Ермек может финально утвердить заявку сразу.
+     */
+
+    const karlygashDone =
+      !needsIsmagulov ||
+      String(head.acc_zhas_status || "").trim() === "Согласовано";
+
+    const secondStageDone = isServiceNs
+      ? String(head.acc_zaitova_status || "").trim() === "Согласовано"
+      : String(head.acc_zhasulan_status || "").trim() === "Согласовано";
+
+    const shevchenkoDone =
+      String(head.acc_shevchenko_status || "").trim() === "Согласовано";
+
+    const maratDone =
+      String(head.acc_marat_status || "").trim() === "Согласовано";
+
+    // Алия и Жасулан ждут Карлыгаш, только если её этап требуется.
+    if (
+      (action === "agree" || action === "reject_agree") &&
+      login === "a_zaitova" &&
+      !karlygashDone
+    ) {
+      throw new Error("Сначала должна согласовать Жаркымбаева Карлыгаш");
+    }
+
+    if (
+      (action === "agree" || action === "reject_agree") &&
+      login === "s_zhasulan" &&
+      !karlygashDone
+    ) {
+      throw new Error("Сначала должна согласовать Жаркымбаева Карлыгаш");
+    }
+
+    // Шевченко ждёт Карлыгаш + Жасулана/Алию.
+    if (
+      (action === "agree" || action === "reject_agree") &&
+      login === "v_shevchenko" &&
+      (!karlygashDone || !secondStageDone)
+    ) {
+      throw new Error(
+        isServiceNs
+          ? "Сначала должна согласовать Заитова Алия"
+          : "Сначала должен согласовать Сулейменов Жасулан"
+      );
+    }
+
+    // Марат ждёт Шевченко.
+    if (
+      (action === "agree" || action === "reject_agree") &&
+      login === "k_marat" &&
+      !shevchenkoDone
+    ) {
+      throw new Error("Сначала должен согласовать Шевченко Владимир");
+    }
+
+    // Согласование Ермека ждёт Марата.
+    // Финальное утверждение action="approve" проходит сразу.
+    if (
+      (action === "agree" || action === "reject_agree") &&
+      login === "k_ermek" &&
+      !maratDone
+    ) {
+      throw new Error(
+        "Сначала должен согласовать Койлибаев Марат. " +
+        "Финально утвердить Касенов Ермек может сразу."
+      );
+    }
+
+    const isReject =
+      action === "reject_agree" ||
+      action === "reject_approve";
+
+    const statusText = isReject
+      ? "Отклонено"
+      : "Согласовано";
+
+    await client.query(`
+      UPDATE public.request_head
+      SET
+        ${approver.nameCol} = $2,
+        ${approver.statusCol} = $3,
+        ${approver.timeCol} = NOW(),
+        ${approver.commentCol} = $4
+      WHERE id = $1
+    `, [
+      requestId,
+      approver.title,
+      statusText,
+      comment
+    ]);
+
+    await client.query(`
+      INSERT INTO public.request_approve_log
+      (
+        request_id,
+        stage_name,
+        approver_login,
+        approver_name,
+        action_type,
+        comment_text
+      )
+      VALUES ($1, $2, $3, $4, $5, $6)
+    `, [
+      requestId,
+      stageName,
+      login,
+      approver.title,
+      action,
+      comment
+    ]);
+
+    /*
+     * Отклонение Исмагулова или Сулейменова сохраняем в заявке.
+     * Строки request_head/request_items не удаляем и в FT не очищаем.
+     * Поэтому в «Отправленных заявках» остаётся статус «Отклонено»
+     * и комментарий с причиной отклонения.
+     */
+
+    /*
+     * После Сулейменова заявка открывается основным согласующим.
+     * Для специальных объектов к этому моменту Исмагулов уже согласовал.
+     */
+    if (
+      action === "agree" &&
+      (
+        (!isServiceNs && login === "s_zhasulan") ||
+        (isServiceNs && login === "a_zaitova")
+      )
+    ) {
+      const nextUsers = ["v_shevchenko"];
+
+      for (const nextLogin of nextUsers) {
+        await client.query(`
+          INSERT INTO public.notifications
+          (
+            user_login,
+            type,
+            title,
+            message,
+            entity_id,
+            entity_page,
+            is_read,
+            created_at
+          )
+          VALUES
+          (
+            $1,
+            'request',
+            $2,
+            $3,
+            $4,
+            'request_card',
+            false,
+            NOW()
+          )
+        `, [
+          nextLogin,
+          `Заявка №${head.request_no} ожидает согласования`,
+          `Сумма: ${Number(head.total_amount || 0).toLocaleString("ru-RU")} ₸`,
+          requestId
+        ]);
+      }
+    }
+
+    /*
+     * После Карлыгаш заявка передаётся:
+     * - Сервис НС -> Алие;
+     * - остальные -> Жасулану.
+     */
+    if (
+      login === ISMAGULOV_LOGIN &&
+      action === "agree"
+    ) {
+      for (
+        const nextLogin of [
+          isServiceNs ? "a_zaitova" : "s_zhasulan"
+        ]
+      ) {
+        await client.query(`
+          INSERT INTO public.notifications
+          (
+            user_login,
+            type,
+            title,
+            message,
+            entity_id,
+            entity_page,
+            is_read,
+            created_at
+          )
+          VALUES
+          (
+            $1,
+            'request',
+            $2,
+            $3,
+            $4,
+            'request_card',
+            false,
+            NOW()
+          )
+        `, [
+          nextLogin,
+          `Заявка №${head.request_no} согласована Жаркымбаевой Карлыгаш`,
+          `${isServiceNs ? "Заявка передана Заитовой Алие." : "Заявка передана Сулейменову Жасулану."} Сумма: ${Number(head.total_amount || 0).toLocaleString("ru-RU")} ₸`,
+          requestId
+        ]);
+      }
+    }
+
+    // После Шевченко уведомляем Марата.
+    if (login === "v_shevchenko" && action === "agree") {
+      await client.query(`
+        INSERT INTO public.notifications
+          (user_login, type, title, message, entity_id, entity_page, is_read, created_at)
+        VALUES
+          ('k_marat', 'request', $1, $2, $3, 'request_card', false, NOW())
+      `, [
+        `Заявка №${head.request_no} ожидает согласования Марата`,
+        `Шевченко Владимир согласовал заявку. Сумма: ${Number(head.total_amount || 0).toLocaleString("ru-RU")} ₸`,
+        requestId
+      ]);
+    }
+
+    // После Марата уведомляем Ермека о его этапе согласования.
+    if (login === "k_marat" && action === "agree") {
+      await client.query(`
+        INSERT INTO public.notifications
+          (user_login, type, title, message, entity_id, entity_page, is_read, created_at)
+        VALUES
+          ('k_ermek', 'request', $1, $2, $3, 'request_card', false, NOW())
+      `, [
+        `Заявка №${head.request_no} ожидает согласования Ермека`,
+        `Койлибаев Марат согласовал заявку. Сумма: ${Number(head.total_amount || 0).toLocaleString("ru-RU")} ₸`,
+        requestId
+      ]);
+    }
+
+    /*
+     * Реестр Согласовано = Да ставится автоматически только тогда,
+     * когда Сулейменов Жасулан (s_zhasulan) нажимает «Согласовано».
+     * Остальные согласующие это поле автоматически не меняют.
+     */
+    const shouldSetRegistryYes =
+      action === "agree" &&
+      (
+        (!isServiceNs && login === "s_zhasulan") ||
+        (isServiceNs && login === "a_zaitova")
+      );
+
+    if (shouldSetRegistryYes) {
+      await setRequestRegistryYes(client, requestId);
+    }
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success: true,
+      request_id: requestId,
+      login,
+      action,
+      status: statusText,
+      needs_ismagulov: needsIsmagulov,
+      registry_flag: shouldSetRegistryYes ? "Да" : null
+    });
+
+  } catch (e) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {}
+
+    console.error("APPROVE-ROWS ERROR:", e);
+
+    return res.status(Number(e.statusCode || 500)).json({
+      success: false,
+      code: e.errorCode || "APPROVE_ROWS_ERROR",
+      error: e.message
+    });
+
+  } finally {
+    client.release();
+  }
+});
+
+
+
+// =====================================================
+// ОТМЕНА ОТКЛОНЁННЫХ СТРОК ПО ОДИНАКОВОМУ ID FT
+// Доступ: s_zhasulan, b_erkin и a_zaitova
+//
+// Для каждого ID FT:
+// 1) находим строки, отклонённые Исмагуловым, Сулейменовым или по утверждению Касенова;
+// 2) самую раннюю созданную строку ZFT оставляем, но очищаем поля заявки;
+// 3) остальные отклонённые строки этого ID FT полностью удаляем;
+// 4) согласованные/утверждённые строки не затрагиваются.
+// =====================================================
+app.post("/cancel-rejected-ft-lines", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const login = String(req.body?.login || "").trim().toLowerCase();
+    const rowIds = Array.isArray(req.body?.row_ids)
+      ? [...new Set(req.body.row_ids.map(Number).filter(Boolean))]
+      : [];
+
+    if (!["s_zhasulan", "b_erkin", "a_zaitova"].includes(login)) {
+      return res.status(403).json({
+        success: false,
+        error: "Отменять отклонённые строки могут только s_zhasulan, b_erkin и a_zaitova"
+      });
+    }
+
+    if (!rowIds.length) {
+      return res.status(400).json({
+        success: false,
+        error: "row_ids required"
+      });
+    }
+
+    await client.query("BEGIN");
+
+    // Проверяем выбранные строки и получаем их ID FT.
+    const selectedResult = await client.query(`
+      SELECT
+        z.id,
+        z.id_ft
+      FROM public.zvk z
+      WHERE z.id = ANY($1::bigint[])
+        AND EXISTS (
+          SELECT 1
+          FROM public.request_items i
+          JOIN public.request_head h
+            ON h.id = i.request_id
+          WHERE i.zvk_row_id = z.id
+            AND (
+              LOWER(TRIM(COALESCE(h.acc_zhas_status, ''))) = 'отклонено'
+              OR LOWER(TRIM(COALESCE(h.acc_zhasulan_status, ''))) = 'отклонено'
+              OR LOWER(TRIM(COALESCE(h.acc_zaitova_status, ''))) = 'отклонено'
+              OR LOWER(TRIM(COALESCE(h.approve_ermek_status, ''))) = 'отклонено'
+            )
+        )
+      FOR UPDATE OF z
+    `, [rowIds]);
+
+    const selectedValidIds = new Set(
+      selectedResult.rows.map(row => Number(row.id)).filter(Boolean)
+    );
+
+    if (selectedValidIds.size !== rowIds.length) {
+      throw new Error(
+        "Отменить можно только строки, где отклонено согласование Исмагулова, Сулейменова или утверждение Касенова Ермека"
+      );
+    }
+
+    const ftIds = [...new Set(
+      selectedResult.rows
+        .map(row => String(row.id_ft || "").trim())
+        .filter(Boolean)
+    )];
+
+    if (!ftIds.length) {
+      throw new Error("Не найден ID FT");
+    }
+
+    let keptCount = 0;
+    let deletedCount = 0;
+    const details = [];
+    const affectedRequestIds = new Set();
+
+    for (const idFt of ftIds) {
+      // Только строки, отклонённые на одном из разрешённых этапов. Согласованные строки не затрагиваются.
+      const rejectedResult = await client.query(`
+        SELECT
+          z.id AS zvk_row_id,
+          z.id_zvk,
+          z.zvk_date,
+          (
+            SELECT MIN(i.request_id)
+            FROM public.request_items i
+            JOIN public.request_head h
+              ON h.id = i.request_id
+            WHERE i.zvk_row_id = z.id
+              AND (
+              LOWER(TRIM(COALESCE(h.acc_zhas_status, ''))) = 'отклонено'
+              OR LOWER(TRIM(COALESCE(h.acc_zhasulan_status, ''))) = 'отклонено'
+              OR LOWER(TRIM(COALESCE(h.acc_zaitova_status, ''))) = 'отклонено'
+              OR LOWER(TRIM(COALESCE(h.approve_ermek_status, ''))) = 'отклонено'
+            )
+          ) AS request_id
+        FROM public.zvk z
+        WHERE z.id_ft = $1
+          AND EXISTS (
+            SELECT 1
+            FROM public.request_items i
+            JOIN public.request_head h
+              ON h.id = i.request_id
+            WHERE i.zvk_row_id = z.id
+              AND (
+              LOWER(TRIM(COALESCE(h.acc_zhas_status, ''))) = 'отклонено'
+              OR LOWER(TRIM(COALESCE(h.acc_zhasulan_status, ''))) = 'отклонено'
+              OR LOWER(TRIM(COALESCE(h.acc_zaitova_status, ''))) = 'отклонено'
+              OR LOWER(TRIM(COALESCE(h.approve_ermek_status, ''))) = 'отклонено'
+            )
+          )
+        ORDER BY z.zvk_date ASC NULLS LAST, z.id ASC
+        FOR UPDATE OF z
+      `, [idFt]);
+
+      const rejectedRows = rejectedResult.rows
+        .slice()
+        .sort((a, b) => {
+          const ad = a.zvk_date ? new Date(a.zvk_date).getTime() : Number.MAX_SAFE_INTEGER;
+          const bd = b.zvk_date ? new Date(b.zvk_date).getTime() : Number.MAX_SAFE_INTEGER;
+          return ad - bd || Number(a.zvk_row_id) - Number(b.zvk_row_id);
+        });
+
+      if (!rejectedRows.length) continue;
+
+      const keepRow = rejectedRows[0];
+      const keepId = Number(keepRow.zvk_row_id);
+      const deleteIds = rejectedRows
+        .slice(1)
+        .map(row => Number(row.zvk_row_id))
+        .filter(Boolean);
+      const allRejectedIds = rejectedRows
+        .map(row => Number(row.zvk_row_id))
+        .filter(Boolean);
+
+      rejectedRows.forEach(row => affectedRequestIds.add(Number(row.request_id)));
+
+      // Сохраняем первую созданную отклонённую ZFT, но делаем её свободной для новой заявки.
+      await client.query(`
+        UPDATE public.zvk
+        SET
+          to_pay = NULL,
+          request_flag = NULL
+        WHERE id = $1
+      `, [keepId]);
+
+      await client.query(`
+        INSERT INTO public.zvk_status
+        (
+          zvk_row_id,
+          status_time,
+          src_d,
+          src_o,
+          money_type,
+          funding_pool_id,
+          chief_approved
+        )
+        VALUES ($1, NOW(), NULL, NULL, NULL, NULL, NULL)
+        ON CONFLICT (zvk_row_id)
+        DO UPDATE SET
+          status_time = NOW(),
+          src_d = NULL,
+          src_o = NULL,
+          money_type = NULL,
+          funding_pool_id = NULL,
+          chief_approved = NULL
+      `, [keepId]);
+
+      await client.query(`
+        UPDATE public.zvk_pay
+        SET
+          registry_flag = NULL,
+          agree_time = NULL
+        WHERE zvk_row_id = $1
+      `, [keepId]);
+
+      // Освобождаем денежные пулы по всем отклонённым ZFT.
+      // После этого суммы снова доступны инициатору при новой заявке.
+      await client.query(`
+        DELETE FROM public.zvk_funding_pool_allocations
+        WHERE zvk_row_id = ANY($1::bigint[])
+      `, [allRejectedIds]);
+
+      // Очищаем старую одиночную связь с пулом и Тип у отклонённых строк.
+      await client.query(`
+        UPDATE public.zvk_status
+        SET
+          funding_pool_id = NULL,
+          money_type = NULL
+        WHERE zvk_row_id = ANY($1::bigint[])
+      `, [allRejectedIds]);
 
       // Все отклонённые строки убираем из «Отправленных заявок», включая оставляемую ZFT.
       await client.query(`
