@@ -16911,7 +16911,9 @@ app.get("/treasury-list", async (req, res) => {
         COALESCE(tq.sort_order, 1000000 + i.id) AS sort_order,
 
         COALESCE(i.aray_paid, '') AS aray_paid,
+        i.aray_pay_time,
         COALESCE(p.is_paid, '') AS is_paid,
+        p.pay_time,
 
         h.approve_ermek_status,
         h.approve_ermek_time
@@ -17125,6 +17127,121 @@ app.post("/treasury-reorder", async (req, res) => {
     try { await client.query("ROLLBACK"); } catch (_) {}
     console.error("treasury-reorder error:", e);
     return res.status(500).json({ success: false, error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+
+
+// =====================================================
+// КАЗНАЧЕЙСТВО: возврат оплаты в течение того же дня
+// =====================================================
+app.post("/treasury-return-paid", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const requestId = Number(req.body?.request_id);
+    const rowIds = Array.isArray(req.body?.row_ids)
+      ? req.body.row_ids.map(Number).filter(Boolean)
+      : [];
+    const login = String(req.body?.login || "").trim().toLowerCase();
+
+    if (!requestId) {
+      return res.status(400).json({ success:false, error:"request_id required" });
+    }
+
+    if (!rowIds.length) {
+      return res.status(400).json({ success:false, error:"row_ids required" });
+    }
+
+    const allowed = ["k_arailym", "admin", "b_erkin"].includes(login);
+    if (!allowed) {
+      return res.status(403).json({
+        success:false,
+        error:"Нет прав возвращать оплату"
+      });
+    }
+
+    await client.query("BEGIN");
+
+    const check = await client.query(`
+      SELECT
+        i.zvk_row_id,
+        i.aray_paid,
+        i.aray_pay_time,
+        p.is_paid,
+        p.pay_time
+      FROM public.request_items i
+      LEFT JOIN public.zvk_pay p
+        ON p.zvk_row_id = i.zvk_row_id
+      WHERE i.request_id = $1
+        AND i.zvk_row_id = ANY($2::bigint[])
+    `, [requestId, rowIds]);
+
+    if (check.rowCount !== rowIds.length) {
+      throw new Error("Не все строки найдены");
+    }
+
+    // Возвращать можно только в тот же календарный день по времени БД.
+    const expired = check.rows.filter(r => {
+      const paidAt = r.aray_pay_time || r.pay_time;
+      if (!paidAt) return true;
+
+      const d = new Date(paidAt);
+      const now = new Date();
+
+      return (
+        d.getFullYear() !== now.getFullYear() ||
+        d.getMonth() !== now.getMonth() ||
+        d.getDate() !== now.getDate()
+      );
+    });
+
+    if (expired.length) {
+      await client.query("ROLLBACK");
+
+      return res.status(400).json({
+        success:false,
+        error:"Возврат оплаты разрешён только до 23:59 дня оплаты"
+      });
+    }
+
+    await client.query(`
+      UPDATE public.request_items
+      SET
+        aray_paid = NULL,
+        aray_pay_time = NULL,
+        aray_paid_by = NULL
+      WHERE request_id = $1
+        AND zvk_row_id = ANY($2::bigint[])
+    `, [requestId, rowIds]);
+
+    await client.query(`
+      UPDATE public.zvk_pay
+      SET
+        is_paid = NULL,
+        pay_time = NULL
+      WHERE zvk_row_id = ANY($1::bigint[])
+    `, [rowIds]);
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success:true,
+      request_id:requestId,
+      returned:rowIds.length
+    });
+
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+
+    console.error("treasury-return-paid error:", e);
+
+    return res.status(500).json({
+      success:false,
+      error:e.message
+    });
   } finally {
     client.release();
   }
