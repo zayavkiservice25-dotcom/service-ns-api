@@ -7232,10 +7232,9 @@ z_karlygash: {
      * 2) Затем либо Жасулан (обычные ЮрЛицо), либо Алия (Сервис НС).
      * 3) Шевченко.
      * 4) Марат.
-     * 5) Согласование Ермека.
      *
-     * Исключение: action="approve" Касенова Ермека НЕ ждёт ни один этап —
-     * Ермек может финально утвердить заявку сразу.
+     * Ермек — исключение:
+     * action="agree", "reject_agree" и "approve" не ждут Шевченко/Марата.
      */
 
     const karlygashDone =
@@ -7291,18 +7290,9 @@ z_karlygash: {
       throw new Error("Сначала должен согласовать Шевченко Владимир");
     }
 
-    // Согласование Ермека ждёт Марата.
-    // Финальное утверждение action="approve" проходит сразу.
-    if (
-      (action === "agree" || action === "reject_agree") &&
-      login === "k_ermek" &&
-      !maratDone
-    ) {
-      throw new Error(
-        "Сначала должен согласовать Койлибаев Марат. " +
-        "Финально утвердить Касенов Ермек может сразу."
-      );
-    }
+    // Ермек может согласовать сразу.
+    // Для action="agree" / "reject_agree" он не ждёт ни Шевченко, ни Марата.
+    // Финальное утверждение action="approve" также доступно сразу.
 
     const isReject =
       action === "reject_agree" ||
@@ -16698,11 +16688,18 @@ app.post("/pre-registry/approve", async (req, res) => {
 
     const row = q.rows[0];
 
-    if (!(Number(row.approved_amount || 0) > 0)) {
+    // Если Ермек отдельно сумму не вводил,
+    // автоматически утверждаем всю сумму Гулнур.
+    const finalApprovedAmount =
+      Number(row.approved_amount || 0) > 0
+        ? Number(row.approved_amount)
+        : Number(row.proposed_amount || 0);
+
+    if (!(finalApprovedAmount > 0)) {
       return res.status(400).json({
         success: false,
         error: "APPROVED_AMOUNT_REQUIRED",
-        message: "Сначала укажите сумму"
+        message: "Сумма для утверждения должна быть больше 0"
       });
     }
 
@@ -16710,15 +16707,17 @@ app.post("/pre-registry/approve", async (req, res) => {
       UPDATE public.pre_registry_items
 
       SET
+        approved_amount = $1,
         approval_status = 'Утверждено',
-        approved_by = $1,
+        approved_by = $2,
         approved_at = NOW(),
         updated_at = NOW()
 
-      WHERE id = $2
+      WHERE id = $3
 
       RETURNING *
     `, [
+      finalApprovedAmount,
       actor,
       itemId
     ]);
@@ -16823,7 +16822,3 @@ app.post("/pre-registry/distributed", async (req, res) => {
 });
 
 app.listen(PORT, () => console.log("Server started on port " + PORT));
-// =====================================================
-// Модуль отдельного сайта «Реестр платежей» удалён.
-// Сохранена общая FT-логика registry_flag для оплаты и обнуления.
-// =====================================================
