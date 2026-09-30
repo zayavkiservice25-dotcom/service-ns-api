@@ -1936,6 +1936,28 @@ await pool.query(`
   ON public.account_saldo (date_to DESC, iban);
 `);
 
+
+// =====================================================
+// КАЗНАЧЕЙСТВО: статус платежа и ручной приоритет
+// Данные самой заявки НЕ дублируются — берутся из Реестра.
+// =====================================================
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS public.treasury_queue (
+    zvk_row_id bigint PRIMARY KEY,
+    payment_status text NOT NULL DEFAULT 'Стандарт',
+    sort_order integer NOT NULL DEFAULT 1000,
+    updated_by text,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT treasury_queue_status_chk
+      CHECK (payment_status IN ('Грос', 'Стандарт', 'Пауза'))
+  );
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS treasury_queue_sort_idx
+  ON public.treasury_queue (payment_status, sort_order, zvk_row_id);
+`);
+
    console.log("DB init OK ✅");
 }
 
@@ -16820,5 +16842,293 @@ app.post("/pre-registry/distributed", async (req, res) => {
     });
   }
 });
+
+
+// =====================================================
+// КАЗНАЧЕЙСТВО
+// =====================================================
+
+function treasuryLoginNorm_(v) {
+  return String(v || "").trim().toLowerCase();
+}
+
+function treasuryRoleNorm_(v) {
+  return String(v || "").trim().toLowerCase();
+}
+
+function canManageTreasury_(login, roleFt) {
+  const lg = treasuryLoginNorm_(login);
+  const role = treasuryRoleNorm_(roleFt);
+
+  return (
+    lg === "k_ermek" ||
+    lg === "b_erkin" ||
+    ["admin", "админ", "administrator", "администратор"].includes(role)
+  );
+}
+
+function canPayTreasury_(login, roleFt) {
+  const lg = treasuryLoginNorm_(login);
+  const role = treasuryRoleNorm_(roleFt);
+
+  return (
+    lg === "k_arailym" ||
+    ["admin", "админ", "administrator", "администратор"].includes(role)
+  );
+}
+
+app.get("/treasury-list", async (req, res) => {
+  try {
+    const login = treasuryLoginNorm_(req.query.login);
+    const roleFt = String(req.query.role_ft || "").trim();
+
+    const canManage = canManageTreasury_(login, roleFt);
+    const canPay = canPayTreasury_(login, roleFt);
+
+    const q = await pool.query(`
+      SELECT
+        i.id AS request_item_id,
+        i.request_id,
+        h.request_no,
+        i.zvk_row_id,
+
+        COALESCE(i.object, '') AS object,
+        COALESCE(NULLIF(trim(f.legal_entity), ''), NULLIF(trim(i.src_d), ''), '') AS division,
+        COALESCE(i.input_name, '') AS input_name,
+        COALESCE(i.id_zvk, '') AS id_zvk,
+        COALESCE(i.contractor, '') AS contractor,
+        COALESCE(i.to_pay, 0) AS to_pay,
+        COALESCE(i.pay_purpose, '') AS pay_purpose,
+        COALESCE(i.src_o, '') AS src_o,
+        COALESCE(i.money_type, '') AS money_type,
+        COALESCE(i.dds_article, '') AS dds_article,
+        COALESCE(i.contract_no, '') AS contract_no,
+        COALESCE(i.invoice_no, '') AS invoice_no,
+        i.invoice_date,
+        COALESCE(i.invoice_pdf, '') AS invoice_pdf,
+
+        COALESCE(NULLIF(trim(tq.payment_status), ''), 'Стандарт') AS payment_status,
+        COALESCE(tq.sort_order, 1000000 + i.id) AS sort_order,
+
+        COALESCE(i.aray_paid, '') AS aray_paid,
+        COALESCE(p.is_paid, '') AS is_paid,
+
+        h.approve_ermek_status,
+        h.approve_ermek_time
+
+      FROM public.request_items i
+      JOIN public.request_head h
+        ON h.id = i.request_id
+
+      LEFT JOIN public.zvk z
+        ON z.id = i.zvk_row_id
+
+      LEFT JOIN public.ft f
+        ON f.id_ft = COALESCE(i.id_ft, z.id_ft)
+
+      LEFT JOIN public.zvk_pay p
+        ON p.zvk_row_id = i.zvk_row_id
+
+      LEFT JOIN public.treasury_queue tq
+        ON tq.zvk_row_id = i.zvk_row_id
+
+      WHERE i.zvk_row_id IS NOT NULL
+        AND lower(trim(COALESCE(h.approve_ermek_status, '')))
+            IN ('согласовано', 'утверждено', 'да')
+
+      ORDER BY
+        CASE COALESCE(NULLIF(trim(tq.payment_status), ''), 'Стандарт')
+          WHEN 'Грос' THEN 1
+          WHEN 'Стандарт' THEN 2
+          WHEN 'Пауза' THEN 3
+          ELSE 4
+        END,
+        COALESCE(tq.sort_order, 1000000 + i.id),
+        i.id
+    `);
+
+    return res.json({
+      success: true,
+      rows: q.rows,
+      can_manage_priority: canManage,
+      can_mark_paid: canPay
+    });
+
+  } catch (e) {
+    console.error("treasury-list error:", e);
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.post("/treasury-status", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const login = treasuryLoginNorm_(req.body?.login);
+    const roleFt = String(req.body?.role_ft || "").trim();
+    const zvkRowId = Number(req.body?.zvk_row_id);
+    const paymentStatus = String(req.body?.payment_status || "").trim();
+
+    if (!canManageTreasury_(login, roleFt)) {
+      return res.status(403).json({
+        success: false,
+        error: "Только Ермек может менять статус платежа"
+      });
+    }
+
+    if (!zvkRowId) {
+      return res.status(400).json({ success: false, error: "zvk_row_id required" });
+    }
+
+    if (!["Грос", "Стандарт", "Пауза"].includes(paymentStatus)) {
+      return res.status(400).json({ success: false, error: "Некорректный статус платежа" });
+    }
+
+    await client.query("BEGIN");
+
+    const exists = await client.query(`
+      SELECT 1
+      FROM public.request_items i
+      JOIN public.request_head h ON h.id = i.request_id
+      WHERE i.zvk_row_id = $1
+        AND lower(trim(COALESCE(h.approve_ermek_status, '')))
+            IN ('согласовано', 'утверждено', 'да')
+      LIMIT 1
+    `, [zvkRowId]);
+
+    if (!exists.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({
+        success: false,
+        error: "Утвержденная строка Реестра не найдена"
+      });
+    }
+
+    const maxOrder = await client.query(`
+      SELECT COALESCE(MAX(sort_order), 0) AS max_order
+      FROM public.treasury_queue
+      WHERE payment_status = $1
+    `, [paymentStatus]);
+
+    const nextOrder = Number(maxOrder.rows[0]?.max_order || 0) + 10;
+
+    await client.query(`
+      INSERT INTO public.treasury_queue
+        (zvk_row_id, payment_status, sort_order, updated_by, updated_at)
+      VALUES
+        ($1, $2, $3, $4, NOW())
+      ON CONFLICT (zvk_row_id)
+      DO UPDATE SET
+        payment_status = EXCLUDED.payment_status,
+        sort_order = EXCLUDED.sort_order,
+        updated_by = EXCLUDED.updated_by,
+        updated_at = NOW()
+    `, [zvkRowId, paymentStatus, nextOrder, login]);
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success: true,
+      zvk_row_id: zvkRowId,
+      payment_status: paymentStatus,
+      sort_order: nextOrder
+    });
+
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+    console.error("treasury-status error:", e);
+    return res.status(500).json({ success: false, error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/treasury-reorder", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const login = treasuryLoginNorm_(req.body?.login);
+    const roleFt = String(req.body?.role_ft || "").trim();
+    const paymentStatus = String(req.body?.payment_status || "").trim();
+
+    const rowIds = Array.isArray(req.body?.row_ids)
+      ? [...new Set(req.body.row_ids.map(Number).filter(Boolean))]
+      : [];
+
+    if (!canManageTreasury_(login, roleFt)) {
+      return res.status(403).json({
+        success: false,
+        error: "Только Ермек может менять приоритет"
+      });
+    }
+
+    if (!["Грос", "Стандарт", "Пауза"].includes(paymentStatus)) {
+      return res.status(400).json({
+        success: false,
+        error: "Некорректный статус платежа"
+      });
+    }
+
+    if (!rowIds.length) {
+      return res.status(400).json({ success: false, error: "row_ids required" });
+    }
+
+    await client.query("BEGIN");
+
+    const valid = await client.query(`
+      SELECT DISTINCT i.zvk_row_id
+      FROM public.request_items i
+      JOIN public.request_head h ON h.id = i.request_id
+      WHERE i.zvk_row_id = ANY($1::bigint[])
+        AND lower(trim(COALESCE(h.approve_ermek_status, '')))
+            IN ('согласовано', 'утверждено', 'да')
+    `, [rowIds]);
+
+    const validSet = new Set(valid.rows.map(r => Number(r.zvk_row_id)));
+    const invalid = rowIds.filter(id => !validSet.has(id));
+
+    if (invalid.length) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        success: false,
+        error: "Есть строки, которых нет в утвержденном Реестре: " + invalid.join(", ")
+      });
+    }
+
+    for (let index = 0; index < rowIds.length; index++) {
+      const rowId = rowIds[index];
+      const orderValue = (index + 1) * 10;
+
+      await client.query(`
+        INSERT INTO public.treasury_queue
+          (zvk_row_id, payment_status, sort_order, updated_by, updated_at)
+        VALUES
+          ($1, $2, $3, $4, NOW())
+        ON CONFLICT (zvk_row_id)
+        DO UPDATE SET
+          payment_status = EXCLUDED.payment_status,
+          sort_order = EXCLUDED.sort_order,
+          updated_by = EXCLUDED.updated_by,
+          updated_at = NOW()
+      `, [rowId, paymentStatus, orderValue, login]);
+    }
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success: true,
+      payment_status: paymentStatus,
+      updated: rowIds.length
+    });
+
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+    console.error("treasury-reorder error:", e);
+    return res.status(500).json({ success: false, error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
 
 app.listen(PORT, () => console.log("Server started on port " + PORT));
