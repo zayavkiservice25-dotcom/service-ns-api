@@ -352,7 +352,8 @@ s.idlzk,
       COALESCE(p.returned_amount, 0) AS returned_amount,
       p.return_status,
       p.return_time,
-      p.return_by
+      p.return_by,
+      z.pre_registry_amount
 
     FROM ft f
     LEFT JOIN zvk z ON z.id_ft = f.id_ft
@@ -5607,7 +5608,13 @@ const query = `
       pool_type.money_type,
       ''
     ) AS money_type,
-    zs.funding_pool_id
+    zs.funding_pool_id,
+    EXISTS (
+      SELECT 1
+      FROM public.pre_registry_items pri
+      WHERE pri.zvk_row_id = v.zvk_row_id
+        AND COALESCE(pri.approval_status, '') NOT IN ('Отменено', 'Отклонено')
+    ) AS pre_registry_sent
   FROM balance_rows v
   LEFT JOIN public.zvk_status zs
     ON zs.zvk_row_id = v.zvk_row_id
@@ -16060,5 +16067,694 @@ app.post("/draft-funding-pools/:poolId/allocate", async (req, res) => {
   }
 });
 
+// =====================================================
+// ДО РЕЕСТР
+// Гулнур -> Ермек -> Жасулан
+// =====================================================
+
+function normalizeLogin_(v) {
+  return String(v || "").trim().toLowerCase();
+}
+
+function isPreRegistryAdmin_(login) {
+  return ["r_gulnur", "k_ermek", "s_zhasulan"].includes(
+    normalizeLogin_(login)
+  );
+}
+
+
+// =====================================================
+// 1. СОХРАНИТЬ ПРЕДВАРИТЕЛЬНУЮ СУММУ В ФТ
+// НЕ МЕНЯЕТ:
+// request_flag
+// to_pay
+// src_o
+// =====================================================
+app.post("/pre-registry/amount-save", async (req, res) => {
+  try {
+    const {
+      zvk_row_id,
+      amount,
+      login
+    } = req.body || {};
+
+    const rowId = Number(zvk_row_id);
+    const actor = normalizeLogin_(login);
+
+    if (!rowId) {
+      return res.status(400).json({
+        success: false,
+        error: "zvk_row_id required"
+      });
+    }
+
+    if (actor !== "r_gulnur") {
+      return res.status(403).json({
+        success: false,
+        error: "NO_RIGHTS"
+      });
+    }
+
+    const amountNum = Number(
+      String(amount ?? "")
+        .replace(/\s/g, "")
+        .replace(",", ".")
+    );
+
+    if (!Number.isFinite(amountNum) || amountNum < 0) {
+      return res.status(400).json({
+        success: false,
+        error: "INVALID_AMOUNT"
+      });
+    }
+
+    // Проверяем, существует ли строка ZFT.
+    const qRow = await pool.query(`
+      SELECT
+        z.id,
+        z.id_ft,
+        z.id_zvk,
+        z.request_flag,
+        z.to_pay,
+        f.sum_ft
+      FROM public.zvk z
+      JOIN public.ft f
+        ON f.id_ft = z.id_ft
+      WHERE z.id = $1
+      LIMIT 1
+    `, [rowId]);
+
+    if (!qRow.rows.length) {
+      return res.status(404).json({
+        success: false,
+        error: "ZVK_ROW_NOT_FOUND"
+      });
+    }
+
+    const row = qRow.rows[0];
+
+    // Предварительная сумма не должна быть больше доступного остатка FT.
+    const balance = await getFtAvailableAmount(
+      pool,
+      row.id_ft,
+      rowId
+    );
+
+    if (
+      amountNum > 0 &&
+      balance.exists &&
+      amountNum > Number(balance.available || 0) + 0.000001
+    ) {
+      return res.status(400).json({
+        success: false,
+        error: "PRE_REGISTRY_AMOUNT_EXCEEDS_REMAINING",
+        message: "Сумма ДоРеестра больше остатка FT",
+        remaining: balance.available,
+        requested: amountNum
+      });
+    }
+
+    const upd = await pool.query(`
+      UPDATE public.zvk
+      SET pre_registry_amount =
+        CASE
+          WHEN $1::numeric = 0 THEN NULL
+          ELSE $1::numeric
+        END
+      WHERE id = $2
+      RETURNING
+        id,
+        id_ft,
+        id_zvk,
+        pre_registry_amount
+    `, [
+      amountNum,
+      rowId
+    ]);
+
+    return res.json({
+      success: true,
+      row: upd.rows[0]
+    });
+
+  } catch (e) {
+    console.error("PRE REGISTRY AMOUNT SAVE ERROR:", e);
+
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
+
+
+// =====================================================
+// 2. СОЗДАТЬ ДО РЕЕСТР
+// Только r_gulnur.
+// Берём сумму из zvk.pre_registry_amount.
+// Заявка остаётся как есть.
+// =====================================================
+app.post("/pre-registry/create", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const {
+      row_ids,
+      login
+    } = req.body || {};
+
+    const actor = normalizeLogin_(login);
+
+    const ids = Array.isArray(row_ids)
+      ? [...new Set(
+          row_ids.map(Number).filter(Boolean)
+        )]
+      : [];
+
+    if (actor !== "r_gulnur") {
+      return res.status(403).json({
+        success: false,
+        error: "NO_RIGHTS"
+      });
+    }
+
+    if (!ids.length) {
+      return res.status(400).json({
+        success: false,
+        error: "row_ids required"
+      });
+    }
+
+    await client.query("BEGIN");
+
+    // Проверяем выбранные ZFT.
+    const rowsQ = await client.query(`
+      SELECT
+        z.id AS zvk_row_id,
+        z.id_ft,
+        z.id_zvk,
+        z.pre_registry_amount,
+
+        f."object" AS object,
+        f.contractor,
+        f.pay_purpose
+
+      FROM public.zvk z
+
+      JOIN public.ft f
+        ON f.id_ft = z.id_ft
+
+      WHERE z.id = ANY($1::bigint[])
+    `, [ids]);
+
+    if (rowsQ.rows.length !== ids.length) {
+      throw new Error("Некоторые выбранные строки ZFT не найдены");
+    }
+
+    for (const row of rowsQ.rows) {
+      const amount = Number(row.pre_registry_amount || 0);
+
+      if (!(amount > 0)) {
+        throw new Error(
+          `${row.id_zvk || row.id_ft}: не заполнена сумма ДоРеестра`
+        );
+      }
+    }
+
+    // Нельзя одну и ту же ZFT второй раз отправлять
+    // в незавершенный ДоРеестр.
+    const existsQ = await client.query(`
+      SELECT
+        i.zvk_row_id,
+        z.id_zvk
+      FROM public.pre_registry_items i
+
+      LEFT JOIN public.zvk z
+        ON z.id = i.zvk_row_id
+
+      WHERE i.zvk_row_id = ANY($1::bigint[])
+        AND COALESCE(i.approval_status, '') NOT IN (
+          'Отменено',
+          'Отклонено'
+        )
+    `, [ids]);
+
+    if (existsQ.rows.length) {
+      const names = existsQ.rows
+        .map(r => r.id_zvk || r.zvk_row_id)
+        .join(", ");
+
+      throw new Error(
+        "Уже находятся в ДоРеестре: " + names
+      );
+    }
+
+    // Создаём шапку.
+    const headQ = await client.query(`
+      INSERT INTO public.pre_registry_head
+        (
+          created_by,
+          status,
+          created_at
+        )
+      VALUES
+        ($1, 'На согласовании', NOW())
+
+      RETURNING
+        id,
+        created_by,
+        status,
+        created_at
+    `, [actor]);
+
+    const preRegistryId = headQ.rows[0].id;
+
+    // Копируем строки.
+    const insertedQ = await client.query(`
+      INSERT INTO public.pre_registry_items
+      (
+        pre_registry_id,
+        zvk_row_id,
+        proposed_amount,
+        approved_amount,
+        approval_status,
+        approved_by,
+        approved_at,
+        distributed_by,
+        distributed_at,
+        created_by,
+        created_at,
+        updated_at
+      )
+
+      SELECT
+        $1,
+        z.id,
+        z.pre_registry_amount,
+        NULL,
+        'Ожидает',
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        $2,
+        NOW(),
+        NOW()
+
+      FROM public.zvk z
+
+      WHERE z.id = ANY($3::bigint[])
+
+      RETURNING *
+    `, [
+      preRegistryId,
+      actor,
+      ids
+    ]);
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success: true,
+      pre_registry_id: preRegistryId,
+      count: insertedQ.rows.length,
+      items: insertedQ.rows
+    });
+
+  } catch (e) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {}
+
+    console.error("PRE REGISTRY CREATE ERROR:", e);
+
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+
+  } finally {
+    client.release();
+  }
+});
+
+
+// =====================================================
+// 3. ПОЛУЧИТЬ ВСЕ СТРОКИ ДО РЕЕСТРА
+// r_gulnur
+// k_ermek
+// s_zhasulan
+// =====================================================
+app.get("/pre-registry", async (req, res) => {
+  try {
+    const login = normalizeLogin_(req.query.login);
+
+    if (!isPreRegistryAdmin_(login)) {
+      return res.status(403).json({
+        success: false,
+        error: "NO_RIGHTS"
+      });
+    }
+
+    const q = await pool.query(`
+      SELECT
+        i.id AS item_id,
+        i.pre_registry_id,
+        i.zvk_row_id,
+
+        z.id_ft,
+        z.id_zvk,
+
+        f."object" AS object,
+        f.contractor,
+        f.pay_purpose,
+
+        i.proposed_amount,
+        i.approved_amount,
+        i.approval_status,
+
+        i.approved_by,
+        i.approved_at,
+
+        i.distributed_by,
+        i.distributed_at,
+
+        i.created_by,
+        i.created_at,
+
+        h.status AS pre_registry_status
+
+      FROM public.pre_registry_items i
+
+      JOIN public.pre_registry_head h
+        ON h.id = i.pre_registry_id
+
+      JOIN public.zvk z
+        ON z.id = i.zvk_row_id
+
+      JOIN public.ft f
+        ON f.id_ft = z.id_ft
+
+      ORDER BY
+        i.created_at DESC,
+        i.id DESC
+    `);
+
+    return res.json({
+      success: true,
+      rows: q.rows
+    });
+
+  } catch (e) {
+    console.error("PRE REGISTRY LIST ERROR:", e);
+
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
+
+
+// =====================================================
+// 4. ЕРМЕК СОХРАНЯЕТ СУММУ
+// Пока НЕ утвердил — может менять сколько угодно.
+// =====================================================
+app.post("/pre-registry/save-approval-amount", async (req, res) => {
+  try {
+    const {
+      item_id,
+      amount,
+      login
+    } = req.body || {};
+
+    const actor = normalizeLogin_(login);
+    const itemId = Number(item_id);
+
+    if (actor !== "k_ermek") {
+      return res.status(403).json({
+        success: false,
+        error: "ONLY_K_ERMEK"
+      });
+    }
+
+    if (!itemId) {
+      return res.status(400).json({
+        success: false,
+        error: "item_id required"
+      });
+    }
+
+    const amountNum = Number(
+      String(amount ?? "")
+        .replace(/\s/g, "")
+        .replace(",", ".")
+    );
+
+    if (!Number.isFinite(amountNum) || amountNum < 0) {
+      return res.status(400).json({
+        success: false,
+        error: "INVALID_AMOUNT"
+      });
+    }
+
+    const oldQ = await pool.query(`
+      SELECT *
+      FROM public.pre_registry_items
+      WHERE id = $1
+      LIMIT 1
+    `, [itemId]);
+
+    if (!oldQ.rows.length) {
+      return res.status(404).json({
+        success: false,
+        error: "ITEM_NOT_FOUND"
+      });
+    }
+
+    const oldRow = oldQ.rows[0];
+
+    if (oldRow.approval_status === "Утверждено") {
+      return res.status(400).json({
+        success: false,
+        error: "ALREADY_APPROVED"
+      });
+    }
+
+    if (
+      amountNum >
+      Number(oldRow.proposed_amount || 0) + 0.000001
+    ) {
+      return res.status(400).json({
+        success: false,
+        error: "APPROVED_AMOUNT_EXCEEDS_PROPOSED",
+        message:
+          "Сумма Ермека не может быть больше суммы, отправленной Гулнур"
+      });
+    }
+
+    const upd = await pool.query(`
+      UPDATE public.pre_registry_items
+
+      SET
+        approved_amount = $1,
+        approval_status = 'Ожидает',
+        updated_at = NOW()
+
+      WHERE id = $2
+
+      RETURNING *
+    `, [
+      amountNum,
+      itemId
+    ]);
+
+    return res.json({
+      success: true,
+      row: upd.rows[0]
+    });
+
+  } catch (e) {
+    console.error("PRE REGISTRY SAVE AMOUNT ERROR:", e);
+
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
+
+
+// =====================================================
+// 5. ЕРМЕК УТВЕРЖДАЕТ
+//
+// ВАЖНО:
+// НЕ меняем request_flag.
+// НЕ меняем zvk.to_pay.
+// НЕ меняем Источник.
+// =====================================================
+app.post("/pre-registry/approve", async (req, res) => {
+  try {
+    const {
+      item_id,
+      login
+    } = req.body || {};
+
+    const actor = normalizeLogin_(login);
+    const itemId = Number(item_id);
+
+    if (actor !== "k_ermek") {
+      return res.status(403).json({
+        success: false,
+        error: "ONLY_K_ERMEK"
+      });
+    }
+
+    if (!itemId) {
+      return res.status(400).json({
+        success: false,
+        error: "item_id required"
+      });
+    }
+
+    const q = await pool.query(`
+      SELECT *
+      FROM public.pre_registry_items
+      WHERE id = $1
+      LIMIT 1
+    `, [itemId]);
+
+    if (!q.rows.length) {
+      return res.status(404).json({
+        success: false,
+        error: "ITEM_NOT_FOUND"
+      });
+    }
+
+    const row = q.rows[0];
+
+    if (!(Number(row.approved_amount || 0) > 0)) {
+      return res.status(400).json({
+        success: false,
+        error: "APPROVED_AMOUNT_REQUIRED",
+        message: "Сначала укажите сумму"
+      });
+    }
+
+    const upd = await pool.query(`
+      UPDATE public.pre_registry_items
+
+      SET
+        approval_status = 'Утверждено',
+        approved_by = $1,
+        approved_at = NOW(),
+        updated_at = NOW()
+
+      WHERE id = $2
+
+      RETURNING *
+    `, [
+      actor,
+      itemId
+    ]);
+
+    return res.json({
+      success: true,
+      row: upd.rows[0]
+    });
+
+  } catch (e) {
+    console.error("PRE REGISTRY APPROVE ERROR:", e);
+
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
+
+
+// =====================================================
+// 6. ЖАСУЛАН: ОТМЕТИТЬ ЧТО РАСПРЕДЕЛЕНИЕ ВЫПОЛНЕНО
+//
+// Пока только статус.
+// На следующем этапе подключим реальные денежные пулы.
+// =====================================================
+app.post("/pre-registry/distributed", async (req, res) => {
+  try {
+    const {
+      item_id,
+      login
+    } = req.body || {};
+
+    const actor = normalizeLogin_(login);
+    const itemId = Number(item_id);
+
+    if (actor !== "s_zhasulan") {
+      return res.status(403).json({
+        success: false,
+        error: "ONLY_S_ZHASULAN"
+      });
+    }
+
+    if (!itemId) {
+      return res.status(400).json({
+        success: false,
+        error: "item_id required"
+      });
+    }
+
+    const q = await pool.query(`
+      SELECT *
+      FROM public.pre_registry_items
+      WHERE id = $1
+      LIMIT 1
+    `, [itemId]);
+
+    if (!q.rows.length) {
+      return res.status(404).json({
+        success: false,
+        error: "ITEM_NOT_FOUND"
+      });
+    }
+
+    if (q.rows[0].approval_status !== "Утверждено") {
+      return res.status(400).json({
+        success: false,
+        error: "NOT_APPROVED_BY_ERMEK",
+        message: "Сначала сумму должен утвердить Ермек"
+      });
+    }
+
+    const upd = await pool.query(`
+      UPDATE public.pre_registry_items
+
+      SET
+        distributed_by = $1,
+        distributed_at = NOW(),
+        updated_at = NOW()
+
+      WHERE id = $2
+
+      RETURNING *
+    `, [
+      actor,
+      itemId
+    ]);
+
+    return res.json({
+      success: true,
+      row: upd.rows[0]
+    });
+
+  } catch (e) {
+    console.error("PRE REGISTRY DISTRIBUTED ERROR:", e);
+
+    return res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
 
 app.listen(PORT, () => console.log("Server started on port " + PORT));
