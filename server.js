@@ -14664,103 +14664,109 @@ app.get("/lzk/request-print/data", async (req, res) => {
       });
     }
 
+    /*
+      ВАЖНО:
+      1 строка отчета = 1 отдельная заявка IDZLZK.
+      IDLZK используется только для связи заявки с лимитом.
+
+      "Срок поставки" берем из lzk.requests.deadline —
+      это дедлайн, который инициатор указал при создании заявки
+      на странице ЛЗК / Лимиты.
+    */
     const q = await pool.query(`
+      WITH approved_requests AS (
+        SELECT
+          r.idzlzk,
+          r.idlzk,
+          r.object_name,
+          r.constructive_name,
+          r.material_name,
+          r.unit,
+          COALESCE(r.fact_qty, 0) AS fact_qty,
+          r.pto_date,
+          r.deadline,
+
+          COALESCE(l.plan_qty, 0) AS plan_qty,
+          COALESCE(l.fact_received, 0) AS fact_received
+
+        FROM lzk.requests r
+
+        JOIN lzk.limits l
+          ON l.idlzk = r.idlzk
+
+        WHERE lower(trim(r.object_name)) = lower(trim($1))
+          AND lower(trim(COALESCE(r.pto_status, '')))
+              IN ('согласован', 'согласовано')
+      ),
+
+      period_rows AS (
+        SELECT
+          a.*,
+
+          -- Накопительно согласовано через ЛЗК ДО начала периода.
+          COALESCE((
+            SELECT SUM(x.fact_qty)
+            FROM approved_requests x
+            WHERE x.idlzk = a.idlzk
+              AND x.pto_date < $2::date
+          ), 0) AS approved_via_lzk,
+
+          -- Накопительно внутри текущего периода
+          -- до конкретной заявки IDZLZK включительно.
+          COALESCE((
+            SELECT SUM(x.fact_qty)
+            FROM approved_requests x
+            WHERE x.idlzk = a.idlzk
+              AND x.pto_date >= $2::date
+              AND x.pto_date < ($3::date + INTERVAL '1 day')
+              AND (
+                x.pto_date < a.pto_date
+                OR (
+                  x.pto_date = a.pto_date
+                  AND NULLIF(regexp_replace(x.idzlzk, '\\D', '', 'g'), '')::bigint
+                      <= NULLIF(regexp_replace(a.idzlzk, '\\D', '', 'g'), '')::bigint
+                )
+              )
+          ), 0) AS approved_period_running
+
+        FROM approved_requests a
+
+        WHERE a.pto_date >= $2::date
+          AND a.pto_date < ($3::date + INTERVAL '1 day')
+      )
+
       SELECT
-        l.idlzk,
-        l.object_name AS object,
-        l.constructive_name AS constructive,
-        l.material_name AS tmc_name,
-        l.unit_name AS unit,
+        p.idzlzk,
+        p.idlzk,
 
-        COALESCE(l.plan_qty, 0) AS plan,
+        p.object_name AS object,
+        p.constructive_name AS constructive,
+        p.material_name AS tmc_name,
+        p.unit,
 
-        -- 1. Одобрено без ЛЗК:
-        -- текущее ручное поле "Фактически одобрено склад"
-        COALESCE(l.fact_received, 0) AS approved_without_lzk,
+        p.plan_qty AS plan,
+        p.fact_received AS approved_without_lzk,
 
-        -- 2. Одобрено через ЛЗК ДО даты "с".
-        -- Например при date_from = 01.09:
-        -- берем все согласованные заявки, где pto_date < 01.09 00:00.
-        COALESCE(
-          SUM(
-            CASE
-              WHEN lower(trim(COALESCE(r.pto_status, '')))
-                   IN ('согласован', 'согласовано')
-               AND r.pto_date < $2::date
-              THEN COALESCE(r.fact_qty, 0)
-              ELSE 0
-            END
-          ),
-          0
-        ) AS approved_via_lzk,
+        p.approved_via_lzk,
 
-        -- 3. Одобрено ЛЗК ЗА ПЕРИОД.
-        -- date_from включительно, date_to включительно.
-        COALESCE(
-          SUM(
-            CASE
-              WHEN lower(trim(COALESCE(r.pto_status, '')))
-                   IN ('согласован', 'согласовано')
-               AND r.pto_date >= $2::date
-               AND r.pto_date < ($3::date + INTERVAL '1 day')
-              THEN COALESCE(r.fact_qty, 0)
-              ELSE 0
-            END
-          ),
-          0
-        ) AS approved_via_lzk_period,
+        -- Количество именно этой отдельной заявки IDZLZK.
+        p.fact_qty AS approved_via_lzk_period,
 
-        -- 4. Остаток на конец выбранного периода:
-        -- План - Без ЛЗК - Через ЛЗК до периода - ЛЗК за период.
         (
-          COALESCE(l.plan_qty, 0)
-          - COALESCE(l.fact_received, 0)
-          - COALESCE(
-              SUM(
-                CASE
-                  WHEN lower(trim(COALESCE(r.pto_status, '')))
-                       IN ('согласован', 'согласовано')
-                   AND r.pto_date < $2::date
-                  THEN COALESCE(r.fact_qty, 0)
-                  ELSE 0
-                END
-              ),
-              0
-            )
-          - COALESCE(
-              SUM(
-                CASE
-                  WHEN lower(trim(COALESCE(r.pto_status, '')))
-                       IN ('согласован', 'согласовано')
-                   AND r.pto_date >= $2::date
-                   AND r.pto_date < ($3::date + INTERVAL '1 day')
-                  THEN COALESCE(r.fact_qty, 0)
-                  ELSE 0
-                END
-              ),
-              0
-            )
-        ) AS remaining
+          p.plan_qty
+          - p.fact_received
+          - p.approved_via_lzk
+          - p.approved_period_running
+        ) AS remaining,
 
-      FROM lzk.limits l
+        to_char(p.deadline, 'YYYY-MM-DD') AS deadline
 
-      LEFT JOIN lzk.requests r
-        ON r.idlzk = l.idlzk
-
-      WHERE lower(trim(l.object_name)) = lower(trim($1))
-
-      GROUP BY
-        l.idlzk,
-        l.object_name,
-        l.constructive_name,
-        l.material_name,
-        l.unit_name,
-        l.plan_qty,
-        l.fact_received
+      FROM period_rows p
 
       ORDER BY
-        NULLIF(regexp_replace(l.idlzk, '\\D', '', 'g'), '')::bigint,
-        l.idlzk
+        p.pto_date,
+        NULLIF(regexp_replace(p.idzlzk, '\\D', '', 'g'), '')::bigint,
+        p.idzlzk
     `, [
       objectName,
       dateFrom,
