@@ -14588,11 +14588,15 @@ app.get("/lzk/request-print/refs", async (req, res) => {
   try {
     const [objectsQ, ptoQ] = await Promise.all([
 
+      // Проекты для "Заявка на ТМЦ":
+      // ТОЛЬКО объекты, по которым есть согласованные IDZLZK.
       pool.query(`
-        SELECT DISTINCT object_name
-        FROM lzk.limits
-        WHERE COALESCE(trim(object_name), '') <> ''
-        ORDER BY object_name
+        SELECT DISTINCT trim(r.object_name) AS object_name
+        FROM lzk.requests r
+        WHERE COALESCE(trim(r.object_name), '') <> ''
+          AND lower(trim(COALESCE(r.pto_status, '')))
+              IN ('согласован', 'согласовано')
+        ORDER BY trim(r.object_name)
       `),
 
       pool.query(`
