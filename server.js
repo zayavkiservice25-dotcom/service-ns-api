@@ -16879,6 +16879,8 @@ function canManageTreasury_(login, roleFt) {
   return (
     lg === "k_ermek" ||
     lg === "b_erkin" ||
+    lg === "s_zhasulan" ||
+    lg === "a_zaitova" ||
     ["admin", "админ", "administrator", "администратор"].includes(role)
   );
 }
@@ -16893,6 +16895,10 @@ function canPayTreasury_(login, roleFt) {
   );
 }
 
+function canChangeTreasuryPaymentPerson_(login) {
+  return treasuryLoginNorm_(login) === "r_gulnur";
+}
+
 app.get("/treasury-list", async (req, res) => {
   try {
     const login = treasuryLoginNorm_(req.query.login);
@@ -16900,6 +16906,7 @@ app.get("/treasury-list", async (req, res) => {
 
     const canManage = canManageTreasury_(login, roleFt);
     const canPay = canPayTreasury_(login, roleFt);
+    const canChangePaymentPerson = canChangeTreasuryPaymentPerson_(login);
 
     const q = await pool.query(`
       SELECT
@@ -16970,7 +16977,8 @@ app.get("/treasury-list", async (req, res) => {
       success: true,
       rows: q.rows,
       can_manage_priority: canManage,
-      can_mark_paid: canPay
+      can_mark_paid: canPay,
+      can_change_payment_person: canChangePaymentPerson
     });
 
   } catch (e) {
@@ -16991,7 +16999,7 @@ app.post("/treasury-status", async (req, res) => {
     if (!canManageTreasury_(login, roleFt)) {
       return res.status(403).json({
         success: false,
-        error: "Только Ермек может менять статус платежа"
+        error: "Нет прав менять статус платежа"
       });
     }
 
@@ -17065,12 +17073,14 @@ app.post("/treasury-status", async (req, res) => {
 app.post("/treasury-payment-person", async (req, res) => {
   try {
     const login = treasuryLoginNorm_(req.body?.login);
-    const roleFt = treasuryRoleNorm_(req.body?.role_ft);
     const zvkRowId = Number(req.body?.zvk_row_id);
     const paymentPerson = String(req.body?.payment_person || "").trim();
-    const allowedLogin = ["k_arailym", "b_erkin", "s_zhasulan", "k_ermek"].includes(login);
-    const allowedRole = ["admin", "админ", "administrator", "администратор"].includes(roleFt);
-    if (!allowedLogin && !allowedRole) return res.status(403).json({success:false,error:"Нет доступа к Казначейству"});
+    if (!canChangeTreasuryPaymentPerson_(login)) {
+      return res.status(403).json({
+        success:false,
+        error:"Поле «Платеж» может менять только Гулнур"
+      });
+    }
     if (!zvkRowId) return res.status(400).json({success:false,error:"zvk_row_id required"});
     if (!["", "Ардак", "Касымхан"].includes(paymentPerson)) return res.status(400).json({success:false,error:"Некорректное значение Платеж"});
 
