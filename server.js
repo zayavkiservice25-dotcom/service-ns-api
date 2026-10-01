@@ -14588,15 +14588,27 @@ app.get("/lzk/request-print/refs", async (req, res) => {
   try {
     const [objectsQ, ptoQ] = await Promise.all([
 
-      // Проекты для "Заявка на ТМЦ":
-      // ТОЛЬКО объекты, по которым есть согласованные IDZLZK.
+      /*
+        Проекты для страницы "Заявка на ТМЦ".
+
+        ВАЖНО:
+        - берем только СОГЛАСОВАННЫЕ заявки IDZLZK;
+        - название объекта берем ТОЛЬКО из lzk.limits.object_name
+          через связь по IDLZK;
+        - r.object_name НЕ используем вообще.
+
+        Поэтому старое ручное значение "жем" из lzk.requests
+        больше не может попасть в выпадающий список.
+      */
       pool.query(`
-        SELECT DISTINCT trim(r.object_name) AS object_name
+        SELECT DISTINCT trim(l.object_name) AS object_name
         FROM lzk.requests r
-        WHERE COALESCE(trim(r.object_name), '') <> ''
-          AND lower(trim(COALESCE(r.pto_status, '')))
+        JOIN lzk.limits l
+          ON l.idlzk = r.idlzk
+        WHERE lower(trim(COALESCE(r.pto_status, '')))
               IN ('согласован', 'согласовано')
-        ORDER BY trim(r.object_name)
+          AND COALESCE(trim(l.object_name), '') <> ''
+        ORDER BY trim(l.object_name)
       `),
 
       pool.query(`
