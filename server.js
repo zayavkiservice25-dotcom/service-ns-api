@@ -1954,6 +1954,11 @@ await pool.query(`
 `);
 
 await pool.query(`
+  ALTER TABLE public.treasury_queue
+  ADD COLUMN IF NOT EXISTS payment_person text;
+`);
+
+await pool.query(`
   CREATE INDEX IF NOT EXISTS treasury_queue_sort_idx
   ON public.treasury_queue (payment_status, sort_order, zvk_row_id);
 `);
@@ -16920,6 +16925,7 @@ app.get("/treasury-list", async (req, res) => {
 
         COALESCE(NULLIF(trim(tq.payment_status), ''), 'Стандарт') AS payment_status,
         COALESCE(tq.sort_order, 1000000 + i.id) AS sort_order,
+        COALESCE(tq.payment_person, '') AS payment_person,
 
         COALESCE(i.aray_paid, '') AS aray_paid,
         i.aray_pay_time,
@@ -17053,6 +17059,40 @@ app.post("/treasury-status", async (req, res) => {
     return res.status(500).json({ success: false, error: e.message });
   } finally {
     client.release();
+  }
+});
+
+app.post("/treasury-payment-person", async (req, res) => {
+  try {
+    const login = treasuryLoginNorm_(req.body?.login);
+    const roleFt = treasuryRoleNorm_(req.body?.role_ft);
+    const zvkRowId = Number(req.body?.zvk_row_id);
+    const paymentPerson = String(req.body?.payment_person || "").trim();
+    const allowedLogin = ["k_arailym", "b_erkin", "s_zhasulan", "k_ermek"].includes(login);
+    const allowedRole = ["admin", "админ", "administrator", "администратор"].includes(roleFt);
+    if (!allowedLogin && !allowedRole) return res.status(403).json({success:false,error:"Нет доступа к Казначейству"});
+    if (!zvkRowId) return res.status(400).json({success:false,error:"zvk_row_id required"});
+    if (!["", "Ардак", "Касымхан"].includes(paymentPerson)) return res.status(400).json({success:false,error:"Некорректное значение Платеж"});
+
+    const exists = await pool.query(`
+      SELECT i.id FROM public.request_items i
+      JOIN public.request_head h ON h.id = i.request_id
+      WHERE i.zvk_row_id = $1
+        AND lower(trim(COALESCE(h.approve_ermek_status, ''))) IN ('согласовано', 'утверждено', 'да')
+      LIMIT 1
+    `,[zvkRowId]);
+    if(!exists.rowCount) return res.status(404).json({success:false,error:"Утвержденная строка Реестра не найдена"});
+    const fallbackOrder=1000000+Number(exists.rows[0].id||0);
+    await pool.query(`
+      INSERT INTO public.treasury_queue (zvk_row_id,payment_status,sort_order,payment_person,updated_by,updated_at)
+      VALUES ($1,'Стандарт',$2,NULLIF($3,''),$4,NOW())
+      ON CONFLICT (zvk_row_id) DO UPDATE SET
+        payment_person=NULLIF(EXCLUDED.payment_person,''),updated_by=EXCLUDED.updated_by,updated_at=NOW()
+    `,[zvkRowId,fallbackOrder,paymentPerson,login]);
+    return res.json({success:true,zvk_row_id:zvkRowId,payment_person:paymentPerson});
+  } catch(e) {
+    console.error("treasury-payment-person error:",e);
+    return res.status(500).json({success:false,error:e.message});
   }
 });
 
