@@ -16080,16 +16080,27 @@ app.post("/draft-funding-pools/:poolId/allocate", async (req, res) => {
 
     const totalAmount = Number(parent.amount || 0);
     const allocatedAmount = Number(allocatedQ.rows[0].allocated_amount || 0);
-    const unallocatedAmount = totalAmount - allocatedAmount;
 
-    if (amount > unallocatedAmount) {
+    // ВАЖНО: денежные суммы сравниваем в тиынах, а не как JS float.
+    // Иначе 446118.32 может внутри JS стать, например, 446118.31999999995
+    // и сумма ровно в остаток ошибочно считается превышением.
+    const totalCents = Math.round(totalAmount * 100);
+    const allocatedCents = Math.round(allocatedAmount * 100);
+    const amountCents = Math.round(amount * 100);
+    const unallocatedCents = totalCents - allocatedCents;
+    const unallocatedAmount = unallocatedCents / 100;
+
+    if (amountCents > unallocatedCents) {
       await client.query("ROLLBACK");
 
       return res.status(400).json({
         success: false,
         error:
           "Нельзя распределить больше остатка. Доступно: " +
-          unallocatedAmount.toLocaleString("ru-RU")
+          unallocatedAmount.toLocaleString("ru-RU", {
+            minimumFractionDigits: 2,
+            maximumFractionDigits: 2
+          })
       });
     }
 
