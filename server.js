@@ -4464,9 +4464,10 @@ const toPayNum = isNoRequest
       // ВАЖНО:
       // rebuildFtTail удаляет открытые системные хвосты и создаёт новый ZFT.
       // Поэтому при Заявка=Нет его запускать нельзя, иначе ZFT3200 станет ZFT3344.
-      const rebuild = flag === "Да"
-        ? await rebuildFtTail(pool, rid)
-        : null;
+const rebuild =
+  flag === "Да" && toPayNum > 0
+    ? await rebuildFtTail(pool, rid)
+    : null;
 
       return res.json({
         success: true,
