@@ -16015,6 +16015,225 @@ app.post("/draft-funding-pools/:poolId/return", async (req, res) => {
 });
 
 
+
+// =====================================================
+// РАСПРЕДЕЛЕНИЕ НЕРАСПРЕДЕЛЁННОЙ СУММЫ МЕЖДУ ЮРЛИЦАМИ
+// ВАЖНО:
+// - Общая сумма родительского пула НЕ меняется.
+// - Сумма добавляется в "Распределено".
+// - "Не распределено" уменьшается автоматически.
+// - Создаётся дочерняя строка с другим ЮрЛицом.
+// - Источник и Тип сохраняются.
+// - Объект и Логин для такого распределения пустые.
+// =====================================================
+app.post("/draft-funding-pools/:poolId/transfer-unallocated-legal-entity", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const poolId = Number(req.params.poolId);
+    const body = req.body || {};
+
+    const targetLegalEntity = String(body.target_legal_entity || "").trim();
+    const actor = String(body.login || body.created_by || "").trim();
+    const actorLogin = actor.toLowerCase();
+    const amount = Number(body.amount);
+
+    const allowed = ["b_erkin", "s_zhasulan", "k_ermek"];
+
+    if (!allowed.includes(actorLogin)) {
+      return res.status(403).json({
+        success:false,
+        error:"Нет доступа к распределению между ЮрЛицами"
+      });
+    }
+
+    if (!Number.isInteger(poolId) || poolId <= 0) {
+      return res.status(400).json({
+        success:false,
+        error:"Неверный pool_id"
+      });
+    }
+
+    if (!targetLegalEntity) {
+      return res.status(400).json({
+        success:false,
+        error:"Выберите новое ЮрЛицо"
+      });
+    }
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({
+        success:false,
+        error:"Сумма должна быть больше 0"
+      });
+    }
+
+    await client.query("BEGIN");
+
+    const parentQ = await client.query(`
+      SELECT
+        p.id,
+        p.legal_entity,
+        p.source_name,
+        p.money_type,
+        p.amount
+      FROM public.draft_funding_pool p
+      WHERE p.id = $1
+        AND p.is_active = true
+        AND p.parent_pool_id IS NULL
+        AND COALESCE(trim(p.object_name), '') = ''
+      FOR UPDATE
+    `, [poolId]);
+
+    if (!parentQ.rows.length) {
+      throw new Error("Общий пул не найден");
+    }
+
+    const parent = parentQ.rows[0];
+
+    if (
+      String(parent.legal_entity || "").trim().toLowerCase() ===
+      targetLegalEntity.toLowerCase()
+    ) {
+      throw new Error("Выберите другое ЮрЛицо");
+    }
+
+    // Считаем текущее распределение ВСЕХ дочерних строк,
+    // включая распределения по объектам и переводы между ЮрЛицами.
+    const allocatedQ = await client.query(`
+      SELECT COALESCE(SUM(c.amount), 0) AS allocated_amount
+      FROM public.draft_funding_pool c
+      WHERE c.parent_pool_id = $1
+        AND c.is_active = true
+    `, [poolId]);
+
+    const totalAmount = Number(parent.amount || 0);
+    const allocatedAmount = Number(allocatedQ.rows[0].allocated_amount || 0);
+
+    const totalCents = Math.round(totalAmount * 100);
+    const allocatedCents = Math.round(allocatedAmount * 100);
+    const availableCents = totalCents - allocatedCents;
+    const transferCents = Math.round(amount * 100);
+
+    if (transferCents > availableCents) {
+      const available = availableCents / 100;
+
+      await client.query("ROLLBACK");
+
+      return res.status(400).json({
+        success:false,
+        error:
+          "Нельзя распределить больше «Не распределено». Доступно: " +
+          available.toLocaleString("ru-RU", {
+            minimumFractionDigits:2,
+            maximumFractionDigits:2
+          })
+      });
+    }
+
+    // Если такое распределение между ЮрЛицами уже есть,
+    // увеличиваем его. Иначе создаём новую дочернюю строку.
+    const existingQ = await client.query(`
+      SELECT id, amount
+      FROM public.draft_funding_pool
+      WHERE is_active = true
+        AND parent_pool_id = $1
+        AND lower(trim(legal_entity)) = lower(trim($2))
+        AND lower(trim(source_name)) = lower(trim($3))
+        AND lower(trim(money_type)) = lower(trim($4))
+        AND COALESCE(trim(object_name), '') = ''
+        AND COALESCE(trim(beneficiary_login), '') = ''
+      ORDER BY id
+      LIMIT 1
+      FOR UPDATE
+    `, [
+      poolId,
+      targetLegalEntity,
+      parent.source_name,
+      parent.money_type
+    ]);
+
+    let row;
+
+    if (existingQ.rows.length) {
+      const upd = await client.query(`
+        UPDATE public.draft_funding_pool
+        SET
+          amount = COALESCE(amount, 0) + $2,
+          created_by = COALESCE(NULLIF($3, ''), created_by)
+        WHERE id = $1
+        RETURNING *
+      `, [
+        existingQ.rows[0].id,
+        amount,
+        actor
+      ]);
+
+      row = upd.rows[0];
+
+    } else {
+      const ins = await client.query(`
+        INSERT INTO public.draft_funding_pool (
+          legal_entity,
+          source_name,
+          money_type,
+          object_name,
+          beneficiary_login,
+          amount,
+          parent_pool_id,
+          is_active,
+          created_by,
+          created_at
+        )
+        VALUES (
+          $1, $2, $3, '', '', $4, $5, true, NULLIF($6, ''), NOW()
+        )
+        RETURNING *
+      `, [
+        targetLegalEntity,
+        parent.source_name,
+        parent.money_type,
+        amount,
+        poolId,
+        actor
+      ]);
+
+      row = ins.rows[0];
+    }
+
+    await client.query("COMMIT");
+
+    const newAllocatedCents = allocatedCents + transferCents;
+    const newUnallocatedCents = totalCents - newAllocatedCents;
+
+    return res.json({
+      success:true,
+      row,
+      parent:{
+        pool_id:Number(parent.id),
+        legal_entity:parent.legal_entity,
+        total_amount:totalAmount,
+        allocated_amount:newAllocatedCents / 100,
+        unallocated_amount:newUnallocatedCents / 100
+      }
+    });
+
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+
+    console.error("DRAFT FUNDING LEGAL ALLOCATION ERROR:", e);
+
+    return res.status(500).json({
+      success:false,
+      error:e.message
+    });
+
+  } finally {
+    client.release();
+  }
+});
+
+
 app.get("/draft-funding-pools/:poolId/allocations", async (req, res) => {
   try {
     const poolId = Number(req.params.poolId);
