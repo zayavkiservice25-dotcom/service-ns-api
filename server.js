@@ -16563,6 +16563,7 @@ app.get("/pre-registry", async (req, res) => {
         z.id_zvk,
 
         f."object" AS object,
+        f.legal_entity AS legal_entity,
         f.contractor,
         f.pay_purpose,
 
