@@ -16258,10 +16258,13 @@ function normalizeLogin_(v) {
   return String(v || "").trim().toLowerCase();
 }
 
-function isPreRegistryAdmin_(login) {
-  return ["r_gulnur", "k_ermek", "s_zhasulan"].includes(
-    normalizeLogin_(login)
-  );
+function isPreRegistryAllViewer_(login) {
+  return [
+    "s_zhasulan",
+    "a_zaitova",
+    "k_ermek",
+    "b_erkin"
+  ].includes(normalizeLogin_(login));
 }
 
 
@@ -16612,11 +16615,26 @@ app.get("/pre-registry", async (req, res) => {
   try {
     const login = normalizeLogin_(req.query.login);
 
-    if (!isPreRegistryAdmin_(login)) {
+    if (!login) {
       return res.status(403).json({
         success: false,
-        error: "NO_RIGHTS"
+        error: "LOGIN_REQUIRED"
       });
+    }
+
+    const canSeeAll = isPreRegistryAllViewer_(login);
+
+    const params = [];
+    let whereSql = "";
+
+    // s_zhasulan и a_zaitova видят все заявки.
+    // k_ermek и b_erkin сохраняют служебный полный доступ.
+    // Все остальные пользователи видят только свои ДоРеестр-заявки.
+    if (!canSeeAll) {
+      params.push(login);
+      whereSql = `
+        WHERE lower(trim(COALESCE(i.created_by, ''))) = $1
+      `;
     }
 
     const q = await pool.query(`
@@ -16659,10 +16677,12 @@ app.get("/pre-registry", async (req, res) => {
       JOIN public.ft f
         ON f.id_ft = z.id_ft
 
+      ${whereSql}
+
       ORDER BY
         i.created_at DESC,
         i.id DESC
-    `);
+    `, params);
 
     return res.json({
       success: true,
