@@ -16224,11 +16224,16 @@ app.post("/pre-registry/amount-save", async (req, res) => {
       });
     }
 
+    // r_gulnur сохраняет прежний полный доступ.
+    // Остальные пользователи могут менять ДоРеестр только по своей строке ФТ.
     if (actor !== "r_gulnur") {
-      return res.status(403).json({
-        success: false,
-        error: "NO_RIGHTS"
-      });
+      const ownRow = await canEditRowByLogin(pool, rowId, actor);
+      if (!ownRow) {
+        return res.status(403).json({
+          success: false,
+          error: "NO_RIGHTS_THIS_ROW"
+        });
+      }
     }
 
     const amountNum = Number(
@@ -16347,10 +16352,10 @@ app.post("/pre-registry/create", async (req, res) => {
         )]
       : [];
 
-    if (actor !== "r_gulnur") {
+    if (!actor) {
       return res.status(403).json({
         success: false,
-        error: "NO_RIGHTS"
+        error: "LOGIN_REQUIRED"
       });
     }
 
@@ -16385,6 +16390,22 @@ app.post("/pre-registry/create", async (req, res) => {
 
     if (rowsQ.rows.length !== ids.length) {
       throw new Error("Некоторые выбранные строки ZFT не найдены");
+    }
+
+    // r_gulnur сохраняет прежний полный доступ.
+    // Любой другой инициатор может создать ДоРеестр только по своим строкам.
+    if (actor !== "r_gulnur") {
+      for (const rowId of ids) {
+        const ownRow = await canEditRowByLogin(client, rowId, actor);
+        if (!ownRow) {
+          await client.query("ROLLBACK");
+          return res.status(403).json({
+            success: false,
+            error: "NO_RIGHTS_THIS_ROW",
+            message: "ДоРеестр можно создавать только по своим строкам ФТ"
+          });
+        }
+      }
     }
 
     for (const row of rowsQ.rows) {
