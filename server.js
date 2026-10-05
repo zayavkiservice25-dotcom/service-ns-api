@@ -16260,6 +16260,7 @@ function normalizeLogin_(v) {
 
 function isPreRegistryAllViewer_(login) {
   return [
+    "admin",
     "s_zhasulan",
     "a_zaitova",
     "k_ermek",
@@ -16628,7 +16629,7 @@ app.get("/pre-registry", async (req, res) => {
     let whereSql = "";
 
     // s_zhasulan и a_zaitova видят все заявки.
-    // k_ermek и b_erkin сохраняют служебный полный доступ.
+    // admin, k_ermek и b_erkin сохраняют служебный полный доступ.
     // Все остальные пользователи видят только свои ДоРеестр-заявки.
     if (!canSeeAll) {
       params.push(login);
