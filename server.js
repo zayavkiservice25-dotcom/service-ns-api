@@ -1862,6 +1862,11 @@ await pool.query(`
     ADD COLUMN IF NOT EXISTS fact_received numeric(18,6) DEFAULT 0;
   `);
 
+  await pool.query(`
+    ALTER TABLE lzk.limits
+    ADD COLUMN IF NOT EXISTS note text;
+  `);
+
 
 await pool.query(`
   ALTER TABLE lzk.requests
@@ -10670,6 +10675,7 @@ app.get("/lzk/limits", async (req, res) => {
         COALESCE(l.price_without_vat, 0) AS column_l,
         COALESCE(l.amount, 0) AS amount_sum,
         COALESCE(l.fact_received, 0) AS fact_received,
+        COALESCE(l.note, '') AS note,
 
         COALESCE(
           SUM(
@@ -10710,7 +10716,8 @@ app.get("/lzk/limits", async (req, res) => {
         l.plan_qty,
         l.price_without_vat,
         l.amount,
-        l.fact_received
+        l.fact_received,
+        l.note
 
       ORDER BY
         regexp_replace(l.idlzk, '\\D', '', 'g')::bigint ASC
@@ -10741,6 +10748,65 @@ app.get("/lzk/limits", async (req, res) => {
       success: false,
       error: e.message
     });
+  }
+});
+
+// Примечание в ЛЗК / Лимиты может изменять только z_karlygash.
+app.post("/lzk/limit-note", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const idlzk = lzkText(body.idlzk);
+    const note = String(body.note ?? "").trim();
+    const login = lzkText(body.login).toLowerCase();
+
+    if (!idlzk) {
+      return res.status(400).json({ success: false, error: "IDLZK не передан" });
+    }
+
+    if (login !== "z_karlygash") {
+      return res.status(403).json({
+        success: false,
+        error: "Примечание может изменять только z_karlygash"
+      });
+    }
+
+    // Дополнительно убеждаемся, что такой пользователь реально есть в public.users.
+    const user = await pool.query(`
+      SELECT 1
+      FROM public.users
+      WHERE lower(trim(login)) = $1
+        AND COALESCE(is_active, true) = true
+      LIMIT 1
+    `, [login]);
+
+    if (!user.rows.length) {
+      return res.status(403).json({
+        success: false,
+        error: "Пользователь z_karlygash не найден или отключен"
+      });
+    }
+
+    const q = await pool.query(`
+      UPDATE lzk.limits
+      SET note = $2
+      WHERE idlzk = $1
+      RETURNING idlzk, note
+    `, [idlzk, note]);
+
+    if (!q.rows.length) {
+      return res.status(404).json({
+        success: false,
+        error: "IDLZK не найден: " + idlzk
+      });
+    }
+
+    return res.json({
+      success: true,
+      row: q.rows[0]
+    });
+  } catch (e) {
+    console.error("LZK LIMIT NOTE ERROR:", e);
+    return res.status(500).json({ success: false, error: e.message });
   }
 });
 
