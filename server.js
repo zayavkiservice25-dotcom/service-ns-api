@@ -15234,8 +15234,66 @@ app.post("/zvk-funding-pools/save", async (req, res) => {
 
 app.get("/draft-funding-summary", async (req, res) => {
   try {
-
     const result = await pool.query(`
+      WITH alloc AS (
+        SELECT
+          a.funding_pool_id,
+
+          COALESCE(SUM(a.amount) FILTER (
+            WHERE lower(trim(COALESCE(cur.request_flag, ''))) <> lower('Обнуление')
+          ), 0)::numeric AS ft_amount,
+
+          COALESCE(SUM(a.amount) FILTER (
+            WHERE trim(COALESCE(cur.is_paid, '')) = 'Да'
+              AND lower(trim(COALESCE(cur.request_flag, ''))) <> lower('Обнуление')
+          ), 0)::numeric AS paid_since_launch,
+
+          COALESCE(SUM(a.amount) FILTER (
+            WHERE trim(COALESCE(cur.registry_flag, '')) = 'Да'
+              AND trim(COALESCE(cur.is_paid, '')) <> 'Да'
+              AND lower(trim(COALESCE(cur.request_flag, ''))) <> lower('Обнуление')
+          ), 0)::numeric AS registry_amount,
+
+          COALESCE(SUM(a.amount) FILTER (
+            WHERE trim(COALESCE(cur.request_flag, '')) = 'Да'
+              AND trim(COALESCE(cur.registry_flag, '')) <> 'Да'
+              AND trim(COALESCE(cur.is_paid, '')) <> 'Да'
+          ), 0)::numeric AS request_amount
+
+        FROM public.zvk_funding_pool_allocations a
+        JOIN public.ft_zvk_current_v2 cur
+          ON cur.zvk_row_id = a.zvk_row_id
+        GROUP BY a.funding_pool_id
+      ),
+
+      ops AS (
+        SELECT
+          o.pool_id,
+
+          COALESCE(SUM(o.amount) FILTER (
+            WHERE o.operation_type = 'RESERVE'
+          ), 0)::numeric AS reserved_amount,
+
+          COALESCE(SUM(o.amount) FILTER (
+            WHERE o.operation_type = 'PAYMENT'
+          ), 0)::numeric AS paid_amount,
+
+          COALESCE(SUM(o.amount) FILTER (
+            WHERE o.operation_type = 'RELEASE'
+          ), 0)::numeric AS released_amount,
+
+          COALESCE(SUM(o.amount) FILTER (
+            WHERE o.operation_type = 'IN'
+          ), 0)::numeric AS incoming_amount,
+
+          COALESCE(SUM(o.amount) FILTER (
+            WHERE o.operation_type = 'ADJUST'
+          ), 0)::numeric AS adjust_amount
+
+        FROM public.draft_funding_operation o
+        GROUP BY o.pool_id
+      )
+
       SELECT
         p.id,
         p.legal_entity,
@@ -15245,159 +15303,40 @@ app.get("/draft-funding-summary", async (req, res) => {
         p.beneficiary_login,
         p.amount AS pool_amount,
 
-        COALESCE((
-          SELECT SUM(a.amount)
-          FROM public.zvk_funding_pool_allocations a
-          JOIN public.ft_zvk_current_v2 cur
-            ON cur.zvk_row_id = a.zvk_row_id
-          WHERE a.funding_pool_id = p.id
-            AND lower(trim(COALESCE(cur.request_flag, ''))) <> lower('Обнуление')
-        ), 0)::numeric AS ft_amount,
+        COALESCE(a.ft_amount, 0)::numeric AS ft_amount,
 
         (
-          p.amount
-          - COALESCE((
-              SELECT SUM(a.amount)
-              FROM public.zvk_funding_pool_allocations a
-              JOIN public.ft_zvk_current_v2 cur
-                ON cur.zvk_row_id = a.zvk_row_id
-              WHERE a.funding_pool_id = p.id
-                AND lower(trim(COALESCE(cur.request_flag, ''))) <> lower('Обнуление')
-            ), 0)
+          p.amount - COALESCE(a.ft_amount, 0)
         )::numeric AS ft_balance,
 
-        COALESCE((
-          SELECT SUM(a.amount)
-          FROM public.zvk_funding_pool_allocations a
-          JOIN public.ft_zvk_current_v2 cur
-            ON cur.zvk_row_id = a.zvk_row_id
-          WHERE a.funding_pool_id = p.id
-            AND trim(COALESCE(cur.is_paid, '')) = 'Да'
-            AND lower(trim(COALESCE(cur.request_flag, ''))) <> lower('Обнуление')
-        ), 0)::numeric AS paid_since_launch,
+        COALESCE(a.paid_since_launch, 0)::numeric AS paid_since_launch,
+        COALESCE(a.registry_amount, 0)::numeric AS registry_amount,
+        COALESCE(a.request_amount, 0)::numeric AS request_amount,
 
-        COALESCE((
-          SELECT SUM(a.amount)
-          FROM public.zvk_funding_pool_allocations a
-          JOIN public.ft_zvk_current_v2 cur
-            ON cur.zvk_row_id = a.zvk_row_id
-          WHERE a.funding_pool_id = p.id
-            AND trim(COALESCE(cur.registry_flag, '')) = 'Да'
-            AND trim(COALESCE(cur.is_paid, '')) <> 'Да'
-            AND lower(trim(COALESCE(cur.request_flag, ''))) <> lower('Обнуление')
-        ), 0)::numeric AS registry_amount,
-
-        COALESCE((
-          SELECT SUM(a.amount)
-          FROM public.zvk_funding_pool_allocations a
-          JOIN public.ft_zvk_current_v2 cur
-            ON cur.zvk_row_id = a.zvk_row_id
-          WHERE a.funding_pool_id = p.id
-            AND trim(COALESCE(cur.request_flag, '')) = 'Да'
-            AND trim(COALESCE(cur.registry_flag, '')) <> 'Да'
-            AND trim(COALESCE(cur.is_paid, '')) <> 'Да'
-        ), 0)::numeric AS request_amount,
-
-        COALESCE(SUM(
-          CASE
-            WHEN o.operation_type = 'RESERVE'
-              THEN o.amount
-            ELSE 0
-          END
-        ), 0) AS reserved_amount,
-
-        COALESCE(SUM(
-          CASE
-            WHEN o.operation_type = 'PAYMENT'
-              THEN o.amount
-            ELSE 0
-          END
-        ), 0) AS paid_amount,
-
-        COALESCE(SUM(
-          CASE
-            WHEN o.operation_type = 'RELEASE'
-              THEN o.amount
-            ELSE 0
-          END
-        ), 0) AS released_amount,
-
-        COALESCE(SUM(
-          CASE
-            WHEN o.operation_type = 'IN'
-              THEN o.amount
-            ELSE 0
-          END
-        ), 0) AS incoming_amount,
-
-        COALESCE(SUM(
-          CASE
-            WHEN o.operation_type = 'ADJUST'
-              THEN o.amount
-            ELSE 0
-          END
-        ), 0) AS adjust_amount,
+        COALESCE(o.reserved_amount, 0)::numeric AS reserved_amount,
+        COALESCE(o.paid_amount, 0)::numeric AS paid_amount,
+        COALESCE(o.released_amount, 0)::numeric AS released_amount,
+        COALESCE(o.incoming_amount, 0)::numeric AS incoming_amount,
+        COALESCE(o.adjust_amount, 0)::numeric AS adjust_amount,
 
         (
           p.amount
-
-          + COALESCE(SUM(
-              CASE
-                WHEN o.operation_type = 'IN'
-                  THEN o.amount
-                ELSE 0
-              END
-            ), 0)
-
-          + COALESCE(SUM(
-              CASE
-                WHEN o.operation_type = 'ADJUST'
-                  THEN o.amount
-                ELSE 0
-              END
-            ), 0)
-
-          + COALESCE(SUM(
-              CASE
-                WHEN o.operation_type = 'RELEASE'
-                  THEN o.amount
-                ELSE 0
-              END
-            ), 0)
-
-          - COALESCE(SUM(
-              CASE
-                WHEN o.operation_type = 'RESERVE'
-                  THEN o.amount
-                ELSE 0
-              END
-            ), 0)
-
-          - COALESCE(SUM(
-              CASE
-                WHEN o.operation_type = 'PAYMENT'
-                  THEN o.amount
-                ELSE 0
-              END
-            ), 0)
-
-        ) AS available_amount
+          + COALESCE(o.incoming_amount, 0)
+          + COALESCE(o.adjust_amount, 0)
+          + COALESCE(o.released_amount, 0)
+          - COALESCE(o.reserved_amount, 0)
+          - COALESCE(o.paid_amount, 0)
+        )::numeric AS available_amount
 
       FROM public.draft_funding_pool p
 
-      LEFT JOIN public.draft_funding_operation o
+      LEFT JOIN alloc a
+        ON a.funding_pool_id = p.id
+
+      LEFT JOIN ops o
         ON o.pool_id = p.id
 
       WHERE p.is_active = true
-
-      GROUP BY
-        p.id,
-        p.legal_entity,
-        p.source_name,
-        p.money_type,
-        p.object_name,
-        p.beneficiary_login,
-        p.amount
 
       ORDER BY
         p.legal_entity,
@@ -15406,19 +15345,13 @@ app.get("/draft-funding-summary", async (req, res) => {
         p.object_name
     `);
 
-
     return res.json({
       success: true,
       rows: result.rows
     });
 
-
   } catch (e) {
-
-    console.error(
-      "DRAFT FUNDING SUMMARY ERROR:",
-      e
-    );
+    console.error("DRAFT FUNDING SUMMARY ERROR:", e);
 
     return res.status(500).json({
       success: false,
