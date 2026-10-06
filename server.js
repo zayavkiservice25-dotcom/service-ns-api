@@ -2819,60 +2819,8 @@ async function canEditRowByLogin(poolOrClient, zvk_row_id, login) {
 
 const ISMAGULOV_LOGIN = "z_karlygash";
 
-// Исмагулов участвует в согласовании только для этих дивизионов.
-// Проверка выполняется первой: Дивизион -> Объект -> Статья ДДС.
-const ISMAGULOV_DIVISIONS = new Set([
-  "Мост",
-  "Сети",
-  "Механизация"
-]);
-
-function normalizeRequestDivision(value) {
-  return String(value || "")
-    .replace(/\u00A0/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function divisionNeedsIsmagulov(value) {
-  return ISMAGULOV_DIVISIONS.has(normalizeRequestDivision(value));
-}
-
-const ISMAGULOV_OBJECTS = new Set([
-  "05-М-Акм. Есиль",
-  "32-М-АлмО. Подкова Алматы",
-  "34-Д-Акм. Акколь",
-  "46-М-Жет. Алмалы 145+950км",
-  "47-М-Жет. Коктерек 2+708км",
-  "48-М-Жет. Тюгельбай 5+250км",
-  "49-М-Жет. Кабанбай 23+850км",
-  "50-М-Жет. Койлык 6+890км",
-  "51-М-Жет. Молалы 64+870км",
-  "52-М-Жет. Карабулак 54+411км",
-  "53-М-Жет. Тастобе 3+462км",
-  "55-М-Жет. Сарыозек Обход",
-  "57-Д-Акм. Макинск",
-  "58-Д-Аст. Улица 37",
-  "61-Д-Акм. Жалтырколь",
-  "63-Д-Аст. Оренбургская",
-  "64-Д-Жет. Хоргос",
-  "67-М-Акт. Жем",
-  "75-М-Крг. Шилы",
-  "76-М-Крг. Шат",
-  "77-М-Акт. Кауылжыр",
-  "78-Д-Аст. Уркер"
-]);
-
-function normalizeRequestObject(value) {
-  return String(value || "")
-    .replace(/\u00A0/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function objectNeedsIsmagulov(value) {
-  return ISMAGULOV_OBJECTS.has(normalizeRequestObject(value));
-}
+// Карлыгаш участвует в согласовании ТОЛЬКО по Статье ДДС.
+// Объект и дивизион на маршрут согласования не влияют.
 
 // Справочник Google Sheets:
 // лист «Статья ДДС»
@@ -3008,9 +2956,27 @@ function getRequestDdsCode(value) {
   return match ? match[1] : "";
 }
 
+const KARLYGASH_EXCLUDED_OBJECTS = new Set([
+  "Кордай пос. (Мост через р.Шу на Каз-Кыр границе)",
+  "Офис",
+  "Офис Жетысу"
+]);
+
+function normalizeKarlygashObject(value) {
+  return String(value || "")
+    .replace(/\u00A0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 async function rowNeedsIsmagulov(row) {
-  // Карлыгаш согласует ТОЛЬКО по Статье ДДС.
-  // Дивизион, объект и ЮрЛицо больше не участвуют в определении маршрута.
+  // Карлыгаш согласует по Статье ДДС, НО не согласует три объекта-исключения.
+  const currentObject = normalizeKarlygashObject(row?.object);
+
+  if (KARLYGASH_EXCLUDED_OBJECTS.has(currentObject)) {
+    return false;
+  }
+
   const allowed = await loadIsmagulovDdsArticles();
   const currentArticle = normalizeRequestDds(row?.dds_article);
 
@@ -3035,11 +3001,6 @@ async function rowNeedsIsmagulov(row) {
 async function requestNeedsIsmagulov(client, requestId) {
   const result = await client.query(`
     SELECT
-      COALESCE(
-        NULLIF(trim(cur.legal_entity), ''),
-        NULLIF(trim(i.src_d), ''),
-        ''
-      ) AS legal_entity,
       COALESCE(
         NULLIF(trim(cur.object), ''),
         NULLIF(trim(i.object), ''),
