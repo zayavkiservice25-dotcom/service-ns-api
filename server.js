@@ -248,6 +248,33 @@ await pool.query(`
   WHERE beneficiary_login IS NOT NULL AND trim(beneficiary_login) <> '';
 `);
 
+// История переводов свободного остатка между дочерними пулами.
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS public.draft_funding_pool_transfer (
+    id bigserial PRIMARY KEY,
+    from_pool_id bigint NOT NULL,
+    to_pool_id bigint,
+    beneficiary_login text NOT NULL,
+    from_legal_entity text,
+    from_object_name text,
+    to_legal_entity text,
+    to_object_name text,
+    amount numeric(18,2) NOT NULL CHECK (amount > 0),
+    created_by text,
+    created_at timestamptz DEFAULT now()
+  );
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS draft_funding_pool_transfer_from_idx
+  ON public.draft_funding_pool_transfer (from_pool_id, created_at DESC);
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS draft_funding_pool_transfer_login_idx
+  ON public.draft_funding_pool_transfer (lower(trim(beneficiary_login)), created_at DESC);
+`);
+
 await pool.query(`
   ALTER TABLE public.zvk_status
   ADD COLUMN IF NOT EXISTS money_type text;
@@ -15908,6 +15935,253 @@ app.post("/draft-funding-pools/:poolId/return", async (req, res) => {
   }
 });
 
+
+
+// =====================================================
+// ПЕРЕВОД СВОБОДНОГО ОСТАТКА ИНИЦИАТОРА МЕЖДУ ДОЧЕРНИМИ ПУЛАМИ
+// - обычный инициатор может переводить только свой beneficiary_login;
+// - b_erkin / s_zhasulan / k_ermek могут переводить любой дочерний пул;
+// - уже использованная в ФТ сумма не переносится;
+// - Источник, Тип и parent_pool_id сохраняются;
+// - меняются ЮрЛицо / Объект и amount дочерних строк.
+// =====================================================
+app.post("/draft-funding-pools/:poolId/transfer", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const poolId = Number(req.params.poolId);
+    const amount = Number(req.body?.amount);
+    const login = String(req.body?.login || "").trim().toLowerCase();
+    const targetLegalEntity = String(req.body?.target_legal_entity || "").trim();
+    const targetObjectName = String(
+      req.body?.target_object_name || req.body?.target_object || req.body?.object_name || ""
+    ).trim();
+    const admins = ["b_erkin", "s_zhasulan", "k_ermek"];
+
+    if (!login) {
+      return res.status(400).json({ success:false, error:"Не определён логин пользователя" });
+    }
+    if (!Number.isInteger(poolId) || poolId <= 0) {
+      return res.status(400).json({ success:false, error:"Неверный pool_id" });
+    }
+    if (!targetLegalEntity) {
+      return res.status(400).json({ success:false, error:"Новое ЮрЛицо не заполнено" });
+    }
+    if (!targetObjectName) {
+      return res.status(400).json({ success:false, error:"Новый объект не заполнен" });
+    }
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ success:false, error:"Сумма перевода должна быть больше 0" });
+    }
+
+    await client.query("BEGIN");
+
+    const sourceQ = await client.query(`
+      SELECT
+        id,
+        parent_pool_id,
+        legal_entity,
+        source_name,
+        money_type,
+        object_name,
+        beneficiary_login,
+        amount
+      FROM public.draft_funding_pool
+      WHERE id = $1
+        AND parent_pool_id IS NOT NULL
+        AND is_active = true
+      FOR UPDATE
+    `, [poolId]);
+
+    if (!sourceQ.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success:false, error:"Распределенный пул не найден" });
+    }
+
+    const source = sourceQ.rows[0];
+    const beneficiaryLogin = String(source.beneficiary_login || "").trim();
+    const ownerLogin = beneficiaryLogin.toLowerCase();
+    const isAdmin = admins.includes(login);
+
+    if (!beneficiaryLogin) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ success:false, error:"У пула не указан инициатор" });
+    }
+    if (!isAdmin && ownerLogin !== login) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ success:false, error:"Можно переводить только свой свободный остаток" });
+    }
+
+    const sameLegal = String(source.legal_entity || "").trim().toLowerCase() === targetLegalEntity.toLowerCase();
+    const sameObject = String(source.object_name || "").trim().toLowerCase() === targetObjectName.toLowerCase();
+    if (sameLegal && sameObject) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ success:false, error:"Выберите другое ЮрЛицо или другой объект" });
+    }
+
+    // Сумма, уже использованная строками ZFT, остаётся в исходном пуле.
+    const usedQ = await client.query(`
+      SELECT COALESCE(SUM(a.amount), 0)::numeric AS used_amount
+      FROM public.zvk_funding_pool_allocations a
+      LEFT JOIN public.ft_zvk_current_v2 cur
+        ON cur.zvk_row_id = a.zvk_row_id
+      WHERE a.funding_pool_id = $1
+        AND (
+          cur.zvk_row_id IS NULL
+          OR lower(trim(COALESCE(cur.request_flag, ''))) <> lower('Обнуление')
+        )
+    `, [poolId]);
+
+    const sourceAmount = Number(source.amount || 0);
+    const usedAmount = Number(usedQ.rows[0]?.used_amount || 0);
+    const sourceCents = Math.round(sourceAmount * 100);
+    const usedCents = Math.round(usedAmount * 100);
+    const amountCents = Math.round(amount * 100);
+    const freeCents = Math.max(0, sourceCents - usedCents);
+
+    if (amountCents > freeCents) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        success:false,
+        error:
+          "Можно перевести не больше свободного остатка: " +
+          (freeCents / 100).toLocaleString("ru-RU", {
+            minimumFractionDigits:2,
+            maximumFractionDigits:2
+          })
+      });
+    }
+
+    // Ищем уже существующий целевой дочерний пул того же общего источника.
+    const targetQ = await client.query(`
+      SELECT id, amount
+      FROM public.draft_funding_pool
+      WHERE is_active = true
+        AND parent_pool_id = $1
+        AND lower(trim(COALESCE(legal_entity, ''))) = lower(trim($2))
+        AND lower(trim(COALESCE(source_name, ''))) = lower(trim($3))
+        AND lower(trim(COALESCE(money_type, ''))) = lower(trim($4))
+        AND lower(trim(COALESCE(object_name, ''))) = lower(trim($5))
+        AND lower(trim(COALESCE(beneficiary_login, ''))) = lower(trim($6))
+        AND id <> $7
+      ORDER BY id
+      LIMIT 1
+      FOR UPDATE
+    `, [
+      source.parent_pool_id,
+      targetLegalEntity,
+      source.source_name,
+      source.money_type,
+      targetObjectName,
+      beneficiaryLogin,
+      poolId
+    ]);
+
+    let targetPoolId;
+    if (targetQ.rowCount) {
+      const targetPool = targetQ.rows[0];
+      const newTargetAmount = Number(targetPool.amount || 0) + amountCents / 100;
+      await client.query(`
+        UPDATE public.draft_funding_pool
+        SET amount = $2
+        WHERE id = $1
+      `, [targetPool.id, newTargetAmount]);
+      targetPoolId = Number(targetPool.id);
+    } else {
+      const insQ = await client.query(`
+        INSERT INTO public.draft_funding_pool (
+          legal_entity,
+          source_name,
+          money_type,
+          object_name,
+          beneficiary_login,
+          amount,
+          parent_pool_id,
+          is_active,
+          created_by,
+          created_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, true, $8, NOW())
+        RETURNING id
+      `, [
+        targetLegalEntity,
+        source.source_name,
+        source.money_type,
+        targetObjectName,
+        beneficiaryLogin,
+        amountCents / 100,
+        source.parent_pool_id,
+        login
+      ]);
+      targetPoolId = Number(insQ.rows[0].id);
+    }
+
+    const newSourceCents = sourceCents - amountCents;
+    const newSourceAmount = newSourceCents / 100;
+
+    // При полном переводе полностью свободного пула строка больше не нужна.
+    if (newSourceCents <= 0 && usedCents <= 0) {
+      await client.query(`
+        DELETE FROM public.draft_funding_pool
+        WHERE id = $1
+      `, [poolId]);
+    } else {
+      await client.query(`
+        UPDATE public.draft_funding_pool
+        SET amount = $2
+        WHERE id = $1
+      `, [poolId, newSourceAmount]);
+    }
+
+    await client.query(`
+      INSERT INTO public.draft_funding_pool_transfer (
+        from_pool_id,
+        to_pool_id,
+        beneficiary_login,
+        from_legal_entity,
+        from_object_name,
+        to_legal_entity,
+        to_object_name,
+        amount,
+        created_by,
+        created_at
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+    `, [
+      poolId,
+      targetPoolId,
+      beneficiaryLogin,
+      source.legal_entity,
+      source.object_name,
+      targetLegalEntity,
+      targetObjectName,
+      amountCents / 100,
+      login
+    ]);
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success:true,
+      from_pool_id:poolId,
+      to_pool_id:targetPoolId,
+      beneficiary_login:beneficiaryLogin,
+      transferred_amount:amountCents / 100,
+      used_amount:usedCents / 100,
+      source_old_amount:sourceCents / 100,
+      source_new_amount:newSourceCents / 100,
+      target_legal_entity:targetLegalEntity,
+      target_object_name:targetObjectName
+    });
+
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+    console.error("DRAFT FUNDING TRANSFER ERROR:", e);
+    return res.status(500).json({ success:false, error:e.message });
+  } finally {
+    client.release();
+  }
+});
 
 
 // =====================================================
