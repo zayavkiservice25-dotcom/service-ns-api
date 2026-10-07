@@ -14756,6 +14756,7 @@ app.get("/lzk/request-print/data", async (req, res) => {
           COALESCE(r.fact_qty, 0) AS fact_qty,
           r.pto_date,
           r.deadline,
+          r.note,
 
           COALESCE(l.plan_qty, 0) AS plan_qty,
           COALESCE(l.fact_received, 0) AS fact_received
@@ -14830,7 +14831,8 @@ app.get("/lzk/request-print/data", async (req, res) => {
           - p.approved_period_running
         ) AS remaining,
 
-        to_char(p.deadline, 'YYYY-MM-DD') AS deadline
+        to_char(p.deadline, 'YYYY-MM-DD') AS deadline,
+        COALESCE(p.note, '') AS note
 
       FROM period_rows p
 
