@@ -15957,6 +15957,7 @@ app.post("/draft-funding-pools/:poolId/transfer", async (req, res) => {
       req.body?.target_object_name || req.body?.target_object || req.body?.object_name || ""
     ).trim();
     const admins = ["b_erkin", "s_zhasulan", "k_ermek"];
+    const allowedOwnTransfer = ["r_gulnur", "a_zaitova"];
 
     if (!login) {
       return res.status(400).json({ success:false, error:"Не определён логин пользователя" });
@@ -16007,9 +16008,15 @@ app.post("/draft-funding-pools/:poolId/transfer", async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(400).json({ success:false, error:"У пула не указан инициатор" });
     }
-    if (!isAdmin && ownerLogin !== login) {
-      await client.query("ROLLBACK");
-      return res.status(403).json({ success:false, error:"Можно переводить только свой свободный остаток" });
+    if (!isAdmin) {
+      if (!allowedOwnTransfer.includes(login)) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({ success:false, error:"Нет доступа к переводу пулов" });
+      }
+      if (ownerLogin !== login) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({ success:false, error:"Можно переводить только свой свободный остаток" });
+      }
     }
 
     const sameLegal = String(source.legal_entity || "").trim().toLowerCase() === targetLegalEntity.toLowerCase();
