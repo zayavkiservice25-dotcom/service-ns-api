@@ -15975,6 +15975,34 @@ app.post("/draft-funding-pools/:poolId/transfer", async (req, res) => {
       return res.status(400).json({ success:false, error:"Сумма перевода должна быть больше 0" });
     }
 
+    // Страховка для старых баз/деплоев: таблица истории могла ещё не быть создана.
+    // CREATE TABLE IF NOT EXISTS безопасен и ничего не удаляет.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS public.draft_funding_pool_transfer (
+        id bigserial PRIMARY KEY,
+        from_pool_id bigint NOT NULL,
+        to_pool_id bigint,
+        beneficiary_login text NOT NULL,
+        from_legal_entity text,
+        from_object_name text,
+        to_legal_entity text,
+        to_object_name text,
+        amount numeric(18,2) NOT NULL CHECK (amount > 0),
+        created_by text,
+        created_at timestamptz DEFAULT now()
+      )
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS draft_funding_pool_transfer_from_idx
+      ON public.draft_funding_pool_transfer (from_pool_id, created_at DESC)
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS draft_funding_pool_transfer_login_idx
+      ON public.draft_funding_pool_transfer (lower(trim(beneficiary_login)), created_at DESC)
+    `);
+
     await client.query("BEGIN");
 
     const sourceQ = await client.query(`
