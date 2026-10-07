@@ -16192,14 +16192,14 @@ app.post("/draft-funding-pools/:poolId/transfer", async (req, res) => {
 
 
 // =====================================================
-// РАСПРЕДЕЛЕНИЕ НЕРАСПРЕДЕЛЁННОЙ СУММЫ МЕЖДУ ЮРЛИЦАМИ
+// ПЕРЕВОД НЕРАСПРЕДЕЛЁННОЙ СУММЫ МЕЖДУ ЮРЛИЦАМИ
 // ВАЖНО:
-// - Общая сумма родительского пула НЕ меняется.
-// - Сумма добавляется в "Распределено".
-// - "Не распределено" уменьшается автоматически.
-// - Создаётся дочерняя строка с другим ЮрЛицом.
+// - Это именно перевод общего пула, а не дочернее распределение.
+// - У исходного общего пула уменьшается Общая сумма.
+// - У целевого общего пула (ЮрЛицо + Источник + Тип) сумма увеличивается.
+// - Если целевого общего пула ещё нет — создаётся новый parent_pool_id = NULL.
+// - Благодаря этому целевое ЮрЛицо сразу появляется в списке «Общие денежные пулы».
 // - Источник и Тип сохраняются.
-// - Объект и Логин для такого распределения пустые.
 // =====================================================
 app.post("/draft-funding-pools/:poolId/transfer-unallocated-legal-entity", async (req, res) => {
   const client = await pool.connect();
@@ -16218,34 +16218,25 @@ app.post("/draft-funding-pools/:poolId/transfer-unallocated-legal-entity", async
     if (!allowed.includes(actorLogin)) {
       return res.status(403).json({
         success:false,
-        error:"Нет доступа к распределению между ЮрЛицами"
+        error:"Нет доступа к переводу между ЮрЛицами"
       });
     }
 
     if (!Number.isInteger(poolId) || poolId <= 0) {
-      return res.status(400).json({
-        success:false,
-        error:"Неверный pool_id"
-      });
+      return res.status(400).json({ success:false, error:"Неверный pool_id" });
     }
 
     if (!targetLegalEntity) {
-      return res.status(400).json({
-        success:false,
-        error:"Выберите новое ЮрЛицо"
-      });
+      return res.status(400).json({ success:false, error:"Выберите новое ЮрЛицо" });
     }
 
     if (!Number.isFinite(amount) || amount <= 0) {
-      return res.status(400).json({
-        success:false,
-        error:"Сумма должна быть больше 0"
-      });
+      return res.status(400).json({ success:false, error:"Сумма должна быть больше 0" });
     }
 
     await client.query("BEGIN");
 
-    const parentQ = await client.query(`
+    const sourceQ = await client.query(`
       SELECT
         p.id,
         p.legal_entity,
@@ -16260,30 +16251,29 @@ app.post("/draft-funding-pools/:poolId/transfer-unallocated-legal-entity", async
       FOR UPDATE
     `, [poolId]);
 
-    if (!parentQ.rows.length) {
+    if (!sourceQ.rows.length) {
       throw new Error("Общий пул не найден");
     }
 
-    const parent = parentQ.rows[0];
+    const source = sourceQ.rows[0];
 
     if (
-      String(parent.legal_entity || "").trim().toLowerCase() ===
+      String(source.legal_entity || "").trim().toLowerCase() ===
       targetLegalEntity.toLowerCase()
     ) {
       throw new Error("Выберите другое ЮрЛицо");
     }
 
-    // Считаем текущее распределение ВСЕХ дочерних строк,
-    // включая распределения по объектам и переводы между ЮрЛицами.
+    // Распределено по объектам из исходного общего пула.
     const allocatedQ = await client.query(`
-      SELECT COALESCE(SUM(c.amount), 0) AS allocated_amount
+      SELECT COALESCE(SUM(c.amount), 0)::numeric AS allocated_amount
       FROM public.draft_funding_pool c
       WHERE c.parent_pool_id = $1
         AND c.is_active = true
     `, [poolId]);
 
-    const totalAmount = Number(parent.amount || 0);
-    const allocatedAmount = Number(allocatedQ.rows[0].allocated_amount || 0);
+    const totalAmount = Number(source.amount || 0);
+    const allocatedAmount = Number(allocatedQ.rows[0]?.allocated_amount || 0);
 
     const totalCents = Math.round(totalAmount * 100);
     const allocatedCents = Math.round(allocatedAmount * 100);
@@ -16291,63 +16281,52 @@ app.post("/draft-funding-pools/:poolId/transfer-unallocated-legal-entity", async
     const transferCents = Math.round(amount * 100);
 
     if (transferCents > availableCents) {
-      const available = availableCents / 100;
-
       await client.query("ROLLBACK");
-
       return res.status(400).json({
         success:false,
         error:
-          "Нельзя распределить больше «Не распределено». Доступно: " +
-          available.toLocaleString("ru-RU", {
+          "Нельзя перевести больше «Не распределено». Доступно: " +
+          (availableCents / 100).toLocaleString("ru-RU", {
             minimumFractionDigits:2,
             maximumFractionDigits:2
           })
       });
     }
 
-    // Если такое распределение между ЮрЛицами уже есть,
-    // увеличиваем его. Иначе создаём новую дочернюю строку.
-    const existingQ = await client.query(`
+    // Ищем отдельный ОБЩИЙ пул у целевого ЮрЛица с тем же Источником и Типом.
+    const targetQ = await client.query(`
       SELECT id, amount
       FROM public.draft_funding_pool
       WHERE is_active = true
-        AND parent_pool_id = $1
-        AND lower(trim(legal_entity)) = lower(trim($2))
-        AND lower(trim(source_name)) = lower(trim($3))
-        AND lower(trim(money_type)) = lower(trim($4))
+        AND parent_pool_id IS NULL
         AND COALESCE(trim(object_name), '') = ''
-        AND COALESCE(trim(beneficiary_login), '') = ''
+        AND lower(trim(legal_entity)) = lower(trim($1))
+        AND lower(trim(source_name)) = lower(trim($2))
+        AND lower(trim(money_type)) = lower(trim($3))
       ORDER BY id
       LIMIT 1
       FOR UPDATE
     `, [
-      poolId,
       targetLegalEntity,
-      parent.source_name,
-      parent.money_type
+      source.source_name,
+      source.money_type
     ]);
 
-    let row;
+    let targetRow;
 
-    if (existingQ.rows.length) {
-      const upd = await client.query(`
+    if (targetQ.rows.length) {
+      const updTarget = await client.query(`
         UPDATE public.draft_funding_pool
         SET
           amount = COALESCE(amount, 0) + $2,
           created_by = COALESCE(NULLIF($3, ''), created_by)
         WHERE id = $1
         RETURNING *
-      `, [
-        existingQ.rows[0].id,
-        amount,
-        actor
-      ]);
+      `, [targetQ.rows[0].id, transferCents / 100, actor]);
 
-      row = upd.rows[0];
-
+      targetRow = updTarget.rows[0];
     } else {
-      const ins = await client.query(`
+      const insTarget = await client.query(`
         INSERT INTO public.draft_funding_pool (
           legal_entity,
           source_name,
@@ -16360,49 +16339,52 @@ app.post("/draft-funding-pools/:poolId/transfer-unallocated-legal-entity", async
           created_by,
           created_at
         )
-        VALUES (
-          $1, $2, $3, '', '', $4, $5, true, NULLIF($6, ''), NOW()
-        )
+        VALUES ($1,$2,$3,'','',$4,NULL,true,NULLIF($5,''),NOW())
         RETURNING *
       `, [
         targetLegalEntity,
-        parent.source_name,
-        parent.money_type,
-        amount,
-        poolId,
+        source.source_name,
+        source.money_type,
+        transferCents / 100,
         actor
       ]);
 
-      row = ins.rows[0];
+      targetRow = insTarget.rows[0];
     }
+
+    // У исходного общего пула уменьшаем Общую сумму.
+    const newSourceTotalCents = totalCents - transferCents;
+
+    if (newSourceTotalCents < allocatedCents) {
+      throw new Error("После перевода общая сумма исходного пула станет меньше уже распределённой суммы");
+    }
+
+    await client.query(`
+      UPDATE public.draft_funding_pool
+      SET amount = $2
+      WHERE id = $1
+    `, [poolId, newSourceTotalCents / 100]);
 
     await client.query("COMMIT");
 
-    const newAllocatedCents = allocatedCents + transferCents;
-    const newUnallocatedCents = totalCents - newAllocatedCents;
-
     return res.json({
       success:true,
-      row,
-      parent:{
-        pool_id:Number(parent.id),
-        legal_entity:parent.legal_entity,
-        total_amount:totalAmount,
-        allocated_amount:newAllocatedCents / 100,
-        unallocated_amount:newUnallocatedCents / 100
-      }
+      transferred_amount:transferCents / 100,
+      source:{
+        pool_id:Number(source.id),
+        legal_entity:source.legal_entity,
+        old_total_amount:totalAmount,
+        new_total_amount:newSourceTotalCents / 100,
+        allocated_amount:allocatedCents / 100,
+        unallocated_amount:(newSourceTotalCents - allocatedCents) / 100
+      },
+      target:targetRow
     });
 
   } catch (e) {
     try { await client.query("ROLLBACK"); } catch (_) {}
-
-    console.error("DRAFT FUNDING LEGAL ALLOCATION ERROR:", e);
-
-    return res.status(500).json({
-      success:false,
-      error:e.message
-    });
-
+    console.error("DRAFT FUNDING LEGAL TRANSFER ERROR:", e);
+    return res.status(500).json({ success:false, error:e.message });
   } finally {
     client.release();
   }
