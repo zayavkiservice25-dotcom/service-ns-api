@@ -3075,6 +3075,21 @@ async function requestIsServiceNs(client, requestId) {
 }
 
 
+
+// Статус попадания в реестр фиксируется сразу при создании.
+// agree_time не устанавливаем: это не дата согласования.
+async function markRowsAsRegistryCreated(client, rowIds) {
+  const ids = [...new Set(rowIds.map(Number).filter(Number.isSafeInteger))];
+  if (!ids.length) return;
+  await client.query(`
+    INSERT INTO public.zvk_pay (zvk_row_id, registry_flag)
+    SELECT z.id, 'Да' FROM public.zvk z WHERE z.id = ANY($1::bigint[])
+    ON CONFLICT (zvk_row_id) DO UPDATE
+    SET registry_flag = 'Да'
+    WHERE COALESCE(public.zvk_pay.registry_flag, '') <> 'Обнуление'
+  `, [ids]);
+}
+
 app.post("/create-request", async (req, res) => {
   const client = await pool.connect();
 
@@ -3162,6 +3177,9 @@ app.post("/create-request", async (req, res) => {
         WHERE v.zvk_row_id = $2
         RETURNING to_pay
       `, [request_id, oneRowId]);
+
+      if (items.rowCount !== 1) throw new Error('Строка ФТ для заявки не найдена');
+      await markRowsAsRegistryCreated(client, [oneRowId]);
 
       const total = items.rows.reduce((s, r) => s + Number(r.to_pay || 0), 0);
       const count = items.rows.length;
@@ -3384,6 +3402,8 @@ app.post("/create-registry", async (req, res) => {
     if (!items.rowCount) {
       throw new Error("Строки для реестра не найдены");
     }
+
+    await markRowsAsRegistryCreated(client, items.rows.map(r => r.zvk_row_id));
 
     const total = items.rows.reduce((s, r) => s + Number(r.to_pay || 0), 0);
     const count = items.rows.length;
@@ -7497,9 +7517,7 @@ z_karlygash: {
         (isServiceNs && login === "a_zaitova")
       );
 
-    if (shouldSetRegistryYes) {
-      await setRequestRegistryYes(client, requestId);
-    }
+    // Признак реестра уже проставлен при создании; согласование его не меняет.
 
     await client.query("COMMIT");
 
@@ -7510,7 +7528,7 @@ z_karlygash: {
       action,
       status: statusText,
       needs_ismagulov: needsIsmagulov,
-      registry_flag: shouldSetRegistryYes ? "Да" : null
+      registry_flag: "Да"
     });
 
   } catch (e) {
@@ -15239,7 +15257,9 @@ app.get("/draft-funding-summary", async (req, res) => {
           ), 0)::numeric AS paid_since_launch,
 
           COALESCE(SUM(a.amount) FILTER (
-            WHERE trim(COALESCE(cur.registry_flag, '')) = 'Да'
+            WHERE (trim(COALESCE(cur.registry_flag, '')) = 'Да'
+              OR EXISTS (SELECT 1 FROM public.request_items ri WHERE ri.zvk_row_id = cur.zvk_row_id)
+              OR EXISTS (SELECT 1 FROM public.registry_items gi WHERE gi.zvk_row_id = cur.zvk_row_id))
               AND trim(COALESCE(cur.is_paid, '')) <> 'Да'
               AND lower(trim(COALESCE(cur.request_flag, ''))) <> lower('Обнуление')
           ), 0)::numeric AS registry_amount,
