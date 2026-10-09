@@ -17893,7 +17893,7 @@ const hrPublic_ = r=>({
   legal_entity:r.legal_entity||'',destination:[r.destination_city,r.destination_country].filter(Boolean).join(', '),
   date_from:r.date_from instanceof Date?r.date_from.toISOString().slice(0,10):String(r.date_from||'').slice(0,10),
   date_to:r.date_to instanceof Date?r.date_to.toISOString().slice(0,10):String(r.date_to||'').slice(0,10),
-  city_type:r.city_category||'',travel_route:r.travel_route||'',lodging_days:r.lodging_days??null,funding_source:r.funding_source||'',basis:r.basis_document||'',purpose:r.purpose||'',
+  city_type:r.city_category||'',travel_route:r.travel_route||'',lodging_days:r.lodging_days??null,stays:r.lodging_stays||[],funding_source:r.funding_source||'',basis:r.basis_document||'',purpose:r.purpose||'',
   status:hrStatusLabel_(r.status),created_at:r.created_at,updated_at:r.updated_at,
   reviewer:r.director_decided_at?r.director_login:'',reviewed_at:r.director_decided_at||'',review_comment:r.director_comment||'',
   days_count:r.days_count,per_diem_amount:r.per_diem_amount,lodging_amount:r.lodging_amount,
@@ -17919,11 +17919,21 @@ app.post('/hr/trips',hrApiGuard_,async(req,res)=>{
   if(!login)throw Object.assign(new Error('LOGIN_REQUIRED'),{status:400});
   const employee=hrRequired_(b.employee,'employee');
   const position=hrRequired_(b.position,'position');
-  const department=hrClean_(b.department);
   const category=hrRequired_(b.category,'category');
   const legal=hrRequired_(b.legal_entity,'legal_entity');
-  const destination=hrRequired_(b.destination,'destination');
-  const cityType=hrRequired_(b.city_type,'city_type');
+  const stays=Array.isArray(b.stays)?b.stays:[];
+  if(stays.length<1||stays.length>30)throw Object.assign(new Error('Укажите от 1 до 30 городов'),{status:400});
+  const allowedTypes=new Set(['major','regional','district','rural']);
+  const cleanedStays=stays.map((item,i)=>{
+   const city=hrRequired_(item.city,'город '+(i+1),200);
+   const type=hrClean_(item.type,30);
+   const nights=Number(item.nights);
+   if(!allowedTypes.has(type)||!Number.isInteger(nights)||nights<0||nights>366)
+     throw Object.assign(new Error('Неверный тип города или число ночей в строке '+(i+1)),{status:400});
+   return {city,type,nights};
+  });
+  const destination=cleanedStays.map(x=>x.city).join(' – ');
+  const cityType=cleanedStays.length===1?cleanedStays[0].type:'Несколько типов';
   const purpose=hrRequired_(b.purpose,'purpose',3000);
   const from=hrRequired_(b.date_from,'date_from',10),to=hrRequired_(b.date_to,'date_to',10);
   const iso=/^\d{4}-\d{2}-\d{2}$/;
@@ -17931,8 +17941,8 @@ app.post('/hr/trips',hrApiGuard_,async(req,res)=>{
   if(!iso.test(from)||!iso.test(to)||Number.isNaN(d1.getTime())||Number.isNaN(d2.getTime())||d1.toISOString().slice(0,10)!==from||d2.toISOString().slice(0,10)!==to||d2<d1)throw Object.assign(new Error('Неверный период командировки'),{status:400});
   const periodDays=Math.round((d2-d1)/86400000)+1;
   const days=b.days_count===''||b.days_count==null?periodDays:Number(b.days_count);
-  const overnight=b.lodging_days===''||b.lodging_days==null?Math.max(0,days-1):Number(b.lodging_days);
-  if(!Number.isInteger(days)||days<1||days>366||!Number.isInteger(overnight)||overnight<0||overnight>366)
+  const overnight=cleanedStays.reduce((n,x)=>n+x.nights,0);
+  if(!Number.isInteger(days)||days<1||days>366||!Number.isInteger(overnight)||overnight<0||overnight>days)
     throw Object.assign(new Error('Неверное количество суток или дней проживания'),{status:400});
   const route=hrRequired_(b.travel_route,'travel_route',1000);
   // Ставки по принятой модели: 1 МРП = 4325 тг (параметр для 2026 г.).
@@ -17940,35 +17950,33 @@ app.post('/hr/trips',hrApiGuard_,async(req,res)=>{
   const baseRate=4325;
   // Категории и типы городов строго по формулам кадровой Google-таблицы.
   const categoryKey=/руковод/i.test(category)?'leader':/началь/i.test(category)?'head':/специал/i.test(category)?'specialist':null;
-  const cityKey=/республиканского значения|крупн/i.test(cityType)?'major':
-    /областные центры|областного значения|областной/i.test(cityType)?'regional':
-    /районные центры|районного значения|боровое|прочий/i.test(cityType)?'district':
-    /сельские|сельск/i.test(cityType)?'rural':null;
   const dailyCoefficients={leader:4,head:3,specialist:2};
   const hotelCoefficients={leader:{major:10,regional:7,district:5,rural:3},
     head:{major:7,regional:4,district:4,rural:3},
     specialist:{major:4,regional:3,district:3,rural:3}};
-  if(!categoryKey||!cityKey)throw Object.assign(new Error('Неверная категория сотрудника или тип города'),{status:400});
+  if(!categoryKey)throw Object.assign(new Error('Неверная категория сотрудника или тип города'),{status:400});
   const amountNumber=(v,label)=>{
     const value=Number(String(v??'0').replace(/\s/g,'').replace(',','.'));
     if(!Number.isFinite(value)||value<0||value>1000000000)
       throw Object.assign(new Error('Неверная сумма: '+label),{status:400});
     return Math.round(value*100)/100;
   };
-  const travel=amountNumber(b.travel_amount,'Проезд');
-  const other=amountNumber(b.other_amount,'Другие расходы');
   const dailyRate=baseRate*dailyCoefficients[categoryKey];
   const perDiem=days*dailyRate;
-  const lodging=overnight*baseRate*hotelCoefficients[categoryKey][cityKey];
+  const lodging=cleanedStays.reduce((sum,x)=>sum+x.nights*baseRate*hotelCoefficients[categoryKey][x.type],0);
 
   if(days>366)throw Object.assign(new Error('Период превышает 366 дней'),{status:400});
   const parts=destination.split(',');const city=parts.shift().trim();const country=parts.join(',').trim()||'Казахстан';
   await client.query('BEGIN');
+  // В форме оставлены только поля Google Формы. Старые колонки в БД
+  // сохраняются для совместимости с историческими заявками.
   const q=await client.query(`INSERT INTO hr.trip_requests
-    (created_by_login,employee_login,employee_name,personnel_no,job_title,department,employee_category,legal_entity,
-     destination_city,destination_country,city_category,date_from,date_to,purpose,funding_source,basis_document,days_count,daily_rate,per_diem_amount,lodging_amount,travel_amount,other_amount,travel_route,lodging_days,status)
-    VALUES ($1,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::date,$12::date,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,'submitted') RETURNING id`,
-    [login,employee,hrClean_(b.employee_number,100),position,department,category,legal,city,country,cityType,from,to,purpose,hrClean_(b.funding_source),hrClean_(b.basis),days,dailyRate,perDiem,lodging,travel,other,route,overnight]);
+    (created_by_login,employee_login,employee_name,job_title,employee_category,legal_entity,
+     destination_city,destination_country,city_category,date_from,date_to,purpose,
+     days_count,daily_rate,per_diem_amount,lodging_amount,travel_route,lodging_days,lodging_stays,status)
+    VALUES ($1,$1,$2,$3,$4,$5,$6,$7,$8,$9::date,$10::date,$11,$12,$13,$14,$15,$16,$17,$18::jsonb,'submitted') RETURNING id`,
+    [login,employee,position,category,legal,city,country,cityType,from,to,purpose,
+     days,dailyRate,perDiem,lodging,route,overnight,JSON.stringify(cleanedStays)]);
   await client.query('INSERT INTO hr.trip_approval_log(trip_id,actor_login,action,new_status) VALUES($1,$2,$3,$4)',[q.rows[0].id,login,'submitted','submitted']);
   const after=await client.query('SELECT request_no FROM hr.trip_requests WHERE id=$1',[q.rows[0].id]);
   await client.query('COMMIT');
