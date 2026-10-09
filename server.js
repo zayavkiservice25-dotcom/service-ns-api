@@ -17883,7 +17883,7 @@ function hrApiGuard_(req,res,next) {
   if(a.length!==b.length || !crypto.timingSafeEqual(a,b))return res.status(401).json({success:false,error:'HR_UNAUTHORIZED'});
   next();
 }
-const hrStatusLabel_ = s => ({draft:'Черновик',submitted:'На согласовании',approved:'Согласовано',rejected:'Отклонено',signing:'На подписании',signed:'Подписано ЭЦП',cancelled:'Отменено'}[s]||s);
+const hrStatusLabel_ = s => ({draft:'Черновик',submitted:'Ожидает подписи',approved:'Согласовано',rejected:'Отклонено',signing:'На подписании',signed:'Подписано ЭЦП',cancelled:'Отменено'}[s]||s);
 const hrClean_ = (v,max=300)=>String(v??'').trim().slice(0,max);
 const hrLogin_ = v=>hrClean_(v,80).toLowerCase();
 const hrRequired_ = (v,name,max=300)=>{const s=hrClean_(v,max);if(!s)throw Object.assign(new Error('Не заполнено: '+name),{status:400});return s;};
@@ -17894,7 +17894,7 @@ const hrPublic_ = r=>({
   date_from:r.date_from instanceof Date?r.date_from.toISOString().slice(0,10):String(r.date_from||'').slice(0,10),
   date_to:r.date_to instanceof Date?r.date_to.toISOString().slice(0,10):String(r.date_to||'').slice(0,10),
   city_type:r.city_category||'',travel_route:r.travel_route||'',lodging_days:r.lodging_days??null,stays:r.lodging_stays||[],funding_source:r.funding_source||'',basis:r.basis_document||'',purpose:r.purpose||'',
-  status:hrStatusLabel_(r.status),created_at:r.created_at,updated_at:r.updated_at,
+  status:r.signature_status==='crypto_verified_pending_trust'?'Подпись получена (проверка)':hrStatusLabel_(r.status),signature_status:r.signature_status||'',created_at:r.created_at,updated_at:r.updated_at,
   reviewer:r.director_decided_at?r.director_login:'',reviewed_at:r.director_decided_at||'',review_comment:r.director_comment||'',
   days_count:r.days_count,per_diem_amount:r.per_diem_amount,lodging_amount:r.lodging_amount,
   travel_amount:r.travel_amount,other_amount:r.other_amount,daily_rate:r.daily_rate,total_amount:r.total_amount
@@ -17906,8 +17906,8 @@ app.get('/hr/trips',hrApiGuard_,async(req,res)=>{
   const login=hrLogin_(req.query.login);if(!login)return res.status(400).json({success:false,error:'LOGIN_REQUIRED'});
   const director=login==='k_ermek';
   const q=director
-    ?'SELECT * FROM hr.trip_requests ORDER BY created_at DESC,id DESC LIMIT 2000'
-    :'SELECT * FROM hr.trip_requests WHERE lower(btrim(employee_login))=$1 ORDER BY created_at DESC,id DESC LIMIT 2000';
+    ?'SELECT r.*,j.status AS signature_status FROM hr.trip_requests r LEFT JOIN hr.trip_order_signature_jobs j ON j.trip_id=r.id ORDER BY r.created_at DESC,r.id DESC LIMIT 2000'
+    :'SELECT r.*,j.status AS signature_status FROM hr.trip_requests r LEFT JOIN hr.trip_order_signature_jobs j ON j.trip_id=r.id WHERE lower(btrim(r.employee_login))=$1 ORDER BY r.created_at DESC,r.id DESC LIMIT 2000';
   const out=await pool.query(q,director?[]:[login]);
   res.json({success:true,is_director:director,rows:out.rows.map(hrPublic_)});
  }catch(e){hrError_(res,e)}
@@ -17988,7 +17988,8 @@ app.post('/hr/trips/review',hrApiGuard_,async(req,res)=>{
  try{
   const b=req.body||{},login=hrLogin_(b.login),id=hrClean_(b.id,80),decision=hrClean_(b.decision,20),comment=hrClean_(b.comment,1000);
   if(login!=='k_ermek')throw Object.assign(new Error('Только директор может согласовать'),{status:403});
-  if(!['approve','reject'].includes(decision))throw Object.assign(new Error('Недопустимое действие'),{status:400});
+  if(decision==='approve')throw Object.assign(new Error('Согласование заменено подписью ЭЦП'),{status:409});
+  if(!['reject'].includes(decision))throw Object.assign(new Error('Недопустимое действие'),{status:400});
   if(decision==='reject'&&!comment)throw Object.assign(new Error('Укажите причину отказа'),{status:400});
   const next=decision==='approve'?'approved':'rejected';
   await client.query('BEGIN');
@@ -18032,7 +18033,7 @@ async function hrBuildOrderPdf_(r,id){
   doc.moveDown(2).fontSize(15).text('ПРОЕКТ ПРИКАЗА',{align:'center'});
   doc.fontSize(10).text('о направлении в служебную командировку',{align:'center'}).moveDown(2);
   doc.text('Номер проекта: '+val(r.request_no));
-  doc.text('Дата согласования: '+formatDate(r.director_decided_at));
+  doc.text('Дата формирования: '+formatDate(new Date()));
   doc.moveDown().fontSize(11).text('Направить в служебную командировку: '+val(r.employee_name));
   doc.text('Должность: '+val(r.job_title));
   doc.text('Период: с '+formatDate(r.date_from)+' по '+formatDate(r.date_to));
@@ -18046,7 +18047,7 @@ async function hrBuildOrderPdf_(r,id){
   doc.text('Суточные: '+money(r.per_diem_amount));
   doc.text('Проживание: '+money(r.lodging_amount));
   doc.text('Итого: '+money(r.total_amount));
-  doc.moveDown().text('Согласовал: '+val(r.director_login||'k_ermek'));
+  doc.moveDown().text('Подписание ЭЦП: ожидается.');
   doc.moveDown(2).fontSize(9).fillColor('#a33232')
     .text('ПРОЕКТ. Документ не подписан ЭЦП и не заменяет подписанный приказ.',{align:'center'});
   doc.end();
@@ -18063,9 +18064,10 @@ app.get('/hr/trips/order-pdf', hrApiGuard_, async (req,res)=>{
   const r=result.rows[0];
   if(login!=='k_ermek' && hrLogin_(r.employee_login)!==login)
     throw Object.assign(new Error('Нет доступа к приказу'),{status:403});
-  if(!['approved','signing','signed'].includes(r.status))
-    throw Object.assign(new Error('PDF доступен после согласования директора'),{status:409});
-  const pdf=await hrBuildOrderPdf_(r,id);
+  if(!['submitted','approved','signing','signed'].includes(r.status))
+    throw Object.assign(new Error('PDF недоступен для этой заявки'),{status:409});
+  const existing=await pool.query('SELECT pdf_bytes FROM hr.trip_order_signature_jobs WHERE trip_id=$1',[r.id]);
+  const pdf=existing.rowCount?existing.rows[0].pdf_bytes:await hrBuildOrderPdf_(r,id);
   res.set('Cache-Control','no-store');
   return res.json({success:true,filename:'HR_Order_'+String(id).replace(/[^a-zA-Z0-9_-]/g,'_')+'.pdf',base64:pdf.toString('base64')});
  }catch(e){hrError_(res,e)}
@@ -18101,8 +18103,8 @@ app.get('/hr/trips/sign-payload',hrApiGuard_,async(req,res)=>{
   try{
     const login=hrLogin_(req.query.login),id=hrClean_(req.query.id,80);hrSigDirector_(login);
     if(!id)throw Object.assign(new Error('Нет номера заявки'),{status:400});
-    const found=await pool.query('SELECT * FROM hr.trip_requests WHERE request_no=$1 AND status=$2',[id,'approved']);
-    if(!found.rowCount)throw Object.assign(new Error('Для подписания нужна согласованная заявка'),{status:409});
+    const found=await pool.query("SELECT * FROM hr.trip_requests WHERE request_no=$1 AND status IN ('submitted','approved')",[id]);
+    if(!found.rowCount)throw Object.assign(new Error('Заявка недоступна для подписания'),{status:409});
     const row=found.rows[0];
     let job=await pool.query('SELECT * FROM hr.trip_order_signature_jobs WHERE trip_id=$1',[row.id]);
     if(!job.rowCount){
@@ -18124,7 +18126,7 @@ app.post('/hr/trips/sign-submit',hrApiGuard_,async(req,res)=>{
     if(cms.length<50||cms[0]!==0x30)throw Object.assign(new Error('Не распознано DER CMS'),{status:400});
     const q=await pool.query(`SELECT j.*,r.status AS trip_status FROM hr.trip_order_signature_jobs j
       JOIN hr.trip_requests r ON r.id=j.trip_id WHERE r.request_no=$1`,[id]);
-    if(!q.rowCount||q.rows[0].trip_status!=='approved')throw Object.assign(new Error('Сначала подготовьте согласованный PDF'),{status:409});
+    if(!q.rowCount||!['submitted','approved'].includes(q.rows[0].trip_status))throw Object.assign(new Error('Сначала подготовьте PDF заявки'),{status:409});
     const job=q.rows[0];
     if(job.cms_bytes)throw Object.assign(new Error('Для этой заявки CMS уже сохранён'),{status:409});
     const result=await hrSigVerifyDetached_(cms,job.pdf_bytes);
@@ -18134,7 +18136,7 @@ app.post('/hr/trips/sign-submit',hrApiGuard_,async(req,res)=>{
       WHERE id=$1 AND cms_bytes IS NULL RETURNING id`,
       [job.id,cms,hrSigCrypto_.createHash('sha256').update(cms).digest('hex'),login]);
     if(!saved.rowCount)throw Object.assign(new Error('Подпись уже сохранена'),{status:409});
-    res.json({success:true,verification_status:'crypto_verified_pending_trust',message:'CMS сохранён; доверие НУЦ, статус отзыва и полномочия НЕ проверены. Статус приказа НЕ изменён.'});
+    res.json({success:true,verification_status:'crypto_verified_pending_trust',message:'CMS сохранён; доверие НУЦ, статус отзыва и полномочия НЕ проверены. Утверждение приказа ОЖИДАЕТ проверки доверия, полномочий и авторизации.'});
   }catch(e){hrError_(res,e)}
 });
 app.get('/hr/trips/sign-file',hrApiGuard_,async(req,res)=>{
