@@ -18103,7 +18103,15 @@ async function hrSigVerifyAttached_(cms,pdf){
       child.once('error',e=>resolve('OpenSSL unavailable: '+e.message));
       child.once('exit',c=>resolve(c===0?'':(logs||'OpenSSL exit '+c).slice(0,500)));
     });
-    if(error)return {ok:false,error};
+    if(error){
+      // Never bypass CMS verification. Distinguish missing signer public key from
+      // an invalid signature or other malformed CMS errors for test diagnostics.
+      const noSignerKey=/CMS_SignerInfo_verify:no public key|signer certificate not found|signer certificate.*not found/i.test(error);
+      if(noSignerKey){
+        return {ok:false,error:'CMS_SIGNER_CERT_MISSING: OpenSSL не нашёл сертификат подписанта/открытый ключ в CMS. Проверьте, что NCALayer включает сертификат подписанта в SignedData. Подпись НЕ подтверждена.'};
+      }
+      return {ok:false,error:'CMS_VERIFY_FAILED: '+error};
+    }
     const verified=await fs.readFile(outPath);
     return {ok:verified.equals(pdf),error:verified.equals(pdf)?'':'Signed content differs from frozen PDF'};
   }finally{await fs.rm(dir,{recursive:true,force:true})}
