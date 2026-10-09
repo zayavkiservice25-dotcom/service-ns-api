@@ -17906,8 +17906,8 @@ app.get('/hr/trips',hrApiGuard_,async(req,res)=>{
   const login=hrLogin_(req.query.login);if(!login)return res.status(400).json({success:false,error:'LOGIN_REQUIRED'});
   const director=login==='k_ermek';
   const q=director
-    ?'SELECT r.*,j.status AS signature_status FROM hr.trip_requests r LEFT JOIN hr.trip_order_signature_jobs j ON j.trip_id=r.id ORDER BY r.created_at DESC,r.id DESC LIMIT 2000'
-    :'SELECT r.*,j.status AS signature_status FROM hr.trip_requests r LEFT JOIN hr.trip_order_signature_jobs j ON j.trip_id=r.id WHERE lower(btrim(r.employee_login))=$1 ORDER BY r.created_at DESC,r.id DESC LIMIT 2000';
+    ?'SELECT r.*,j.sign_status AS signature_status FROM hr.trip_requests r LEFT JOIN hr.trip_order_signature_jobs j ON j.trip_request_id=r.id ORDER BY r.created_at DESC,r.id DESC LIMIT 2000'
+    :'SELECT r.*,j.sign_status AS signature_status FROM hr.trip_requests r LEFT JOIN hr.trip_order_signature_jobs j ON j.trip_request_id=r.id WHERE lower(btrim(r.employee_login))=$1 ORDER BY r.created_at DESC,r.id DESC LIMIT 2000';
   const out=await pool.query(q,director?[]:[login]);
   res.json({success:true,is_director:director,rows:out.rows.map(hrPublic_)});
  }catch(e){hrError_(res,e)}
@@ -18066,7 +18066,7 @@ app.get('/hr/trips/order-pdf', hrApiGuard_, async (req,res)=>{
     throw Object.assign(new Error('Нет доступа к приказу'),{status:403});
   if(!['submitted','approved','signing','signed'].includes(r.status))
     throw Object.assign(new Error('PDF недоступен для этой заявки'),{status:409});
-  const existing=await pool.query('SELECT pdf_bytes FROM hr.trip_order_signature_jobs WHERE trip_id=$1',[r.id]);
+  const existing=await pool.query('SELECT pdf_bytes FROM hr.trip_order_signature_jobs WHERE trip_request_id=$1',[r.id]);
   const pdf=existing.rowCount?existing.rows[0].pdf_bytes:await hrBuildOrderPdf_(r,id);
   res.set('Cache-Control','no-store');
   return res.json({success:true,filename:'HR_Order_'+String(id).replace(/[^a-zA-Z0-9_-]/g,'_')+'.pdf',base64:pdf.toString('base64')});
@@ -18106,14 +18106,14 @@ app.get('/hr/trips/sign-payload',hrApiGuard_,async(req,res)=>{
     const found=await pool.query("SELECT * FROM hr.trip_requests WHERE request_no=$1 AND status IN ('submitted','approved')",[id]);
     if(!found.rowCount)throw Object.assign(new Error('Заявка недоступна для подписания'),{status:409});
     const row=found.rows[0];
-    let job=await pool.query('SELECT * FROM hr.trip_order_signature_jobs WHERE trip_id=$1',[row.id]);
+    let job=await pool.query('SELECT * FROM hr.trip_order_signature_jobs WHERE trip_request_id=$1',[row.id]);
     if(!job.rowCount){
       const pdf=await hrBuildOrderPdf_(row,id);
-      job=await pool.query(`INSERT INTO hr.trip_order_signature_jobs(trip_id,pdf_bytes,pdf_sha256,status)
-        VALUES($1,$2,$3,'prepared') ON CONFLICT(trip_id) DO UPDATE SET trip_id=excluded.trip_id RETURNING *`,
+      job=await pool.query(`INSERT INTO hr.trip_order_signature_jobs(trip_request_id,pdf_bytes,pdf_sha256,sign_status)
+        VALUES($1,$2,$3,'prepared') ON CONFLICT(trip_request_id) DO UPDATE SET trip_request_id=excluded.trip_request_id RETURNING *`,
         [row.id,pdf,hrSigCrypto_.createHash('sha256').update(pdf).digest('hex')]);
     }
-    res.set('Cache-Control','no-store').json({success:true,id,pdf_base64:job.rows[0].pdf_bytes.toString('base64'),sha256:job.rows[0].pdf_sha256,verification_status:job.rows[0].status});
+    res.set('Cache-Control','no-store').json({success:true,id,pdf_base64:job.rows[0].pdf_bytes.toString('base64'),sha256:job.rows[0].pdf_sha256,verification_status:job.rows[0].sign_status});
   }catch(e){hrError_(res,e)}
 });
 app.post('/hr/trips/sign-submit',hrApiGuard_,async(req,res)=>{
@@ -18125,16 +18125,16 @@ app.post('/hr/trips/sign-submit',hrApiGuard_,async(req,res)=>{
     const cms=Buffer.from(cms_base64.replace(/\s/g,''),'base64');
     if(cms.length<50||cms[0]!==0x30)throw Object.assign(new Error('Не распознано DER CMS'),{status:400});
     const q=await pool.query(`SELECT j.*,r.status AS trip_status FROM hr.trip_order_signature_jobs j
-      JOIN hr.trip_requests r ON r.id=j.trip_id WHERE r.request_no=$1`,[id]);
+      JOIN hr.trip_requests r ON r.id=j.trip_request_id WHERE r.request_no=$1`,[id]);
     if(!q.rowCount||!['submitted','approved'].includes(q.rows[0].trip_status))throw Object.assign(new Error('Сначала подготовьте PDF заявки'),{status:409});
     const job=q.rows[0];
     if(job.cms_bytes)throw Object.assign(new Error('Для этой заявки CMS уже сохранён'),{status:409});
     const result=await hrSigVerifyDetached_(cms,job.pdf_bytes);
     if(!result.ok)throw Object.assign(new Error('CMS не прошёл криптографическую проверку: '+result.error),{status:422});
     const saved=await pool.query(`UPDATE hr.trip_order_signature_jobs
-      SET cms_bytes=$2, cms_sha256=$3, status='crypto_verified_pending_trust', submitted_login=$4, submitted_at=now()
+      SET cms_bytes=$2, sign_status='crypto_verified_pending_trust', signer_login=$3, crypto_verified=true, trust_verified=false, updated_at=now()
       WHERE id=$1 AND cms_bytes IS NULL RETURNING id`,
-      [job.id,cms,hrSigCrypto_.createHash('sha256').update(cms).digest('hex'),login]);
+      [job.id,cms,login]);
     if(!saved.rowCount)throw Object.assign(new Error('Подпись уже сохранена'),{status:409});
     res.json({success:true,verification_status:'crypto_verified_pending_trust',message:'CMS сохранён; доверие НУЦ, статус отзыва и полномочия НЕ проверены. Утверждение приказа ОЖИДАЕТ проверки доверия, полномочий и авторизации.'});
   }catch(e){hrError_(res,e)}
@@ -18142,10 +18142,10 @@ app.post('/hr/trips/sign-submit',hrApiGuard_,async(req,res)=>{
 app.get('/hr/trips/sign-file',hrApiGuard_,async(req,res)=>{
  try{
   const login=hrLogin_(req.query.login),id=hrClean_(req.query.id,80);hrSigDirector_(login);
-  const q=await pool.query(`SELECT j.cms_bytes,j.cms_sha256 FROM hr.trip_order_signature_jobs j
-    JOIN hr.trip_requests r ON r.id=j.trip_id WHERE r.request_no=$1`,[id]);
+  const q=await pool.query(`SELECT j.cms_bytes FROM hr.trip_order_signature_jobs j
+    JOIN hr.trip_requests r ON r.id=j.trip_request_id WHERE r.request_no=$1`,[id]);
   if(!q.rowCount||!q.rows[0].cms_bytes)throw Object.assign(new Error('CMS пока нет'),{status:404});
-  res.set('Cache-Control','no-store').json({success:true,filename:'HR_Order_'+id.replace(/[^a-zA-Z0-9_-]/g,'_')+'.pdf.p7s',base64:q.rows[0].cms_bytes.toString('base64'),sha256:q.rows[0].cms_sha256});
+  res.set('Cache-Control','no-store').json({success:true,filename:'HR_Order_'+id.replace(/[^a-zA-Z0-9_-]/g,'_')+'.pdf.p7s',base64:q.rows[0].cms_bytes.toString('base64'),sha256:hrSigCrypto_.createHash('sha256').update(q.rows[0].cms_bytes).digest('hex')});
  }catch(e){hrError_(res,e)}
 });
 
