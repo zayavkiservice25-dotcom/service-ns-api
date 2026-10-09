@@ -18007,17 +18007,8 @@ app.post('/hr/trips/review',hrApiGuard_,async(req,res)=>{
 // Не подписан ЭЦП; не сохраняется в архиве.
 // Требует npm package `pdfkit` и кириллический TTF в ОС Render.
 // ============================================================
-app.get('/hr/trips/order-pdf', hrApiGuard_, async (req,res)=>{
- try{
-  const login=hrLogin_(req.query.login), id=hrClean_(req.query.id,80);
-  if(!login || !id)throw Object.assign(new Error('Укажите заявку и логин'),{status:400});
-  const result=await pool.query('SELECT * FROM hr.trip_requests WHERE request_no=$1 LIMIT 1',[id]);
-  if(!result.rows.length)throw Object.assign(new Error('Заявка не найдена'),{status:404});
-  const r=result.rows[0];
-  if(login!=='k_ermek' && hrLogin_(r.employee_login)!==login)
-    throw Object.assign(new Error('Нет доступа к приказу'),{status:403});
-  if(!['approved','signing','signed'].includes(r.status))
-    throw Object.assign(new Error('PDF доступен после согласования директора'),{status:409});
+
+async function hrBuildOrderPdf_(r,id){
   let PDFDocument;
   try{PDFDocument=require('pdfkit')}catch(e){throw Object.assign(new Error('На Render установите пакет pdfkit'),{status:503})}
   const fs=require('fs');
@@ -18060,8 +18051,99 @@ app.get('/hr/trips/order-pdf', hrApiGuard_, async (req,res)=>{
     .text('ПРОЕКТ. Документ не подписан ЭЦП и не заменяет подписанный приказ.',{align:'center'});
   doc.end();
   const pdf=await complete;
+  return pdf;
+}
+
+app.get('/hr/trips/order-pdf', hrApiGuard_, async (req,res)=>{
+ try{
+  const login=hrLogin_(req.query.login), id=hrClean_(req.query.id,80);
+  if(!login || !id)throw Object.assign(new Error('Укажите заявку и логин'),{status:400});
+  const result=await pool.query('SELECT * FROM hr.trip_requests WHERE request_no=$1 LIMIT 1',[id]);
+  if(!result.rows.length)throw Object.assign(new Error('Заявка не найдена'),{status:404});
+  const r=result.rows[0];
+  if(login!=='k_ermek' && hrLogin_(r.employee_login)!==login)
+    throw Object.assign(new Error('Нет доступа к приказу'),{status:403});
+  if(!['approved','signing','signed'].includes(r.status))
+    throw Object.assign(new Error('PDF доступен после согласования директора'),{status:409});
+  const pdf=await hrBuildOrderPdf_(r,id);
   res.set('Cache-Control','no-store');
   return res.json({success:true,filename:'HR_Order_'+String(id).replace(/[^a-zA-Z0-9_-]/g,'_')+'.pdf',base64:pdf.toString('base64')});
+ }catch(e){hrError_(res,e)}
+});
+
+
+// TEST-PHASE: detached CMS signed over frozen PDF bytes.
+// OpenSSL -noverify validates cryptographic binding only. PKI trust/CRL/OCSP,
+// signing authority and authenticated user sessions are NOT implemented.
+const hrSigCrypto_=require('crypto');
+async function hrSigVerifyDetached_(cms,pdf){
+  const fs=require('fs/promises'),os=require('os'),path=require('path');
+  const {spawn}=require('child_process');
+  const dir=await fs.mkdtemp(path.join(os.tmpdir(),'hr-cms-'));
+  const cmsPath=path.join(dir,'sign.cms'),pdfPath=path.join(dir,'order.pdf'),outPath=path.join(dir,'verified.pdf');
+  try{
+    await Promise.all([fs.writeFile(cmsPath,cms,{mode:0o600}),fs.writeFile(pdfPath,pdf,{mode:0o600})]);
+    const error=await new Promise(resolve=>{
+      let logs='';const child=spawn('openssl',['cms','-verify','-binary','-inform','DER','-in',cmsPath,'-content',pdfPath,'-noverify','-out',outPath],{stdio:['ignore','ignore','pipe']});
+      child.stderr.on('data',b=>{logs+=b.toString().slice(0,1000)});
+      child.once('error',e=>resolve('OpenSSL unavailable: '+e.message));
+      child.once('exit',c=>resolve(c===0?'':(logs||'OpenSSL exit '+c).slice(0,500)));
+    });
+    if(error)return {ok:false,error};
+    const verified=await fs.readFile(outPath);
+    return {ok:verified.equals(pdf),error:verified.equals(pdf)?'':'Signed content differs from frozen PDF'};
+  }finally{await fs.rm(dir,{recursive:true,force:true})}
+}
+function hrSigDirector_(login){
+  if(login!=='k_ermek')throw Object.assign(new Error('Доступ только директору'),{status:403});
+}
+app.get('/hr/trips/sign-payload',hrApiGuard_,async(req,res)=>{
+  try{
+    const login=hrLogin_(req.query.login),id=hrClean_(req.query.id,80);hrSigDirector_(login);
+    if(!id)throw Object.assign(new Error('Нет номера заявки'),{status:400});
+    const found=await pool.query('SELECT * FROM hr.trip_requests WHERE request_no=$1 AND status=$2',[id,'approved']);
+    if(!found.rowCount)throw Object.assign(new Error('Для подписания нужна согласованная заявка'),{status:409});
+    const row=found.rows[0];
+    let job=await pool.query('SELECT * FROM hr.trip_order_signature_jobs WHERE trip_id=$1',[row.id]);
+    if(!job.rowCount){
+      const pdf=await hrBuildOrderPdf_(row,id);
+      job=await pool.query(`INSERT INTO hr.trip_order_signature_jobs(trip_id,pdf_bytes,pdf_sha256,status)
+        VALUES($1,$2,$3,'prepared') ON CONFLICT(trip_id) DO UPDATE SET trip_id=excluded.trip_id RETURNING *`,
+        [row.id,pdf,hrSigCrypto_.createHash('sha256').update(pdf).digest('hex')]);
+    }
+    res.set('Cache-Control','no-store').json({success:true,id,pdf_base64:job.rows[0].pdf_bytes.toString('base64'),sha256:job.rows[0].pdf_sha256,verification_status:job.rows[0].status});
+  }catch(e){hrError_(res,e)}
+});
+app.post('/hr/trips/sign-submit',hrApiGuard_,async(req,res)=>{
+  try{
+    const {login:loginRaw,id:idRaw,cms_base64}=req.body||{};
+    const login=hrLogin_(loginRaw),id=hrClean_(idRaw,80);hrSigDirector_(login);
+    if(typeof cms_base64!=='string'||cms_base64.length<100||cms_base64.length>6_000_000||!/^[A-Za-z0-9+/=\s]+$/.test(cms_base64))
+      throw Object.assign(new Error('Неверный формат CMS'),{status:400});
+    const cms=Buffer.from(cms_base64.replace(/\s/g,''),'base64');
+    if(cms.length<50||cms[0]!==0x30)throw Object.assign(new Error('Не распознано DER CMS'),{status:400});
+    const q=await pool.query(`SELECT j.*,r.status AS trip_status FROM hr.trip_order_signature_jobs j
+      JOIN hr.trip_requests r ON r.id=j.trip_id WHERE r.request_no=$1`,[id]);
+    if(!q.rowCount||q.rows[0].trip_status!=='approved')throw Object.assign(new Error('Сначала подготовьте согласованный PDF'),{status:409});
+    const job=q.rows[0];
+    if(job.cms_bytes)throw Object.assign(new Error('Для этой заявки CMS уже сохранён'),{status:409});
+    const result=await hrSigVerifyDetached_(cms,job.pdf_bytes);
+    if(!result.ok)throw Object.assign(new Error('CMS не прошёл криптографическую проверку: '+result.error),{status:422});
+    const saved=await pool.query(`UPDATE hr.trip_order_signature_jobs
+      SET cms_bytes=$2, cms_sha256=$3, status='crypto_verified_pending_trust', submitted_login=$4, submitted_at=now()
+      WHERE id=$1 AND cms_bytes IS NULL RETURNING id`,
+      [job.id,cms,hrSigCrypto_.createHash('sha256').update(cms).digest('hex'),login]);
+    if(!saved.rowCount)throw Object.assign(new Error('Подпись уже сохранена'),{status:409});
+    res.json({success:true,verification_status:'crypto_verified_pending_trust',message:'CMS сохранён; доверие НУЦ, статус отзыва и полномочия НЕ проверены. Статус приказа НЕ изменён.'});
+  }catch(e){hrError_(res,e)}
+});
+app.get('/hr/trips/sign-file',hrApiGuard_,async(req,res)=>{
+ try{
+  const login=hrLogin_(req.query.login),id=hrClean_(req.query.id,80);hrSigDirector_(login);
+  const q=await pool.query(`SELECT j.cms_bytes,j.cms_sha256 FROM hr.trip_order_signature_jobs j
+    JOIN hr.trip_requests r ON r.id=j.trip_id WHERE r.request_no=$1`,[id]);
+  if(!q.rowCount||!q.rows[0].cms_bytes)throw Object.assign(new Error('CMS пока нет'),{status:404});
+  res.set('Cache-Control','no-store').json({success:true,filename:'HR_Order_'+id.replace(/[^a-zA-Z0-9_-]/g,'_')+'.pdf.p7s',base64:q.rows[0].cms_bytes.toString('base64'),sha256:q.rows[0].cms_sha256});
  }catch(e){hrError_(res,e)}
 });
 
