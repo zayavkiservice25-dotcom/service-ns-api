@@ -17893,7 +17893,7 @@ const hrPublic_ = r=>({
   legal_entity:r.legal_entity||'',destination:[r.destination_city,r.destination_country].filter(Boolean).join(', '),
   date_from:r.date_from instanceof Date?r.date_from.toISOString().slice(0,10):String(r.date_from||'').slice(0,10),
   date_to:r.date_to instanceof Date?r.date_to.toISOString().slice(0,10):String(r.date_to||'').slice(0,10),
-  city_type:r.city_category||'',funding_source:r.funding_source||'',basis:r.basis_document||'',purpose:r.purpose||'',
+  city_type:r.city_category||'',travel_route:r.travel_route||'',lodging_days:r.lodging_days??null,funding_source:r.funding_source||'',basis:r.basis_document||'',purpose:r.purpose||'',
   status:hrStatusLabel_(r.status),created_at:r.created_at,updated_at:r.updated_at,
   reviewer:r.director_decided_at?r.director_login:'',reviewed_at:r.director_decided_at||'',review_comment:r.director_comment||'',
   days_count:r.days_count,per_diem_amount:r.per_diem_amount,lodging_amount:r.lodging_amount,
@@ -17919,7 +17919,7 @@ app.post('/hr/trips',hrApiGuard_,async(req,res)=>{
   if(!login)throw Object.assign(new Error('LOGIN_REQUIRED'),{status:400});
   const employee=hrRequired_(b.employee,'employee');
   const position=hrRequired_(b.position,'position');
-  const department=hrRequired_(b.department,'department');
+  const department=hrClean_(b.department);
   const category=hrRequired_(b.category,'category');
   const legal=hrRequired_(b.legal_entity,'legal_entity');
   const destination=hrRequired_(b.destination,'destination');
@@ -17929,7 +17929,12 @@ app.post('/hr/trips',hrApiGuard_,async(req,res)=>{
   const iso=/^\d{4}-\d{2}-\d{2}$/;
   const d1=new Date(from+'T00:00:00Z'),d2=new Date(to+'T00:00:00Z');
   if(!iso.test(from)||!iso.test(to)||Number.isNaN(d1.getTime())||Number.isNaN(d2.getTime())||d1.toISOString().slice(0,10)!==from||d2.toISOString().slice(0,10)!==to||d2<d1)throw Object.assign(new Error('Неверный период командировки'),{status:400});
-  const days=Math.round((d2-d1)/86400000)+1;
+  const periodDays=Math.round((d2-d1)/86400000)+1;
+  const days=b.days_count===''||b.days_count==null?periodDays:Number(b.days_count);
+  const overnight=b.lodging_days===''||b.lodging_days==null?Math.max(0,days-1):Number(b.lodging_days);
+  if(!Number.isInteger(days)||days<1||days>366||!Number.isInteger(overnight)||overnight<0||overnight>366)
+    throw Object.assign(new Error('Неверное количество суток или дней проживания'),{status:400});
+  const route=hrRequired_(b.travel_route,'travel_route',1000);
   // Ставки по принятой модели: 1 МРП = 4325 тг (параметр для 2026 г.).
   // Проживание предварительно считаем по ночам, а суточные — по календарным дням.
   const baseRate=4325;
@@ -17944,7 +17949,6 @@ app.post('/hr/trips',hrApiGuard_,async(req,res)=>{
     head:{major:7,regional:4,district:4,rural:3},
     specialist:{major:4,regional:3,district:3,rural:3}};
   if(!categoryKey||!cityKey)throw Object.assign(new Error('Неверная категория сотрудника или тип города'),{status:400});
-  const overnight=Math.max(0,days-1);
   const amountNumber=(v,label)=>{
     const value=Number(String(v??'0').replace(/\s/g,'').replace(',','.'));
     if(!Number.isFinite(value)||value<0||value>1000000000)
@@ -17962,9 +17966,9 @@ app.post('/hr/trips',hrApiGuard_,async(req,res)=>{
   await client.query('BEGIN');
   const q=await client.query(`INSERT INTO hr.trip_requests
     (created_by_login,employee_login,employee_name,personnel_no,job_title,department,employee_category,legal_entity,
-     destination_city,destination_country,city_category,date_from,date_to,purpose,funding_source,basis_document,days_count,daily_rate,per_diem_amount,lodging_amount,travel_amount,other_amount,status)
-    VALUES ($1,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::date,$12::date,$13,$14,$15,$16,$17,$18,$19,$20,$21,'submitted') RETURNING id`,
-    [login,employee,hrClean_(b.employee_number,100),position,department,category,legal,city,country,cityType,from,to,purpose,hrClean_(b.funding_source),hrClean_(b.basis),days,dailyRate,perDiem,lodging,travel,other]);
+     destination_city,destination_country,city_category,date_from,date_to,purpose,funding_source,basis_document,days_count,daily_rate,per_diem_amount,lodging_amount,travel_amount,other_amount,travel_route,lodging_days,status)
+    VALUES ($1,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::date,$12::date,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,'submitted') RETURNING id`,
+    [login,employee,hrClean_(b.employee_number,100),position,department,category,legal,city,country,cityType,from,to,purpose,hrClean_(b.funding_source),hrClean_(b.basis),days,dailyRate,perDiem,lodging,travel,other,route,overnight]);
   await client.query('INSERT INTO hr.trip_approval_log(trip_id,actor_login,action,new_status) VALUES($1,$2,$3,$4)',[q.rows[0].id,login,'submitted','submitted']);
   const after=await client.query('SELECT request_no FROM hr.trip_requests WHERE id=$1',[q.rows[0].id]);
   await client.query('COMMIT');
