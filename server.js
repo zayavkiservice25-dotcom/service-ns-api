@@ -17973,10 +17973,10 @@ app.post('/hr/trips',hrApiGuard_,async(req,res)=>{
   const q=await client.query(`INSERT INTO hr.trip_requests
     (created_by_login,employee_login,employee_name,job_title,employee_category,legal_entity,
      destination_city,destination_country,city_category,date_from,date_to,purpose,
-     days_count,daily_rate,per_diem_amount,lodging_amount,travel_route,lodging_days,lodging_stays,status)
-    VALUES ($1,$1,$2,$3,$4,$5,$6,$7,$8,$9::date,$10::date,$11,$12,$13,$14,$15,$16,$17,$18::jsonb,'submitted') RETURNING id`,
+     days_count,daily_rate,per_diem_amount,lodging_amount,total_amount,travel_route,lodging_days,lodging_stays,status)
+    VALUES ($1,$1,$2,$3,$4,$5,$6,$7,$8,$9::date,$10::date,$11,$12,$13,$14,$15,$16,$17,$18,$19::jsonb,'submitted') RETURNING id`,
     [login,employee,position,category,legal,city,country,cityType,from,to,purpose,
-     days,dailyRate,perDiem,lodging,route,overnight,JSON.stringify(cleanedStays)]);
+     days,dailyRate,perDiem,lodging,perDiem+lodging,route,overnight,JSON.stringify(cleanedStays)]);
   await client.query('INSERT INTO hr.trip_approval_log(trip_id,actor_login,action,new_status) VALUES($1,$2,$3,$4)',[q.rows[0].id,login,'submitted','submitted']);
   const after=await client.query('SELECT request_no FROM hr.trip_requests WHERE id=$1',[q.rows[0].id]);
   await client.query('COMMIT');
@@ -17992,13 +17992,77 @@ app.post('/hr/trips/review',hrApiGuard_,async(req,res)=>{
   if(decision==='reject'&&!comment)throw Object.assign(new Error('Укажите причину отказа'),{status:400});
   const next=decision==='approve'?'approved':'rejected';
   await client.query('BEGIN');
-  const updated=await client.query(`UPDATE hr.trip_requests SET status=$1,director_decided_at=now(),director_comment=$2,updated_at=now()
-    WHERE request_no=$3 AND status='submitted' RETURNING id`,[next,comment,id]);
+  const updated=await client.query(`UPDATE hr.trip_requests SET status=$1,director_decided_at=now(),director_comment=$2,director_login=$4,updated_at=now()
+    WHERE request_no=$3 AND status='submitted' RETURNING id`,[next,comment,id,login]);
   if(updated.rowCount!==1)throw Object.assign(new Error('Заявка не найдена или уже обработана'),{status:409});
   await client.query(`INSERT INTO hr.trip_approval_log(trip_id,actor_login,action,previous_status,new_status,comment_text)
     VALUES($1,$2,$3,'submitted',$4,$5)`,[updated.rows[0].id,login,decision==='approve'?'approved':'rejected',next,comment]);
   await client.query('COMMIT');res.json({success:true,status:hrStatusLabel_(next)});
  }catch(e){try{await client.query('ROLLBACK')}catch(_){}hrError_(res,e)}finally{client.release()}
+});
+
+
+// ============================================================
+// HR: ознакомительный PDF-приказ после согласования директором.
+// Не подписан ЭЦП; не сохраняется в архиве.
+// Требует npm package `pdfkit` и кириллический TTF в ОС Render.
+// ============================================================
+app.get('/hr/trips/order-pdf', hrApiGuard_, async (req,res)=>{
+ try{
+  const login=hrLogin_(req.query.login), id=hrClean_(req.query.id,80);
+  if(!login || !id)throw Object.assign(new Error('Укажите заявку и логин'),{status:400});
+  const result=await pool.query('SELECT * FROM hr.trip_requests WHERE request_no=$1 LIMIT 1',[id]);
+  if(!result.rows.length)throw Object.assign(new Error('Заявка не найдена'),{status:404});
+  const r=result.rows[0];
+  if(login!=='k_ermek' && hrLogin_(r.employee_login)!==login)
+    throw Object.assign(new Error('Нет доступа к приказу'),{status:403});
+  if(!['approved','signing','signed'].includes(r.status))
+    throw Object.assign(new Error('PDF доступен после согласования директора'),{status:409});
+  let PDFDocument;
+  try{PDFDocument=require('pdfkit')}catch(e){throw Object.assign(new Error('На Render установите пакет pdfkit'),{status:503})}
+  const fs=require('fs');
+  const fontCandidates=[process.env.HR_PDF_FONT_TTF,
+    '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+    '/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf'].filter(Boolean);
+  const font=fontCandidates.find(x=>fs.existsSync(x));
+  if(!font)throw Object.assign(new Error('Не найден кириллический TTF. Задайте HR_PDF_FONT_TTF'),{status:503});
+  const doc=new PDFDocument({size:'A4',margin:55,info:{Title:'Проект приказа '+id,Author:'Service NS'}});
+  const chunks=[];
+  doc.on('data',chunk=>chunks.push(chunk));
+  const complete=new Promise((resolve,reject)=>{doc.on('end',()=>resolve(Buffer.concat(chunks)));doc.on('error',reject)});
+  doc.font(font);
+  const val=v=>String(v??'').trim()||'—';
+  const dt=d=>d instanceof Date?d.toISOString().slice(0,10):String(d||'').slice(0,10);
+  const formatDate=d=>{const a=dt(d).split('-');return a.length===3?a.reverse().join('.'):val(d)};
+  const money=v=>new Intl.NumberFormat('ru-RU',{minimumFractionDigits:2,maximumFractionDigits:2}).format(Number(v||0))+' тенге';
+  const stays=Array.isArray(r.lodging_stays)?r.lodging_stays:[];
+  const locNames={major:'Города республиканского значения',regional:'Областные центры / города областного значения',district:'Районные центры / города районного значения (включая Боровое)',rural:'Сельские населённые пункты'};
+  doc.fontSize(10).text(val(r.legal_entity),{align:'right'});
+  doc.moveDown(2).fontSize(15).text('ПРОЕКТ ПРИКАЗА',{align:'center'});
+  doc.fontSize(10).text('о направлении в служебную командировку',{align:'center'}).moveDown(2);
+  doc.text('Номер проекта: '+val(r.request_no));
+  doc.text('Дата согласования: '+formatDate(r.director_decided_at));
+  doc.moveDown().fontSize(11).text('Направить в служебную командировку: '+val(r.employee_name));
+  doc.text('Должность: '+val(r.job_title));
+  doc.text('Период: с '+formatDate(r.date_from)+' по '+formatDate(r.date_to));
+  doc.text('Количество суток: '+val(r.days_count));
+  doc.text('Маршрут: '+val(r.travel_route||r.destination_city));
+  doc.moveDown().text('Цель командировки: '+val(r.purpose));
+  doc.moveDown().text('Места пребывания и проживание:');
+  if(stays.length)stays.forEach((s,i)=>doc.fontSize(9).text((i+1)+'. '+val(s.city)+' — '+val(locNames[s.type]||s.type)+', '+Number(s.nights||0)+' ноч.'));
+  else doc.fontSize(9).text(val(r.destination_city)+' — '+val(r.lodging_days)+' ноч.');
+  doc.moveDown().fontSize(10).text('Расчёт по заявке:');
+  doc.text('Суточные: '+money(r.per_diem_amount));
+  doc.text('Проживание: '+money(r.lodging_amount));
+  doc.text('Итого: '+money(r.total_amount));
+  doc.moveDown().text('Согласовал: '+val(r.director_login||'k_ermek'));
+  doc.moveDown(2).fontSize(9).fillColor('#a33232')
+    .text('ПРОЕКТ. Документ не подписан ЭЦП и не заменяет подписанный приказ.',{align:'center'});
+  doc.end();
+  const pdf=await complete;
+  res.set('Cache-Control','no-store');
+  return res.json({success:true,filename:'HR_Order_'+String(id).replace(/[^a-zA-Z0-9_-]/g,'_')+'.pdf',base64:pdf.toString('base64')});
+ }catch(e){hrError_(res,e)}
 });
 
 app.listen(PORT, () => console.log("Server started on port " + PORT));
