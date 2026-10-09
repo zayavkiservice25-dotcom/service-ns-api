@@ -17933,18 +17933,17 @@ app.post('/hr/trips',hrApiGuard_,async(req,res)=>{
   // Ставки по принятой модели: 1 МРП = 4325 тг (параметр для 2026 г.).
   // Проживание предварительно считаем по ночам, а суточные — по календарным дням.
   const baseRate=4325;
-  const rateByCategory={
-    'Руководство (директор, исполнительный директор)':4,
-    'Начальники структурных подразделений (заместители директора, начальники отделов)':3,
-    'Специалисты':2
-  };
-  const rateByCity={
-    'Республиканского значения / крупный':10,
-    'Областной':7,
-    'Прочий':5
-  };
-  if(!Object.hasOwn(rateByCategory,category)||!Object.hasOwn(rateByCity,cityType))
-    throw Object.assign(new Error('Неверная категория сотрудника или города'),{status:400});
+  // Категории и типы городов строго по формулам кадровой Google-таблицы.
+  const categoryKey=/руковод/i.test(category)?'leader':/началь/i.test(category)?'head':/специал/i.test(category)?'specialist':null;
+  const cityKey=/республиканского значения|крупн/i.test(cityType)?'major':
+    /областные центры|областного значения|областной/i.test(cityType)?'regional':
+    /районные центры|районного значения|боровое|прочий/i.test(cityType)?'district':
+    /сельские|сельск/i.test(cityType)?'rural':null;
+  const dailyCoefficients={leader:4,head:3,specialist:2};
+  const hotelCoefficients={leader:{major:10,regional:7,district:5,rural:3},
+    head:{major:7,regional:4,district:4,rural:3},
+    specialist:{major:4,regional:3,district:3,rural:3}};
+  if(!categoryKey||!cityKey)throw Object.assign(new Error('Неверная категория сотрудника или тип города'),{status:400});
   const overnight=Math.max(0,days-1);
   const amountNumber=(v,label)=>{
     const value=Number(String(v??'0').replace(/\s/g,'').replace(',','.'));
@@ -17954,9 +17953,9 @@ app.post('/hr/trips',hrApiGuard_,async(req,res)=>{
   };
   const travel=amountNumber(b.travel_amount,'Проезд');
   const other=amountNumber(b.other_amount,'Другие расходы');
-  const dailyRate=baseRate*rateByCategory[category];
+  const dailyRate=baseRate*dailyCoefficients[categoryKey];
   const perDiem=days*dailyRate;
-  const lodging=overnight*baseRate*rateByCity[cityType];
+  const lodging=overnight*baseRate*hotelCoefficients[categoryKey][cityKey];
 
   if(days>366)throw Object.assign(new Error('Период превышает 366 дней'),{status:400});
   const parts=destination.split(',');const city=parts.shift().trim();const country=parts.join(',').trim()||'Казахстан';
