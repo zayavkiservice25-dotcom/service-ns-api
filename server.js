@@ -18142,9 +18142,20 @@ app.post('/hr/trips/sign-submit',hrApiGuard_,async(req,res)=>{
   try{
     const {login:loginRaw,id:idRaw,cms_base64}=req.body||{};
     const login=hrLogin_(loginRaw),id=hrClean_(idRaw,80);hrSigDirector_(login);
-    if(typeof cms_base64!=='string'||cms_base64.length<100||cms_base64.length>6_000_000||!/^[A-Za-z0-9+/=\s]+$/.test(cms_base64))
-      throw Object.assign(new Error('Неверный формат CMS'),{status:400});
-    const cms=Buffer.from(cms_base64.replace(/\s/g,''),'base64');
+    // NCALayer может вернуть DER-CMS как Base64 или PEM (BEGIN CMS/PKCS7).
+    // Приводим представление к DER, не изменяя подписанные байты контейнера.
+    if(typeof cms_base64!=='string'||cms_base64.length>8_000_000)
+      throw Object.assign(new Error('Неверный формат CMS: ожидается строка'),{status:400});
+    let cmsText=cms_base64.trim();
+    if(/^-----BEGIN (CMS|PKCS7)-----/.test(cmsText)) {
+      const pem=cmsText.match(/^-----BEGIN (CMS|PKCS7)-----\s*([A-Za-z0-9+/=\s]+?)\s*-----END \1-----\s*$/);
+      if(!pem)throw Object.assign(new Error('Неверный формат PEM CMS'),{status:400});
+      cmsText=pem[2];
+    }
+    cmsText=cmsText.replace(/\s/g,'');
+    if(cmsText.length<100||cmsText.length%4!==0||!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(cmsText))
+      throw Object.assign(new Error('Неверный формат Base64 CMS'),{status:400});
+    const cms=Buffer.from(cmsText,'base64');
     if(cms.length<50||cms[0]!==0x30)throw Object.assign(new Error('Не распознано DER CMS'),{status:400});
     const q=await pool.query(`SELECT j.*,r.status AS trip_status FROM hr.trip_order_signature_jobs j
       JOIN hr.trip_requests r ON r.id=j.trip_request_id WHERE r.request_no=$1`,[id]);
