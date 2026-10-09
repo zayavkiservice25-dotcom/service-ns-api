@@ -17897,7 +17897,7 @@ const hrPublic_ = r=>({
   status:hrStatusLabel_(r.status),created_at:r.created_at,updated_at:r.updated_at,
   reviewer:r.director_decided_at?r.director_login:'',reviewed_at:r.director_decided_at||'',review_comment:r.director_comment||'',
   days_count:r.days_count,per_diem_amount:r.per_diem_amount,lodging_amount:r.lodging_amount,
-  travel_amount:r.travel_amount,total_amount:r.total_amount
+  travel_amount:r.travel_amount,other_amount:r.other_amount,daily_rate:r.daily_rate,total_amount:r.total_amount
 });
 const hrError_ = (res,e)=>{const code=e.status||500;if(code>=500)console.error('HR API:',e);return res.status(code).json({success:false,error:code>=500?'HR_SERVER_ERROR':e.message});};
 
@@ -17930,14 +17930,42 @@ app.post('/hr/trips',hrApiGuard_,async(req,res)=>{
   const d1=new Date(from+'T00:00:00Z'),d2=new Date(to+'T00:00:00Z');
   if(!iso.test(from)||!iso.test(to)||Number.isNaN(d1.getTime())||Number.isNaN(d2.getTime())||d1.toISOString().slice(0,10)!==from||d2.toISOString().slice(0,10)!==to||d2<d1)throw Object.assign(new Error('Неверный период командировки'),{status:400});
   const days=Math.round((d2-d1)/86400000)+1;
+  // Ставки по принятой модели: 1 МРП = 4325 тг (параметр для 2026 г.).
+  // Проживание предварительно считаем по ночам, а суточные — по календарным дням.
+  const baseRate=4325;
+  const rateByCategory={
+    'Руководство (директор, исполнительный директор)':4,
+    'Начальники структурных подразделений (заместители директора, начальники отделов)':3,
+    'Специалисты':2
+  };
+  const rateByCity={
+    'Республиканского значения / крупный':10,
+    'Областной':7,
+    'Прочий':5
+  };
+  if(!Object.hasOwn(rateByCategory,category)||!Object.hasOwn(rateByCity,cityType))
+    throw Object.assign(new Error('Неверная категория сотрудника или города'),{status:400});
+  const overnight=Math.max(0,days-1);
+  const amountNumber=(v,label)=>{
+    const value=Number(String(v??'0').replace(/\s/g,'').replace(',','.'));
+    if(!Number.isFinite(value)||value<0||value>1000000000)
+      throw Object.assign(new Error('Неверная сумма: '+label),{status:400});
+    return Math.round(value*100)/100;
+  };
+  const travel=amountNumber(b.travel_amount,'Проезд');
+  const other=amountNumber(b.other_amount,'Другие расходы');
+  const dailyRate=baseRate*rateByCategory[category];
+  const perDiem=days*dailyRate;
+  const lodging=overnight*baseRate*rateByCity[cityType];
+
   if(days>366)throw Object.assign(new Error('Период превышает 366 дней'),{status:400});
   const parts=destination.split(',');const city=parts.shift().trim();const country=parts.join(',').trim()||'Казахстан';
   await client.query('BEGIN');
   const q=await client.query(`INSERT INTO hr.trip_requests
     (created_by_login,employee_login,employee_name,personnel_no,job_title,department,employee_category,legal_entity,
-     destination_city,destination_country,city_category,date_from,date_to,purpose,funding_source,basis_document,days_count,status)
-    VALUES ($1,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::date,$12::date,$13,$14,$15,$16,'submitted') RETURNING id`,
-    [login,employee,hrClean_(b.employee_number,100),position,department,category,legal,city,country,cityType,from,to,purpose,hrClean_(b.funding_source),hrClean_(b.basis),days]);
+     destination_city,destination_country,city_category,date_from,date_to,purpose,funding_source,basis_document,days_count,daily_rate,per_diem_amount,lodging_amount,travel_amount,other_amount,status)
+    VALUES ($1,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::date,$12::date,$13,$14,$15,$16,$17,$18,$19,$20,$21,'submitted') RETURNING id`,
+    [login,employee,hrClean_(b.employee_number,100),position,department,category,legal,city,country,cityType,from,to,purpose,hrClean_(b.funding_source),hrClean_(b.basis),days,dailyRate,perDiem,lodging,travel,other]);
   await client.query('INSERT INTO hr.trip_approval_log(trip_id,actor_login,action,new_status) VALUES($1,$2,$3,$4)',[q.rows[0].id,login,'submitted','submitted']);
   const after=await client.query('SELECT request_no FROM hr.trip_requests WHERE id=$1',[q.rows[0].id]);
   await client.query('COMMIT');
