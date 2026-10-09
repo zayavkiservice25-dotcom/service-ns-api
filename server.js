@@ -11983,8 +11983,8 @@ app.post("/lzk/components/order", async (req, res) => {
         FOR UPDATE OF s
       `,[idzlzk,idplxk]);
       if (!check.rowCount) throw new Error(`Компонент ${idplxk} не найден`);
-      const plan=Number(check.rows[0].plan_qty||0), ordered=Number(check.rows[0].ordered_qty||0);
-      if (ordered + qty > plan + 0.000001) throw new Error(`Количество по ${idplxk} превышает остаток`);
+      // Превышение количества компонента относительно плана разрешено.
+      // Заказ сохраняется, остаток может быть отрицательным.
       await client.query(`UPDATE lzk.supply SET ordered_qty=COALESCE(ordered_qty,0)+$3, updated_at=NOW() WHERE idzlzk=$1 AND idplxk=$2`,[idzlzk,idplxk,qty]);
     }
     await client.query("COMMIT");
@@ -17866,5 +17866,100 @@ app.post("/treasury-return-paid", async (req, res) => {
   }
 });
 
+
+
+// ============================================================
+// HR / Командировки (PostgreSQL schema hr)
+// ВНИМАНИЕ: X-HR-API-KEY защищает вызовы от посторонних клиентов,
+// но login от старого GAS-приложения не доказывает личность.
+// До появления проверяемой сессии НЕ использовать боевые персональные данные.
+// ============================================================
+function hrApiGuard_(req,res,next) {
+  const expected=process.env.HR_API_KEY;
+  const received=req.get('X-HR-API-KEY') || '';
+  if(!expected || expected.length<24) return res.status(503).json({success:false,error:'HR_API_KEY_NOT_CONFIGURED'});
+  const crypto=require('crypto');
+  const a=Buffer.from(expected),b=Buffer.from(received);
+  if(a.length!==b.length || !crypto.timingSafeEqual(a,b))return res.status(401).json({success:false,error:'HR_UNAUTHORIZED'});
+  next();
+}
+const hrStatusLabel_ = s => ({draft:'Черновик',submitted:'На согласовании',approved:'Согласовано',rejected:'Отклонено',signing:'На подписании',signed:'Подписано ЭЦП',cancelled:'Отменено'}[s]||s);
+const hrClean_ = (v,max=300)=>String(v??'').trim().slice(0,max);
+const hrLogin_ = v=>hrClean_(v,80).toLowerCase();
+const hrRequired_ = (v,name,max=300)=>{const s=hrClean_(v,max);if(!s)throw Object.assign(new Error('Не заполнено: '+name),{status:400});return s;};
+const hrPublic_ = r=>({
+  id:r.request_no || String(r.id), owner_login:r.employee_login, employee:r.employee_name,
+  employee_number:r.personnel_no||'',position:r.job_title||'',department:r.department||'',category:r.employee_category||'',
+  legal_entity:r.legal_entity||'',destination:[r.destination_city,r.destination_country].filter(Boolean).join(', '),
+  date_from:r.date_from instanceof Date?r.date_from.toISOString().slice(0,10):String(r.date_from||'').slice(0,10),
+  date_to:r.date_to instanceof Date?r.date_to.toISOString().slice(0,10):String(r.date_to||'').slice(0,10),
+  city_type:r.city_category||'',funding_source:r.funding_source||'',basis:r.basis_document||'',purpose:r.purpose||'',
+  status:hrStatusLabel_(r.status),created_at:r.created_at,updated_at:r.updated_at,
+  reviewer:r.director_decided_at?r.director_login:'',reviewed_at:r.director_decided_at||'',review_comment:r.director_comment||'',
+  days_count:r.days_count,per_diem_amount:r.per_diem_amount,lodging_amount:r.lodging_amount,
+  travel_amount:r.travel_amount,total_amount:r.total_amount
+});
+const hrError_ = (res,e)=>{const code=e.status||500;if(code>=500)console.error('HR API:',e);return res.status(code).json({success:false,error:code>=500?'HR_SERVER_ERROR':e.message});};
+
+app.get('/hr/trips',hrApiGuard_,async(req,res)=>{
+ try{
+  const login=hrLogin_(req.query.login);if(!login)return res.status(400).json({success:false,error:'LOGIN_REQUIRED'});
+  const director=login==='k_ermek';
+  const q=director
+    ?'SELECT * FROM hr.trip_requests ORDER BY created_at DESC,id DESC LIMIT 2000'
+    :'SELECT * FROM hr.trip_requests WHERE lower(btrim(employee_login))=$1 ORDER BY created_at DESC,id DESC LIMIT 2000';
+  const out=await pool.query(q,director?[]:[login]);
+  res.json({success:true,is_director:director,rows:out.rows.map(hrPublic_)});
+ }catch(e){hrError_(res,e)}
+});
+app.post('/hr/trips',hrApiGuard_,async(req,res)=>{
+ const client=await pool.connect();
+ try{
+  const b=req.body||{},login=hrLogin_(b.login);
+  if(!login)throw Object.assign(new Error('LOGIN_REQUIRED'),{status:400});
+  const employee=hrRequired_(b.employee,'employee');
+  const position=hrRequired_(b.position,'position');
+  const department=hrRequired_(b.department,'department');
+  const category=hrRequired_(b.category,'category');
+  const legal=hrRequired_(b.legal_entity,'legal_entity');
+  const destination=hrRequired_(b.destination,'destination');
+  const cityType=hrRequired_(b.city_type,'city_type');
+  const purpose=hrRequired_(b.purpose,'purpose',3000);
+  const from=hrRequired_(b.date_from,'date_from',10),to=hrRequired_(b.date_to,'date_to',10);
+  const iso=/^\d{4}-\d{2}-\d{2}$/;
+  const d1=new Date(from+'T00:00:00Z'),d2=new Date(to+'T00:00:00Z');
+  if(!iso.test(from)||!iso.test(to)||Number.isNaN(d1.getTime())||Number.isNaN(d2.getTime())||d1.toISOString().slice(0,10)!==from||d2.toISOString().slice(0,10)!==to||d2<d1)throw Object.assign(new Error('Неверный период командировки'),{status:400});
+  const days=Math.round((d2-d1)/86400000)+1;
+  if(days>366)throw Object.assign(new Error('Период превышает 366 дней'),{status:400});
+  const parts=destination.split(',');const city=parts.shift().trim();const country=parts.join(',').trim()||'Казахстан';
+  await client.query('BEGIN');
+  const q=await client.query(`INSERT INTO hr.trip_requests
+    (created_by_login,employee_login,employee_name,personnel_no,job_title,department,employee_category,legal_entity,
+     destination_city,destination_country,city_category,date_from,date_to,purpose,funding_source,basis_document,days_count,status)
+    VALUES ($1,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::date,$12::date,$13,$14,$15,$16,'submitted') RETURNING id`,
+    [login,employee,hrClean_(b.employee_number,100),position,department,category,legal,city,country,cityType,from,to,purpose,hrClean_(b.funding_source),hrClean_(b.basis),days]);
+  await client.query('INSERT INTO hr.trip_approval_log(trip_id,actor_login,action,new_status) VALUES($1,$2,$3,$4)',[q.rows[0].id,login,'submitted','submitted']);
+  const after=await client.query('SELECT request_no FROM hr.trip_requests WHERE id=$1',[q.rows[0].id]);
+  await client.query('COMMIT');
+  res.status(201).json({success:true,id:after.rows[0].request_no});
+ }catch(e){try{await client.query('ROLLBACK')}catch(_){}hrError_(res,e)}finally{client.release()}
+});
+app.post('/hr/trips/review',hrApiGuard_,async(req,res)=>{
+ const client=await pool.connect();
+ try{
+  const b=req.body||{},login=hrLogin_(b.login),id=hrClean_(b.id,80),decision=hrClean_(b.decision,20),comment=hrClean_(b.comment,1000);
+  if(login!=='k_ermek')throw Object.assign(new Error('Только директор может согласовать'),{status:403});
+  if(!['approve','reject'].includes(decision))throw Object.assign(new Error('Недопустимое действие'),{status:400});
+  if(decision==='reject'&&!comment)throw Object.assign(new Error('Укажите причину отказа'),{status:400});
+  const next=decision==='approve'?'approved':'rejected';
+  await client.query('BEGIN');
+  const updated=await client.query(`UPDATE hr.trip_requests SET status=$1,director_decided_at=now(),director_comment=$2,updated_at=now()
+    WHERE request_no=$3 AND status='submitted' RETURNING id`,[next,comment,id]);
+  if(updated.rowCount!==1)throw Object.assign(new Error('Заявка не найдена или уже обработана'),{status:409});
+  await client.query(`INSERT INTO hr.trip_approval_log(trip_id,actor_login,action,previous_status,new_status,comment_text)
+    VALUES($1,$2,$3,'submitted',$4,$5)`,[updated.rows[0].id,login,decision==='approve'?'approved':'rejected',next,comment]);
+  await client.query('COMMIT');res.json({success:true,status:hrStatusLabel_(next)});
+ }catch(e){try{await client.query('ROLLBACK')}catch(_){}hrError_(res,e)}finally{client.release()}
+});
 
 app.listen(PORT, () => console.log("Server started on port " + PORT));
