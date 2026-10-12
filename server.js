@@ -1884,6 +1884,19 @@ await pool.query(`
     ADD COLUMN IF NOT EXISTS received_qty numeric(18,6) DEFAULT 0;
   `);
 
+  await pool.query(`ALTER TABLE lzk.supply
+    ADD COLUMN IF NOT EXISTS comparison_protocol text,
+    ADD COLUMN IF NOT EXISTS supplier_name text,
+    ADD COLUMN IF NOT EXISTS contract_details text,
+    ADD COLUMN IF NOT EXISTS unit_price numeric(18,2),
+    ADD COLUMN IF NOT EXISTS payment_invoice text,
+    ADD COLUMN IF NOT EXISTS delivery_terms text,
+    ADD COLUMN IF NOT EXISTS payment_terms text,
+    ADD COLUMN IF NOT EXISTS destination_warehouse_mol text,
+    ADD COLUMN IF NOT EXISTS onec_receipt_status text,
+    ADD COLUMN IF NOT EXISTS purchase_status_note text,
+    ADD COLUMN IF NOT EXISTS documents_esf text;`);
+
   await pool.query(`
     ALTER TABLE lzk.limits
     ADD COLUMN IF NOT EXISTS fact_received numeric(18,6) DEFAULT 0;
@@ -11421,6 +11434,17 @@ app.get("/lzk/supply", async (req, res) => {
           s.documents_status AS documents,
           s.receive_status AS receive_tmc,
           COALESCE(s.received_qty, 0) AS done,
+          s.comparison_protocol,
+          s.supplier_name,
+          s.contract_details,
+          s.unit_price,
+          s.payment_invoice,
+          s.delivery_terms,
+          s.payment_terms,
+          s.destination_warehouse_mol,
+          s.onec_receipt_status,
+          s.purchase_status_note,
+          s.documents_esf,
           s.trust_qty,
           s.trust_from AS trust_who,
           s.trust_invoice,
@@ -11475,6 +11499,17 @@ app.get("/lzk/supply", async (req, res) => {
           s.documents_status AS documents,
           s.receive_status AS receive_tmc,
           COALESCE(s.received_qty, 0) AS done,
+          s.comparison_protocol,
+          s.supplier_name,
+          s.contract_details,
+          s.unit_price,
+          s.payment_invoice,
+          s.delivery_terms,
+          s.payment_terms,
+          s.destination_warehouse_mol,
+          s.onec_receipt_status,
+          s.purchase_status_note,
+          s.documents_esf,
           s.trust_qty,
           s.trust_from AS trust_who,
           s.trust_invoice,
@@ -11555,6 +11590,17 @@ app.post("/lzk/supply/save", async (req, res) => {
         trust_from,
         trust_invoice,
         trusted_person,
+        comparison_protocol,
+        supplier_name,
+        contract_details,
+        unit_price,
+        payment_invoice,
+        delivery_terms,
+        payment_terms,
+        destination_warehouse_mol,
+        onec_receipt_status,
+        purchase_status_note,
+        documents_esf,
         created_at,
         updated_at
       )
@@ -11571,6 +11617,17 @@ app.post("/lzk/supply/save", async (req, res) => {
         $10,
         $11,
         $12,
+        $13,
+        $14,
+        $15,
+        $16,
+        $17,
+        $18,
+        $19,
+        $20,
+        $21,
+        $22,
+        $23,
         NOW(),
         NOW()
       )
@@ -11586,6 +11643,18 @@ app.post("/lzk/supply/save", async (req, res) => {
         trust_from = EXCLUDED.trust_from,
         trust_invoice = EXCLUDED.trust_invoice,
         trusted_person = EXCLUDED.trusted_person,
+        comparison_protocol = EXCLUDED.comparison_protocol,
+        supplier_name = EXCLUDED.supplier_name,
+        contract_details = EXCLUDED.contract_details,
+        unit_price = EXCLUDED.unit_price,
+        payment_invoice = EXCLUDED.payment_invoice,
+        delivery_terms = EXCLUDED.delivery_terms,
+        payment_terms = EXCLUDED.payment_terms,
+        destination_warehouse_mol = EXCLUDED.destination_warehouse_mol,
+        onec_receipt_status = EXCLUDED.onec_receipt_status,
+        purchase_status_note = EXCLUDED.purchase_status_note,
+        documents_esf = EXCLUDED.documents_esf,
+
         updated_at = NOW()
       RETURNING *
     `, [
@@ -11600,7 +11669,18 @@ app.post("/lzk/supply/save", async (req, res) => {
       body.trust_qty || null,
       body.trust_who || null,
       body.trust_invoice || null,
-      body.trusted_person || null
+      body.trusted_person || null,
+      (body.comparison_protocol ?? null),
+      (body.supplier_name ?? null),
+      (body.contract_details ?? null),
+      (lzkNum(body.unit_price) ?? null),
+      (body.payment_invoice ?? null),
+      (body.delivery_terms ?? null),
+      (body.payment_terms ?? null),
+      (body.destination_warehouse_mol ?? null),
+      (body.onec_receipt_status ?? null),
+      (body.purchase_status_note ?? null),
+      (body.documents_esf ?? null)
     ]);
     // ВАЖНО: lzk.limits.fact_received теперь используется как "Одобрено без ЛЗК".
     // Панель снабженца больше не должна перезаписывать это ручное поле.
