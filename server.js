@@ -18177,9 +18177,17 @@ async function hrSigVerifyAttached_(cms,pdf){
     if(error){
       // Never bypass CMS verification. Distinguish missing signer public key from
       // an invalid signature or other malformed CMS errors for test diagnostics.
-      const noSignerKey=/CMS_SignerInfo_verify:no public key|signer certificate not found|signer certificate.*not found/i.test(error);
+      // Казахстанский ГОСТ в CMS может быть корректным, но стандартный OpenSSL
+      // в Render не умеет декодировать его открытый ключ. Нельзя принимать такую
+      // подпись как успешную без ГОСТ-совместимой криптографической проверки.
+      const unsupportedGost = /X509_PUBKEY_get0:decode error|Unable to load Public Key/i.test(error)
+        || (/CMS_SignerInfo_verify:no public key/i.test(error) && /decode error/i.test(error));
+      if (unsupportedGost) {
+        return {ok:false,error:'CMS_GOST_NOT_SUPPORTED: CMS содержит сертификат, но OpenSSL сервера не поддерживает алгоритм открытого ключа НУЦ РК (ГОСТ). Для подтверждения подписи подключите ГОСТ-совместимый криптопровайдер или доверенный сервис проверки CMS. Подпись пока НЕ проверена.'};
+      }
+      const noSignerKey=/signer certificate not found|signer certificate.*not found/i.test(error);
       if(noSignerKey){
-        return {ok:false,error:'CMS_SIGNER_CERT_MISSING: OpenSSL не нашёл сертификат подписанта/открытый ключ в CMS. Проверьте, что NCALayer включает сертификат подписанта в SignedData. Подпись НЕ подтверждена.'};
+        return {ok:false,error:'CMS_SIGNER_CERT_MISSING: В CMS не найден сертификат подписанта. Подпись НЕ подтверждена.'};
       }
       return {ok:false,error:'CMS_VERIFY_FAILED: '+error};
     }
