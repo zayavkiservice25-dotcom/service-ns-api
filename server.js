@@ -14879,6 +14879,77 @@ app.get("/lzk/request-print/data", async (req, res) => {
   }
 });
 
+
+// Отчет по пулам: только чтение. Суммы привязаны к allocations, а не ко всей заявке.
+app.get('/draft-funding-report', async (req, res) => {
+  try {
+    res.set('Cache-Control', 'no-store');
+    const login = String(req.query.login || '').trim().toLowerCase();
+    if (!login) return res.status(401).json({success:false,error:'Укажите логин'});
+    const user = await pool.query("SELECT role_ft FROM public.users WHERE lower(trim(login))=$1 LIMIT 1", [login]);
+    if (!user.rowCount) return res.status(403).json({success:false,error:'Пользователь не найден'});
+    const all = ['s_zhasulan','a_zaitova','v_shevchenko','k_marat','k_ermek','b_erkin','k_arailym'].includes(login)
+      || ['admin','админ','администратор'].includes(String(user.rows[0].role_ft || '').trim().toLowerCase());
+    const result = await pool.query(`
+      WITH heads AS (
+        SELECT DISTINCT ON (i.zvk_row_id) i.zvk_row_id, h.*
+        FROM public.request_items i JOIN public.request_head h ON h.id=i.request_id
+        WHERE i.zvk_row_id IS NOT NULL
+        ORDER BY i.zvk_row_id, h.id DESC
+      ), bindings AS (
+        SELECT a.funding_pool_id, a.zvk_row_id, a.amount
+        FROM public.zvk_funding_pool_allocations a
+        UNION ALL
+        SELECT zs.funding_pool_id, cur.zvk_row_id, COALESCE(cur.to_pay,0)
+        FROM public.zvk_status zs JOIN public.ft_zvk_current_v2 cur ON cur.zvk_row_id=zs.zvk_row_id
+        WHERE zs.funding_pool_id IS NOT NULL AND NOT EXISTS (
+          SELECT 1 FROM public.zvk_funding_pool_allocations a WHERE a.zvk_row_id=zs.zvk_row_id
+        )
+      ), states AS (
+        SELECT a.*, cur.zvk_row_id IS NULL AS missing,
+          lower(trim(COALESCE(cur.is_paid,'')))='да' AS paid,
+          lower(trim(COALESCE(cur.request_flag,'')))='обнуление'
+            OR lower(trim(COALESCE(cur.registry_flag,'')))='обнуление' AS reset,
+          lower(trim(COALESCE(h.approve_ermek_status,''))) IN ('да','согласовано','утверждено') AS approved,
+          'отклонено' IN (lower(trim(COALESCE(h.acc_zhas_status,''))),
+            lower(trim(COALESCE(h.acc_zhasulan_status,''))),lower(trim(COALESCE(h.acc_zaitova_status,''))),
+            lower(trim(COALESCE(h.acc_ermek_status,''))),lower(trim(COALESCE(h.approve_ermek_status,'')))) AS rejected,
+          lower(trim(COALESCE(cur.registry_flag,'')))='да' OR h.id IS NOT NULL
+            OR EXISTS(SELECT 1 FROM public.registry_items gi WHERE gi.zvk_row_id=a.zvk_row_id) AS in_registry
+        FROM bindings a LEFT JOIN public.ft_zvk_current_v2 cur ON cur.zvk_row_id=a.zvk_row_id
+        LEFT JOIN heads h ON h.zvk_row_id=a.zvk_row_id
+      ), usage AS (
+        SELECT funding_pool_id,
+          COALESCE(sum(amount) FILTER(WHERE paid),0) AS paid,
+          COALESCE(sum(amount) FILTER(WHERE NOT paid AND NOT reset AND NOT rejected AND in_registry AND NOT missing),0) AS registry,
+          COALESCE(sum(amount) FILTER(WHERE NOT paid AND NOT reset AND NOT rejected AND in_registry AND approved AND NOT missing),0) AS approved,
+          count(*) FILTER(WHERE missing) AS missing
+        FROM states GROUP BY funding_pool_id
+      ), children AS (
+        SELECT parent_pool_id, sum(amount) AS amount FROM public.draft_funding_pool
+        WHERE is_active=true AND parent_pool_id IS NOT NULL GROUP BY parent_pool_id
+      ), balances AS (
+        SELECT p.id, p.legal_entity,p.source_name,p.money_type,p.beneficiary_login,p.object_name,
+          CASE WHEN p.parent_pool_id IS NULL AND COALESCE(trim(p.object_name),'')='' THEN 'Нет' ELSE 'Да' END AS distributed,
+          p.amount - CASE WHEN p.parent_pool_id IS NULL AND COALESCE(trim(p.object_name),'')='' THEN COALESCE(c.amount,0) ELSE 0 END
+            - COALESCE(u.paid,0) AS balance,
+          COALESCE(u.registry,0) AS registry, COALESCE(u.approved,0) AS approved,
+          COALESCE(u.missing,0) AS missing
+        FROM public.draft_funding_pool p LEFT JOIN children c ON c.parent_pool_id=p.id
+        LEFT JOIN usage u ON u.funding_pool_id=p.id
+        WHERE p.is_active=true AND ($1::boolean OR lower(trim(COALESCE(p.beneficiary_login,'')))=$2)
+      )
+      SELECT *, balance-approved AS after_approved, balance-registry AS free
+      FROM balances WHERE distributed='Да' OR balance<>0 OR registry<>0 OR missing<>0
+      ORDER BY legal_entity,source_name,money_type,beneficiary_login,object_name,id
+    `,[all,login]);
+    res.json({success:true,rows:result.rows,scope:all?'all':'own',updated_at:new Date().toISOString()});
+  } catch(e) {
+    console.error('POOLS REPORT ERROR',e);
+    res.status(500).json({success:false,error:'Не удалось получить отчет по пулам. Проверьте журнал сервера.'});
+  }
+});
+
 app.get("/draft-funding-pools", async (req, res) => {
   try {
     const result = await pool.query(`
