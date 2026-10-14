@@ -6072,6 +6072,31 @@ app.post("/save-ft", async (req, res) => {
 // FT BASIS: чтение основания и истории; изменение только создателем
 // Авторизация по токену текущего входа (без повторного ввода пароля).
 // =====================================================
+// Поиск заявок для FT BASIS. Требует действующую сессию.
+// Источник — те же IDZLZK, которые сервер проверяет при сохранении.
+app.get('/ft-lzk-basis/candidates', async (req,res) => {
+  try {
+    const actor = await getAuthenticatedFtUser(req);
+    if (!actor) return res.status(401).json({success:false,error:'AUTH_REQUIRED'});
+    const search = String(req.query.q || '').trim().slice(0,150);
+    const pattern = '%' + search + '%';
+    const data = await pool.query(`
+      SELECT r.idzlzk, r.object_name, r.material_name,
+             COALESCE((SELECT MAX(s.supplier_name) FROM lzk.supply s WHERE s.idzlzk=r.idzlzk),'') AS supplier_name
+      FROM lzk.requests r
+      WHERE r.idzlzk ILIKE $1
+         OR COALESCE(r.object_name,'') ILIKE $1
+         OR COALESCE(r.material_name,'') ILIKE $1
+         OR EXISTS (SELECT 1 FROM lzk.supply s WHERE s.idzlzk=r.idzlzk AND COALESCE(s.supplier_name,'') ILIKE $1)
+      ORDER BY r.request_date DESC NULLS LAST, r.idzlzk DESC
+      LIMIT 80`,[pattern]);
+    return res.json({success:true,rows:data.rows});
+  } catch(e) {
+    console.error('FT BASIS CANDIDATES:',e);
+    return res.status(500).json({success:false,error:'CANDIDATES_UNAVAILABLE'});
+  }
+});
+
 app.get("/ft-lzk-basis", async (req, res) => {
   try {
     const idFt = String(req.query.id_ft || "").trim();
