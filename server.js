@@ -8,6 +8,7 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const path = require("path");
+const crypto = require("crypto");
 const { Pool } = require("pg");
 const app = express();
 const nodemailer = require("nodemailer");
@@ -122,6 +123,44 @@ mechanization text,
   await pool.query(`ALTER TABLE public.ft ADD COLUMN IF NOT EXISTS dds_article text;`);
   await pool.query(`ALTER TABLE public.ft ADD COLUMN IF NOT EXISTS contract_no text;`);
   await pool.query(`ALTER TABLE public.ft ADD COLUMN IF NOT EXISTS contract_date date;`);
+
+  // Серверные сессии: токен выдаётся один раз после входа.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.app_sessions (
+      token_hash text PRIMARY KEY,
+      user_login text NOT NULL,
+      expires_at timestamptz NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now()
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS app_sessions_expires_idx ON public.app_sessions (expires_at);`);
+
+  // Счета из Панели снабженца ЛЗК (обычные старые FT остаются MANUAL).
+  await pool.query(`ALTER TABLE public.ft ADD COLUMN IF NOT EXISTS source_type text DEFAULT 'MANUAL';`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.ft_lzk_basis (
+      id bigserial PRIMARY KEY,
+      id_ft text NOT NULL REFERENCES public.ft(id_ft),
+      id_zlzk text NOT NULL,
+      amount numeric(18,2),
+      created_at timestamptz DEFAULT now(),
+      UNIQUE (id_ft, id_zlzk)
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS ft_lzk_basis_zlzk_idx ON public.ft_lzk_basis (id_zlzk);`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.ft_lzk_basis_history (
+      id bigserial PRIMARY KEY,
+      id_ft text NOT NULL REFERENCES public.ft(id_ft),
+      id_zlzk text NOT NULL,
+      action text NOT NULL CHECK (action IN ('ADD', 'REMOVE')),
+      changed_by text NOT NULL,
+      changed_at timestamptz NOT NULL DEFAULT now()
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS ft_lzk_basis_history_ft_time_idx
+    ON public.ft_lzk_basis_history (id_ft, changed_at DESC, id DESC);`);
+
 
   // Один исходный PDF Drive может создать только одну запись FT.
   // Старые строки остаются с NULL и не конфликтуют между собой.
@@ -2139,6 +2178,23 @@ const r = await pool.query(`
 });
 
 
+// Подтверждение серверной сессии. Сам login в теле запроса не является авторизацией.
+function hashFtAuthToken(token) {
+  return crypto.createHash('sha256').update(String(token)).digest('hex');
+}
+async function getAuthenticatedFtUser(req, db = pool) {
+  const match = String(req.get('authorization') || '').match(/^Bearer\s+([A-Za-z0-9_-]{32,256})$/i);
+  if (!match) return null;
+  const result = await db.query(`
+    SELECT u.login, u.role_ft
+    FROM public.app_sessions s
+    JOIN public.users u ON lower(trim(u.login)) = lower(trim(s.user_login))
+    WHERE s.token_hash = $1 AND s.expires_at > NOW() AND u.is_active = true
+    LIMIT 1
+  `, [hashFtAuthToken(match[1])]);
+  return result.rows[0] || null;
+}
+
 app.post("/login", async (req, res) => {
   try {
     const { login, password } = req.body || {};
@@ -2176,8 +2232,15 @@ app.post("/login", async (req, res) => {
       });
     }
 
+const authToken = crypto.randomBytes(32).toString('hex');
+await pool.query(`
+  INSERT INTO public.app_sessions (token_hash, user_login, expires_at)
+  VALUES ($1, $2, NOW() + INTERVAL '12 hours')
+`, [hashFtAuthToken(authToken), user.login]);
+
 return res.json({
   success: true,
+  auth_token: authToken,
   user: {
     login: user.login,
     email: user.email,
@@ -5570,6 +5633,20 @@ if (isAdmin || isAll) {
     }
 
 
+    // Вкладка «ЛЗК счета»: только дополнительный фильтр.
+    // Все старые условия прав просмотра и статусов остаются без изменений.
+    const ftView = String(req.query.ft_view || 'all').trim().toLowerCase();
+    if (!['all', 'lzk'].includes(ftView)) {
+      return res.status(400).json({ success:false, error:'INVALID_FT_VIEW' });
+    }
+    if (ftView === 'lzk') {
+      where.push(`EXISTS (
+        SELECT 1 FROM public.ft ft_origin
+        WHERE ft_origin.id_ft = v.id_ft
+          AND COALESCE(ft_origin.source_type, 'MANUAL') = 'LZK'
+      )`);
+    }
+
     const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
 
 const query = `
@@ -5740,10 +5817,29 @@ app.post("/save-ft", async (req, res) => {
       invoice_date,
       invoice_pdf,
       sum_ft,
-      source_file_id
+      source_file_id,
+      source_type,
+      idzlzk_ids
     } = req.body || {};
 
     sourceFileId = String(source_file_id || "").trim();
+
+    // Никаких ZLZK у обычного ручного ввода не требуется.
+    const origin = source_type == null || source_type === "" ? "MANUAL" : String(source_type).trim().toUpperCase();
+    if (!["MANUAL", "LZK"].includes(origin)) {
+      return res.status(400).json({ success:false, error:"Invalid source_type" });
+    }
+    if (idzlzk_ids !== undefined && !Array.isArray(idzlzk_ids)) {
+      return res.status(400).json({ success:false, error:"idzlzk_ids must be an array" });
+    }
+    const lzkIds = (idzlzk_ids || []).map(v => String(v ?? "").trim());
+    if (lzkIds.some(v => !v || v.length > 120) || new Set(lzkIds).size !== lzkIds.length || lzkIds.length > 500) {
+      return res.status(400).json({ success:false, error:"Invalid or duplicate idzlzk_ids" });
+    }
+    if ((origin === "LZK" && lzkIds.length === 0) || (origin !== "LZK" && lzkIds.length > 0)) {
+      return res.status(400).json({ success:false, error:"LZK origin must include idzlzk_ids" });
+    }
+
 
     if (!input_name) {
       return res.status(400).json({ success:false, error:"input_name is required" });
@@ -5780,6 +5876,20 @@ app.post("/save-ft", async (req, res) => {
     }
 
     await client.query("BEGIN");
+
+    // Все выбранные ZLZK должны существовать; проверка внутри одной транзакции.
+    if (origin === "LZK") {
+      const found = await client.query(
+        `SELECT DISTINCT idzlzk FROM lzk.requests WHERE idzlzk = ANY($1::text[])`,
+        [lzkIds]
+      );
+      const known = new Set(found.rows.map(r => r.idzlzk));
+      const missing = lzkIds.filter(id => !known.has(id));
+      if (missing.length) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ success:false, error:"Unknown idzlzk", missing });
+      }
+    }
 
     // Первая проверка идемпотентности:
     // если этот Google Drive PDF уже отправлялся — просто возвращаем прежние ID.
@@ -5827,13 +5937,14 @@ app.post("/save-ft", async (req, res) => {
           invoice_date,
           invoice_pdf,
           sum_ft,
-          source_file_id
+          source_file_id,
+          source_type
         )
       VALUES
         (
           $1,$2,$3,$4,$5,$6,$7,
           $8,$9,$10,$11,
-          $12,$13,$14,$15,$16
+          $12,$13,$14,$15,$16,$17
         )
       RETURNING id_ft
       `,
@@ -5855,9 +5966,18 @@ app.post("/save-ft", async (req, res) => {
         invoiceDateNormalized,
         invoice_pdf ? String(invoice_pdf).trim() : null,
         sumNum,
-        sourceFileId || null
+        sourceFileId || null,
+        origin
       ]
     );
+
+    // Первоначальное основание FT (не фактическое распределение будущих ZFT).
+    for (const id_zlzk of lzkIds) {
+      await client.query(
+        `INSERT INTO public.ft_lzk_basis (id_ft, id_zlzk) VALUES ($1, $2)`,
+        [id_ft, id_zlzk]
+      );
+    }
 
     const zftRow = await client.query(
       `SELECT 'ZFT' || nextval('zvk_id_seq')::text AS id_zvk`
@@ -5896,7 +6016,9 @@ app.post("/save-ft", async (req, res) => {
       success:true,
       already_exists:false,
       id_ft:r.rows[0].id_ft,
-      id_zvk
+      id_zvk,
+      source_type:origin,
+      idzlzk_ids:lzkIds
     });
 
   } catch (e) {
@@ -5931,6 +6053,144 @@ app.post("/save-ft", async (req, res) => {
       error:e && e.message ? e.message : String(e)
     });
 
+  } finally {
+    client.release();
+  }
+});
+
+// =====================================================
+// FT BASIS: чтение основания и истории; изменение только создателем
+// Авторизация по токену текущего входа (без повторного ввода пароля).
+// =====================================================
+app.get("/ft-lzk-basis", async (req, res) => {
+  try {
+    const idFt = String(req.query.id_ft || "").trim();
+    if (!idFt) return res.status(400).json({ success:false, error:"id_ft required" });
+    const actor = await getAuthenticatedFtUser(req);
+    if (!actor) return res.status(401).json({success:false, error:'AUTH_REQUIRED'});
+
+    const ft = await pool.query(
+      `SELECT id_ft, input_name, COALESCE(source_type, 'MANUAL') AS source_type
+       FROM public.ft WHERE id_ft=$1 LIMIT 1`, [idFt]
+    );
+    if (!ft.rowCount) return res.status(404).json({ success:false, error:"FT_NOT_FOUND" });
+    const owner = String(ft.rows[0].input_name || '').trim().toLowerCase();
+    const actorLogin = String(actor.login || '').trim().toLowerCase();
+    const privileged = ['admin','supervisor','operator'].includes(String(actor.role_ft || '').toLowerCase())
+      || ['b_erkin','s_zhasulan','zh_elnur','t_serik','a_zaitova'].includes(actorLogin);
+    if (!privileged && actorLogin !== owner) return res.status(403).json({success:false,error:'NO_VIEW_RIGHTS'});
+
+    const basis = await pool.query(
+      `SELECT id_zlzk, amount, created_at
+       FROM public.ft_lzk_basis WHERE id_ft=$1 ORDER BY id`, [idFt]
+    );
+    const history = await pool.query(
+      `SELECT id_zlzk, action, changed_by, changed_at
+       FROM public.ft_lzk_basis_history WHERE id_ft=$1
+       ORDER BY changed_at DESC, id DESC LIMIT 500`, [idFt]
+    );
+    return res.json({ success:true, ft:ft.rows[0], basis:basis.rows, history:history.rows });
+  } catch (e) {
+    console.error("GET FT-LZK-BASIS ERROR:", e);
+    return res.status(500).json({ success:false, error:"INTERNAL_ERROR" });
+  }
+});
+
+// POST /ft-lzk-basis/update
+// { id_ft:"FT50", idzlzk_ids:["ZLZK101","ZLZK102"] } + Authorization: Bearer <token>
+// Передаётся ПОЛНЫЙ итоговый список; пустой список удаляет все связи.
+app.post("/ft-lzk-basis/update", async (req, res) => {
+  const idFt = String(req.body?.id_ft || "").trim();
+  const rawIds = req.body?.idzlzk_ids;
+  if (!idFt || !Array.isArray(rawIds)) {
+    return res.status(400).json({success:false, error:"id_ft, idzlzk_ids required"});
+  }
+  if (rawIds.length > 500 || rawIds.some(v => typeof v !== "string")) {
+    return res.status(400).json({success:false, error:"INVALID_ZLZK_LIST"});
+  }
+  const ids = rawIds.map(x => x.trim());
+  if (ids.some(x => !x || x.length > 120) || new Set(ids).size !== ids.length) {
+    return res.status(400).json({success:false, error:"EMPTY_OR_DUPLICATE_ZLZK"});
+  }
+
+  const client = await pool.connect();
+  try {
+    const actor = await getAuthenticatedFtUser(req, client);
+    if (!actor) return res.status(401).json({success:false, error:'AUTH_REQUIRED'});
+    const login = String(actor.login).trim().toLowerCase();
+    await client.query("BEGIN");
+    const ftResult = await client.query(
+      `SELECT id_ft, input_name FROM public.ft WHERE id_ft=$1 FOR UPDATE`, [idFt]
+    );
+    if (!ftResult.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({success:false, error:"FT_NOT_FOUND"});
+    }
+
+    // Никто, включая администратора, не может менять чужой FT BASIS.
+    // Сравнение именно с создателем счета, а не с именем заявителя ZFT.
+    const owner = String(ftResult.rows[0].input_name || "").trim().toLowerCase();
+    if (owner !== login) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({success:false, error:"ONLY_FT_CREATOR_CAN_EDIT_BASIS"});
+    }
+
+    if (ids.length) {
+      const found = await client.query(
+        `SELECT DISTINCT idzlzk FROM lzk.requests WHERE idzlzk=ANY($1::text[])`, [ids]
+      );
+      const known = new Set(found.rows.map(r => String(r.idzlzk)));
+      const missing = ids.filter(x => !known.has(x));
+      if (missing.length) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({success:false, error:"UNKNOWN_ZLZK", missing});
+      }
+    }
+
+    const current = await client.query(
+      `SELECT id_zlzk FROM public.ft_lzk_basis WHERE id_ft=$1 FOR UPDATE`, [idFt]
+    );
+    const old = new Set(current.rows.map(r => String(r.id_zlzk)));
+    const desired = new Set(ids);
+    const remove = [...old].filter(x => !desired.has(x));
+    const add = ids.filter(x => !old.has(x));
+
+    if (remove.length) {
+      await client.query(
+        `DELETE FROM public.ft_lzk_basis WHERE id_ft=$1 AND id_zlzk=ANY($2::text[])`,
+        [idFt, remove]
+      );
+    }
+    for (const id of add) {
+      await client.query(
+        `INSERT INTO public.ft_lzk_basis (id_ft, id_zlzk) VALUES ($1,$2)`, [idFt, id]
+      );
+    }
+    for (const id of remove) {
+      await client.query(
+        `INSERT INTO public.ft_lzk_basis_history (id_ft, id_zlzk, action, changed_by)
+         VALUES ($1,$2,'REMOVE',$3)`, [idFt, id, login]
+      );
+    }
+    for (const id of add) {
+      await client.query(
+        `INSERT INTO public.ft_lzk_basis_history (id_ft, id_zlzk, action, changed_by)
+         VALUES ($1,$2,'ADD',$3)`, [idFt, id, login]
+      );
+    }
+    // Если к обычному FT впервые добавили основание, он становится LZK.
+    // При удалении всех связей статус LZK не сбрасываем автоматически:
+    // это сохраняет факт происхождения для аудита.
+    if (ids.length) {
+      await client.query(`UPDATE public.ft SET source_type='LZK' WHERE id_ft=$1`, [idFt]);
+    }
+
+    await client.query("COMMIT");
+    return res.json({success:true, id_ft:idFt, idzlzk_ids:ids, added:add, removed:remove});
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+    console.error("UPDATE FT-LZK-BASIS ERROR:", e);
+    return res.status(500).json({success:false, error:"INTERNAL_ERROR"});
   } finally {
     client.release();
   }
