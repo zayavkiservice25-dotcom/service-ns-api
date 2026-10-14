@@ -5643,13 +5643,13 @@ if (isAdmin || isAll) {
     if (!['all', 'lzk'].includes(ftView)) {
       return res.status(400).json({ success:false, error:'INVALID_FT_VIEW' });
     }
-    if (ftView === 'lzk') {
-      where.push(`EXISTS (
-        SELECT 1 FROM public.ft ft_origin
-        WHERE ft_origin.id_ft = v.id_ft
-          AND COALESCE(ft_origin.source_type, 'MANUAL') = 'LZK'
-      )`);
-    }
+    // Вкладки взаимоисключающие. Основание — наличие привязанных ZLZK
+    // либо явно отмеченный источник LZK (для старых записей).
+    const lzkInvoiceCondition = `(
+      EXISTS (SELECT 1 FROM public.ft_lzk_basis fbl WHERE fbl.id_ft = v.id_ft)
+      OR EXISTS (SELECT 1 FROM public.ft fo WHERE fo.id_ft = v.id_ft AND COALESCE(fo.source_type, 'MANUAL') = 'LZK')
+    )`;
+    where.push(ftView === 'lzk' ? lzkInvoiceCondition : `NOT ${lzkInvoiceCondition}`);
 
     const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
 
@@ -5724,6 +5724,7 @@ const query = `
     ) AS money_type,
 
     zs.funding_pool_id,
+    COALESCE(lzk_basis.idzlzk_ids, '') AS idzlzk_ids,
 
     EXISTS (
       SELECT 1
@@ -5733,6 +5734,11 @@ const query = `
     ) AS pre_registry_sent
 
   FROM balance_rows v
+
+  LEFT JOIN LATERAL (
+    SELECT string_agg(b.id_zlzk, ', ' ORDER BY b.id_zlzk) AS idzlzk_ids
+    FROM (SELECT DISTINCT id_zlzk FROM public.ft_lzk_basis WHERE id_ft = v.id_ft) b
+  ) lzk_basis ON TRUE
 
   LEFT JOIN public.zvk zlive
     ON zlive.id = v.zvk_row_id
