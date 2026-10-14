@@ -147,6 +147,10 @@ mechanization text,
       UNIQUE (id_ft, id_zlzk)
     );
   `);
+  // FT BASIS stores references to ZLZK, not paid amounts.
+  // Existing databases may have amount NOT NULL from an older schema.
+  // DROP NOT NULL is idempotent and preserves all rows/amounts.
+  await pool.query(`ALTER TABLE public.ft_lzk_basis ALTER COLUMN amount DROP NOT NULL;`);
   await pool.query(`CREATE INDEX IF NOT EXISTS ft_lzk_basis_zlzk_idx ON public.ft_lzk_basis (id_zlzk);`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS public.ft_lzk_basis_history (
