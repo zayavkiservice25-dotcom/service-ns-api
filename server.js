@@ -162,6 +162,11 @@ mechanization text,
       changed_at timestamptz NOT NULL DEFAULT now()
     );
   `);
+  await pool.query(`ALTER TABLE public.ft_lzk_basis_history ADD COLUMN IF NOT EXISTS old_amount numeric(18,2);`);
+  await pool.query(`ALTER TABLE public.ft_lzk_basis_history ADD COLUMN IF NOT EXISTS new_amount numeric(18,2);`);
+  // История сумм не стирается даже при удалении заявки.
+  await pool.query(`ALTER TABLE public.ft_lzk_basis_history DROP CONSTRAINT IF EXISTS ft_lzk_basis_history_action_check;`);
+  await pool.query(`ALTER TABLE public.ft_lzk_basis_history ADD CONSTRAINT ft_lzk_basis_history_action_check CHECK (action IN ('ADD','REMOVE','AMOUNT_CHANGE'));`);
   await pool.query(`CREATE INDEX IF NOT EXISTS ft_lzk_basis_history_ft_time_idx
     ON public.ft_lzk_basis_history (id_ft, changed_at DESC, id DESC);`);
 
@@ -5829,7 +5834,8 @@ app.post("/save-ft", async (req, res) => {
       sum_ft,
       source_file_id,
       source_type,
-      idzlzk_ids
+      idzlzk_ids,
+      idzlzk_amounts
     } = req.body || {};
 
     sourceFileId = String(source_file_id || "").trim();
@@ -5845,6 +5851,15 @@ app.post("/save-ft", async (req, res) => {
     const lzkIds = (idzlzk_ids || []).map(v => String(v ?? "").trim());
     if (lzkIds.some(v => !v || v.length > 120) || new Set(lzkIds).size !== lzkIds.length || lzkIds.length > 500) {
       return res.status(400).json({ success:false, error:"Invalid or duplicate idzlzk_ids" });
+    }
+    let lzkAmountById=new Map();
+    if(origin==='LZK'){
+      if(!Array.isArray(idzlzk_amounts)||idzlzk_amounts.length!==lzkIds.length)return res.status(400).json({success:false,error:'ZLZK_AMOUNTS_REQUIRED'});
+      for(const x of idzlzk_amounts){
+        const id=String(x?.id_zlzk||'').trim();const value=String(x?.amount??'').trim();
+        if(!/^\d+(?:\.\d{1,2})?$/.test(value)||!lzkIds.includes(id)||lzkAmountById.has(id)||Number(value)<=0)return res.status(400).json({success:false,error:'INVALID_ZLZK_AMOUNT'});
+        lzkAmountById.set(id,value);
+      }
     }
     if ((origin === "LZK" && lzkIds.length === 0) || (origin !== "LZK" && lzkIds.length > 0)) {
       return res.status(400).json({ success:false, error:"LZK origin must include idzlzk_ids" });
@@ -5885,6 +5900,10 @@ app.post("/save-ft", async (req, res) => {
       return res.status(400).json({ success:false, error:"sum_ft must be number" });
     }
 
+    if(origin==='LZK'){
+      const cents=lzkIds.reduce((sum,id)=>sum+Math.round(Number(lzkAmountById.get(id))*100),0);
+      if(cents!==Math.round(sumNum*100))return res.status(400).json({success:false,error:'FT_SUM_MISMATCH'});
+    }
     await client.query("BEGIN");
 
     // Все выбранные ZLZK должны существовать; проверка внутри одной транзакции.
@@ -5984,11 +6003,17 @@ app.post("/save-ft", async (req, res) => {
     // Первоначальное основание FT (не фактическое распределение будущих ZFT).
     for (const id_zlzk of lzkIds) {
       await client.query(
-        `INSERT INTO public.ft_lzk_basis (id_ft, id_zlzk) VALUES ($1, $2)`,
-        [id_ft, id_zlzk]
+        `INSERT INTO public.ft_lzk_basis (id_ft, id_zlzk, amount) VALUES ($1, $2, $3)`,
+        [id_ft, id_zlzk, lzkAmountById.get(id_zlzk)]
       );
     }
 
+    if(origin==='LZK'){
+      for(const id of lzkIds){await client.query(
+        `INSERT INTO public.ft_lzk_basis_history (id_ft,id_zlzk,action,changed_by,new_amount) VALUES ($1,$2,'ADD',$3,$4)`,
+        [id_ft,id,String(input_name).trim(),lzkAmountById.get(id)]);
+      }
+    }
     const zftRow = await client.query(
       `SELECT 'ZFT' || nextval('zvk_id_seq')::text AS id_zvk`
     );
@@ -6120,7 +6145,7 @@ app.get("/ft-lzk-basis", async (req, res) => {
        FROM public.ft_lzk_basis WHERE id_ft=$1 ORDER BY id`, [idFt]
     );
     const history = await pool.query(
-      `SELECT id_zlzk, action, changed_by, changed_at
+      `SELECT id_zlzk, action, changed_by, changed_at, old_amount, new_amount
        FROM public.ft_lzk_basis_history WHERE id_ft=$1
        ORDER BY changed_at DESC, id DESC LIMIT 500`, [idFt]
     );
@@ -6148,6 +6173,16 @@ app.post("/ft-lzk-basis/update", async (req, res) => {
     return res.status(400).json({success:false, error:"EMPTY_OR_DUPLICATE_ZLZK"});
   }
 
+  const amounts=req.body?.idzlzk_amounts;
+  if(!Array.isArray(amounts)||amounts.length!==ids.length)return res.status(400).json({success:false,error:'ZLZK_AMOUNTS_REQUIRED'});
+  const amountById=new Map();
+  for(const row of amounts){
+    const id=String(row?.id_zlzk||'').trim(), amount=String(row?.amount??'').trim();
+    if(!ids.includes(id)||amountById.has(id)||!/^\d+(?:\.\d{1,2})?$/.test(amount)||Number(amount)<=0)return res.status(400).json({success:false,error:'INVALID_ZLZK_AMOUNT'});
+    amountById.set(id,amount);
+  }
+  const totalCents=ids.reduce((acc,id)=>acc+Math.round(Number(amountById.get(id))*100),0);
+  if(!Number.isSafeInteger(totalCents)||totalCents<=0)return res.status(400).json({success:false,error:'INVALID_FT_TOTAL'});
   const client = await pool.connect();
   try {
     const actor = await getAuthenticatedFtUser(req, client);
@@ -6183,12 +6218,23 @@ app.post("/ft-lzk-basis/update", async (req, res) => {
     }
 
     const current = await client.query(
-      `SELECT id_zlzk FROM public.ft_lzk_basis WHERE id_ft=$1 FOR UPDATE`, [idFt]
+      `SELECT id_zlzk, amount FROM public.ft_lzk_basis WHERE id_ft=$1 FOR UPDATE`, [idFt]
     );
     const old = new Set(current.rows.map(r => String(r.id_zlzk)));
+    const oldAmounts=new Map(current.rows.map(r=>[String(r.id_zlzk),r.amount]));
     const desired = new Set(ids);
     const remove = [...old].filter(x => !desired.has(x));
     const add = ids.filter(x => !old.has(x));
+    const changed = ids.filter(x=>old.has(x)&&Math.round(Number(oldAmounts.get(x))*100)!==Math.round(Number(amountById.get(x))*100));
+    // Не сокращать сумму FT ниже уже распределённой суммы по ZFT.
+    const allocated=await client.query(`
+      SELECT COALESCE(SUM(GREATEST(COALESCE(v.to_pay,0),0)),0) AS total
+      FROM (SELECT DISTINCT ON (id_zvk) id_zvk,to_pay FROM public.zvk
+            WHERE id_ft=$1 ORDER BY id_zvk,zvk_date DESC NULLS LAST,id DESC) v`,[idFt]);
+    if(Math.round(Number(allocated.rows[0].total)*100)>totalCents){
+      await client.query('ROLLBACK');
+      return res.status(409).json({success:false,error:'FT_TOTAL_BELOW_ZFT_ALLOCATIONS'});
+    }
 
     if (remove.length) {
       await client.query(
@@ -6198,21 +6244,24 @@ app.post("/ft-lzk-basis/update", async (req, res) => {
     }
     for (const id of add) {
       await client.query(
-        `INSERT INTO public.ft_lzk_basis (id_ft, id_zlzk) VALUES ($1,$2)`, [idFt, id]
+        `INSERT INTO public.ft_lzk_basis (id_ft, id_zlzk, amount) VALUES ($1,$2,$3)`, [idFt, id, amountById.get(id)]
       );
     }
+    for(const id of changed){await client.query(`UPDATE public.ft_lzk_basis SET amount=$3 WHERE id_ft=$1 AND id_zlzk=$2`,[idFt,id,amountById.get(id)]);}
     for (const id of remove) {
       await client.query(
-        `INSERT INTO public.ft_lzk_basis_history (id_ft, id_zlzk, action, changed_by)
-         VALUES ($1,$2,'REMOVE',$3)`, [idFt, id, login]
+        `INSERT INTO public.ft_lzk_basis_history (id_ft, id_zlzk, action, changed_by, old_amount)
+         VALUES ($1,$2,'REMOVE',$3,$4)`, [idFt, id, login, oldAmounts.get(id)]
       );
     }
     for (const id of add) {
       await client.query(
-        `INSERT INTO public.ft_lzk_basis_history (id_ft, id_zlzk, action, changed_by)
-         VALUES ($1,$2,'ADD',$3)`, [idFt, id, login]
+        `INSERT INTO public.ft_lzk_basis_history (id_ft, id_zlzk, action, changed_by, new_amount)
+         VALUES ($1,$2,'ADD',$3,$4)`, [idFt, id, login, amountById.get(id)]
       );
     }
+    for(const id of changed){await client.query(`INSERT INTO public.ft_lzk_basis_history (id_ft,id_zlzk,action,changed_by,old_amount,new_amount) VALUES ($1,$2,'AMOUNT_CHANGE',$3,$4,$5)`,[idFt,id,login,oldAmounts.get(id),amountById.get(id)]);}
+    await client.query(`UPDATE public.ft SET sum_ft=$2 WHERE id_ft=$1`,[idFt,(totalCents/100).toFixed(2)]);
     // Если к обычному FT впервые добавили основание, он становится LZK.
     // При удалении всех связей статус LZK не сбрасываем автоматически:
     // это сохраняет факт происхождения для аудита.
