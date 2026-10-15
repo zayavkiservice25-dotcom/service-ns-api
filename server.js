@@ -6270,7 +6270,7 @@ app.post("/ft-lzk-basis/update", async (req, res) => {
     }
 
     await client.query("COMMIT");
-    return res.json({success:true, id_ft:idFt, idzlzk_ids:ids, added:add, removed:remove});
+    return res.json({success:true, id_ft:idFt, idzlzk_ids:ids, added:add, removed:remove, sum_ft:(totalCents/100).toFixed(2)});
   } catch (e) {
     try { await client.query("ROLLBACK"); } catch (_) {}
     console.error("UPDATE FT-LZK-BASIS ERROR:", e);
