@@ -49,7 +49,7 @@ jobs:
 
           
       - name: Deploy existing Render service
-        if: github.ref == 'refs/heads/main'
+        if: ${{ false }}
         env:
           RENDER_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
           IMAGE_TAG: git-${{ github.sha }}
