@@ -45,3 +45,27 @@ jobs:
           file: Dockerfile.actions
           push: true
           tags: saga02/service-ns-kalkan:git-${{ github.sha }}
+
+          
+      - name: Deploy existing Render service
+        if: github.ref == 'refs/heads/main'
+        env:
+          RENDER_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+          IMAGE_TAG: git-${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import urllib.parse
+          import urllib.request
+
+          hook = os.environ["RENDER_HOOK"]
+          image = "docker.io/saga02/service-ns-kalkan:" + os.environ["IMAGE_TAG"]
+          sep = "&" if "?" in hook else "?"
+          url = hook + sep + "imgURL=" + urllib.parse.quote(image, safe="")
+
+          with urllib.request.urlopen(url, timeout=30) as response:
+              print("Render deploy request:", response.status)
+              if response.status not in (200, 202):
+                  raise RuntimeError("Render deploy was not accepted")
+          PY
+
