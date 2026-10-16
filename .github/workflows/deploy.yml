@@ -1,12 +1,12 @@
 
 name: Service NS Docker Build
-# Проверка автоматического запуска
+
 on:
   workflow_dispatch:
   push:
-  branches:
-    - kalkan-test
-    - main
+    branches:
+      - kalkan-test
+      - main
 
 permissions:
   contents: read
