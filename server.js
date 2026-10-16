@@ -2195,7 +2195,7 @@ async function getAuthenticatedFtUser(req, db = pool) {
   const match = String(req.get('authorization') || '').match(/^Bearer\s+([A-Za-z0-9_-]{32,256})$/i);
   if (!match) return null;
   const result = await db.query(`
-    SELECT u.login, u.role_ft
+    SELECT u.login, u.role_ft, u.role_hr
     FROM public.app_sessions s
     JOIN public.users u ON lower(trim(u.login)) = lower(trim(s.user_login))
     WHERE s.token_hash = $1 AND s.expires_at > NOW() AND u.is_active = true
@@ -18588,45 +18588,67 @@ app.get('/hr/trips/order-pdf', hrApiGuard_, async (req,res)=>{
 // signing authority and authenticated user sessions are NOT implemented.
 const hrSigCrypto_=require('crypto');
 async function hrSigVerifyAttached_(cms,pdf){
+  // Fail closed: no approval unless the signed, embedded PDF equals the frozen PDF.
+  // KalkanCrypt extension installed in the same Docker container as Node.js.
   const fs=require('fs/promises'),os=require('os'),path=require('path');
   const {spawn}=require('child_process');
+  if (!Buffer.isBuffer(cms)||!Buffer.isBuffer(pdf)) return {ok:false,error:'MISSING_BINARY'};
   const dir=await fs.mkdtemp(path.join(os.tmpdir(),'hr-cms-'));
-  const cmsPath=path.join(dir,'sign.cms'),outPath=path.join(dir,'verified.pdf');
-  try{
+  try {
+    const cmsPath=path.join(dir,'input.p7m'),pdfPath=path.join(dir,'frozen.pdf');
     await fs.writeFile(cmsPath,cms,{mode:0o600});
-    const error=await new Promise(resolve=>{
-      let logs='';const child=spawn('openssl',['cms','-verify','-binary','-inform','DER','-in',cmsPath,'-noverify','-out',outPath],{stdio:['ignore','ignore','pipe']});
-      child.stderr.on('data',b=>{logs+=b.toString().slice(0,1000)});
-      child.once('error',e=>resolve('OpenSSL unavailable: '+e.message));
-      child.once('exit',c=>resolve(c===0?'':(logs||'OpenSSL exit '+c).slice(0,500)));
+    await fs.writeFile(pdfPath,pdf,{mode:0o600});
+    const check=await new Promise(resolve=>{
+      const args=['-d','extension=/opt/kalkan/kalkancrypt.so',
+        '/app/kalkan/kalkan_verify_worker.php',cmsPath,pdfPath];
+      const child=spawn('php',args,{stdio:['ignore','pipe','pipe'],timeout:30000});
+      let stdout='',stderr='';let completed=false;
+      function finish(payload){if(!completed){completed=true;resolve(payload)}}
+      child.stdout.on('data',chunk=>{stdout+=chunk.toString();if(stdout.length>16000)child.kill()});
+      child.stderr.on('data',chunk=>{stderr+=chunk.toString();if(stderr.length>16000)child.kill()});
+      child.on('error',()=>finish({ok:false,reason:'PHP_UNAVAILABLE'}));
+      child.on('close',code=>{
+        const last=stdout.trim().split(/\r?\n/).pop()||'';
+        try {
+          const obj=JSON.parse(last);
+          finish(code===0?obj:{ok:false,reason:obj.reason||'KALKAN_FAILED'});
+        }catch(_){finish({ok:false,reason:'KALKAN_BAD_RESULT'})}
+      });
     });
-    if(error){
-      // Never bypass CMS verification. Distinguish missing signer public key from
-      // an invalid signature or other malformed CMS errors for test diagnostics.
-      // Казахстанский ГОСТ в CMS может быть корректным, но стандартный OpenSSL
-      // в Render не умеет декодировать его открытый ключ. Нельзя принимать такую
-      // подпись как успешную без ГОСТ-совместимой криптографической проверки.
-      const unsupportedGost = /X509_PUBKEY_get0:decode error|Unable to load Public Key/i.test(error)
-        || (/CMS_SignerInfo_verify:no public key/i.test(error) && /decode error/i.test(error));
-      if (unsupportedGost) {
-        return {ok:false,error:'CMS_GOST_NOT_SUPPORTED: CMS содержит сертификат, но OpenSSL сервера не поддерживает алгоритм открытого ключа НУЦ РК (ГОСТ). Для подтверждения подписи подключите ГОСТ-совместимый криптопровайдер или доверенный сервис проверки CMS. Подпись пока НЕ проверена.'};
-      }
-      const noSignerKey=/signer certificate not found|signer certificate.*not found/i.test(error);
-      if(noSignerKey){
-        return {ok:false,error:'CMS_SIGNER_CERT_MISSING: В CMS не найден сертификат подписанта. Подпись НЕ подтверждена.'};
-      }
-      return {ok:false,error:'CMS_VERIFY_FAILED: '+error};
-    }
-    const verified=await fs.readFile(outPath);
-    return {ok:verified.equals(pdf),error:verified.equals(pdf)?'':'Signed content differs from frozen PDF'};
-  }finally{await fs.rm(dir,{recursive:true,force:true})}
+    if(check.ok!==true) return {ok:false,error:check.reason||'KALKAN_FAILED'};
+    // Login-based signing access is checked by hrSignSessionDirector_ from a
+    // verified server-side session. This fingerprint is diagnostic only;
+    // identity, organization and signing authority are NOT confirmed here.
+    const actual=String(check.signer_cert_sha256||'').trim().toLowerCase();
+    return {
+      ok:true,
+      error:'',
+      signer_cert_sha256:/^[0-9a-f]{64}$/.test(actual)?actual:null
+    };
+  }finally {await fs.rm(dir,{recursive:true,force:true})}
 }
-function hrSigDirector_(login){
-  if(login!=='k_ermek')throw Object.assign(new Error('Доступ только директору'),{status:403});
+// Критические маршруты ЭЦП требуют существующую серверную сессию (Bearer).
+// HR_API_KEY один не подтверждает личность: клиентский login больше не используется.
+// Доступ имеет только k_ermek по серверной сессии. Владелец ЭЦП ТОО,
+// БИН и полномочия подписанта здесь НЕ удостоверяются и требуют
+// отдельной проверки перед окончательным юридическим статусом.
+async function hrSignSessionDirector_(req,res,next){
+  try {
+    const user=await getAuthenticatedFtUser(req);
+    if(!user) return res.status(401).json({success:false,error:'HR_SIGN_SESSION_REQUIRED'});
+    const login=hrLogin_(user.login);
+    if(login!=='k_ermek') return res.status(403).json({success:false,error:'HR_SIGN_DIRECTOR_ONLY'});
+    req.hrSignerLogin=login;
+    req.hrSignerRoleHr=user.role_hr;
+    next();
+  } catch(e) {
+    console.error('HR sign authorization:',e);
+    return res.status(503).json({success:false,error:'HR_SIGN_AUTH_UNAVAILABLE'});
+  }
 }
-app.get('/hr/trips/sign-payload',hrApiGuard_,async(req,res)=>{
+app.get('/hr/trips/sign-payload',hrApiGuard_,hrSignSessionDirector_,async(req,res)=>{
   try{
-    const login=hrLogin_(req.query.login),id=hrClean_(req.query.id,80);hrSigDirector_(login);
+    const id=hrClean_(req.query.id,80);
     if(!id)throw Object.assign(new Error('Нет номера заявки'),{status:400});
     const found=await pool.query("SELECT * FROM hr.trip_requests WHERE request_no=$1 AND status IN ('submitted','approved')",[id]);
     if(!found.rowCount)throw Object.assign(new Error('Заявка недоступна для подписания'),{status:409});
@@ -18651,10 +18673,10 @@ app.get('/hr/trips/sign-payload',hrApiGuard_,async(req,res)=>{
     res.set('Cache-Control','no-store').json({success:true,id,pdf_base64:job.rows[0].pdf_bytes.toString('base64'),sha256:job.rows[0].pdf_sha256,verification_status:job.rows[0].sign_status});
   }catch(e){hrError_(res,e)}
 });
-app.post('/hr/trips/sign-submit',hrApiGuard_,async(req,res)=>{
+app.post('/hr/trips/sign-submit',hrApiGuard_,hrSignSessionDirector_,async(req,res)=>{
   try{
-    const {login:loginRaw,id:idRaw,cms_base64}=req.body||{};
-    const login=hrLogin_(loginRaw),id=hrClean_(idRaw,80);hrSigDirector_(login);
+    const {id:idRaw,cms_base64}=req.body||{};
+    const login=req.hrSignerLogin,id=hrClean_(idRaw,80);
     // NCALayer может вернуть DER-CMS как Base64 или PEM (BEGIN CMS/PKCS7).
     // Приводим представление к DER, не изменяя подписанные байты контейнера.
     if(typeof cms_base64!=='string'||cms_base64.length>8_000_000)
@@ -18682,12 +18704,12 @@ app.post('/hr/trips/sign-submit',hrApiGuard_,async(req,res)=>{
       WHERE id=$1 AND cms_bytes IS NULL RETURNING id`,
       [job.id,cms,login]);
     if(!saved.rowCount)throw Object.assign(new Error('Подпись уже сохранена'),{status:409});
-    res.json({success:true,verification_status:'crypto_verified_pending_trust',message:'CMS сохранён; доверие НУЦ, статус отзыва и полномочия НЕ проверены. Утверждение приказа ОЖИДАЕТ проверки доверия, полномочий и авторизации.'});
+    res.json({success:true,verification_status:'crypto_verified_pending_trust',message:'CMS сохранён после криптографической проверки PDF и текущей OCSP-проверки SDK. Личность подписанта, принадлежность ЭЦП ТОО, полномочия и архивная проверка на дату подписания ещё не подтверждены; юридический статус приказа ожидает проверки.'});
   }catch(e){hrError_(res,e)}
 });
-app.get('/hr/trips/sign-file',hrApiGuard_,async(req,res)=>{
+app.get('/hr/trips/sign-file',hrApiGuard_,hrSignSessionDirector_,async(req,res)=>{
  try{
-  const login=hrLogin_(req.query.login),id=hrClean_(req.query.id,80);hrSigDirector_(login);
+  const id=hrClean_(req.query.id,80);
   const q=await pool.query(`SELECT j.cms_bytes FROM hr.trip_order_signature_jobs j
     JOIN hr.trip_requests r ON r.id=j.trip_request_id WHERE r.request_no=$1`,[id]);
   if(!q.rowCount||!q.rows[0].cms_bytes)throw Object.assign(new Error('CMS пока нет'),{status:404});

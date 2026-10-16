@@ -1,0 +1,13 @@
+.git
+node_modules
+.env
+.env.*
+*.p12
+*.pfx
+*.key
+*.pem
+*.crt
+*.p7m
+*.p7s
+private-sdk/*.p12
+private-sdk/*.pfx
