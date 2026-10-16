@@ -18391,7 +18391,7 @@ const hrPublic_ = r=>({
   date_from:r.date_from instanceof Date?r.date_from.toISOString().slice(0,10):String(r.date_from||'').slice(0,10),
   date_to:r.date_to instanceof Date?r.date_to.toISOString().slice(0,10):String(r.date_to||'').slice(0,10),
   city_type:r.city_category||'',travel_route:r.travel_route||'',lodging_days:r.lodging_days??null,stays:r.lodging_stays||[],funding_source:r.funding_source||'',basis:r.basis_document||'',purpose:r.purpose||'',
-  status:r.signature_status==='crypto_verified_pending_trust'?'Подпись получена (проверка)':hrStatusLabel_(r.status),signature_status:r.signature_status||'',created_at:r.created_at,updated_at:r.updated_at,
+  status:r.signature_status==='crypto_verified_pending_trust'?'Подписано ЭЦП':hrStatusLabel_(r.status),signature_status:r.signature_status||'',signature_trust_verified:r.signature_trust_verified===true,created_at:r.created_at,updated_at:r.updated_at,
   reviewer:r.director_decided_at?r.director_login:'',reviewed_at:r.director_decided_at||'',review_comment:r.director_comment||'',
   days_count:r.days_count,per_diem_amount:r.per_diem_amount,lodging_amount:r.lodging_amount,
   travel_amount:r.travel_amount,other_amount:r.other_amount,daily_rate:r.daily_rate,total_amount:r.total_amount
@@ -18403,8 +18403,8 @@ app.get('/hr/trips',hrApiGuard_,async(req,res)=>{
   const login=hrLogin_(req.query.login);if(!login)return res.status(400).json({success:false,error:'LOGIN_REQUIRED'});
   const director=login==='k_ermek';
   const q=director
-    ?'SELECT r.*,j.sign_status AS signature_status FROM hr.trip_requests r LEFT JOIN hr.trip_order_signature_jobs j ON j.trip_request_id=r.id ORDER BY r.created_at DESC,r.id DESC LIMIT 2000'
-    :'SELECT r.*,j.sign_status AS signature_status FROM hr.trip_requests r LEFT JOIN hr.trip_order_signature_jobs j ON j.trip_request_id=r.id WHERE lower(btrim(r.employee_login))=$1 ORDER BY r.created_at DESC,r.id DESC LIMIT 2000';
+    ?'SELECT r.*,j.sign_status AS signature_status,j.trust_verified AS signature_trust_verified FROM hr.trip_requests r LEFT JOIN hr.trip_order_signature_jobs j ON j.trip_request_id=r.id ORDER BY r.created_at DESC,r.id DESC LIMIT 2000'
+    :'SELECT r.*,j.sign_status AS signature_status,j.trust_verified AS signature_trust_verified FROM hr.trip_requests r LEFT JOIN hr.trip_order_signature_jobs j ON j.trip_request_id=r.id WHERE lower(btrim(r.employee_login))=$1 ORDER BY r.created_at DESC,r.id DESC LIMIT 2000';
   const out=await pool.query(q,director?[]:[login]);
   res.json({success:true,is_director:director,rows:out.rows.map(hrPublic_)});
  }catch(e){hrError_(res,e)}
@@ -18712,7 +18712,7 @@ app.post('/hr/trips/sign-submit',hrApiGuard_,hrSignSessionDirector_,async(req,re
       [job.id,cms,login,result.signer_subject,result.signer_iin,result.certificate_serial,
        result.certificate_valid_from,result.certificate_valid_to]);
     if(!saved.rowCount)throw Object.assign(new Error('Подпись уже сохранена'),{status:409});
-    res.json({success:true,verification_status:'crypto_verified_pending_trust',message:'CMS сохранён после криптографической проверки PDF и текущей OCSP-проверки SDK. Личность подписанта, принадлежность ЭЦП ТОО, полномочия и архивная проверка на дату подписания ещё не подтверждены; юридический статус приказа ожидает проверки.'});
+    res.json({success:true,verification_status:'crypto_verified_pending_trust',signature_label:'Подписано ЭЦП',trust_verified:false,message:'Приказ подписан ЭЦП: CMS с вложенным PDF сохранён, криптографическая подпись и текущая OCSP-проверка пройдены. Юридическая проверка личности и полномочий подписанта, БИН ТОО и архивных доказательств остаётся незавершённой.'});
   }catch(e){hrError_(res,e)}
 });
 app.get('/hr/trips/sign-file',hrApiGuard_,hrSignSessionDirector_,async(req,res)=>{
