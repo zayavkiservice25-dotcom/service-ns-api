@@ -50,6 +50,30 @@ try {
   if (!is_string($certDer) || strlen($certDer)<100 || ord($certDer[0])!==0x30)
     result(false,'SIGNER_CERT_FORMAT_UNKNOWN');
   $signerFingerprint=hash('sha256',$certDer);
+  // Public X.509 metadata ONLY. Do not import, export or store private keys.
+  // Some OpenSSL builds cannot decode Kazakh GOST certs. In that case keep
+  // fields null instead of inventing identity or marking trust as verified.
+  $pem="-----BEGIN CERTIFICATE-----\n".chunk_split(base64_encode($certDer),64,"\n")."-----END CERTIFICATE-----\n";
+  $parsed=@openssl_x509_parse($pem, false);
+  $subject=null; $serial=null; $validFrom=null; $validTo=null; $iin=null;
+  if (is_array($parsed)) {
+    $subjectName=$parsed['name']??null;
+    if (is_string($subjectName) && $subjectName!=='' && strlen($subjectName)<=4096) $subject=$subjectName;
+    $serialValue=$parsed['serialNumberHex']??null;
+    if (is_string($serialValue) && preg_match('/^[0-9a-fA-F]{1,128}$/D',$serialValue)) $serial=strtoupper($serialValue);
+    foreach (['validFrom_time_t'=>'validFrom','validTo_time_t'=>'validTo'] as $key=>$dest) {
+      $epoch=$parsed[$key]??null;
+      if (is_int($epoch) && $epoch>0 && $epoch<4102444800) {
+        if ($dest==='validFrom') $validFrom=gmdate('Y-m-d\TH:i:s\Z',$epoch);
+        else $validTo=gmdate('Y-m-d\TH:i:s\Z',$epoch);
+      }
+    }
+    // Kazakhstan NCA: only an explicitly labelled IIN in the certificate
+    // subject can populate signer_iin; do not confuse it with organization BIN.
+    $subjectSerial=$parsed['subject']['serialNumber']??$parsed['subject']['serialnumber']??null;
+    if (is_string($subjectSerial) && preg_match('/^IIN([0-9]{12})$/iD',trim($subjectSerial),$m)) $iin=$m[1];
+  }
+
   $outInfo=''; $ocsp='';
   $r=KalkanCrypt_X509ValidateCertificate($signerCert,0x404,'http://ocsp.pki.gov.kz/',0,$outInfo,0,$ocsp);
   if ($r!==0||!str_contains($outInfo,'Verify chain and certificates: - OK.'))
@@ -59,6 +83,10 @@ try {
   result(true,'CRYPTO_AND_CURRENT_OCSP_OK_PENDING_AUTHORITY',[
     'pdf_sha256'=>hash('sha256',$pdf), 'cms_sha256'=>hash('sha256',$cms),
     'signer_cert_sha256'=>$signerFingerprint,
+    'signer_subject'=>$subject, 'signer_iin'=>$iin,
+    'certificate_serial'=>$serial,
+    'certificate_valid_from'=>$validFrom, 'certificate_valid_to'=>$validTo,
+    'certificate_metadata_parsed'=>is_array($parsed),
     'ocsp_response_preserved'=>strlen($ocsp)>0
   ]);
 } catch (Throwable $e) { result(false,'SDK_EXCEPTION'); }

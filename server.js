@@ -18583,9 +18583,8 @@ app.get('/hr/trips/order-pdf', hrApiGuard_, async (req,res)=>{
 });
 
 
-// TEST-PHASE: attached CMS with encapsulated frozen PDF bytes.
-// OpenSSL -noverify validates cryptographic binding only. PKI trust/CRL/OCSP,
-// signing authority and authenticated user sessions are NOT implemented.
+// Attached CMS with frozen PDF; KalkanCrypt checks cryptography and current
+// certificate chain/OCSP. Legal signing authority and archival evidence remain pending.
 const hrSigCrypto_=require('crypto');
 async function hrSigVerifyAttached_(cms,pdf){
   // Fail closed: no approval unless the signed, embedded PDF equals the frozen PDF.
@@ -18623,7 +18622,12 @@ async function hrSigVerifyAttached_(cms,pdf){
     return {
       ok:true,
       error:'',
-      signer_cert_sha256:/^[0-9a-f]{64}$/.test(actual)?actual:null
+      signer_cert_sha256:/^[0-9a-f]{64}$/.test(actual)?actual:null,
+      signer_subject:typeof check.signer_subject==='string' && check.signer_subject.length<=4096 ? check.signer_subject : null,
+      signer_iin:typeof check.signer_iin==='string' && /^[0-9]{12}$/.test(check.signer_iin) ? check.signer_iin : null,
+      certificate_serial:typeof check.certificate_serial==='string' && /^[0-9A-Fa-f]{1,128}$/.test(check.certificate_serial) ? check.certificate_serial : null,
+      certificate_valid_from:typeof check.certificate_valid_from==='string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(check.certificate_valid_from) ? check.certificate_valid_from : null,
+      certificate_valid_to:typeof check.certificate_valid_to==='string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(check.certificate_valid_to) ? check.certificate_valid_to : null
     };
   }finally {await fs.rm(dir,{recursive:true,force:true})}
 }
@@ -18700,9 +18704,13 @@ app.post('/hr/trips/sign-submit',hrApiGuard_,hrSignSessionDirector_,async(req,re
     const result=await hrSigVerifyAttached_(cms,job.pdf_bytes);
     if(!result.ok)throw Object.assign(new Error('CMS не прошёл криптографическую проверку: '+result.error),{status:422});
     const saved=await pool.query(`UPDATE hr.trip_order_signature_jobs
-      SET cms_bytes=$2, sign_status='crypto_verified_pending_trust', signer_login=$3, crypto_verified=true, trust_verified=false, updated_at=now()
+      SET cms_bytes=$2, sign_status='crypto_verified_pending_trust', signer_login=$3,
+          signer_subject=$4, signer_iin=$5, certificate_serial=$6,
+          certificate_valid_from=$7, certificate_valid_to=$8,
+          crypto_verified=true, trust_verified=false, updated_at=now()
       WHERE id=$1 AND cms_bytes IS NULL RETURNING id`,
-      [job.id,cms,login]);
+      [job.id,cms,login,result.signer_subject,result.signer_iin,result.certificate_serial,
+       result.certificate_valid_from,result.certificate_valid_to]);
     if(!saved.rowCount)throw Object.assign(new Error('Подпись уже сохранена'),{status:409});
     res.json({success:true,verification_status:'crypto_verified_pending_trust',message:'CMS сохранён после криптографической проверки PDF и текущей OCSP-проверки SDK. Личность подписанта, принадлежность ЭЦП ТОО, полномочия и архивная проверка на дату подписания ещё не подтверждены; юридический статус приказа ожидает проверки.'});
   }catch(e){hrError_(res,e)}
