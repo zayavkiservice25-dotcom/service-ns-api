@@ -1,6 +1,6 @@
 
 name: Service NS Docker Build
-
+# Проверка автоматического запуска
 on:
   workflow_dispatch:
   push:
