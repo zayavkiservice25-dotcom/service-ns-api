@@ -1,0 +1,72 @@
+
+name: Service NS Docker Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - kalkan-test
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout GitHub code
+        uses: actions/checkout@v4
+
+      - name: Login to private Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Prepare Dockerfile
+        run: |
+          cat > Dockerfile.actions <<'EOF'
+          FROM saga02/service-ns-kalkan:test-20261016
+          WORKDIR /app
+          COPY package.json package-lock.json ./
+          RUN npm ci --omit=dev
+          COPY server.js ./server.js
+          COPY public/ ./public/
+          COPY kalkan/kalkan_verify_worker.php ./kalkan/kalkan_verify_worker.php
+          ENV NODE_ENV=production
+          CMD ["node", "server.js"]
+          EOF
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.actions
+          push: true
+          tags: saga02/service-ns-kalkan:git-${{ github.sha }}
+
+          
+      - name: Deploy existing Render service
+        if: ${{ false }}
+        env:
+          RENDER_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+          IMAGE_TAG: git-${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import urllib.parse
+          import urllib.request
+
+          hook = os.environ["RENDER_HOOK"]
+          image = "docker.io/saga02/service-ns-kalkan:" + os.environ["IMAGE_TAG"]
+          sep = "&" if "?" in hook else "?"
+          url = hook + sep + "imgURL=" + urllib.parse.quote(image, safe="")
+
+          with urllib.request.urlopen(url, timeout=30) as response:
+              print("Render deploy request:", response.status)
+              if response.status not in (200, 202):
+                  raise RuntimeError("Render deploy was not accepted")
+          PY
+
