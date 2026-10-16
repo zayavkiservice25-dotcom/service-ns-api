@@ -1,0 +1,44 @@
+
+name: Service NS Docker Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout GitHub code
+        uses: actions/checkout@v4
+
+      - name: Login to private Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Prepare Dockerfile
+        run: |
+          cat > Dockerfile.actions <<'EOF'
+          FROM saga02/service-ns-kalkan:test-20261016
+          WORKDIR /app
+          COPY package.json package-lock.json ./
+          RUN npm ci --omit=dev
+          COPY server.js ./server.js
+          COPY public/ ./public/
+          COPY kalkan/kalkan_verify_worker.php ./kalkan/kalkan_verify_worker.php
+          ENV NODE_ENV=production
+          CMD ["node", "server.js"]
+          EOF
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.actions
+          push: true
+          tags: saga02/service-ns-kalkan:git-${{ github.sha }}
