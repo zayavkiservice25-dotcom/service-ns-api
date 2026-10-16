@@ -4,8 +4,9 @@ name: Service NS Docker Build
 on:
   workflow_dispatch:
   push:
-    branches:
-      - kalkan-test
+  branches:
+    - kalkan-test
+    - main
 
 permissions:
   contents: read
