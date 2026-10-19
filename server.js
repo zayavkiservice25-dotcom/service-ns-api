@@ -19023,4 +19023,49 @@ app.get('/hr/kedo-applications/summary', hrApiGuard_, async(req,res)=>{
   }catch(e){console.error('[KEDO HR VIEW]',e.message);res.status(500).json({success:false,error:'KEDO_HR_VIEW_FAILED'});}
 });
 
+// =====================================================
+// KEDO: скачать ОРИГИНАЛЬНУЮ печатную форму заявления PDF.
+// Через GAS, с внутренним HR_API_KEY; KEDO_USER_TOKEN остаётся на Render.
+// =====================================================
+app.get('/hr/kedo-applications/print-pdf', hrApiGuard_, async(req,res)=>{
+  try {
+    const login=String(req.query.login||'').trim().toLowerCase();
+    const id=String(req.query.id||'').trim();
+    if(!/^[a-z0-9_.-]{2,90}$/.test(login) || !/^[0-9a-f-]{36}$/i.test(id))
+      return res.status(400).json({success:false,error:'INVALID_LOGIN_OR_ID'});
+    const user=await pool.query(`SELECT 1 FROM public.users
+      WHERE lower(trim(login))=$1 AND is_active=true LIMIT 1`,[login]);
+    if(!user.rowCount)return res.status(403).json({success:false,error:'HR_ACCESS_DENIED'});
+    const q=await pool.query(`SELECT application_id,print_form_key,status
+      FROM hr.kedo_applications WHERE application_id=$1::uuid LIMIT 1`,[id]);
+    if(!q.rowCount)return res.status(404).json({success:false,error:'APPLICATION_NOT_FOUND'});
+    if(q.rows[0].status!=='COMPLETED')return res.status(409).json({success:false,error:'APPLICATION_NOT_COMPLETED'});
+    const key=String(q.rows[0].print_form_key||'');
+    if(!key.endsWith('/print_form.pdf') || !key.startsWith(id+'/'))
+      return res.status(404).json({success:false,error:'PRINT_FORM_NOT_AVAILABLE'});
+    if(!KEDO_ROOT_ || !KEDO_TOKEN_)return res.status(503).json({success:false,error:'KEDO_NOT_CONFIGURED'});
+    const path='/api/v1/hr/applications/management/applications/'+encodeURIComponent(id)+'/files?file_key='+encodeURIComponent(key);
+    const controller=new AbortController();
+    const timer=setTimeout(()=>controller.abort(),30000);
+    let response;
+    try {
+      response=await fetch(KEDO_ROOT_+path,{
+        headers:{Authorization:'User-Token '+KEDO_TOKEN_,Accept:'application/pdf'},
+        signal:controller.signal,redirect:'error'
+      });
+      if(!response.ok)throw new Error('KEDO_PDF_HTTP_'+response.status);
+      const declared=Number(response.headers.get('content-length')||0);
+      if(declared>8*1024*1024)throw new Error('PDF_TOO_LARGE_FOR_GAS');
+      const bytes=Buffer.from(await response.arrayBuffer());
+      if(bytes.length>8*1024*1024)throw new Error('PDF_TOO_LARGE_FOR_GAS');
+      if(bytes.subarray(0,5).toString('latin1')!=='%PDF-')throw new Error('KEDO_RETURNED_NON_PDF');
+      res.set('Cache-Control','no-store');
+      return res.json({success:true,filename:'KEDO_komandirovka_'+id+'.pdf',
+        base64:bytes.toString('base64')});
+    } finally {clearTimeout(timer)}
+  }catch(e){console.error('[KEDO PDF]',e.message);
+    res.status(502).json({success:false,error:e.message||'KEDO_PDF_FAILED'});
+  }
+});
+
 app.listen(PORT, () => console.log("Server started on port " + PORT));
