@@ -19037,81 +19037,92 @@ app.get('/hr/kedo-applications/print-pdf', hrApiGuard_, async(req,res)=>{
     const user=await pool.query(`SELECT 1 FROM public.users
       WHERE lower(trim(login))=$1 AND is_active=true LIMIT 1`,[login]);
     if(!user.rowCount)return res.status(403).json({success:false,error:'HR_ACCESS_DENIED'});
-    const q=await pool.query(`SELECT application_id,print_form_key,status
+    const q=await pool.query(`SELECT application_id,status,print_form_key,print_form_link,files_metadata
       FROM hr.kedo_applications WHERE application_id=$1::uuid LIMIT 1`,[id]);
     if(!q.rowCount)return res.status(404).json({success:false,error:'APPLICATION_NOT_FOUND'});
     if(q.rows[0].status!=='COMPLETED')return res.status(409).json({success:false,error:'APPLICATION_NOT_COMPLETED'});
     if(!KEDO_ROOT_ || !KEDO_TOKEN_)return res.status(503).json({success:false,error:'KEDO_NOT_CONFIGURED'});
 
-    const base='/api/v1/hr/applications/management/applications/'+encodeURIComponent(id);
-    const headers={Authorization:'User-Token '+KEDO_TOKEN_};
-    let key=String(q.rows[0].print_form_key||'');
-    let fileKind='print';
-    // PDF печатной формы предпочтителен. При отсутствии ключа заново читаем файлы
-    // заявления. Если печатной формы нет — предлагаем обычный PDF заявления,
-    // но никогда не подставляем карточку ЭЦП или приказ другого документа.
-    if(!(key.startsWith(id+'/') && key.endsWith('/print_form.pdf'))){
-      const resp=await fetch(KEDO_ROOT_+base+'/ext/files',{
-        headers:{...headers,Accept:'application/json'},redirect:'error',signal:AbortSignal.timeout(25000)
+    const base='/api/v1/hr/applications/management/applications/'+id;
+    const authHeaders={Authorization:'User-Token '+KEDO_TOKEN_};
+    const origin=new URL(KEDO_ROOT_).origin;
+    // Никогда не запрашиваем произвольные ссылки из БД / Dudocs с серверным токеном.
+    function safeFileUrl(link){
+      if(typeof link!=='string'||!link.trim()||link.length>4096)return null;
+      try {
+        const u=new URL(link);
+        if(u.protocol!=='https:' || u.origin!==origin || u.username || u.password || u.hash)return null;
+        if(u.pathname!==base+'/files')return null;
+        const fileKey=u.searchParams.get('file_key');
+        if(!fileKey || !fileKey.trim() || u.searchParams.getAll('file_key').length!==1)return null;
+        if(!fileKey.toLowerCase().endsWith('.pdf') || fileKey.length>1024)return null;
+        if(u.searchParams.size!==1)return null;
+        return u.toString();
+      } catch(_){return null}
+    }
+    function entry(f){
+      if(!f||typeof f!=='object')return null;
+      const key=typeof f.key==='string'?f.key.trim():'';
+      const link=typeof f.link==='string'?f.link.trim():'';
+      const filename=String(f.name||'');
+      const kind=key.endsWith('/print_form.pdf')?'print':
+        (key===id+'.pdf'?'original':(/КЭД|ddcard/i.test(filename+' '+key)?'card':'other'));
+      let url=safeFileUrl(link);
+      if(!url && key && key.length<=1024 && key.toLowerCase().endsWith('.pdf'))
+        url=origin+base+'/files?file_key='+encodeURIComponent(key);
+      if(!url)return null;
+      const rank=kind==='print'?0:kind==='original'?1:kind==='other'?2:3;
+      return {url,key,filename,kind,rank};
+    }
+    const db=q.rows[0];
+    let files=[];
+    try {
+      const resp=await fetch(origin+base+'/ext/files',{
+        headers:{...authHeaders,Accept:'application/json'},redirect:'error',signal:AbortSignal.timeout(25000)
       });
-      if(!resp.ok){
-        console.warn('[KEDO PDF] file list HTTP',resp.status,'application',id);
-        return res.status(502).json({success:false,error:'KEDO_FILE_LIST_HTTP_'+resp.status});
-      }
-      const json=await resp.json();
-      // API разных версий может оборачивать elements в data/result и файл в file.
-      // Не используем ссылки на произвольные ресурсы: скачивание только с KEDO_ROOT_.
-      const candidates=[json?.elements,json?.data?.elements,json?.result?.elements,
-        json?.files,json?.data?.files,json?.result?.files,json?.data,json?.result];
-      const rawFiles=candidates.find(Array.isArray)||[];
-      const files=rawFiles.map(f=>{
-        if(!f||typeof f!=='object')return null;
-        const nested=f.file&&typeof f.file==='object'?f.file:
-          f.metadata&&typeof f.metadata==='object'?f.metadata:f;
-        const fileKey=[f.key,nested.key,f.file_key,nested.file_key,
-          f.storage_key,nested.storage_key].find(x=>typeof x==='string'&&x.trim());
-        return {...f,key:fileKey||'',type:f.type||nested.type||f.mime_type||nested.mime_type||'',
-          name:f.name||nested.name||''};
-      }).filter(Boolean);
-      const valid=f=>typeof f.key==='string'&&f.key.length<=1024&&
-        f.key.toLowerCase().endsWith('.pdf')&&
-        (!f.type||String(f.type).toLowerCase()==='application/pdf');
-      const printed=files.find(f=>valid(f)&&f.key.toLowerCase().endsWith('/print_form.pdf'));
-      const original=files.find(f=>valid(f)&&f.key===id+'.pdf');
-      const choice=printed||original;
-      // Диагностика только названий полей и ключей. Токены/URL/контент не выводим.
-      console.log('[KEDO PDF DIAG]',JSON.stringify({application_id:id,
-        top_level_keys:Object.keys(json||{}).slice(0,25),
-        raw_files_count:rawFiles.length,
-        file_fields:rawFiles.slice(0,5).map(f=>f&&typeof f==='object'?Object.keys(f):typeof f),
-        file_nested_fields:rawFiles.slice(0,5).map(f=>f?.file&&typeof f.file==='object'?Object.keys(f.file):[]),
-        files:files.slice(0,10).map(f=>({key:f.key,type:f.type,name:f.name})),
-        selected:choice?.key||null}));
-      if(!choice)return res.status(404).json({success:false,error:'APPLICATION_PDF_NOT_AVAILABLE',
-        message:'Dudocs не предоставил ключ PDF заявления; смотрите [KEDO PDF DIAG] в Render Logs'});
-      key=choice.key;
-      fileKind=printed?'print':'original';
-      if(printed){
-        await pool.query(`UPDATE hr.kedo_applications SET print_form_key=$2
-          WHERE application_id=$1::uuid`,[id,key]);
+      if(resp.ok){
+        const json=await resp.json();
+        files=Array.isArray(json.elements)?json.elements:[];
+      }else console.warn('[KEDO PDF] file list HTTP',resp.status,'application',id);
+    }catch(e){console.warn('[KEDO PDF] file list unavailable',id,e.message)}
+    const stored=Array.isArray(db.files_metadata)?db.files_metadata:[];
+    const candidates=[...files,...stored,{key:db.print_form_key,link:db.print_form_link,name:'print_form.pdf'}]
+      .map(entry).filter(Boolean).sort((a,b)=>a.rank-b.rank);
+    const unique=candidates.filter((c,i,arr)=>arr.findIndex(x=>x.url===c.url)===i);
+    console.log('[KEDO PDF LINK]',id,'listed',files.length,'stored',stored.length,
+      'candidates',unique.map(c=>({kind:c.kind,hasKey:Boolean(c.key),hasLink:true})));
+    if(!unique.length)return res.status(404).json({success:false,error:'APPLICATION_PDF_NOT_AVAILABLE',
+      message:'Dudocs не вернул ссылку на PDF с допустимым адресом'});
+
+    let lastError='';
+    for(const chosen of unique){
+      try {
+        const response=await fetch(chosen.url,{
+          headers:{...authHeaders,Accept:'application/pdf'},redirect:'error',signal:AbortSignal.timeout(30000)
+        });
+        if(!response.ok){
+          lastError='HTTP '+response.status;
+          console.warn('[KEDO PDF LINK] download HTTP',response.status,'application',id,'kind',chosen.kind);
+          continue;
+        }
+        const declared=Number(response.headers.get('content-length')||0);
+        if(declared>8*1024*1024)return res.status(413).json({success:false,error:'PDF_TOO_LARGE_FOR_GAS'});
+        const bytes=Buffer.from(await response.arrayBuffer());
+        if(bytes.length>8*1024*1024)return res.status(413).json({success:false,error:'PDF_TOO_LARGE_FOR_GAS'});
+        if(bytes.subarray(0,5).toString('latin1')!=='%PDF-'){
+          lastError='NOT_PDF';
+          console.warn('[KEDO PDF LINK] non-PDF response',id,'kind',chosen.kind);
+          continue;
+        }
+        console.log('[KEDO PDF LINK] downloaded',id,chosen.kind,bytes.length);
+        return res.json({success:true,filename:'Dudocs_zayavlenie_'+id+'.pdf',
+          file_kind:chosen.kind,base64:bytes.toString('base64')});
+      }catch(e){
+        lastError='FETCH_FAILED';
+        console.warn('[KEDO PDF LINK] fetch failed',id,chosen.kind,e.message);
       }
     }
-    const url=KEDO_ROOT_+base+'/files?file_key='+encodeURIComponent(key);
-    const response=await fetch(url,{
-      headers:{...headers,Accept:'application/pdf'},redirect:'error',signal:AbortSignal.timeout(30000)
-    });
-    if(!response.ok){
-      console.warn('[KEDO PDF] download HTTP',response.status,'application',id,'kind',fileKind);
-      return res.status(502).json({success:false,error:'KEDO_DOWNLOAD_HTTP_'+response.status});
-    }
-    const declared=Number(response.headers.get('content-length')||0);
-    if(declared>8*1024*1024)return res.status(413).json({success:false,error:'PDF_TOO_LARGE_FOR_GAS'});
-    const bytes=Buffer.from(await response.arrayBuffer());
-    if(bytes.length>8*1024*1024)return res.status(413).json({success:false,error:'PDF_TOO_LARGE_FOR_GAS'});
-    if(bytes.subarray(0,5).toString('latin1')!=='%PDF-')
-      return res.status(502).json({success:false,error:'KEDO_RETURNED_NON_PDF'});
-    return res.json({success:true,filename:'Dudocs_zayavlenie_'+id+'.pdf',
-      file_kind:fileKind,base64:bytes.toString('base64')});
+    return res.status(502).json({success:false,error:'KEDO_PDF_DOWNLOAD_FAILED',detail:lastError});
   }catch(e){
     console.error('[KEDO PDF]',e.message);
     return res.status(502).json({success:false,error:'KEDO_PDF_FAILED',message:e.message});
