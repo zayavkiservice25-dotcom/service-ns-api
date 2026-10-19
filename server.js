@@ -19129,4 +19129,102 @@ app.get('/hr/kedo-applications/print-pdf', hrApiGuard_, async(req,res)=>{
   }
 });
 
+
+// ============================================================
+// TELEGRAM SERVICE NS: личные сообщения, Chat ID в PostgreSQL.
+// Бот НЕ связывает пользователя с логином автоматически по /start.
+// Не передавайте Telegram токен в Google Apps Script или браузер.
+// ============================================================
+const TELEGRAM_TOKEN_NS_ = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
+const TELEGRAM_PUBLIC_URL_NS_ = String(process.env.TELEGRAM_WEBHOOK_BASE_URL || process.env.RENDER_EXTERNAL_URL || '').trim().replace(/\/+$/, '');
+const TELEGRAM_SECRET_NS_ = TELEGRAM_TOKEN_NS_
+  ? crypto.createHash('sha256').update('SNS-telegram-webhook-v1:' + TELEGRAM_TOKEN_NS_).digest('hex')
+  : '';
+const TELEGRAM_HOOK_PATH_NS_ = '/api/telegram/sns-updates';
+
+async function telegramNsQuery_(method, body) {
+  if (!TELEGRAM_TOKEN_NS_) throw new Error('TELEGRAM_BOT_TOKEN_NOT_CONFIGURED');
+  const resp = await fetch('https://api.telegram.org/bot' + TELEGRAM_TOKEN_NS_ + '/' + method, {
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(body), signal:AbortSignal.timeout(15000)
+  });
+  const data = await resp.json().catch(()=>null);
+  if (!resp.ok || !data?.ok) throw new Error('TELEGRAM_' + method + '_FAILED_HTTP_' + resp.status + (data?.description ? ':' + String(data.description).slice(0,120) : ''));
+  return data.result;
+}
+async function telegramNsSend_(chatId, message) {
+  if(!/^\d{1,20}$/.test(String(chatId))) throw new Error('INVALID_TELEGRAM_CHAT_ID');
+  return telegramNsQuery_('sendMessage',{chat_id:String(chatId),text:String(message).slice(0,3900),disable_web_page_preview:true});
+}
+async function telegramNsSendToLogin_(login, message) {
+  const rows=await pool.query('SELECT chat_id::text AS chat_id FROM public.telegram_users WHERE login=$1', [String(login).trim().toLowerCase()]);
+  if(!rows.rowCount) return {sent:false,reason:'TELEGRAM_CHAT_NOT_LINKED'};
+  await telegramNsSend_(rows.rows[0].chat_id,message);
+  return {sent:true};
+}
+// Вызов для будущей логики проверки денег: сумма дефицита рассчитывается
+// из действительного остатка, а не из отправленного пользователем текста.
+async function telegramNsTripShortfall_(employee,required,available){
+  const need=Number(required),free=Number(available);
+  if(!Number.isFinite(need)||!Number.isFinite(free)||need<=free) return {sent:false,reason:'NO_SHORTFALL'};
+  const money=x=>x.toLocaleString('ru-RU',{minimumFractionDigits:2,maximumFractionDigits:2})+' ₸';
+  const msg='⚠️ Недостаточно денег на командировку\n'
+    +'Сотрудник: '+String(employee||'—').slice(0,160)+'\n'
+    +'Объект: Командировка\nТип: Тек\n'
+    +'Требуется: '+money(need)+'\nДоступно: '+money(free)+'\n'
+    +'Не хватает: '+money(need-free);
+  return telegramNsSendToLogin_('a_zaitova',msg);
+}
+
+app.post(TELEGRAM_HOOK_PATH_NS_,async(req,res)=>{
+  if(!TELEGRAM_SECRET_NS_ || req.get('X-Telegram-Bot-Api-Secret-Token')!==TELEGRAM_SECRET_NS_)
+    return res.status(403).json({ok:false});
+  // Сначала отвечаем Telegram, затем обрабатываем сообщение.
+  res.json({ok:true});
+  try {
+    const message=req.body?.message;
+    if(!message?.chat?.id || message.chat.type!=='private')return;
+    const txt=String(message.text||'').trim();
+    if(!/^\/(start|id)(?:@\w+)?(?:\s|$)/i.test(txt))return;
+    await telegramNsSend_(message.chat.id,
+      'Service NS Finance ✅\nВаш Chat ID: '+String(message.chat.id)+'\n'
+      +'Передайте этот номер администратору Service NS для привязки к рабочему логину.\n'
+      +'Никому не передавайте токен BotFather.');
+  }catch(e){console.error('[TELEGRAM SNS] update failed:',e.message)}
+});
+
+// Тест отправки конкретному сотруднику. Защищено X-HR-API-KEY.
+app.post('/hr/telegram/test',hrApiGuard_,async(req,res)=>{
+  try{
+    const login=String(req.body?.login||'a_zaitova').trim().toLowerCase();
+    if(login!=='a_zaitova')return res.status(400).json({success:false,error:'ONLY_A_ZAITOVA_FOR_TEST'});
+    const result=await telegramNsSendToLogin_(login,'✅ Service NS Finance: тестовое уведомление. Подключение Telegram работает.');
+    res.status(result.sent?200:404).json({success:result.sent,...result});
+  }catch(e){console.error('[TELEGRAM SNS] test failed:',e.message);res.status(502).json({success:false,error:'TELEGRAM_SEND_FAILED'});}
+});
+
+async function telegramNsInit_(){
+  try{
+    await pool.query(`CREATE TABLE IF NOT EXISTS public.telegram_users (
+      login text PRIMARY KEY,
+      chat_id bigint NOT NULL UNIQUE,
+      created_at timestamptz NOT NULL DEFAULT now()
+    )`);
+    if(!TELEGRAM_TOKEN_NS_){console.log('[TELEGRAM SNS] Bot token not configured');return;}
+    if(!TELEGRAM_PUBLIC_URL_NS_ || !/^https:\/\//i.test(TELEGRAM_PUBLIC_URL_NS_)){
+      console.warn('[TELEGRAM SNS] Set TELEGRAM_WEBHOOK_BASE_URL to https://service-ns-api.onrender.com');return;
+    }
+    const url=new URL(TELEGRAM_PUBLIC_URL_NS_);
+    if(url.username||url.password||url.search||url.hash)throw new Error('INVALID_TELEGRAM_WEBHOOK_BASE_URL');
+    await telegramNsQuery_('setWebhook',{
+      url:url.origin+TELEGRAM_HOOK_PATH_NS_,
+      secret_token:TELEGRAM_SECRET_NS_,
+      allowed_updates:['message'],drop_pending_updates:false
+    });
+    console.log('[TELEGRAM SNS] Webhook ready:',url.origin+TELEGRAM_HOOK_PATH_NS_);
+  }catch(e){console.error('[TELEGRAM SNS] Init failed:',e.message)}
+}
+// Не удалять таблицы при запуске: старый код HR и финансов может на них ссылаться.
+setTimeout(()=>{void telegramNsInit_()},3000);
+
 app.listen(PORT, () => console.log("Server started on port " + PORT));
