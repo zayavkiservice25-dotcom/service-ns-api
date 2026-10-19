@@ -8383,6 +8383,21 @@ app.post("/request-items-paid-bulk", async (req, res) => {
       });
     }
 
+    // KEDO finance rows require a full funding-pool allocation before payment.
+    if (paidValue === 'Да') {
+      const insufficient = await client.query(`
+        SELECT l.application_id::text AS application_id
+        FROM hr.kedo_finance_links l
+        WHERE l.zvk_row_id = ANY($1::bigint[])
+          AND COALESCE((SELECT SUM(a.amount) FROM public.zvk_funding_pool_allocations a
+                        WHERE a.zvk_row_id=l.zvk_row_id),0) < l.amount
+        LIMIT 1`,[row_ids]);
+      if (insufficient.rowCount) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({success:false,error:'Командировка: не выделены деньги из пула. Оплата запрещена.'});
+      }
+    }
+
     const head = await client.query(`
       SELECT approve_ermek_status
       FROM public.request_head
@@ -18391,6 +18406,176 @@ function hrApiGuard_(req,res,next) {
 // ENV: KEDO_BASE_URL, KEDO_USER_TOKEN, KEDO_SYNC_FROM,
 //      KEDO_SYNC_INTERVAL_MINUTES, KEDO_APPLICATION_TYPE_IDS (необязательно).
 // =====================================================
+
+// FINANCIAL IMPORT IS OPT-IN. Writes to FT and Registry when explicitly enabled
+// using KEDO_FINANCE_AUTO_SYNC=true. Never auto-create an uncalculable payment.
+function kedoFinanceCompute_(v,raw){
+  const pick=(...keys)=>{for(const k of keys){if(v[k]!==null&&v[k]!==undefined&&String(v[k]).trim()!=='')return v[k]}return null};
+  const category=String(pick('position_type','position_category','employee_category','category','job_type')||'').toLowerCase();
+  const rank=/началь|заместител|руководител[ьи] структурн|руководител[ьи] подразделен/.test(category)?'head':
+    /специал|аналитик|инженер/.test(category)?'specialist':
+    /руководств|^директор|генеральн.*директор|исполнительн.*директор|управляющ.*директор/.test(category)?'leader':null;
+  const start=String(pick('trip_start_date','mission_start_date')||raw.start_date||'');
+  const end=String(pick('trip_end_date','mission_end_date')||raw.end_date||'');
+  const date=s=>/^\d{2}\.\d{2}\.\d{4}$/.test(s)?s.slice(6)+'-'+s.slice(3,5)+'-'+s.slice(0,2):s.slice(0,10);
+  const date1=date(start),date2=date(end);
+  const from=Date.parse(date1+'T00:00:00Z'),to=Date.parse(date2+'T00:00:00Z');
+  const n=x=>{if(x===null||x===undefined||String(x).trim()==='')return null;const out=Number(String(x).replace(/\s/g,'').replace(',','.'));return Number.isFinite(out)?out:null};
+  const stated=n(pick('trip_days_count','mission_days_count','gen_days','days_count'));
+  const days=stated===null?Math.round((to-from)/86400000)+1:stated;
+  if(!rank||!Number.isInteger(days)||days<=0||!Number.isFinite(from)||!Number.isFinite(to)||to<from) return null;
+  const daily={leader:4,head:3,specialist:2};
+  const hotel={leader:[10,7,5,3],head:[7,4,4,3],specialist:[4,3,3,3]};
+  const ordinal=['first','second','third','fourth','fifth'];
+  let nightsTotal=0,lodging=0,found=false;
+  for(let i=1;i<=5;i++){
+    const city=pick('type'+i,'city'+i,'city_'+i);
+    const rawType=pick('living_'+i,'living'+i,'city_type'+i);
+    const night=n(pick(ordinal[i-1],i===4?'forth':'__none__','days'+i,'nights'+i));
+    if(city===null&&rawType===null&&night===null)continue;
+    const match=String(rawType||'').trim().toLowerCase().match(/^(?:тип\s*)?([1-4])$/);
+    if(!city||!match||!Number.isInteger(night)||night<0)return null;
+    lodging+=night*hotel[rank][Number(match[1])-1]*4325;
+    nightsTotal+=night;found=true;
+  }
+  if(!found||nightsTotal>days)return null;
+  const total=days*daily[rank]*4325+lodging;
+  if(!Number.isSafeInteger(total)||total<=0)return null;
+  return {total,start:date1,end:date2};
+}
+
+async function kedoFinanceReconcile_(){
+ const pending=await pool.query(`SELECT l.application_id::text AS id,l.zvk_row_id,l.amount
+   FROM hr.kedo_finance_links l WHERE l.missing_amount>0 ORDER BY l.created_at LIMIT 100`);
+ for(const row of pending.rows){
+  const c=await pool.connect();
+  try{
+   await c.query('BEGIN');
+   await c.query('SELECT pg_advisory_xact_lock(hashtext($1))',[row.id]);
+   const pools=await c.query(`SELECT p.id,p.source_name,
+     p.amount-COALESCE((SELECT SUM(a.amount) FROM public.zvk_funding_pool_allocations a WHERE a.funding_pool_id=p.id),0) AS free
+     FROM public.draft_funding_pool p
+     WHERE p.is_active=true AND p.parent_pool_id IS NOT NULL
+       AND lower(trim(p.legal_entity))=lower('Сервис НС')
+       AND lower(trim(p.object_name))=lower('Командировка')
+       AND lower(trim(p.money_type))=lower('Тек')
+     ORDER BY free DESC,p.id FOR UPDATE OF p`);
+   const chosen=pools.rows.find(p=>Number(p.free)>=Number(row.amount));
+   if(!chosen){await c.query('ROLLBACK');continue;}
+   await c.query(`INSERT INTO public.zvk_funding_pool_allocations(zvk_row_id,funding_pool_id,amount,created_by)
+     VALUES($1,$2,$3,'KEDO') ON CONFLICT(zvk_row_id,funding_pool_id) DO NOTHING`,[row.zvk_row_id,chosen.id,row.amount]);
+   await c.query(`UPDATE public.zvk_status SET src_o=$2,src_d='Сервис НС'
+     WHERE zvk_row_id=$1`,[row.zvk_row_id,chosen.source_name]);
+   await c.query(`UPDATE public.request_items SET src_o=$2,src_d='Сервис НС'
+     WHERE zvk_row_id=$1`,[row.zvk_row_id,chosen.source_name]);
+   await c.query(`UPDATE public.registry_items SET src_o=$2,src_d='Сервис НС'
+     WHERE zvk_row_id=$1`,[row.zvk_row_id,chosen.source_name]);
+   await c.query(`UPDATE hr.kedo_finance_links SET missing_amount=0 WHERE application_id=$1::uuid`,[row.id]);
+   await c.query('COMMIT');
+   console.log('[KEDO FIN] FUNDED',row.id,chosen.id);
+  }catch(e){await c.query('ROLLBACK').catch(()=>{});console.error('[KEDO FIN] RECONCILE',row.id,e.message)}
+  finally{c.release()}
+ }
+}
+
+async function kedoFinanceSync_(){
+  await kedoFinanceReconcile_();
+  // Retry an undelivered shortfall alert without sending duplicates after success.
+  const unsent=await pool.query(`SELECT f.application_id::text AS id,f.amount,
+      f.missing_amount,a.employee_full_name
+    FROM hr.kedo_finance_links f JOIN hr.kedo_applications a USING(application_id)
+    WHERE f.missing_amount>0 AND f.notice_sent=false ORDER BY f.created_at LIMIT 30`);
+  for(const n of unsent.rows){
+    try{
+      const result=await telegramNsTripShortfall_(n.employee_full_name,Number(n.amount),Number(n.amount)-Number(n.missing_amount));
+      if(result?.sent) await pool.query('UPDATE hr.kedo_finance_links SET notice_sent=true WHERE application_id=$1::uuid',[n.id]);
+    }catch(e){console.warn('[KEDO FIN] Notice pending',n.id,e.message)}
+  }
+  const applications=await pool.query(`SELECT application_id::text AS id, employee_full_name,
+     application_values, start_date, end_date, status, files_metadata
+     FROM hr.kedo_applications a WHERE status='COMPLETED'
+       AND a.sent_at >= $1::timestamptz
+       AND NOT EXISTS(SELECT 1 FROM hr.kedo_finance_links f WHERE f.application_id=a.application_id)
+     ORDER BY sent_at, application_id LIMIT 50`,
+    [process.env.KEDO_FINANCE_START_DATE || '2099-01-01']);
+  for(const a of applications.rows){
+    const data=kedoFinanceCompute_(a.application_values||{},a);
+    if(!data){console.warn('[KEDO FIN] SKIP_NO_CALC',a.id);continue;}
+    const employee=String(a.employee_full_name||a.application_values?.employee||'').trim();
+    if(!employee){console.warn('[KEDO FIN] SKIP_NO_EMPLOYEE',a.id);continue;}
+    const client=await pool.connect();let notice=null;
+    try{
+      await client.query('BEGIN');
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))',[a.id]);
+      const exists=await client.query('SELECT 1 FROM hr.kedo_finance_links WHERE application_id=$1::uuid',[a.id]);
+      if(exists.rowCount){await client.query('ROLLBACK');continue;}
+      // Conservative free balance: never allocate a pool that does not cover full amount.
+      // Paid historical allocations are counted too: this avoids accidental overspending.
+      const funds=await client.query(`SELECT p.id,p.source_name,
+          (p.amount-COALESCE((SELECT SUM(a.amount) FROM public.zvk_funding_pool_allocations a WHERE a.funding_pool_id=p.id),0)) AS free
+        FROM public.draft_funding_pool p
+        WHERE p.is_active=true AND p.parent_pool_id IS NOT NULL
+          AND lower(trim(p.legal_entity))=lower('Сервис НС')
+          AND lower(trim(p.object_name))=lower('Командировка')
+          AND lower(trim(p.money_type))=lower('Тек')
+        ORDER BY free DESC,p.id FOR UPDATE OF p`);
+      const adequate=funds.rows.find(p=>Number(p.free)>=data.total)||null;
+      const available=Math.max(0,...funds.rows.map(p=>Number(p.free)||0));
+      const missing=adequate?0:Math.max(0,data.total-available);
+      const pdfs=Array.isArray(a.files_metadata)?a.files_metadata:[];
+      const pdf=pdfs.find(f=>String(f.key||'').endsWith('/print_form.pdf')&&f.link)
+        ||pdfs.find(f=>f.type==='application/pdf'&&f.link);
+      const pdfLink=pdf&&typeof pdf.link==='string'&&pdf.link.startsWith('https://sns.doodocs.kz/')?pdf.link:null;
+      const ft=await client.query(`INSERT INTO public.ft
+       (id_ft,input_date,input_name,legal_entity,"object",contractor,pay_purpose,dds_article,contract_no,invoice_no,invoice_date,invoice_pdf,sum_ft,source_type)
+       VALUES ('FT'||nextval('public.ft_id_seq'),now(),'a_zaitova','Сервис НС','Командировка',
+         $1,$2,'103. Командировочные','Без договора','Приказ',(now() AT TIME ZONE 'Asia/Almaty')::date,$3,$4,'KEDO')
+       RETURNING id_ft`,[employee,'Служебная командировка с '+data.start+' по '+data.end,pdfLink,data.total]);
+      const idFt=ft.rows[0].id_ft;
+      const z=await client.query(`INSERT INTO public.zvk(id_ft,id_zvk,zvk_date,zvk_name,to_pay,request_flag)
+       VALUES($1,'ZFT'||nextval('public.zvk_id_seq'),now(),'a_zaitova',$2,'Да') RETURNING id,id_zvk`,[idFt,data.total]);
+      const zid=z.rows[0].id;
+      await client.query(`INSERT INTO public.zvk_status(zvk_row_id,status_time,src_d,src_o,money_type)
+       VALUES($1,now(),'Сервис НС',$2,'Тек')`,[zid,adequate?.source_name||null]);
+      if(adequate){await client.query(`INSERT INTO public.zvk_funding_pool_allocations
+       (zvk_row_id,funding_pool_id,amount,created_by) VALUES($1,$2,$3,'KEDO')`,[zid,adequate.id,data.total]);}
+      const head=await client.query(`INSERT INTO public.request_head
+       (created_by,total_amount,items_count,approve_ermek_status,approve_ermek_name,approve_ermek_time,
+        workflow_stage,agree_status)
+       VALUES('a_zaitova',$1,1,'Согласовано','Авто KEDO',now(),'Оплата Арай','Согласовано') RETURNING id`,[data.total]);
+      const requestId=head.rows[0].id;
+      await client.query(`INSERT INTO public.request_items
+       (request_id,zvk_row_id,id_ft,id_zvk,object,contractor,pay_purpose,dds_article,
+        contract_no,invoice_no,invoice_date,invoice_pdf,src_d,src_o,money_type,to_pay)
+       SELECT $1,$2,id_ft,$7,"object",contractor,pay_purpose,dds_article,
+        contract_no,invoice_no,invoice_date,invoice_pdf,$3,$4,'Тек',$5
+       FROM public.ft WHERE id_ft=$6`,[requestId,zid,'Сервис НС',adequate?.source_name||null,data.total,idFt,z.rows[0].id_zvk]);
+      const registry=await client.query(`INSERT INTO public.registry_head
+       (created_by,workflow_stage,agree_status,archive_flag,total_amount,items_count)
+       VALUES('a_zaitova','Оплата Арай','Согласовано','Нет',$1,1) RETURNING id`,[data.total]);
+      const registryId=registry.rows[0].id;
+      await client.query(`INSERT INTO public.registry_items
+       (registry_id,zvk_row_id,id_ft,id_zvk,object,contractor,pay_purpose,dds_article,
+        contract_no,invoice_no,invoice_date,invoice_pdf,src_d,src_o,to_pay)
+       SELECT $1,$2,id_ft,$3,"object",contractor,pay_purpose,dds_article,
+        contract_no,invoice_no,invoice_date,invoice_pdf,$4,$5,$6 FROM public.ft WHERE id_ft=$7`,
+       [registryId,zid,z.rows[0].id_zvk,'Сервис НС',adequate?.source_name||null,data.total,idFt]);
+      await markRowsAsRegistryCreated(client,[zid]);
+      await client.query(`INSERT INTO hr.kedo_finance_links
+       (application_id,id_ft,zvk_row_id,registry_id,amount,missing_amount)
+       VALUES($1::uuid,$2,$3,$4,$5,$6)`,[a.id,idFt,zid,registryId,data.total,missing]);
+      await client.query('COMMIT');
+      if(missing>0)notice={employee,amount:data.total,available,applicationId:a.id};
+      console.log('[KEDO FIN] CREATED',a.id,idFt,z.rows[0].id_zvk,'missing',missing);
+    }catch(e){await client.query('ROLLBACK').catch(()=>{});console.error('[KEDO FIN] ERROR',a.id,e.message)}
+    finally{client.release()}
+    if(notice){try{
+       const sent=await telegramNsTripShortfall_(notice.employee,notice.amount,notice.available);
+       if(sent?.sent)await pool.query('UPDATE hr.kedo_finance_links SET notice_sent=true WHERE application_id=$1::uuid',[notice.applicationId]);
+    }catch(e){console.warn('[KEDO FIN] Telegram failed',e.message)}}
+  }
+}
+
 const KEDO_ROOT_ = String(process.env.KEDO_BASE_URL || '').trim().replace(/\/+$/, '');
 const KEDO_TOKEN_ = String(process.env.KEDO_USER_TOKEN || '').trim();
 let kedoSyncBusy_ = false;
@@ -18408,6 +18593,20 @@ async function kedoRequest_(endpoint) {
     if (!data || !Array.isArray(data.elements)) throw new Error('KEDO: elements[] не найден в ' + endpoint.split('?')[0]);
     return data;
   } finally { clearTimeout(timeout); }
+}
+
+// KEDO -> FT link: stable and unique, payment status read from zvk_pay.
+async function kedoFinanceEnsure_(){
+  await pool.query(`CREATE TABLE IF NOT EXISTS hr.kedo_finance_links (
+    application_id uuid PRIMARY KEY REFERENCES hr.kedo_applications(application_id),
+    id_ft text UNIQUE,
+    zvk_row_id bigint UNIQUE,
+    registry_id bigint,
+    amount numeric(18,2),
+    missing_amount numeric(18,2) NOT NULL DEFAULT 0,
+    notice_sent boolean NOT NULL DEFAULT false,
+    created_at timestamptz NOT NULL DEFAULT now()
+  )`);
 }
 
 async function kedoEnsureDb_() {
@@ -18445,6 +18644,7 @@ async function kedoEnsureDb_() {
   await pool.query(`CREATE INDEX IF NOT EXISTS kedo_applications_type_idx ON hr.kedo_applications(type_id)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS kedo_applications_status_idx ON hr.kedo_applications(status)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS kedo_applications_values_gin ON hr.kedo_applications USING GIN(application_values)`);
+  await kedoFinanceEnsure_();
 }
 
 async function kedoSync_() {
@@ -18537,6 +18737,9 @@ async function kedoSync_() {
       }
     }
     console.log('[KEDO] Синхронизация заявлений завершена, обработано:', saved);
+    if (process.env.KEDO_FINANCE_AUTO_SYNC === 'true' && process.env.KEDO_FINANCE_START_DATE) {
+      await kedoFinanceSync_();
+    }
   } catch (error) {
     console.error('[KEDO] Ошибка синхронизации заявлений:', error.message);
   } finally { kedoSyncBusy_ = false; }
@@ -18571,11 +18774,16 @@ app.get('/hr/kedo-applications/summary', hrApiGuard_, async(req,res)=>{
       WHERE lower(trim(login))=$1 AND is_active=true LIMIT 1`,[login]);
     if(!user.rowCount)return res.status(403).json({success:false,error:'HR_ACCESS_DENIED'});
     // Права конкретного пользователя должны проверяться на уровне сессии при уходе от GAS.
-    const q=await pool.query(`SELECT application_id::text AS id, type_title, status,
-      sent_at,start_date,end_date,employee_full_name,department_title,
-      organization_title,application_values,raw_data,print_form_link,doodocs_hr_link
-      FROM hr.kedo_applications WHERE status='COMPLETED'
-      ORDER BY sent_at DESC NULLS LAST, application_id DESC LIMIT 2000`);
+    const q=await pool.query(`SELECT a.application_id::text AS id, a.type_title, a.status,
+      a.sent_at,a.start_date,a.end_date,a.employee_full_name,a.department_title,
+      a.organization_title,a.application_values,a.raw_data,a.print_form_link,a.doodocs_hr_link,
+      f.id_ft AS finance_id_ft, f.zvk_row_id AS finance_zvk_row_id,
+      COALESCE(p.is_paid,'Нет') AS finance_paid, p.pay_time AS finance_pay_time
+      FROM hr.kedo_applications a
+      LEFT JOIN hr.kedo_finance_links f ON f.application_id=a.application_id
+      LEFT JOIN public.zvk_pay p ON p.zvk_row_id=f.zvk_row_id
+      WHERE a.status='COMPLETED'
+      ORDER BY a.sent_at DESC NULLS LAST, a.application_id DESC LIMIT 2000`);
     const rows=q.rows.map(r=>({
       id:r.id,status:r.status,employee:r.employee_full_name,
       organization:r.organization_title,department:r.department_title,
@@ -18583,7 +18791,10 @@ app.get('/hr/kedo-applications/summary', hrApiGuard_, async(req,res)=>{
       values:r.application_values||{},
       // Поля недоступны в отдельном столбце, но могут находиться в оригинальном ответе.
       application_link:r.doodocs_hr_link || r.raw_data?.link || null,
-      has_print_form:Boolean(r.print_form_link)
+      has_print_form:Boolean(r.print_form_link),
+      finance_id_ft:r.finance_id_ft||null,
+      finance_paid:r.finance_paid==='Да'?'Да':'Нет',
+      finance_pay_time:r.finance_pay_time||null
     }));
     res.set('Cache-Control','no-store');
     res.json({success:true,rows});
