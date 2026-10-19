@@ -19028,10 +19028,11 @@ app.get('/hr/kedo-applications/summary', hrApiGuard_, async(req,res)=>{
 // Через GAS, с внутренним HR_API_KEY; KEDO_USER_TOKEN остаётся на Render.
 // =====================================================
 app.get('/hr/kedo-applications/print-pdf', hrApiGuard_, async(req,res)=>{
+  res.set('Cache-Control','no-store');
   try {
     const login=String(req.query.login||'').trim().toLowerCase();
-    const id=String(req.query.id||'').trim();
-    if(!/^[a-z0-9_.-]{2,90}$/.test(login) || !/^[0-9a-f-]{36}$/i.test(id))
+    const id=String(req.query.id||'').trim().toLowerCase();
+    if(!/^[a-z0-9_.-]{2,90}$/.test(login) || !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(id))
       return res.status(400).json({success:false,error:'INVALID_LOGIN_OR_ID'});
     const user=await pool.query(`SELECT 1 FROM public.users
       WHERE lower(trim(login))=$1 AND is_active=true LIMIT 1`,[login]);
@@ -19040,31 +19041,61 @@ app.get('/hr/kedo-applications/print-pdf', hrApiGuard_, async(req,res)=>{
       FROM hr.kedo_applications WHERE application_id=$1::uuid LIMIT 1`,[id]);
     if(!q.rowCount)return res.status(404).json({success:false,error:'APPLICATION_NOT_FOUND'});
     if(q.rows[0].status!=='COMPLETED')return res.status(409).json({success:false,error:'APPLICATION_NOT_COMPLETED'});
-    const key=String(q.rows[0].print_form_key||'');
-    if(!key.endsWith('/print_form.pdf') || !key.startsWith(id+'/'))
-      return res.status(404).json({success:false,error:'PRINT_FORM_NOT_AVAILABLE'});
     if(!KEDO_ROOT_ || !KEDO_TOKEN_)return res.status(503).json({success:false,error:'KEDO_NOT_CONFIGURED'});
-    const path='/api/v1/hr/applications/management/applications/'+encodeURIComponent(id)+'/files?file_key='+encodeURIComponent(key);
-    const controller=new AbortController();
-    const timer=setTimeout(()=>controller.abort(),30000);
-    let response;
-    try {
-      response=await fetch(KEDO_ROOT_+path,{
-        headers:{Authorization:'User-Token '+KEDO_TOKEN_,Accept:'application/pdf'},
-        signal:controller.signal,redirect:'error'
+
+    const base='/api/v1/hr/applications/management/applications/'+encodeURIComponent(id);
+    const headers={Authorization:'User-Token '+KEDO_TOKEN_};
+    let key=String(q.rows[0].print_form_key||'');
+    let fileKind='print';
+    // PDF печатной формы предпочтителен. При отсутствии ключа заново читаем файлы
+    // заявления. Если печатной формы нет — предлагаем обычный PDF заявления,
+    // но никогда не подставляем карточку ЭЦП или приказ другого документа.
+    if(!(key.startsWith(id+'/') && key.endsWith('/print_form.pdf'))){
+      const resp=await fetch(KEDO_ROOT_+base+'/ext/files',{
+        headers:{...headers,Accept:'application/json'},redirect:'error',signal:AbortSignal.timeout(25000)
       });
-      if(!response.ok)throw new Error('KEDO_PDF_HTTP_'+response.status);
-      const declared=Number(response.headers.get('content-length')||0);
-      if(declared>8*1024*1024)throw new Error('PDF_TOO_LARGE_FOR_GAS');
-      const bytes=Buffer.from(await response.arrayBuffer());
-      if(bytes.length>8*1024*1024)throw new Error('PDF_TOO_LARGE_FOR_GAS');
-      if(bytes.subarray(0,5).toString('latin1')!=='%PDF-')throw new Error('KEDO_RETURNED_NON_PDF');
-      res.set('Cache-Control','no-store');
-      return res.json({success:true,filename:'KEDO_komandirovka_'+id+'.pdf',
-        base64:bytes.toString('base64')});
-    } finally {clearTimeout(timer)}
-  }catch(e){console.error('[KEDO PDF]',e.message);
-    res.status(502).json({success:false,error:e.message||'KEDO_PDF_FAILED'});
+      if(!resp.ok){
+        console.warn('[KEDO PDF] file list HTTP',resp.status,'application',id);
+        return res.status(502).json({success:false,error:'KEDO_FILE_LIST_HTTP_'+resp.status});
+      }
+      const json=await resp.json();
+      const files=Array.isArray(json.elements)?json.elements:[];
+      const valid=f=>f && typeof f.key==='string' &&
+        f.key.length<=1024 && f.key.toLowerCase().endsWith('.pdf') &&
+        (f.type==null || String(f.type).toLowerCase()==='application/pdf');
+      const printed=files.find(f=>valid(f)&&f.key===id+'/print_form.pdf') ||
+        files.find(f=>valid(f)&&f.key.startsWith(id+'/')&&f.key.endsWith('/print_form.pdf'));
+      const original=files.find(f=>valid(f)&&f.key===id+'.pdf');
+      const choice=printed||original;
+      console.log('[KEDO PDF] application',id,'files',files.map(f=>({key:f.key,type:f.type})),
+        'selected',choice?.key||'NONE');
+      if(!choice)return res.status(404).json({success:false,error:'APPLICATION_PDF_NOT_AVAILABLE'});
+      key=choice.key;
+      fileKind=printed?'print':'original';
+      if(printed){
+        await pool.query(`UPDATE hr.kedo_applications SET print_form_key=$2
+          WHERE application_id=$1::uuid`,[id,key]);
+      }
+    }
+    const url=KEDO_ROOT_+base+'/files?file_key='+encodeURIComponent(key);
+    const response=await fetch(url,{
+      headers:{...headers,Accept:'application/pdf'},redirect:'error',signal:AbortSignal.timeout(30000)
+    });
+    if(!response.ok){
+      console.warn('[KEDO PDF] download HTTP',response.status,'application',id,'kind',fileKind);
+      return res.status(502).json({success:false,error:'KEDO_DOWNLOAD_HTTP_'+response.status});
+    }
+    const declared=Number(response.headers.get('content-length')||0);
+    if(declared>8*1024*1024)return res.status(413).json({success:false,error:'PDF_TOO_LARGE_FOR_GAS'});
+    const bytes=Buffer.from(await response.arrayBuffer());
+    if(bytes.length>8*1024*1024)return res.status(413).json({success:false,error:'PDF_TOO_LARGE_FOR_GAS'});
+    if(bytes.subarray(0,5).toString('latin1')!=='%PDF-')
+      return res.status(502).json({success:false,error:'KEDO_RETURNED_NON_PDF'});
+    return res.json({success:true,filename:'Dudocs_zayavlenie_'+id+'.pdf',
+      file_kind:fileKind,base64:bytes.toString('base64')});
+  }catch(e){
+    console.error('[KEDO PDF]',e.message);
+    return res.status(502).json({success:false,error:'KEDO_PDF_FAILED',message:e.message});
   }
 });
 
