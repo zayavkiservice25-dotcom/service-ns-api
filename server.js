@@ -18495,9 +18495,10 @@ async function kedoFinanceSync_(){
      application_values, start_date, end_date, status, files_metadata
      FROM hr.kedo_applications a WHERE status='COMPLETED'
        AND a.sent_at >= $1::timestamptz
+       AND a.application_id = $2::uuid
        AND NOT EXISTS(SELECT 1 FROM hr.kedo_finance_links f WHERE f.application_id=a.application_id)
      ORDER BY sent_at, application_id LIMIT 50`,
-    [process.env.KEDO_FINANCE_START_DATE || '2099-01-01']);
+    [process.env.KEDO_FINANCE_START_DATE || '2099-01-01', process.env.KEDO_FINANCE_ONLY_APPLICATION_ID]);
   for(const a of applications.rows){
     const data=kedoFinanceCompute_(a.application_values||{},a);
     if(!data){console.warn('[KEDO FIN] SKIP_NO_CALC',a.id);continue;}
@@ -18737,7 +18738,7 @@ async function kedoSync_() {
       }
     }
     console.log('[KEDO] Синхронизация заявлений завершена, обработано:', saved);
-    if (process.env.KEDO_FINANCE_AUTO_SYNC === 'true' && process.env.KEDO_FINANCE_START_DATE) {
+    if (process.env.KEDO_FINANCE_AUTO_SYNC === 'true' && process.env.KEDO_FINANCE_START_DATE && /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(String(process.env.KEDO_FINANCE_ONLY_APPLICATION_ID || ''))) {
       await kedoFinanceSync_();
     }
   } catch (error) {
