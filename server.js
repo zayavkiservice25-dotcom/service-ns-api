@@ -409,7 +409,6 @@ await pool.query(`
       f.pay_purpose,
       f.dds_article,
       f.contract_no,
-      f.contract_date,
 
       f.invoice_no,
       f.invoice_date,
