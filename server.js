@@ -209,8 +209,19 @@ mechanization text,
   // ДоРеестр: предварительная сумма Гулнур. Не связана с обычным to_pay.
   await pool.query(`ALTER TABLE public.zvk ADD COLUMN IF NOT EXISTS pre_registry_amount numeric(18,2);`);
 
-  await pool.query(`ALTER TABLE public.zvk DROP CONSTRAINT IF EXISTS zvk_pkey;`);
-  await pool.query(`ALTER TABLE public.zvk ADD CONSTRAINT zvk_pkey PRIMARY KEY (id);`);
+  // Не удаляем действующий PK: на него ссылаются финансовые внешние ключи.
+  // Создаём PK лишь если в таблице его ещё нет.
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'public.zvk'::regclass AND contype = 'p'
+      ) THEN
+        ALTER TABLE public.zvk ADD CONSTRAINT zvk_pkey PRIMARY KEY (id);
+      END IF;
+    END $$;
+  `);
 
   // ✅ СИНХРОНИЗИРУЕМ sequence bigserial для zvk.id (исправляет duplicate zvk_pkey)
   await pool.query(`
