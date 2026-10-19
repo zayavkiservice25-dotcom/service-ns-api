@@ -18989,4 +18989,38 @@ if (KEDO_ROOT_ && KEDO_TOKEN_) {
 // КОНЕЦ KEDO
 // =====================================================
 
+
+// =====================================================
+// KEDO -> просмотр завершённых заявлений для страницы HR.
+// Источник: hr.kedo_applications. Никаких изменений исходных данных.
+// Защита: внутренний HR_API_KEY, как и в остальных HR API.
+// =====================================================
+app.get('/hr/kedo-applications/summary', hrApiGuard_, async(req,res)=>{
+  try {
+    const login=String(req.query.login||'').trim().toLowerCase();
+    if(!/^[a-z0-9_.-]{2,90}$/.test(login))
+      return res.status(400).json({success:false,error:'LOGIN_REQUIRED'});
+    const user=await pool.query(`SELECT role_hr,role_ft FROM public.users
+      WHERE lower(trim(login))=$1 AND is_active=true LIMIT 1`,[login]);
+    if(!user.rowCount)return res.status(403).json({success:false,error:'HR_ACCESS_DENIED'});
+    // Права конкретного пользователя должны проверяться на уровне сессии при уходе от GAS.
+    const q=await pool.query(`SELECT application_id::text AS id, type_title, status,
+      sent_at,start_date,end_date,employee_full_name,department_title,
+      organization_title,application_values,raw_data,print_form_link,doodocs_hr_link
+      FROM hr.kedo_applications WHERE status='COMPLETED'
+      ORDER BY sent_at DESC NULLS LAST, application_id DESC LIMIT 2000`);
+    const rows=q.rows.map(r=>({
+      id:r.id,status:r.status,employee:r.employee_full_name,
+      organization:r.organization_title,department:r.department_title,
+      sent_at:r.sent_at,start_date:r.start_date,end_date:r.end_date,
+      values:r.application_values||{},
+      // Поля недоступны в отдельном столбце, но могут находиться в оригинальном ответе.
+      application_link:r.doodocs_hr_link || r.raw_data?.link || null,
+      has_print_form:Boolean(r.print_form_link)
+    }));
+    res.set('Cache-Control','no-store');
+    res.json({success:true,rows});
+  }catch(e){console.error('[KEDO HR VIEW]',e.message);res.status(500).json({success:false,error:'KEDO_HR_VIEW_FAILED'});}
+});
+
 app.listen(PORT, () => console.log("Server started on port " + PORT));
