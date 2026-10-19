@@ -19059,17 +19059,36 @@ app.get('/hr/kedo-applications/print-pdf', hrApiGuard_, async(req,res)=>{
         return res.status(502).json({success:false,error:'KEDO_FILE_LIST_HTTP_'+resp.status});
       }
       const json=await resp.json();
-      const files=Array.isArray(json.elements)?json.elements:[];
-      const valid=f=>f && typeof f.key==='string' &&
-        f.key.length<=1024 && f.key.toLowerCase().endsWith('.pdf') &&
-        (f.type==null || String(f.type).toLowerCase()==='application/pdf');
-      const printed=files.find(f=>valid(f)&&f.key===id+'/print_form.pdf') ||
-        files.find(f=>valid(f)&&f.key.startsWith(id+'/')&&f.key.endsWith('/print_form.pdf'));
+      // API разных версий может оборачивать elements в data/result и файл в file.
+      // Не используем ссылки на произвольные ресурсы: скачивание только с KEDO_ROOT_.
+      const candidates=[json?.elements,json?.data?.elements,json?.result?.elements,
+        json?.files,json?.data?.files,json?.result?.files,json?.data,json?.result];
+      const rawFiles=candidates.find(Array.isArray)||[];
+      const files=rawFiles.map(f=>{
+        if(!f||typeof f!=='object')return null;
+        const nested=f.file&&typeof f.file==='object'?f.file:
+          f.metadata&&typeof f.metadata==='object'?f.metadata:f;
+        const fileKey=[f.key,nested.key,f.file_key,nested.file_key,
+          f.storage_key,nested.storage_key].find(x=>typeof x==='string'&&x.trim());
+        return {...f,key:fileKey||'',type:f.type||nested.type||f.mime_type||nested.mime_type||'',
+          name:f.name||nested.name||''};
+      }).filter(Boolean);
+      const valid=f=>typeof f.key==='string'&&f.key.length<=1024&&
+        f.key.toLowerCase().endsWith('.pdf')&&
+        (!f.type||String(f.type).toLowerCase()==='application/pdf');
+      const printed=files.find(f=>valid(f)&&f.key.toLowerCase().endsWith('/print_form.pdf'));
       const original=files.find(f=>valid(f)&&f.key===id+'.pdf');
       const choice=printed||original;
-      console.log('[KEDO PDF] application',id,'files',files.map(f=>({key:f.key,type:f.type})),
-        'selected',choice?.key||'NONE');
-      if(!choice)return res.status(404).json({success:false,error:'APPLICATION_PDF_NOT_AVAILABLE'});
+      // Диагностика только названий полей и ключей. Токены/URL/контент не выводим.
+      console.log('[KEDO PDF DIAG]',JSON.stringify({application_id:id,
+        top_level_keys:Object.keys(json||{}).slice(0,25),
+        raw_files_count:rawFiles.length,
+        file_fields:rawFiles.slice(0,5).map(f=>f&&typeof f==='object'?Object.keys(f):typeof f),
+        file_nested_fields:rawFiles.slice(0,5).map(f=>f?.file&&typeof f.file==='object'?Object.keys(f.file):[]),
+        files:files.slice(0,10).map(f=>({key:f.key,type:f.type,name:f.name})),
+        selected:choice?.key||null}));
+      if(!choice)return res.status(404).json({success:false,error:'APPLICATION_PDF_NOT_AVAILABLE',
+        message:'Dudocs не предоставил ключ PDF заявления; смотрите [KEDO PDF DIAG] в Render Logs'});
       key=choice.key;
       fileKind=printed?'print':'original';
       if(printed){
