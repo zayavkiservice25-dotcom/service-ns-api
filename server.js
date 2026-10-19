@@ -18817,11 +18817,12 @@ app.get('/hr/trips/sign-file',hrApiGuard_,hrSignSessionDirector_,async(req,res)=
 
 
 // =====================================================
-// KEDO (Dudocs) -> PostgreSQL: только сохранение исходных данных.
-// Без расчета командировочных; изменения шаблонов сохраняются в JSONB.
-// ENV: KEDO_BASE_URL, KEDO_USER_TOKEN, KEDO_SYNC_FROM (YYYY-MM-DD),
-//      KEDO_SYNC_INTERVAL_MINUTES (default 30), KEDO_DOCUMENT_TYPE_IDS (optional).
-// Никаких публичных маршрутов для запуска синхронизации и выдачи токена.
+// KEDO: заявления «Служебная командировка» -> схема hr.
+// Новый API: /api/v1/hr/applications/management
+// Не изменяет существующие hr.trip_requests / hr.kedo_documents.
+// Все произвольные переменные и 1–5 мест проживания хранятся как JSONB.
+// ENV: KEDO_BASE_URL, KEDO_USER_TOKEN, KEDO_SYNC_FROM,
+//      KEDO_SYNC_INTERVAL_MINUTES, KEDO_APPLICATION_TYPE_IDS (необязательно).
 // =====================================================
 const KEDO_ROOT_ = String(process.env.KEDO_BASE_URL || '').trim().replace(/\/+$/, '');
 const KEDO_TOKEN_ = String(process.env.KEDO_USER_TOKEN || '').trim();
@@ -18831,9 +18832,7 @@ async function kedoRequest_(endpoint) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 25000);
   try {
-    const url = KEDO_ROOT_ + '/api/v1/hr/documents/management' + endpoint;
-    const response = await fetch(url, {
-      method: 'GET',
+    const response = await fetch(KEDO_ROOT_ + '/api/v1/hr/applications/management' + endpoint, {
       headers: { Authorization: 'User-Token ' + KEDO_TOKEN_, Accept: 'application/json' },
       signal: controller.signal
     });
@@ -18846,52 +18845,39 @@ async function kedoRequest_(endpoint) {
 
 async function kedoEnsureDb_() {
   await pool.query(`CREATE SCHEMA IF NOT EXISTS hr`);
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS hr.kedo_document_types (
-      document_type_id text PRIMARY KEY,
-      title text,
-      variables jsonb NOT NULL DEFAULT '[]'::jsonb,
-      raw_data jsonb NOT NULL DEFAULT '{}'::jsonb,
-      synced_at timestamptz NOT NULL DEFAULT now()
-    )`);
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS hr.kedo_documents (
-      document_id text PRIMARY KEY,
-      document_type_id text NOT NULL,
-      document_type text,
-      document_number text,
-      document_date text,
-      status text,
-      employee_full_name text,
-      external_employee_id text,
-      organization_title text,
-      external_organization_id text,
-      doodocs_hr_link text,
-      document_variables jsonb NOT NULL DEFAULT '[]'::jsonb,
-      document_values jsonb NOT NULL DEFAULT '{}'::jsonb,
-      raw_data jsonb NOT NULL DEFAULT '{}'::jsonb,
-      synced_at timestamptz NOT NULL DEFAULT now()
-    )`);
-  // Совместимость с ранее созданными hr.kedo_* таблицами.
-  // Не трогаем hr.trip_requests / hr.trip_documents.
-  await pool.query(`ALTER TABLE hr.kedo_document_types ADD COLUMN IF NOT EXISTS raw_data jsonb NOT NULL DEFAULT '{}'::jsonb`);
-  await pool.query(`ALTER TABLE hr.kedo_document_types ADD COLUMN IF NOT EXISTS synced_at timestamptz NOT NULL DEFAULT now()`);
-  await pool.query(`ALTER TABLE hr.kedo_documents ADD COLUMN IF NOT EXISTS document_type text`);
-  await pool.query(`ALTER TABLE hr.kedo_documents ADD COLUMN IF NOT EXISTS doodocs_hr_link text`);
-  await pool.query(`ALTER TABLE hr.kedo_documents ADD COLUMN IF NOT EXISTS document_variables jsonb NOT NULL DEFAULT '[]'::jsonb`);
-  await pool.query(`ALTER TABLE hr.kedo_documents ADD COLUMN IF NOT EXISTS raw_data jsonb NOT NULL DEFAULT '{}'::jsonb`);
-  await pool.query(`ALTER TABLE hr.kedo_documents ADD COLUMN IF NOT EXISTS synced_at timestamptz NOT NULL DEFAULT now()`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS kedo_documents_type_idx ON hr.kedo_documents (document_type_id)`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS kedo_documents_status_idx ON hr.kedo_documents (status)`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS kedo_documents_values_gin ON hr.kedo_documents USING GIN (document_values)`);
-}
-
-// KEDO может возвращать дату 07.10.2026; PostgreSQL DATE требует ISO-формат.
-function kedoIsoDate_(value) {
-  if (!value) return null;
-  const v = String(value).trim();
-  const match = /^(\d{2})\.(\d{2})\.(\d{4})$/.exec(v);
-  return match ? `${match[3]}-${match[2]}-${match[1]}` : v;
+  await pool.query(`CREATE TABLE IF NOT EXISTS hr.kedo_application_types (
+    type_id uuid PRIMARY KEY,
+    title text,
+    variables jsonb NOT NULL DEFAULT '[]'::jsonb,
+    raw_data jsonb NOT NULL DEFAULT '{}'::jsonb,
+    synced_at timestamptz NOT NULL DEFAULT now()
+  )`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS hr.kedo_applications (
+    application_id uuid PRIMARY KEY,
+    type_id uuid NOT NULL,
+    type_title text,
+    status text,
+    sent_at timestamptz,
+    start_date timestamptz,
+    end_date timestamptz,
+    employee_full_name text,
+    external_employee_id text,
+    department_title text,
+    external_department_id text,
+    organization_title text,
+    external_organization_id text,
+    doodocs_hr_link text,
+    variables jsonb NOT NULL DEFAULT '[]'::jsonb,
+    application_values jsonb NOT NULL DEFAULT '{}'::jsonb,
+    raw_data jsonb NOT NULL DEFAULT '{}'::jsonb,
+    print_form_key text,
+    print_form_link text,
+    files_metadata jsonb NOT NULL DEFAULT '[]'::jsonb,
+    synced_at timestamptz NOT NULL DEFAULT now()
+  )`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS kedo_applications_type_idx ON hr.kedo_applications(type_id)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS kedo_applications_status_idx ON hr.kedo_applications(status)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS kedo_applications_values_gin ON hr.kedo_applications USING GIN(application_values)`);
 }
 
 async function kedoSync_() {
@@ -18903,94 +18889,93 @@ async function kedoSync_() {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(from)) throw new Error('Неверный KEDO_SYNC_FROM');
     await kedoEnsureDb_();
 
-    const configuredIds = String(process.env.KEDO_DOCUMENT_TYPE_IDS || '')
-      .split(',').map(v => v.trim()).filter(Boolean);
-    const typeResult = await kedoRequest_('/ext/document-types?title=' + encodeURIComponent('командир'));
-    const allowedIds = new Set(configuredIds);
-    for (const type of typeResult.elements) {
-      if (!type || !type.id) continue;
-      allowedIds.add(String(type.id));
-      await pool.query(`
-        INSERT INTO hr.kedo_document_types(document_type_id,title,variables,raw_data,synced_at)
-        VALUES($1,$2,$3::jsonb,$4::jsonb,now())
-        ON CONFLICT(document_type_id) DO UPDATE SET
-          title=EXCLUDED.title, variables=EXCLUDED.variables,
-          raw_data=EXCLUDED.raw_data, synced_at=now()`,
-        [String(type.id), type.title || null, JSON.stringify(type.variables || []), JSON.stringify(type)]);
+    // API не поддерживает поиск типов по названию, поэтому читаем все страницы.
+    const typeIds = new Set(String(process.env.KEDO_APPLICATION_TYPE_IDS || '')
+      .split(',').map(v => v.trim()).filter(v => /^[0-9a-f-]{36}$/i.test(v)));
+    let typeOffset = 0;
+    for (let page = 0; page < 200; page++) {
+      const data = await kedoRequest_('/ext/application-types?limit=100&offset=' + typeOffset);
+      for (const type of data.elements) {
+        if (!type || !type.id || String(type.title || '').trim().toLowerCase() !== 'служебная командировка') continue;
+        typeIds.add(String(type.id));
+        await pool.query(`INSERT INTO hr.kedo_application_types(type_id,title,variables,raw_data,synced_at)
+          VALUES($1,$2,$3::jsonb,$4::jsonb,now()) ON CONFLICT(type_id) DO UPDATE SET
+          title=EXCLUDED.title,variables=EXCLUDED.variables,raw_data=EXCLUDED.raw_data,synced_at=now()`,
+          [type.id, type.title || null, JSON.stringify(type.variables || []), JSON.stringify(type)]);
+      }
+      typeOffset += data.elements.length;
+      if (!data.elements.length || typeOffset >= Number(data.total || 0) || data.elements.length < 100) break;
     }
-    if (!allowedIds.size) {
-      console.warn('[KEDO] Нет типов приказов для синхронизации');
+    if (!typeIds.size) {
+      console.warn('[KEDO] Тип заявления «Служебная командировка» не найден');
       return;
     }
 
-    const limit = 50;
-    let saved = 0, offset = 0;
-    // Защита от бесконечного обхода при некорректной пагинации.
-    for (let page = 0; page < 10000; page++) {
-      const params = new URLSearchParams({status:'COMPLETED',created_at_start:from,limit:String(limit),offset:String(offset)});
-      const data = await kedoRequest_('/ext/documents?' + params.toString());
-
-
-console.log('[KEDO DEBUG] total:', data.total);
-
-console.log('[KEDO DEBUG] documents:',
-  JSON.stringify(
-    (data.elements || []).map(d => ({
-      id: d.id,
-      status: d.status,
-      document_type: d.document_type,
-      document_type_id: d.document_type_id,
-      document_number: d.document_number
-    }))
-  )
-);
-
-
-      for (const doc of data.elements) {
-        if (!doc || !doc.id || !allowedIds.has(String(doc.document_type_id))) continue;
-        await pool.query(`
-          INSERT INTO hr.kedo_documents (
-            document_id,document_type_id,document_type,document_number,document_date,status,
-            employee_full_name,external_employee_id,organization_title,external_organization_id,
-            doodocs_hr_link,document_variables,document_values,raw_data,synced_at
+    let saved = 0;
+    for (const typeId of typeIds) {
+      let offset = 0;
+      for (let page = 0; page < 10000; page++) {
+        const params = new URLSearchParams({
+          type_id: typeId, status: 'COMPLETED', created_at_start: from,
+          limit: '50', offset: String(offset)
+        });
+        const data = await kedoRequest_('/ext/applications?' + params.toString());
+        console.log('[KEDO] Тип:', typeId, 'всего заявлений API:', data.total ?? data.elements.length);
+        for (const doc of data.elements) {
+          if (!doc || !doc.id || String(doc.type_id) !== typeId) continue;
+          const vars = doc.values && typeof doc.values === 'object' ? doc.values : {};
+          // Если вложенное значение location/multiple_text объект или массив, сохраняем его без преобразования.
+          let files = [];
+          let print = null;
+          try {
+            const result = await kedoRequest_('/applications/' + encodeURIComponent(String(doc.id)) + '/ext/files');
+            files = result.elements;
+            print = files.find(f => typeof f.key === 'string' && f.key.endsWith('/print_form.pdf')) || null;
+          } catch (fileErr) {
+            console.warn('[KEDO] Не удалось получить список файлов заявления:', String(doc.id), fileErr.message);
+          }
+          await pool.query(`INSERT INTO hr.kedo_applications (
+            application_id,type_id,type_title,status,sent_at,start_date,end_date,
+            employee_full_name,external_employee_id,department_title,external_department_id,
+            organization_title,external_organization_id,doodocs_hr_link,variables,
+            application_values,raw_data,print_form_key,print_form_link,files_metadata,synced_at
           ) VALUES (
-            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13::jsonb,$14::jsonb,now()
-          ) ON CONFLICT(document_id) DO UPDATE SET
-            document_type_id=EXCLUDED.document_type_id,
-            document_type=EXCLUDED.document_type,
-            document_number=EXCLUDED.document_number,
-            document_date=EXCLUDED.document_date,
-            status=EXCLUDED.status,
-            employee_full_name=EXCLUDED.employee_full_name,
-            external_employee_id=EXCLUDED.external_employee_id,
-            organization_title=EXCLUDED.organization_title,
-            external_organization_id=EXCLUDED.external_organization_id,
-            doodocs_hr_link=EXCLUDED.doodocs_hr_link,
-            document_variables=EXCLUDED.document_variables,
-            document_values=EXCLUDED.document_values,
-            raw_data=EXCLUDED.raw_data,
-            synced_at=now()`,
-          [String(doc.id),String(doc.document_type_id),doc.document_type||null,
-           doc.document_number||null,kedoIsoDate_(doc.document_date),doc.status||null,
-           doc.employee_full_name||null,doc.external_employee_id||null,
-           doc.organization_title||null,doc.external_organization_id||null,
-           doc.doodocs_hr_link||null,JSON.stringify(doc.document_variables||[]),
-           JSON.stringify(doc.document_values||{}),JSON.stringify(doc)]);
-        saved++;
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,
+            $15::jsonb,$16::jsonb,$17::jsonb,$18,$19,$20::jsonb,now()
+          ) ON CONFLICT(application_id) DO UPDATE SET
+            type_id=EXCLUDED.type_id,type_title=EXCLUDED.type_title,status=EXCLUDED.status,
+            sent_at=EXCLUDED.sent_at,start_date=EXCLUDED.start_date,end_date=EXCLUDED.end_date,
+            employee_full_name=EXCLUDED.employee_full_name,external_employee_id=EXCLUDED.external_employee_id,
+            department_title=EXCLUDED.department_title,external_department_id=EXCLUDED.external_department_id,
+            organization_title=EXCLUDED.organization_title,external_organization_id=EXCLUDED.external_organization_id,
+            doodocs_hr_link=EXCLUDED.doodocs_hr_link,variables=EXCLUDED.variables,
+            application_values=EXCLUDED.application_values,raw_data=EXCLUDED.raw_data,
+            print_form_key=COALESCE(EXCLUDED.print_form_key,hr.kedo_applications.print_form_key),
+            print_form_link=COALESCE(EXCLUDED.print_form_link,hr.kedo_applications.print_form_link),
+            files_metadata=CASE WHEN EXCLUDED.files_metadata = '[]'::jsonb
+              THEN hr.kedo_applications.files_metadata ELSE EXCLUDED.files_metadata END,
+            synced_at=now()`, [
+              doc.id, doc.type_id, doc.type_title || null, doc.status || null,
+              doc.sent_at || null, doc.start_date || null, doc.end_date || null,
+              doc.employee_full_name || null, doc.external_employee_id || null,
+              doc.department_title || null, doc.external_department_id || null,
+              doc.organization_title || null, doc.external_organization_id || null,
+              doc.link || null, JSON.stringify(doc.variables || []), JSON.stringify(vars),
+              JSON.stringify(doc), print?.key || null, print?.link || null, JSON.stringify(files)
+            ]);
+          saved++;
+        }
+        offset += data.elements.length;
+        if (!data.elements.length || offset >= Number(data.total || 0) || data.elements.length < 50) break;
       }
-      offset += data.elements.length;
-      if (!data.elements.length || offset >= Number(data.total || 0) || data.elements.length < limit) break;
     }
-    console.log('[KEDO] Синхронизация завершена, записей обработано:', saved);
+    console.log('[KEDO] Синхронизация заявлений завершена, обработано:', saved);
   } catch (error) {
-    console.error('[KEDO] Ошибка синхронизации:', error.message);
-  } finally {
-    kedoSyncBusy_ = false;
-  }
+    console.error('[KEDO] Ошибка синхронизации заявлений:', error.message);
+  } finally { kedoSyncBusy_ = false; }
 }
 
 if (KEDO_ROOT_ && KEDO_TOKEN_) {
-  // Отдельная синхронизация не должна мешать запуску основного сайта.
   setTimeout(() => { void kedoSync_(); }, 12000);
   const configuredMinutes = Number(process.env.KEDO_SYNC_INTERVAL_MINUTES || 30);
   const minutes = Number.isFinite(configuredMinutes) ? Math.max(5, configuredMinutes) : 30;
@@ -18998,6 +18983,8 @@ if (KEDO_ROOT_ && KEDO_TOKEN_) {
 } else {
   console.log('[KEDO] Синхронизация выключена: задайте KEDO_BASE_URL и KEDO_USER_TOKEN');
 }
+// =====================================================
+// КОНЕЦ KEDO
 // =====================================================
 // КОНЕЦ KEDO
 // =====================================================
