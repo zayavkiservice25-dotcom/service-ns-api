@@ -18929,6 +18929,23 @@ async function kedoSync_() {
     for (let page = 0; page < 10000; page++) {
       const params = new URLSearchParams({status:'COMPLETED',created_at_start:from,limit:String(limit),offset:String(offset)});
       const data = await kedoRequest_('/ext/documents?' + params.toString());
+
+
+console.log('[KEDO DEBUG] total:', data.total);
+
+console.log('[KEDO DEBUG] documents:',
+  JSON.stringify(
+    (data.elements || []).map(d => ({
+      id: d.id,
+      status: d.status,
+      document_type: d.document_type,
+      document_type_id: d.document_type_id,
+      document_number: d.document_number
+    }))
+  )
+);
+
+
       for (const doc of data.elements) {
         if (!doc || !doc.id || !allowedIds.has(String(doc.document_type_id))) continue;
         await pool.query(`
