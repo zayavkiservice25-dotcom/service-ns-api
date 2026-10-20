@@ -5,7 +5,7 @@
 
 require("dotenv").config();
 
-const SERVICE_NS_BUILD_ID = "SNS-ZVK-PK-SAFE-20261020-1056";
+const SERVICE_NS_BUILD_ID = "SNS-KEDO-REGISTRY-FUNDED-20261020";
 console.log("[SNS BUILD]", SERVICE_NS_BUILD_ID);
 
 
@@ -18463,9 +18463,42 @@ function kedoFinanceCompute_(v,raw){
   return {total,start:date1,end:date2};
 }
 
+// Реестр создаётся ТОЛЬКО после полного выделения денег из пула.
+// Обе операции (выделение и создание Реестра) выполняются в одной транзакции.
+async function kedoCreateFundedRegistry_(client, zid, idFt, idZvk, sourceName, amount){
+  if (!sourceName || !String(sourceName).trim()) throw new Error('KEDO: Источник Объект пустой, создание Реестра запрещено');
+  const data = {total: amount};
+  const adequate = {source_name: sourceName};
+  const z = {rows:[{id_zvk:idZvk}]};
+  const head=await client.query(`INSERT INTO public.request_head
+   (created_by,total_amount,items_count,approve_ermek_status,approve_ermek_name,approve_ermek_time,
+    workflow_stage,agree_status)
+   VALUES('a_zaitova',$1,1,'Согласовано','Авто KEDO',now(),'Оплата Арай','Согласовано') RETURNING id`,[data.total]);
+  const requestId=head.rows[0].id;
+  await client.query(`INSERT INTO public.request_items
+   (request_id,zvk_row_id,id_ft,id_zvk,object,contractor,pay_purpose,dds_article,
+    contract_no,invoice_no,invoice_date,invoice_pdf,src_d,src_o,money_type,to_pay)
+   SELECT $1,$2,id_ft,$7,"object",contractor,pay_purpose,dds_article,
+    contract_no,invoice_no,invoice_date,invoice_pdf,$3,$4,'Тек',$5
+   FROM public.ft WHERE id_ft=$6`,[requestId,zid,'Сервис НС',adequate?.source_name||null,data.total,idFt,z.rows[0].id_zvk]);
+  const registry=await client.query(`INSERT INTO public.registry_head
+   (created_by,workflow_stage,agree_status,archive_flag,total_amount,items_count)
+   VALUES('a_zaitova','Оплата Арай','Согласовано','Нет',$1,1) RETURNING id`,[data.total]);
+  const registryId=registry.rows[0].id;
+  await client.query(`INSERT INTO public.registry_items
+   (registry_id,zvk_row_id,id_ft,id_zvk,object,contractor,pay_purpose,dds_article,
+    contract_no,invoice_no,invoice_date,invoice_pdf,src_d,src_o,to_pay)
+   SELECT $1,$2,id_ft,$3,"object",contractor,pay_purpose,dds_article,
+    contract_no,invoice_no,invoice_date,invoice_pdf,$4,$5,$6 FROM public.ft WHERE id_ft=$7`,
+   [registryId,zid,z.rows[0].id_zvk,'Сервис НС',adequate?.source_name||null,data.total,idFt]);
+  await markRowsAsRegistryCreated(client,[zid]);
+  return registryId;
+}
+
 async function kedoFinanceReconcile_(){
- const pending=await pool.query(`SELECT l.application_id::text AS id,l.zvk_row_id,l.amount
-   FROM hr.kedo_finance_links l WHERE l.missing_amount>0 ORDER BY l.created_at LIMIT 100`);
+ const pending=await pool.query(`SELECT l.application_id::text AS id,l.zvk_row_id,l.id_ft,l.registry_id,z.id_zvk,l.amount
+   FROM hr.kedo_finance_links l
+   JOIN public.zvk z ON z.id=l.zvk_row_id WHERE l.missing_amount>0 ORDER BY l.created_at LIMIT 100`);
  for(const row of pending.rows){
   const c=await pool.connect();
   try{
@@ -18478,6 +18511,7 @@ async function kedoFinanceReconcile_(){
        AND lower(trim(p.legal_entity))=lower('Сервис НС')
        AND lower(trim(p.object_name))=lower('Командировка')
        AND lower(trim(p.money_type))=lower('Тек')
+       AND NULLIF(btrim(p.source_name), '') IS NOT NULL
      ORDER BY free DESC,p.id FOR UPDATE OF p`);
    const chosen=pools.rows.find(p=>Number(p.free)>=Number(row.amount));
    if(!chosen){await c.query('ROLLBACK');continue;}
@@ -18489,6 +18523,12 @@ async function kedoFinanceReconcile_(){
      WHERE zvk_row_id=$1`,[row.zvk_row_id,chosen.source_name]);
    await c.query(`UPDATE public.registry_items SET src_o=$2,src_d='Сервис НС'
      WHERE zvk_row_id=$1`,[row.zvk_row_id,chosen.source_name]);
+   // До появления финансирования registry_id должен оставаться NULL.
+   // Когда источник определён, создаём Реестр в той же транзакции.
+   if (!row.registry_id) {
+     const newRegistryId=await kedoCreateFundedRegistry_(c,row.zvk_row_id,row.id_ft,row.id_zvk,chosen.source_name,Number(row.amount));
+     await c.query(`UPDATE hr.kedo_finance_links SET registry_id=$2 WHERE application_id=$1::uuid`,[row.id,newRegistryId]);
+   }
    await c.query(`UPDATE hr.kedo_finance_links SET missing_amount=0 WHERE application_id=$1::uuid`,[row.id]);
    await c.query('COMMIT');
    console.log('[KEDO FIN] FUNDED',row.id,chosen.id);
@@ -18538,6 +18578,7 @@ async function kedoFinanceSync_(){
           AND lower(trim(p.legal_entity))=lower('Сервис НС')
           AND lower(trim(p.object_name))=lower('Командировка')
           AND lower(trim(p.money_type))=lower('Тек')
+          AND NULLIF(btrim(p.source_name), '') IS NOT NULL
         ORDER BY free DESC,p.id FOR UPDATE OF p`);
       const adequate=funds.rows.find(p=>Number(p.free)>=data.total)||null;
       const available=Math.max(0,...funds.rows.map(p=>Number(p.free)||0));
@@ -18559,28 +18600,11 @@ async function kedoFinanceSync_(){
        VALUES($1,now(),'Сервис НС',$2,'Тек')`,[zid,adequate?.source_name||null]);
       if(adequate){await client.query(`INSERT INTO public.zvk_funding_pool_allocations
        (zvk_row_id,funding_pool_id,amount,created_by) VALUES($1,$2,$3,'KEDO')`,[zid,adequate.id,data.total]);}
-      const head=await client.query(`INSERT INTO public.request_head
-       (created_by,total_amount,items_count,approve_ermek_status,approve_ermek_name,approve_ermek_time,
-        workflow_stage,agree_status)
-       VALUES('a_zaitova',$1,1,'Согласовано','Авто KEDO',now(),'Оплата Арай','Согласовано') RETURNING id`,[data.total]);
-      const requestId=head.rows[0].id;
-      await client.query(`INSERT INTO public.request_items
-       (request_id,zvk_row_id,id_ft,id_zvk,object,contractor,pay_purpose,dds_article,
-        contract_no,invoice_no,invoice_date,invoice_pdf,src_d,src_o,money_type,to_pay)
-       SELECT $1,$2,id_ft,$7,"object",contractor,pay_purpose,dds_article,
-        contract_no,invoice_no,invoice_date,invoice_pdf,$3,$4,'Тек',$5
-       FROM public.ft WHERE id_ft=$6`,[requestId,zid,'Сервис НС',adequate?.source_name||null,data.total,idFt,z.rows[0].id_zvk]);
-      const registry=await client.query(`INSERT INTO public.registry_head
-       (created_by,workflow_stage,agree_status,archive_flag,total_amount,items_count)
-       VALUES('a_zaitova','Оплата Арай','Согласовано','Нет',$1,1) RETURNING id`,[data.total]);
-      const registryId=registry.rows[0].id;
-      await client.query(`INSERT INTO public.registry_items
-       (registry_id,zvk_row_id,id_ft,id_zvk,object,contractor,pay_purpose,dds_article,
-        contract_no,invoice_no,invoice_date,invoice_pdf,src_d,src_o,to_pay)
-       SELECT $1,$2,id_ft,$3,"object",contractor,pay_purpose,dds_article,
-        contract_no,invoice_no,invoice_date,invoice_pdf,$4,$5,$6 FROM public.ft WHERE id_ft=$7`,
-       [registryId,zid,z.rows[0].id_zvk,'Сервис НС',adequate?.source_name||null,data.total,idFt]);
-      await markRowsAsRegistryCreated(client,[zid]);
+      // Без источника финансирования оставляем заявку только в ФТ.
+      // Создание Реестра перенесено в kedoFinanceReconcile_ после поступления денег.
+      const registryId = adequate
+        ? await kedoCreateFundedRegistry_(client,zid,idFt,z.rows[0].id_zvk,adequate.source_name,data.total)
+        : null;
       await client.query(`INSERT INTO hr.kedo_finance_links
        (application_id,id_ft,zvk_row_id,registry_id,amount,missing_amount)
        VALUES($1::uuid,$2,$3,$4,$5,$6)`,[a.id,idFt,zid,registryId,data.total,missing]);
