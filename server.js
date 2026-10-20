@@ -5,6 +5,10 @@
 
 require("dotenv").config();
 
+const SERVICE_NS_BUILD_ID = "SNS-ZVK-PK-SAFE-20261020-1056";
+console.log("[SNS BUILD]", SERVICE_NS_BUILD_ID);
+
+
 const express = require("express");
 const cors = require("cors");
 const path = require("path");
@@ -18753,8 +18757,14 @@ async function kedoSync_() {
       }
     }
     console.log('[KEDO] Синхронизация заявлений завершена, обработано:', saved);
-    if (process.env.KEDO_FINANCE_AUTO_SYNC === 'true' && process.env.KEDO_FINANCE_START_DATE && /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(String(process.env.KEDO_FINANCE_ONLY_APPLICATION_ID || ''))) {
+    const finEnabled = process.env.KEDO_FINANCE_AUTO_SYNC === 'true';
+    const finDateSet = Boolean(process.env.KEDO_FINANCE_START_DATE);
+    const finIdValid = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(String(process.env.KEDO_FINANCE_ONLY_APPLICATION_ID || ''));
+    console.log('[KEDO FIN] GATE', JSON.stringify({enabled:finEnabled,dateSet:finDateSet,applicationIdValid:finIdValid,build:SERVICE_NS_BUILD_ID}));
+    if (finEnabled && finDateSet && finIdValid) {
+      console.log('[KEDO FIN] SYNC START');
       await kedoFinanceSync_();
+      console.log('[KEDO FIN] SYNC DONE');
     }
   } catch (error) {
     console.error('[KEDO] Ошибка синхронизации заявлений:', error.message);
