@@ -209,8 +209,8 @@ mechanization text,
   // ДоРеестр: предварительная сумма Гулнур. Не связана с обычным to_pay.
   await pool.query(`ALTER TABLE public.zvk ADD COLUMN IF NOT EXISTS pre_registry_amount numeric(18,2);`);
 
-  // Не удаляем действующий PK: на него ссылаются финансовые внешние ключи.
-  // Создаём PK лишь если в таблице его ещё нет.
+  // PK public.zvk.id сохраняется: удалять его нельзя, поскольку от него зависят FK денежных пулов.
+  // PostgreSQL: только проверка существования и создание при отсутствии.
   await pool.query(`
     DO $$
     BEGIN
