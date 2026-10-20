@@ -396,8 +396,9 @@ await pool.query(`
 
 
   // ✅ VIEW: ИСТОРИЯ
+  if (!(await pool.query("SELECT to_regclass('public.ft_zvk_history_v2') AS name")).rows[0].name) {
   await pool.query(`
-    CREATE OR REPLACE VIEW ft_zvk_history_v2 AS
+    CREATE VIEW ft_zvk_history_v2 AS
     SELECT
       f.id_ft,
       f.input_date,
@@ -457,9 +458,12 @@ s.idlzk,
     LEFT JOIN zvk_pay p ON p.zvk_row_id = z.id;
   `);
 
+  }
+
   // ✅ VIEW: ТЕКУЩЕЕ
+  if (!(await pool.query("SELECT to_regclass('public.ft_zvk_current_v2') AS name")).rows[0].name) {
   await pool.query(`
-    CREATE OR REPLACE VIEW ft_zvk_current_v2 AS
+    CREATE VIEW ft_zvk_current_v2 AS
     WITH ranked AS (
       SELECT
         v.*,
@@ -473,6 +477,7 @@ s.idlzk,
     FROM ranked
     WHERE rn = 1
   `);
+  }
 
 
   
