@@ -5,7 +5,7 @@
 
 require("dotenv").config();
 
-const SERVICE_NS_BUILD_ID = "SNS-KEDO-INSTANT-POOL-20261021";
+const SERVICE_NS_BUILD_ID = "SNS-KEDO-ORDER-PDF-20261021";
 console.log("[SNS BUILD]", SERVICE_NS_BUILD_ID);
 
 
@@ -18891,6 +18891,97 @@ app.get('/hr/kedo-applications/summary', hrApiGuard_, async(req,res)=>{
 // KEDO: скачать ОРИГИНАЛЬНУЮ печатную форму заявления PDF.
 // Через GAS, с внутренним HR_API_KEY; KEDO_USER_TOKEN остаётся на Render.
 // =====================================================
+
+// KEDO: PDF печатной формы ПРИКАЗА (отдельно от PDF заявления).
+// API /api/v1/hr/documents/management; доступ через GAS HR_API_KEY.
+app.get('/hr/kedo-orders/print-pdf', hrApiGuard_, async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  try {
+    const login=String(req.query.login||'').trim().toLowerCase();
+    const applicationId=String(req.query.id||'').trim().toLowerCase();
+    if(!/^[a-z0-9_.-]{2,90}$/.test(login)||
+       !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(applicationId))
+      return res.status(400).json({success:false,error:'INVALID_LOGIN_OR_ID'});
+    const user=await pool.query(`SELECT 1 FROM public.users
+      WHERE lower(trim(login))=$1 AND is_active=true LIMIT 1`,[login]);
+    if(!user.rowCount)return res.status(403).json({success:false,error:'HR_ACCESS_DENIED'});
+    const aq=await pool.query(`SELECT employee_full_name,organization_title,application_values,start_date,end_date,status
+      FROM hr.kedo_applications WHERE application_id=$1::uuid LIMIT 1`,[applicationId]);
+    if(!aq.rowCount)return res.status(404).json({success:false,error:'APPLICATION_NOT_FOUND'});
+    const appRow=aq.rows[0];
+    if(appRow.status!=='COMPLETED')return res.status(409).json({success:false,error:'APPLICATION_NOT_COMPLETED'});
+    if(!KEDO_ROOT_||!KEDO_TOKEN_)return res.status(503).json({success:false,error:'KEDO_NOT_CONFIGURED'});
+    const origin=new URL(KEDO_ROOT_).origin;
+    const root=origin+'/api/v1/hr/documents/management';
+    const auth={'Authorization':'User-Token '+KEDO_TOKEN_};
+    const fetchJson=async pathname => {
+      const r=await fetch(root+pathname,{headers:{...auth,Accept:'application/json'},
+        redirect:'error',signal:AbortSignal.timeout(25000)});
+      if(!r.ok)throw new Error('KEDO_DOCUMENTS_HTTP_'+r.status);
+      const j=await r.json();
+      if(!j||!Array.isArray(j.elements))throw new Error('KEDO_DOCUMENTS_INVALID_RESPONSE');
+      return j;
+    };
+    const norm=s=>String(s||'').normalize('NFKC').replace(/\s+/g,' ').trim().toLowerCase();
+    const date=s=>{const x=String(s||'').trim();const d=x.match(/^(\d{2})\.(\d{2})\.(\d{4})/);
+      if(d)return d[3]+'-'+d[2]+'-'+d[1];const iso=x.match(/^(\d{4}-\d{2}-\d{2})/);return iso?iso[1]:'';};
+    const appValues=appRow.application_values||{};
+    const appFrom=date(appValues.mission_start_date||appValues.trip_start_date||appRow.start_date);
+    const appTo=date(appValues.mission_end_date||appValues.trip_end_date||appRow.end_date);
+    if(!norm(appRow.employee_full_name)||!appFrom||!appTo)
+      return res.status(409).json({success:false,error:'APPLICATION_MATCH_DATA_MISSING',
+        message:'Нет ФИО или дат для надёжного сопоставления приказа с заявлением'});
+    const types=await fetchJson('/ext/document-types?title='+encodeURIComponent('командир'));
+    const orderTypes=new Set(types.elements.filter(x=>norm(x.title)==='приказ о командировании').map(x=>String(x.id)));
+    if(!orderTypes.size)return res.status(404).json({success:false,error:'ORDER_TYPE_NOT_FOUND'});
+    // Запрашиваем документы порциями: фильтра по document_type_id у API нет.
+    // Для старых приказов не устанавливаем узкий фильтр по дате создания.
+    let docs=[];
+    const limit=100,maxPages=20;
+    for(let offset=0,page=0;page<maxPages;offset+=limit,page++){
+      const resp=await fetchJson('/ext/documents?status=COMPLETED&limit='+limit+'&offset='+offset);
+      docs.push(...resp.elements);
+      if(resp.elements.length<limit||docs.length>=Number(resp.total||Infinity))break;
+    }
+    const matches=docs.filter(d=>{
+      if(!orderTypes.has(String(d.document_type_id||'')))return false;
+      const v=d.document_values||{};
+      const employee=norm(d.employee_full_name||v.employee_full_name_nominative||v.employee_full_name);
+      const from=date(v.mission_start_date||v.trip_start_date);
+      const to=date(v.mission_end_date||v.trip_end_date);
+      const org=norm(d.organization_title);
+      return employee===norm(appRow.employee_full_name)&&from===appFrom&&to===appTo&&
+        (!org||!norm(appRow.organization_title)||org===norm(appRow.organization_title));
+    });
+    if(matches.length!==1)return res.status(matches.length?409:404).json({success:false,
+      error:matches.length?'MULTIPLE_MATCHING_ORDERS':'ORDER_NOT_FOUND',
+      message:matches.length?'Найдено несколько подходящих приказов; нужна однозначная связь с заявлением':
+        'Подписанный приказ с теми же ФИО и датами в KEDO не найден'});
+    const documentId=String(matches[0].id||'');
+    if(!/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(documentId))
+      return res.status(502).json({success:false,error:'INVALID_KEDO_DOCUMENT_ID'});
+    const files=await fetchJson('/documents/'+encodeURIComponent(documentId)+'/ext/files');
+    const file=files.elements.find(f=>String(f.key||'').endsWith('/print_form.pdf'));
+    if(!file)return res.status(404).json({success:false,error:'ORDER_PRINT_FORM_NOT_FOUND'});
+    const fileKey=String(file.key||'');
+    const expectedPath='/api/v1/hr/documents/management/documents/'+documentId+'/files';
+    const url=origin+expectedPath+'?file_key='+encodeURIComponent(fileKey);
+    // Формируем URL сами: токен никогда не отправляется по произвольному link.
+    const pdfRes=await fetch(url,{headers:{...auth,Accept:'application/pdf'},
+      redirect:'error',signal:AbortSignal.timeout(35000)});
+    if(!pdfRes.ok)return res.status(502).json({success:false,error:'ORDER_PDF_HTTP_'+pdfRes.status});
+    const declared=Number(pdfRes.headers.get('content-length')||0);
+    if(declared>8*1024*1024)return res.status(413).json({success:false,error:'ORDER_PDF_TOO_LARGE'});
+    const bytes=Buffer.from(await pdfRes.arrayBuffer());
+    if(bytes.length>8*1024*1024)return res.status(413).json({success:false,error:'ORDER_PDF_TOO_LARGE'});
+    if(bytes.subarray(0,5).toString('latin1')!=='%PDF-')
+      return res.status(502).json({success:false,error:'KEDO_ORDER_NOT_PDF'});
+    res.json({success:true,filename:'Dudocs_prikaz_'+documentId+'.pdf',
+      document_id:documentId,base64:bytes.toString('base64')});
+  }catch(e){console.error('[KEDO ORDER PDF]',e.message);
+    res.status(502).json({success:false,error:'KEDO_ORDER_PDF_ERROR',message:e.message});}
+});
+
 app.get('/hr/kedo-applications/print-pdf', hrApiGuard_, async(req,res)=>{
   res.set('Cache-Control','no-store');
   try {
