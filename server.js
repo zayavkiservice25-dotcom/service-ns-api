@@ -5,7 +5,7 @@
 
 require("dotenv").config();
 
-const SERVICE_NS_BUILD_ID = "SNS-KEDO-SIGNED-ORDERS-20261021";
+const SERVICE_NS_BUILD_ID = "SNS-KEDO-DRIVE-ORDERS-20261021";
 console.log("[SNS BUILD]", SERVICE_NS_BUILD_ID);
 
 
@@ -16027,35 +16027,6 @@ app.get("/draft-funding-logins", async (req, res) => {
   }
 });
 
-// История существующих распределений и зафиксированных переводов.
-// Существовавшие до внедрения правки/возвраты, для которых не было аудита,
-// по этим данным достоверно восстановить невозможно.
-app.get("/draft-funding-pools/history", async (req,res)=>{
-  try {
-    const login=String(req.query.login||" ").trim().toLowerCase();
-    if (!["b_erkin","s_zhasulan","a_zaitova","k_ermek"].includes(login)) return res.status(403).json({success:false,error:"Нет доступа к истории"});
-    const q=await pool.query(`
-      SELECT x.* FROM (
-        SELECT c.created_at, 'Распределение'::text AS event_type,
-          c.created_by AS actor_login, c.beneficiary_login,
-          c.legal_entity, c.source_name, c.money_type, c.object_name,
-          c.amount, c.id AS event_id
-        FROM public.draft_funding_pool c
-        WHERE c.parent_pool_id IS NOT NULL
-        UNION ALL
-        SELECT tr.created_at, 'Перевод'::text AS event_type,
-          tr.created_by, tr.beneficiary_login,
-          tr.to_legal_entity, p.source_name, p.money_type,
-          (coalesce(tr.from_object_name,'') || ' → ' || coalesce(tr.to_object_name,'')) AS object_name,
-          tr.amount, tr.id AS event_id
-        FROM public.draft_funding_pool_transfer tr
-        LEFT JOIN public.draft_funding_pool p ON p.id=tr.from_pool_id
-      ) x ORDER BY x.created_at DESC NULLS LAST, x.event_id DESC LIMIT 2000
-    `);
-    res.json({success:true,rows:q.rows});
-  } catch(e) {console.error('FUNDING HISTORY',e);res.status(500).json({success:false,error:e.message});}
-});
-
 app.get("/draft-funding-pools/manage", async (req, res) => {
   try {
     const q = await pool.query(`
@@ -16204,7 +16175,7 @@ app.put("/draft-funding-pools/:poolId", async (req, res) => {
     const poolId = Number(req.params.poolId);
     const body = req.body || {};
     const login = String(body.login || body.created_by || "").trim().toLowerCase();
-    const allowed = ["b_erkin", "s_zhasulan", "a_zaitova", "k_ermek"];
+    const allowed = ["b_erkin", "s_zhasulan", "k_ermek"];
 
     if (!allowed.includes(login)) {
       return res.status(403).json({ success:false, error:"Нет доступа к изменению пула" });
@@ -16308,7 +16279,7 @@ app.delete("/draft-funding-pools/:poolId", async (req, res) => {
   try {
     const poolId = Number(req.params.poolId);
     const login = String(req.body?.login || "").trim().toLowerCase();
-    const allowed = ["b_erkin", "s_zhasulan", "a_zaitova", "k_ermek"];
+    const allowed = ["b_erkin", "s_zhasulan", "k_ermek"];
 
     if (!allowed.includes(login)) {
       return res.status(403).json({ success:false, error:"Нет доступа к удалению пула" });
@@ -16400,7 +16371,7 @@ app.post("/draft-funding-pools/:poolId/return", async (req, res) => {
     const poolId = Number(req.params.poolId);
     const amount = Number(req.body?.amount);
     const login = String(req.body?.login || "").trim().toLowerCase();
-    const allowed = ["b_erkin", "s_zhasulan", "a_zaitova", "k_ermek"];
+    const allowed = ["b_erkin", "s_zhasulan", "k_ermek"];
 
     if (!allowed.includes(login)) {
       return res.status(403).json({
@@ -16541,7 +16512,7 @@ app.post("/draft-funding-pools/:poolId/transfer", async (req, res) => {
     const targetObjectName = String(
       req.body?.target_object_name || req.body?.target_object || req.body?.object_name || ""
     ).trim();
-    const admins = ["b_erkin", "s_zhasulan", "a_zaitova", "k_ermek"];
+    const admins = ["b_erkin", "s_zhasulan", "k_ermek"];
     const allowedOwnTransfer = ["r_gulnur", "a_zaitova"];
 
     if (!login) {
@@ -16827,7 +16798,7 @@ app.post("/draft-funding-pools/:poolId/transfer-unallocated-legal-entity", async
     const actorLogin = actor.toLowerCase();
     const amount = Number(body.amount);
 
-    const allowed = ["b_erkin", "s_zhasulan", "a_zaitova", "k_ermek"];
+    const allowed = ["b_erkin", "s_zhasulan", "k_ermek"];
 
     if (!allowed.includes(actorLogin)) {
       return res.status(403).json({
@@ -17089,7 +17060,7 @@ app.post("/draft-funding-pools/:poolId/allocate", async (req, res) => {
     const amount = Number(body.amount);
 
     const allocatorLogin = createdBy.toLowerCase();
-    const allowedAllocators = ["b_erkin", "s_zhasulan", "a_zaitova", "k_ermek"];
+    const allowedAllocators = ["b_erkin", "s_zhasulan", "k_ermek"];
 
     if (!allowedAllocators.includes(allocatorLogin)) {
       return res.status(403).json({
@@ -18656,7 +18627,7 @@ async function kedoFinanceSync_(){
        (id_ft,input_date,input_name,legal_entity,"object",contractor,pay_purpose,dds_article,contract_no,invoice_no,invoice_date,invoice_pdf,sum_ft,source_type)
        VALUES ('FT'||nextval('public.ft_id_seq'),now(),'a_zaitova','Сервис НС','Командировка',
          $1,$2,'103. Командировочные','Без договора','Приказ',(now() AT TIME ZONE 'Asia/Almaty')::date,$3,$4,'KEDO')
-       RETURNING id_ft`,[employee,'Служебная командировка с '+data.start+' по '+data.end,pdfLink,data.total]);
+       RETURNING id_ft`,[employee,'Служебная командировка с '+data.start+' по '+data.end,null,data.total]);
       const idFt=ft.rows[0].id_ft;
       const z=await client.query(`INSERT INTO public.zvk(id_ft,id_zvk,zvk_date,zvk_name,to_pay,request_flag)
        VALUES($1,'ZFT'||nextval('public.zvk_id_seq'),now(),'a_zaitova',$2,'Да') RETURNING id,id_zvk`,[idFt,data.total]);
@@ -18855,6 +18826,8 @@ async function kedoSync_() {
       await kedoFinanceSync_();
       console.log('[KEDO FIN] SYNC DONE');
     }
+    try { await kedoDriveSyncSignedOrders_(); }
+    catch(e) { console.error('[KEDO DRIVE] SYNC ERROR', e.message); }
   } catch (error) {
     console.error('[KEDO] Ошибка синхронизации заявлений:', error.message);
   } finally { kedoSyncBusy_ = false; }
@@ -18868,6 +18841,161 @@ if (KEDO_ROOT_ && KEDO_TOKEN_) {
 } else {
   console.log('[KEDO] Синхронизация выключена: задайте KEDO_BASE_URL и KEDO_USER_TOKEN');
 }
+
+// =====================================================
+// KEDO COMPLETED приказ -> Google Drive -> FT.invoice_pdf
+// Только фактически найденный связанный приказ. Без дублирования и
+// без изменений сумм/статусов/финансирования.
+// =====================================================
+let kedoDriveBusy_ = false;
+const KEDO_DRIVE_UUID_RE_ = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
+const KEDO_DRIVE_FOLDER_ = String(process.env.GOOGLE_DRIVE_FOLDER_ID||'').trim();
+function kedoDriveConfigured_(){
+  return Boolean(KEDO_ROOT_ && KEDO_TOKEN_ &&
+    process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET &&
+    process.env.GOOGLE_REFRESH_TOKEN && KEDO_DRIVE_FOLDER_);
+}
+async function kedoDriveGoogleToken_(){
+  const form = new URLSearchParams({
+    client_id:process.env.GOOGLE_CLIENT_ID,
+    client_secret:process.env.GOOGLE_CLIENT_SECRET,
+    refresh_token:process.env.GOOGLE_REFRESH_TOKEN,
+    grant_type:'refresh_token'
+  });
+  const r=await fetch('https://oauth2.googleapis.com/token',{
+    method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:form,signal:AbortSignal.timeout(20000),redirect:'error'
+  });
+  if(!r.ok)throw new Error('GOOGLE_REFRESH_HTTP_'+r.status+' (проверьте срок действия refresh token)');
+  const j=await r.json();
+  if(!j.access_token)throw new Error('GOOGLE_ACCESS_TOKEN_MISSING');
+  return j.access_token;
+}
+async function kedoDriveRequestJson_(endpoint){
+  const origin=new URL(KEDO_ROOT_).origin;
+  const r=await fetch(origin+'/api/v1/hr/documents/management'+endpoint,{
+    headers:{Authorization:'User-Token '+KEDO_TOKEN_,Accept:'application/json'},
+    redirect:'error',signal:AbortSignal.timeout(30000)
+  });
+  if(!r.ok)throw new Error('KEDO_ORDER_HTTP_'+r.status);
+  const data=await r.json();
+  if(!Array.isArray(data.elements))throw new Error('KEDO_ORDER_ELEMENTS_MISSING');
+  return data;
+}
+async function kedoDriveGetPdf_(documentId){
+  const origin=new URL(KEDO_ROOT_).origin;
+  const files=await kedoDriveRequestJson_('/documents/'+encodeURIComponent(documentId)+'/ext/files');
+  const file=files.elements.find(f=>String(f.key||'').endsWith('/print_form.pdf'));
+  if(!file)throw new Error('ORDER_PRINT_FORM_NOT_FOUND');
+  let url;
+  try{url=new URL(String(file.link||''));}catch(_){throw new Error('ORDER_PDF_LINK_MISSING')}
+  const expected='/api/v1/hr/documents/management/documents/'+documentId+'/files';
+  if(url.origin!==origin||url.protocol!=='https:'||url.pathname!==expected||
+     url.username||url.password||url.hash||url.searchParams.size!==1||
+     url.searchParams.getAll('file_key').length!==1||
+     url.searchParams.get('file_key')!==file.key)
+    throw new Error('ORDER_PDF_LINK_UNEXPECTED');
+  const r=await fetch(url,{headers:{Authorization:'User-Token '+KEDO_TOKEN_,Accept:'application/pdf'},
+    redirect:'error',signal:AbortSignal.timeout(35000)});
+  if(!r.ok)throw new Error('KEDO_PRINT_PDF_HTTP_'+r.status);
+  if(Number(r.headers.get('content-length')||0)>8*1024*1024)
+    throw new Error('ORDER_PDF_TOO_LARGE');
+  const bytes=Buffer.from(await r.arrayBuffer());
+  if(bytes.length>8*1024*1024 || bytes.subarray(0,5).toString('latin1')!=='%PDF-')
+    throw new Error('ORDER_PDF_INVALID');
+  return bytes;
+}
+async function kedoDriveUpload_(token,documentId,bytes){
+  // Поиск по имени защищает от дубликатов при сбое между загрузкой и записью БД.
+  const fileName='KEDO_prikaz_'+documentId+'.pdf';
+  const q="name = '"+fileName+"' and '"+KEDO_DRIVE_FOLDER_.replace(/'/g,'')+"' in parents and trashed = false";
+  const listing=await fetch('https://www.googleapis.com/drive/v3/files?'+new URLSearchParams({
+    q,fields:'files(id,name,mimeType),nextPageToken',page_size:'100',spaces:'drive'}),{
+      headers:{Authorization:'Bearer '+token},redirect:'error',signal:AbortSignal.timeout(25000)
+    });
+  if(!listing.ok)throw new Error('GOOGLE_DRIVE_LIST_HTTP_'+listing.status);
+  const existing=await listing.json();
+  const found=(existing.files||[]).find(x=>x.name===fileName&&x.mimeType==='application/pdf');
+  if(found)return found.id;
+  const boundary='kedo_drive_'+require('crypto').randomBytes(12).toString('hex');
+  const metadata=JSON.stringify({name:fileName,mimeType:'application/pdf',parents:[KEDO_DRIVE_FOLDER_]});
+  const body=Buffer.concat([
+    Buffer.from('--'+boundary+'\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n'+metadata+'\r\n'),
+    Buffer.from('--'+boundary+'\r\nContent-Type: application/pdf\r\n\r\n'),
+    bytes,Buffer.from('\r\n--'+boundary+'--\r\n')
+  ]);
+  const uploaded=await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink',{
+    method:'POST',headers:{Authorization:'Bearer '+token,'Content-Type':'multipart/related; boundary='+boundary},
+    body,redirect:'error',signal:AbortSignal.timeout(60000)
+  });
+  if(!uploaded.ok)throw new Error('GOOGLE_DRIVE_UPLOAD_HTTP_'+uploaded.status+
+    ' (при 403/404 проверьте доступ OAuth к выбранной папке)');
+  const json=await uploaded.json();
+  if(!json.id)throw new Error('GOOGLE_DRIVE_FILE_ID_MISSING');
+  return json.id;
+}
+async function kedoDriveSyncSignedOrders_(){
+  if(!kedoDriveConfigured_()||kedoDriveBusy_)return;
+  kedoDriveBusy_=true;
+  try{
+    await pool.query(`CREATE TABLE IF NOT EXISTS hr.kedo_drive_orders (
+      application_id uuid PRIMARY KEY,
+      document_id uuid NOT NULL UNIQUE,
+      file_id text NOT NULL,
+      file_url text NOT NULL,
+      id_ft text NOT NULL,
+      uploaded_at timestamptz NOT NULL DEFAULT now()
+    )`);
+    const targets=await pool.query(`SELECT l.application_id::text AS application_id,l.id_ft
+      FROM hr.kedo_finance_links l
+      JOIN hr.kedo_applications a ON a.application_id=l.application_id
+      LEFT JOIN hr.kedo_drive_orders d ON d.application_id=l.application_id
+      WHERE l.id_ft IS NOT NULL AND a.status='COMPLETED' AND d.application_id IS NULL
+      ORDER BY a.sent_at DESC NULLS LAST LIMIT 100`);
+    if(!targets.rows.length)return;
+    const targetMap=new Map(targets.rows.map(x=>[x.application_id.toLowerCase(),x.id_ft]));
+    let docs=[];
+    for(let offset=0,page=0;page<20;offset+=100,page++){
+      const d=await kedoDriveRequestJson_('/ext/documents?limit=100&offset='+offset);
+      docs.push(...d.elements);
+      if(d.elements.length<100||docs.length>=Number(d.total||Infinity))break;
+    }
+    const selected=new Map();
+    for(const d of docs){
+      const appId=String(d.application_id||'').toLowerCase();
+      const documentId=String(d.id||'');
+      if(!targetMap.has(appId)||!KEDO_DRIVE_UUID_RE_.test(documentId) ||
+         String(d.status||'').toUpperCase()!=='COMPLETED')continue;
+      if(!selected.has(appId))selected.set(appId,[]);
+      selected.get(appId).push(d);
+    }
+    if(!selected.size){console.log('[KEDO DRIVE] Пока нет подписанных приказов для ФТ');return;}
+    let googleToken;
+    for(const [appId,matches] of selected){
+      if(matches.length!==1){console.warn('[KEDO DRIVE] multiple completed orders',appId);continue;}
+      const documentId=matches[0].id;
+      try{
+        if(!googleToken)googleToken=await kedoDriveGoogleToken_();
+        const bytes=await kedoDriveGetPdf_(documentId);
+        const fileId=await kedoDriveUpload_(googleToken,documentId,bytes);
+        const fileUrl='https://drive.google.com/file/d/'+encodeURIComponent(fileId)+'/view';
+        // Ссылку и подтверждение загрузки записываем одним коммитом.
+        const c=await pool.connect();
+        try{
+          await c.query('BEGIN');
+          await c.query(`INSERT INTO hr.kedo_drive_orders(application_id,document_id,file_id,file_url,id_ft)
+            VALUES($1::uuid,$2::uuid,$3,$4,$5) ON CONFLICT(application_id) DO NOTHING`,
+            [appId,documentId,fileId,fileUrl,targetMap.get(appId)]);
+          await c.query(`UPDATE public.ft f SET invoice_pdf=$2
+            WHERE f.id_ft=$1 AND f.source_type='KEDO'`,[targetMap.get(appId),fileUrl]);
+          await c.query('COMMIT');
+          console.log('[KEDO DRIVE] ORDER SAVED',appId,targetMap.get(appId),documentId);
+        }catch(e){await c.query('ROLLBACK').catch(()=>{});throw e}finally{c.release()}
+      }catch(e){console.error('[KEDO DRIVE] ERROR',appId,e.message)}
+    }
+  }finally{kedoDriveBusy_=false}
+}
+
 // =====================================================
 // КОНЕЦ KEDO
 // =====================================================
