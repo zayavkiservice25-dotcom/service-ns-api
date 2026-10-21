@@ -5,7 +5,7 @@
 
 require("dotenv").config();
 
-const SERVICE_NS_BUILD_ID = "SNS-KEDO-ORDER-PDF-20261021";
+const SERVICE_NS_BUILD_ID = "SNS-KEDO-SIGNED-ORDERS-20261021";
 console.log("[SNS BUILD]", SERVICE_NS_BUILD_ID);
 
 
@@ -18922,41 +18922,46 @@ app.get('/hr/kedo-orders/print-pdf', hrApiGuard_, async (req, res) => {
       if(!j||!Array.isArray(j.elements))throw new Error('KEDO_DOCUMENTS_INVALID_RESPONSE');
       return j;
     };
-    const norm=s=>String(s||'').normalize('NFKC').replace(/\s+/g,' ').trim().toLowerCase();
-    const date=s=>{const x=String(s||'').trim();const d=x.match(/^(\d{2})\.(\d{2})\.(\d{4})/);
-      if(d)return d[3]+'-'+d[2]+'-'+d[1];const iso=x.match(/^(\d{4}-\d{2}-\d{2})/);return iso?iso[1]:'';};
-    const appValues=appRow.application_values||{};
-    const appFrom=date(appValues.mission_start_date||appValues.trip_start_date||appRow.start_date);
-    const appTo=date(appValues.mission_end_date||appValues.trip_end_date||appRow.end_date);
-    if(!norm(appRow.employee_full_name)||!appFrom||!appTo)
-      return res.status(409).json({success:false,error:'APPLICATION_MATCH_DATA_MISSING',
-        message:'Нет ФИО или дат для надёжного сопоставления приказа с заявлением'});
-    const types=await fetchJson('/ext/document-types?title='+encodeURIComponent('командир'));
-    const orderTypes=new Set(types.elements.filter(x=>norm(x.title)==='приказ о командировании').map(x=>String(x.id)));
-    if(!orderTypes.size)return res.status(404).json({success:false,error:'ORDER_TYPE_NOT_FOUND'});
-    // Запрашиваем документы порциями: фильтра по document_type_id у API нет.
-    // Для старых приказов не устанавливаем узкий фильтр по дате создания.
+    // KEDO: связь приказа с заявлением — только по application_id.
+    // ФИО/даты не используются во избежание загрузки чужого документа.
+    const fetchDetail=async documentId => {
+      const r=await fetch(root+'/documents/'+encodeURIComponent(documentId),{
+        headers:{...auth,Accept:'application/json'},redirect:'error',signal:AbortSignal.timeout(25000)});
+      if(!r.ok)throw new Error('KEDO_DOCUMENT_DETAIL_HTTP_'+r.status);
+      const j=await r.json();
+      return j.data||j.document||j;
+    };
     let docs=[];
     const limit=100,maxPages=20;
     for(let offset=0,page=0;page<maxPages;offset+=limit,page++){
-      const resp=await fetchJson('/ext/documents?status=COMPLETED&limit='+limit+'&offset='+offset);
+      // Запрашиваем все статусы, потому что API может возвращать другие статусы,
+      // а фильтр application_id ещё не развёрнут у поставщика.
+      const resp=await fetchJson('/ext/documents?limit='+limit+'&offset='+offset);
       docs.push(...resp.elements);
       if(resp.elements.length<limit||docs.length>=Number(resp.total||Infinity))break;
     }
-    const matches=docs.filter(d=>{
-      if(!orderTypes.has(String(d.document_type_id||'')))return false;
-      const v=d.document_values||{};
-      const employee=norm(d.employee_full_name||v.employee_full_name_nominative||v.employee_full_name);
-      const from=date(v.mission_start_date||v.trip_start_date);
-      const to=date(v.mission_end_date||v.trip_end_date);
-      const org=norm(d.organization_title);
-      return employee===norm(appRow.employee_full_name)&&from===appFrom&&to===appTo&&
-        (!org||!norm(appRow.organization_title)||org===norm(appRow.organization_title));
-    });
-    if(matches.length!==1)return res.status(matches.length?409:404).json({success:false,
-      error:matches.length?'MULTIPLE_MATCHING_ORDERS':'ORDER_NOT_FOUND',
-      message:matches.length?'Найдено несколько подходящих приказов; нужна однозначная связь с заявлением':
-        'Подписанный приказ с теми же ФИО и датами в KEDO не найден'});
+    let matches=docs.filter(d=>
+      String(d.application_id||'').toLowerCase()===applicationId &&
+      String(d.status||'').toUpperCase()==='COMPLETED');
+    // Резерв: старые приказы могут содержать связь только в linked_documents
+    // карточки, а не в списке документов.
+    if(!matches.length){
+      for(const doc of docs.filter(d=>String(d.status||'').toUpperCase()==='COMPLETED'&&!d.application_id)){
+        const v=await fetchDetail(String(doc.id));
+        const linked=v.linked_documents||v.data?.linked_documents||[];
+        if(Array.isArray(linked)&&linked.some(l=>
+          String(l.entity_type||'').toLowerCase()==='application' &&
+          String(l.entity_id||'').toLowerCase()===applicationId))matches.push(doc);
+      }
+    }
+    if(matches.length!==1){
+      const pending=docs.some(d=>String(d.application_id||'').toLowerCase()===applicationId &&
+        String(d.status||'').toUpperCase()!=='COMPLETED');
+      return res.status(matches.length?409:404).json({success:false,
+        error:matches.length?'MULTIPLE_SIGNED_ORDERS':pending?'ORDER_NOT_SIGNED':'SIGNED_ORDER_NOT_FOUND',
+        message:matches.length?'К заявлению привязано несколько подписанных приказов':
+          pending?'Приказ существует, но пока не подписан':'Подписанный приказ к заявлению не найден'});
+    }
     const documentId=String(matches[0].id||'');
     if(!/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(documentId))
       return res.status(502).json({success:false,error:'INVALID_KEDO_DOCUMENT_ID'});
