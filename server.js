@@ -5,7 +5,7 @@
 
 require("dotenv").config();
 
-const SERVICE_NS_BUILD_ID = "SNS-KEDO-REGISTRY-FUNDED-20261020";
+const SERVICE_NS_BUILD_ID = "SNS-KEDO-INSTANT-POOL-20261021";
 console.log("[SNS BUILD]", SERVICE_NS_BUILD_ID);
 
 
@@ -16148,6 +16148,7 @@ app.post("/draft-funding-pools/create", async (req, res) => {
     }
 
     await client.query("COMMIT");
+    kedoFinanceOnPoolChange_("/draft-funding-pools/create");
 
     return res.json({
       success: true,
@@ -16258,6 +16259,7 @@ app.put("/draft-funding-pools/:poolId", async (req, res) => {
     `, [poolId, legalEntity, sourceName, moneyType]);
 
     await client.query("COMMIT");
+    kedoFinanceOnPoolChange_("/draft-funding-pools/:poolId");
     return res.json({ success:true, row:upd.rows[0] });
 
   } catch (e) {
@@ -16465,6 +16467,7 @@ app.post("/draft-funding-pools/:poolId/return", async (req, res) => {
     }
 
     await client.query("COMMIT");
+    kedoFinanceOnPoolChange_("/draft-funding-pools/:poolId/return");
 
     return res.json({
       success:true,
@@ -16748,6 +16751,7 @@ app.post("/draft-funding-pools/:poolId/transfer", async (req, res) => {
     ]);
 
     await client.query("COMMIT");
+    kedoFinanceOnPoolChange_("/draft-funding-pools/:poolId/transfer");
 
     return res.json({
       success:true,
@@ -16947,6 +16951,7 @@ app.post("/draft-funding-pools/:poolId/transfer-unallocated-legal-entity", async
     `, [poolId, newSourceTotalCents / 100]);
 
     await client.query("COMMIT");
+    kedoFinanceOnPoolChange_("/draft-funding-pools/:poolId/transfer-unallocated-legal-entity");
 
     return res.json({
       success:true,
@@ -17184,6 +17189,7 @@ app.post("/draft-funding-pools/:poolId/allocate", async (req, res) => {
     ]);
 
     await client.query("COMMIT");
+    kedoFinanceOnPoolChange_("/draft-funding-pools/:poolId/allocate");
 
     return res.json({
       success: true,
@@ -18495,7 +18501,29 @@ async function kedoCreateFundedRegistry_(client, zid, idFt, idZvk, sourceName, a
   return registryId;
 }
 
-async function kedoFinanceReconcile_(){
+let kedoFinanceReconcileInFlight_ = null;
+function kedoFinanceReconcile_(){
+  if (kedoFinanceReconcileInFlight_) return kedoFinanceReconcileInFlight_;
+  const task = kedoFinanceReconcileCore_();
+  kedoFinanceReconcileInFlight_ = task;
+  void task.finally(() => {
+    if (kedoFinanceReconcileInFlight_ === task) kedoFinanceReconcileInFlight_ = null;
+  }).catch(() => {});
+  return task;
+}
+
+// Once a funding pool mutation has COMMITTED, reconcile without waiting for Dudocs.
+// Never interfere with the success response or roll back an already committed change.
+function kedoFinanceOnPoolChange_(context){
+  if (process.env.KEDO_FINANCE_AUTO_SYNC !== 'true') return;
+  setImmediate(() => {
+    void kedoFinanceReconcile_().catch(e =>
+      console.error('[KEDO FIN] INSTANT RECONCILE ERROR', context, e.message)
+    );
+  });
+}
+
+async function kedoFinanceReconcileCore_(){
  const pending=await pool.query(`SELECT l.application_id::text AS id,l.zvk_row_id,l.id_ft,l.registry_id,z.id_zvk,l.amount
    FROM hr.kedo_finance_links l
    JOIN public.zvk z ON z.id=l.zvk_row_id WHERE l.missing_amount>0 ORDER BY l.created_at LIMIT 100`);
@@ -18504,6 +18532,14 @@ async function kedoFinanceReconcile_(){
   try{
    await c.query('BEGIN');
    await c.query('SELECT pg_advisory_xact_lock(hashtext($1))',[row.id]);
+   const current=await c.query(`SELECT missing_amount,registry_id,zvk_row_id,amount
+     FROM hr.kedo_finance_links WHERE application_id=$1::uuid FOR UPDATE`,[row.id]);
+   if (!current.rowCount || Number(current.rows[0].missing_amount) <= 0) {
+     await c.query('ROLLBACK'); continue;
+   }
+   row.registry_id = current.rows[0].registry_id;
+   row.zvk_row_id = current.rows[0].zvk_row_id;
+   row.amount = current.rows[0].amount;
    const pools=await c.query(`SELECT p.id,p.source_name,
      p.amount-COALESCE((SELECT SUM(a.amount) FROM public.zvk_funding_pool_allocations a WHERE a.funding_pool_id=p.id),0) AS free
      FROM public.draft_funding_pool p
