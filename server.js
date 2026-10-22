@@ -11070,7 +11070,7 @@ app.get("/lzk/limits", async (req, res) => {
         l.unit_name AS unit,
         COALESCE(l.plan_qty, 0) AS plan,
         COALESCE(l.price_without_vat, 0) AS column_l,
-        COALESCE(l.amount, 0) AS amount_sum,
+        ROUND(COALESCE(l.plan_qty, 0) * COALESCE(l.price_without_vat, 0), 2) AS amount_sum,
         COALESCE(l.fact_received, 0) AS fact_received,
         COALESCE(l.note, '') AS note,
 
