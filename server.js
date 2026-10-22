@@ -15410,6 +15410,48 @@ app.get('/draft-funding-report', async (req, res) => {
   }
 });
 
+// История распределений и переводов денежных пулов.
+// ВАЖНО: маршрут расположен до /:poolId, чтобы "history" не был принят за ID.
+app.get("/draft-funding-pools/history", async (req, res) => {
+  try {
+    const login = String(req.query.login || "").trim().toLowerCase();
+    const allowed = ["s_zhasulan", "a_zaitova", "k_ermek", "b_erkin"];
+    if (!allowed.includes(login)) {
+      return res.status(403).json({ success: false, error: "Нет доступа к истории пулов" });
+    }
+    const result = await pool.query(`
+      SELECT event_type, created_at, actor_login, beneficiary_login,
+             legal_entity, source_name, money_type, object_name, amount
+      FROM (
+        SELECT 'Распределение'::text AS event_type,
+               c.created_at, c.created_by::text AS actor_login,
+               c.beneficiary_login::text, c.legal_entity::text,
+               c.source_name::text, c.money_type::text,
+               c.object_name::text, c.amount AS amount,
+               c.id AS event_id, 1 AS event_order
+        FROM public.draft_funding_pool c
+        WHERE c.parent_pool_id IS NOT NULL
+        UNION ALL
+        SELECT 'Перевод'::text AS event_type,
+               t.created_at, t.created_by::text AS actor_login,
+               t.beneficiary_login::text,
+               t.to_legal_entity::text AS legal_entity,
+               p.source_name::text, p.money_type::text,
+               t.to_object_name::text AS object_name,
+               t.amount, t.id AS event_id, 2 AS event_order
+        FROM public.draft_funding_pool_transfer t
+        LEFT JOIN public.draft_funding_pool p ON p.id = t.from_pool_id
+      ) history
+      ORDER BY created_at DESC NULLS LAST, event_order DESC, event_id DESC
+      LIMIT 5000
+    `);
+    return res.json({ success: true, rows: result.rows });
+  } catch (e) {
+    console.error("DRAFT FUNDING HISTORY ERROR:", e);
+    return res.status(500).json({ success: false, error: "Ошибка загрузки истории пулов. Проверьте Render Logs." });
+  }
+});
+
 app.get("/draft-funding-pools", async (req, res) => {
   try {
     const result = await pool.query(`
@@ -16175,7 +16217,7 @@ app.put("/draft-funding-pools/:poolId", async (req, res) => {
     const poolId = Number(req.params.poolId);
     const body = req.body || {};
     const login = String(body.login || body.created_by || "").trim().toLowerCase();
-    const allowed = ["b_erkin", "s_zhasulan", "k_ermek"];
+    const allowed = ["b_erkin", "s_zhasulan", "a_zaitova", "k_ermek"];
 
     if (!allowed.includes(login)) {
       return res.status(403).json({ success:false, error:"Нет доступа к изменению пула" });
@@ -16279,7 +16321,7 @@ app.delete("/draft-funding-pools/:poolId", async (req, res) => {
   try {
     const poolId = Number(req.params.poolId);
     const login = String(req.body?.login || "").trim().toLowerCase();
-    const allowed = ["b_erkin", "s_zhasulan", "k_ermek"];
+    const allowed = ["b_erkin", "s_zhasulan", "a_zaitova", "k_ermek"];
 
     if (!allowed.includes(login)) {
       return res.status(403).json({ success:false, error:"Нет доступа к удалению пула" });
@@ -16371,7 +16413,7 @@ app.post("/draft-funding-pools/:poolId/return", async (req, res) => {
     const poolId = Number(req.params.poolId);
     const amount = Number(req.body?.amount);
     const login = String(req.body?.login || "").trim().toLowerCase();
-    const allowed = ["b_erkin", "s_zhasulan", "k_ermek"];
+    const allowed = ["b_erkin", "s_zhasulan", "a_zaitova", "k_ermek"];
 
     if (!allowed.includes(login)) {
       return res.status(403).json({
@@ -16512,7 +16554,7 @@ app.post("/draft-funding-pools/:poolId/transfer", async (req, res) => {
     const targetObjectName = String(
       req.body?.target_object_name || req.body?.target_object || req.body?.object_name || ""
     ).trim();
-    const admins = ["b_erkin", "s_zhasulan", "k_ermek"];
+    const admins = ["b_erkin", "s_zhasulan", "a_zaitova", "k_ermek"];
     const allowedOwnTransfer = ["r_gulnur", "a_zaitova"];
 
     if (!login) {
@@ -16798,7 +16840,7 @@ app.post("/draft-funding-pools/:poolId/transfer-unallocated-legal-entity", async
     const actorLogin = actor.toLowerCase();
     const amount = Number(body.amount);
 
-    const allowed = ["b_erkin", "s_zhasulan", "k_ermek"];
+    const allowed = ["b_erkin", "s_zhasulan", "a_zaitova", "k_ermek"];
 
     if (!allowed.includes(actorLogin)) {
       return res.status(403).json({
@@ -17060,7 +17102,7 @@ app.post("/draft-funding-pools/:poolId/allocate", async (req, res) => {
     const amount = Number(body.amount);
 
     const allocatorLogin = createdBy.toLowerCase();
-    const allowedAllocators = ["b_erkin", "s_zhasulan", "k_ermek"];
+    const allowedAllocators = ["b_erkin", "s_zhasulan", "a_zaitova", "k_ermek"];
 
     if (!allowedAllocators.includes(allocatorLogin)) {
       return res.status(403).json({
