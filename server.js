@@ -5,7 +5,7 @@
 
 require("dotenv").config();
 
-const SERVICE_NS_BUILD_ID = "SNS-HR-LOCAL-TRIPS-20261022";
+const SERVICE_NS_BUILD_ID = "SNS-HR-TRIP-TELEGRAM-20261022";
 console.log("[SNS BUILD]", SERVICE_NS_BUILD_ID);
 
 
@@ -19443,6 +19443,110 @@ app.post('/hr/telegram/test',hrApiGuard_,async(req,res)=>{
     res.status(result.sent?200:404).json({success:result.sent,...result});
   }catch(e){console.error('[TELEGRAM SNS] test failed:',e.message);res.status(502).json({success:false,error:'TELEGRAM_SEND_FAILED'});}
 });
+
+// ============================================================
+// HR: надёжные Telegram-уведомления по событиям в PostgreSQL.
+// Переход 'signed' означает только ВНУТРЕННЕЕ подтверждение, НЕ ЭЦП.
+// Триггер не подписывает приказы и не меняет финансы.
+// ============================================================
+let hrTelegramDispatchBusy_ = false;
+async function hrTelegramInit_(){
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS hr.trip_telegram_outbox (
+      id bigserial PRIMARY KEY,
+      trip_id bigint NOT NULL REFERENCES hr.trip_requests(id) ON DELETE CASCADE,
+      event_kind text NOT NULL CHECK (event_kind IN ('created','director_signed')),
+      recipient_login text NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      sent_at timestamptz,
+      attempts integer NOT NULL DEFAULT 0,
+      last_error text,
+      UNIQUE(trip_id,event_kind)
+    )`);
+  // После INSERT submitted ставим письмо директору в очередь.
+  // После ФАКТИЧЕСКОГО изменения на signed директором — кадровику.
+  await pool.query(`
+    CREATE OR REPLACE FUNCTION hr.trip_telegram_enqueue_event()
+    RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF TG_OP = 'INSERT' THEN
+        IF NEW.status = 'submitted' THEN
+          INSERT INTO hr.trip_telegram_outbox (trip_id,event_kind,recipient_login)
+          VALUES (NEW.id,'created','k_ermek')
+          ON CONFLICT (trip_id,event_kind) DO NOTHING;
+        END IF;
+      ELSIF TG_OP = 'UPDATE' THEN
+        IF NEW.status = 'signed'
+           AND OLD.status IS DISTINCT FROM NEW.status
+           AND lower(btrim(COALESCE(NEW.director_login,''))) = 'k_ermek' THEN
+          INSERT INTO hr.trip_telegram_outbox (trip_id,event_kind,recipient_login)
+          VALUES (NEW.id,'director_signed','h_r')
+          ON CONFLICT (trip_id,event_kind) DO NOTHING;
+        END IF;
+      END IF;
+      RETURN NEW;
+    END; $$`);
+  await pool.query(`DROP TRIGGER IF EXISTS trip_telegram_events ON hr.trip_requests`);
+  await pool.query(`CREATE TRIGGER trip_telegram_events
+    AFTER INSERT OR UPDATE OF status,director_login ON hr.trip_requests
+    FOR EACH ROW EXECUTE FUNCTION hr.trip_telegram_enqueue_event()`);
+  console.log('[HR TG] Outbox ready');
+}
+function hrTelegramText_(r, kind){
+  const ruMoney = value => Number(value||0).toLocaleString('ru-RU',{minimumFractionDigits:2,maximumFractionDigits:2}) + ' ₸';
+  const fmt = value => { const s=value instanceof Date ? value.toISOString().slice(0,10) : String(value||'').slice(0,10);return /^\d{4}-\d{2}-\d{2}$/.test(s)?s.slice(8)+'.'+s.slice(5,7)+'.'+s.slice(0,4):s; };
+  const num = String(r.request_no||r.id);
+  const lines = kind==='created'
+    ? ['📋 Новая заявка на командировку','На ваше подписание поступил приказ о командировке.']
+    : ['✅ Приказ о командировке подписан','Ермек Ергазиевич подтвердил приказ в Service NS (без ЭЦП).'];
+  lines.push('', 'Заявка: КМ-'+num,
+    'Сотрудник: '+String(r.employee_name||'—'),
+    'Организация: '+String(r.legal_entity||'—'),
+    'Маршрут: '+String(r.travel_route||r.destination_city||'—'),
+    'Период: '+fmt(r.date_from)+' — '+fmt(r.date_to),
+    'Сумма: '+ruMoney(r.total_amount), '');
+  lines.push(kind==='created'?'Статус: Ожидает подписи директора':'Кадровику: проверить номер и дату приказа, затем подтвердить оформление.');
+  return lines.join('\n');
+}
+async function hrTelegramDispatch_(){
+  if(hrTelegramDispatchBusy_ || !TELEGRAM_TOKEN_NS_) return;
+  hrTelegramDispatchBusy_=true;
+  try{
+    const pending=await pool.query(`SELECT o.id,o.event_kind,o.recipient_login,
+        r.id AS trip_id,r.request_no,r.employee_name,r.legal_entity,
+        r.travel_route,r.destination_city,r.date_from,r.date_to,r.total_amount
+      FROM hr.trip_telegram_outbox o JOIN hr.trip_requests r ON r.id=o.trip_id
+      WHERE o.sent_at IS NULL AND o.attempts < 30
+        AND (o.attempts=0 OR o.created_at < now()-interval '2 minutes')
+      ORDER BY o.id LIMIT 20`);
+    for(const r of pending.rows){
+      // Advisory lock prevents two Render instances sending same message simultaneously.
+      const client=await pool.connect();
+      try{
+        await client.query('BEGIN');
+        const locked=await client.query(`SELECT id FROM hr.trip_telegram_outbox
+          WHERE id=$1 AND sent_at IS NULL FOR UPDATE SKIP LOCKED`,[r.id]);
+        if(!locked.rowCount){await client.query('ROLLBACK');continue;}
+        const result=await telegramNsSendToLogin_(r.recipient_login,hrTelegramText_(r,r.event_kind));
+        if(result.sent){
+          await client.query(`UPDATE hr.trip_telegram_outbox SET sent_at=now(),attempts=attempts+1,last_error=NULL WHERE id=$1`,[r.id]);
+          console.log('[HR TG] Sent',r.event_kind,'trip',r.trip_id,'to',r.recipient_login);
+        }else{
+          await client.query(`UPDATE hr.trip_telegram_outbox SET attempts=attempts+1,last_error=$2 WHERE id=$1`,[r.id,result.reason||'NOT_SENT']);
+          console.warn('[HR TG] Not sent',r.event_kind,r.trip_id,result.reason);
+        }
+        await client.query('COMMIT');
+      }catch(err){
+        try{await client.query('ROLLBACK')}catch(_){}
+        await pool.query(`UPDATE hr.trip_telegram_outbox SET attempts=attempts+1,last_error=$2 WHERE id=$1`,[r.id,String(err.message||err).slice(0,250)]).catch(()=>{});
+        console.error('[HR TG] Send failed:',String(err.message||err).slice(0,200));
+      }finally{client.release()}
+    }
+  }catch(e){console.error('[HR TG] Dispatcher:',e.message)}
+  finally{hrTelegramDispatchBusy_=false}
+}
+setTimeout(()=>{void hrTelegramInit_().then(()=>hrTelegramDispatch_()).catch(e=>console.error('[HR TG] Init:',e.message))},5000);
+setInterval(()=>{void hrTelegramDispatch_()},60000).unref?.();
 
 async function telegramNsInit_(){
   try{
