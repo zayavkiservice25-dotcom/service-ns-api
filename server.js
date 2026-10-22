@@ -18489,7 +18489,7 @@ app.post('/hr/trips',hrApiGuard_,async(req,res)=>{
   // Проживание предварительно считаем по ночам, а суточные — по календарным дням.
   const baseRate=4325;
   // Категории и типы городов строго по формулам кадровой Google-таблицы.
-  const categoryKey=/руковод/i.test(category)?'leader':/началь/i.test(category)?'head':/специал/i.test(category)?'specialist':null;
+  const categoryKey=/^(оператор|тралист)$/i.test(category)?'specialist':/руковод/i.test(category)?'leader':/началь/i.test(category)?'head':/специал/i.test(category)?'specialist':null;
   const dailyCoefficients={leader:4,head:3,specialist:2};
   const hotelCoefficients={leader:{major:10,regional:7,district:5,rural:3},
     head:{major:7,regional:4,district:4,rural:3},
@@ -18501,7 +18501,7 @@ app.post('/hr/trips',hrApiGuard_,async(req,res)=>{
       throw Object.assign(new Error('Неверная сумма: '+label),{status:400});
     return Math.round(value*100)/100;
   };
-  const dailyRate=baseRate*dailyCoefficients[categoryKey];
+  const dailyRate=baseRate*(/^(оператор|тралист)$/i.test(category)?4:dailyCoefficients[categoryKey]);
   const perDiem=days*dailyRate;
   const lodging=cleanedStays.reduce((sum,x)=>sum+x.nights*baseRate*hotelCoefficients[categoryKey][x.type],0);
 
