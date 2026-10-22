@@ -5,7 +5,7 @@
 
 require("dotenv").config();
 
-const SERVICE_NS_BUILD_ID = "SNS-KEDO-DRIVE-ORDERS-20261021";
+const SERVICE_NS_BUILD_ID = "SNS-HR-LOCAL-TRIPS-20261022";
 console.log("[SNS BUILD]", SERVICE_NS_BUILD_ID);
 
 
@@ -11070,7 +11070,7 @@ app.get("/lzk/limits", async (req, res) => {
         l.unit_name AS unit,
         COALESCE(l.plan_qty, 0) AS plan,
         COALESCE(l.price_without_vat, 0) AS column_l,
-        ROUND(COALESCE(l.plan_qty, 0) * COALESCE(l.price_without_vat, 0), 2) AS amount_sum,
+        COALESCE(l.amount, 0) AS amount_sum,
         COALESCE(l.fact_received, 0) AS fact_received,
         COALESCE(l.note, '') AS note,
 
@@ -15410,48 +15410,6 @@ app.get('/draft-funding-report', async (req, res) => {
   }
 });
 
-// История распределений и переводов денежных пулов.
-// ВАЖНО: маршрут расположен до /:poolId, чтобы "history" не был принят за ID.
-app.get("/draft-funding-pools/history", async (req, res) => {
-  try {
-    const login = String(req.query.login || "").trim().toLowerCase();
-    const allowed = ["s_zhasulan", "a_zaitova", "k_ermek", "b_erkin"];
-    if (!allowed.includes(login)) {
-      return res.status(403).json({ success: false, error: "Нет доступа к истории пулов" });
-    }
-    const result = await pool.query(`
-      SELECT event_type, created_at, actor_login, beneficiary_login,
-             legal_entity, source_name, money_type, object_name, amount
-      FROM (
-        SELECT 'Распределение'::text AS event_type,
-               c.created_at, c.created_by::text AS actor_login,
-               c.beneficiary_login::text, c.legal_entity::text,
-               c.source_name::text, c.money_type::text,
-               c.object_name::text, c.amount AS amount,
-               c.id AS event_id, 1 AS event_order
-        FROM public.draft_funding_pool c
-        WHERE c.parent_pool_id IS NOT NULL
-        UNION ALL
-        SELECT 'Перевод'::text AS event_type,
-               t.created_at, t.created_by::text AS actor_login,
-               t.beneficiary_login::text,
-               t.to_legal_entity::text AS legal_entity,
-               p.source_name::text, p.money_type::text,
-               t.to_object_name::text AS object_name,
-               t.amount, t.id AS event_id, 2 AS event_order
-        FROM public.draft_funding_pool_transfer t
-        LEFT JOIN public.draft_funding_pool p ON p.id = t.from_pool_id
-      ) history
-      ORDER BY created_at DESC NULLS LAST, event_order DESC, event_id DESC
-      LIMIT 5000
-    `);
-    return res.json({ success: true, rows: result.rows });
-  } catch (e) {
-    console.error("DRAFT FUNDING HISTORY ERROR:", e);
-    return res.status(500).json({ success: false, error: "Ошибка загрузки истории пулов. Проверьте Render Logs." });
-  }
-});
-
 app.get("/draft-funding-pools", async (req, res) => {
   try {
     const result = await pool.query(`
@@ -16217,7 +16175,7 @@ app.put("/draft-funding-pools/:poolId", async (req, res) => {
     const poolId = Number(req.params.poolId);
     const body = req.body || {};
     const login = String(body.login || body.created_by || "").trim().toLowerCase();
-    const allowed = ["b_erkin", "s_zhasulan", "a_zaitova", "k_ermek"];
+    const allowed = ["b_erkin", "s_zhasulan", "k_ermek"];
 
     if (!allowed.includes(login)) {
       return res.status(403).json({ success:false, error:"Нет доступа к изменению пула" });
@@ -16321,7 +16279,7 @@ app.delete("/draft-funding-pools/:poolId", async (req, res) => {
   try {
     const poolId = Number(req.params.poolId);
     const login = String(req.body?.login || "").trim().toLowerCase();
-    const allowed = ["b_erkin", "s_zhasulan", "a_zaitova", "k_ermek"];
+    const allowed = ["b_erkin", "s_zhasulan", "k_ermek"];
 
     if (!allowed.includes(login)) {
       return res.status(403).json({ success:false, error:"Нет доступа к удалению пула" });
@@ -16413,7 +16371,7 @@ app.post("/draft-funding-pools/:poolId/return", async (req, res) => {
     const poolId = Number(req.params.poolId);
     const amount = Number(req.body?.amount);
     const login = String(req.body?.login || "").trim().toLowerCase();
-    const allowed = ["b_erkin", "s_zhasulan", "a_zaitova", "k_ermek"];
+    const allowed = ["b_erkin", "s_zhasulan", "k_ermek"];
 
     if (!allowed.includes(login)) {
       return res.status(403).json({
@@ -16554,7 +16512,7 @@ app.post("/draft-funding-pools/:poolId/transfer", async (req, res) => {
     const targetObjectName = String(
       req.body?.target_object_name || req.body?.target_object || req.body?.object_name || ""
     ).trim();
-    const admins = ["b_erkin", "s_zhasulan", "a_zaitova", "k_ermek"];
+    const admins = ["b_erkin", "s_zhasulan", "k_ermek"];
     const allowedOwnTransfer = ["r_gulnur", "a_zaitova"];
 
     if (!login) {
@@ -16840,7 +16798,7 @@ app.post("/draft-funding-pools/:poolId/transfer-unallocated-legal-entity", async
     const actorLogin = actor.toLowerCase();
     const amount = Number(body.amount);
 
-    const allowed = ["b_erkin", "s_zhasulan", "a_zaitova", "k_ermek"];
+    const allowed = ["b_erkin", "s_zhasulan", "k_ermek"];
 
     if (!allowed.includes(actorLogin)) {
       return res.status(403).json({
@@ -17102,7 +17060,7 @@ app.post("/draft-funding-pools/:poolId/allocate", async (req, res) => {
     const amount = Number(body.amount);
 
     const allocatorLogin = createdBy.toLowerCase();
-    const allowedAllocators = ["b_erkin", "s_zhasulan", "a_zaitova", "k_ermek"];
+    const allowedAllocators = ["b_erkin", "s_zhasulan", "k_ermek"];
 
     if (!allowedAllocators.includes(allocatorLogin)) {
       return res.status(403).json({
@@ -18462,10 +18420,134 @@ function hrApiGuard_(req,res,next) {
   if(a.length!==b.length || !crypto.timingSafeEqual(a,b))return res.status(401).json({success:false,error:'HR_UNAUTHORIZED'});
   next();
 }
-// Старые HR-маршруты создания и ЭЦП удалены.
-// Сохраняем только Dudocs/KEDO заявления и Telegram.
+// Локальные заявки на командировку. Dudocs не используется.
+const hrStatusLabel_ = s => ({draft:'Черновик',submitted:'Ожидает подписи',approved:'Согласовано',rejected:'Отклонено',signing:'На подписании',signed:'Подписано ЭЦП',cancelled:'Отменено'}[s]||s);
+const hrClean_ = (v,max=300)=>String(v??'').trim().slice(0,max);
+const hrLogin_ = v=>hrClean_(v,80).toLowerCase();
+const hrRequired_ = (v,name,max=300)=>{const s=hrClean_(v,max);if(!s)throw Object.assign(new Error('Не заполнено: '+name),{status:400});return s;};
+const hrPublic_ = r=>({
+  id:r.request_no || String(r.id), owner_login:r.employee_login, employee:r.employee_name,
+  employee_number:r.personnel_no||'',position:r.job_title||'',department:r.department||'',category:r.employee_category||'',
+  legal_entity:r.legal_entity||'',destination:[r.destination_city,r.destination_country].filter(Boolean).join(', '),
+  date_from:r.date_from instanceof Date?r.date_from.toISOString().slice(0,10):String(r.date_from||'').slice(0,10),
+  date_to:r.date_to instanceof Date?r.date_to.toISOString().slice(0,10):String(r.date_to||'').slice(0,10),
+  city_type:r.city_category||'',travel_route:r.travel_route||'',lodging_days:r.lodging_days??null,stays:r.lodging_stays||[],funding_source:r.funding_source||'',basis:r.basis_document||'',purpose:r.purpose||'',
+  status:r.signature_status==='crypto_verified_pending_trust'?'Подпись получена (проверка)':hrStatusLabel_(r.status),signature_status:r.signature_status||'',created_at:r.created_at,updated_at:r.updated_at,
+  reviewer:r.director_decided_at?r.director_login:'',reviewed_at:r.director_decided_at||'',review_comment:r.director_comment||'',
+  days_count:r.days_count,per_diem_amount:r.per_diem_amount,lodging_amount:r.lodging_amount,
+  travel_amount:r.travel_amount,other_amount:r.other_amount,daily_rate:r.daily_rate,total_amount:r.total_amount
+});
+const hrError_ = (res,e)=>{const code=e.status||500;if(code>=500)console.error('HR API:',e);return res.status(code).json({success:false,error:code>=500?'HR_SERVER_ERROR':e.message});};
+
+app.get('/hr/trips',hrApiGuard_,async(req,res)=>{
+ try{
+  const login=hrLogin_(req.query.login);if(!login)return res.status(400).json({success:false,error:'LOGIN_REQUIRED'});
+  const director=login==='k_ermek';
+  const q=director
+    ?'SELECT r.*,NULL::text AS signature_status FROM hr.trip_requests r ORDER BY r.created_at DESC,r.id DESC LIMIT 2000'
+    :'SELECT r.*,NULL::text AS signature_status FROM hr.trip_requests r WHERE lower(btrim(r.employee_login))=$1 ORDER BY r.created_at DESC,r.id DESC LIMIT 2000';
+  const out=await pool.query(q,director?[]:[login]);
+  res.json({success:true,is_director:director,rows:out.rows.map(hrPublic_)});
+ }catch(e){hrError_(res,e)}
+});
+app.post('/hr/trips',hrApiGuard_,async(req,res)=>{
+ const client=await pool.connect();
+ try{
+  const b=req.body||{},login=hrLogin_(b.login);
+  if(!login)throw Object.assign(new Error('LOGIN_REQUIRED'),{status:400});
+  const employee=hrRequired_(b.employee,'employee');
+  const position=hrRequired_(b.position,'position');
+  const category=hrRequired_(b.category,'category');
+  const legal=hrRequired_(b.legal_entity,'legal_entity');
+  const stays=Array.isArray(b.stays)?b.stays:[];
+  if(stays.length<1||stays.length>30)throw Object.assign(new Error('Укажите от 1 до 30 городов'),{status:400});
+  const allowedTypes=new Set(['major','regional','district','rural']);
+  const cleanedStays=stays.map((item,i)=>{
+   const city=hrRequired_(item.city,'город '+(i+1),200);
+   const type=hrClean_(item.type,30);
+   const nights=Number(item.nights);
+   if(!allowedTypes.has(type)||!Number.isInteger(nights)||nights<0||nights>366)
+     throw Object.assign(new Error('Неверный тип города или число ночей в строке '+(i+1)),{status:400});
+   return {city,type,nights};
+  });
+  const destination=cleanedStays.map(x=>x.city).join(' – ');
+  const cityType=cleanedStays.length===1?cleanedStays[0].type:'Несколько типов';
+  const purpose=hrRequired_(b.purpose,'purpose',3000);
+  const from=hrRequired_(b.date_from,'date_from',10),to=hrRequired_(b.date_to,'date_to',10);
+  const iso=/^\d{4}-\d{2}-\d{2}$/;
+  const d1=new Date(from+'T00:00:00Z'),d2=new Date(to+'T00:00:00Z');
+  if(!iso.test(from)||!iso.test(to)||Number.isNaN(d1.getTime())||Number.isNaN(d2.getTime())||d1.toISOString().slice(0,10)!==from||d2.toISOString().slice(0,10)!==to||d2<d1)throw Object.assign(new Error('Неверный период командировки'),{status:400});
+  const periodDays=Math.round((d2-d1)/86400000)+1;
+  const days=b.days_count===''||b.days_count==null?periodDays:Number(b.days_count);
+  const overnight=cleanedStays.reduce((n,x)=>n+x.nights,0);
+  if(!Number.isInteger(days)||days<1||days>366||!Number.isInteger(overnight)||overnight<0||overnight>days)
+    throw Object.assign(new Error('Неверное количество суток или дней проживания'),{status:400});
+  const route=hrRequired_(b.travel_route,'travel_route',1000);
+  // Ставки по принятой модели: 1 МРП = 4325 тг (параметр для 2026 г.).
+  // Проживание предварительно считаем по ночам, а суточные — по календарным дням.
+  const baseRate=4325;
+  // Категории и типы городов строго по формулам кадровой Google-таблицы.
+  const categoryKey=/руковод/i.test(category)?'leader':/началь/i.test(category)?'head':/специал/i.test(category)?'specialist':null;
+  const dailyCoefficients={leader:4,head:3,specialist:2};
+  const hotelCoefficients={leader:{major:10,regional:7,district:5,rural:3},
+    head:{major:7,regional:4,district:4,rural:3},
+    specialist:{major:4,regional:3,district:3,rural:3}};
+  if(!categoryKey)throw Object.assign(new Error('Неверная категория сотрудника или тип города'),{status:400});
+  const amountNumber=(v,label)=>{
+    const value=Number(String(v??'0').replace(/\s/g,'').replace(',','.'));
+    if(!Number.isFinite(value)||value<0||value>1000000000)
+      throw Object.assign(new Error('Неверная сумма: '+label),{status:400});
+    return Math.round(value*100)/100;
+  };
+  const dailyRate=baseRate*dailyCoefficients[categoryKey];
+  const perDiem=days*dailyRate;
+  const lodging=cleanedStays.reduce((sum,x)=>sum+x.nights*baseRate*hotelCoefficients[categoryKey][x.type],0);
+
+  if(days>366)throw Object.assign(new Error('Период превышает 366 дней'),{status:400});
+  const parts=destination.split(',');const city=parts.shift().trim();const country=parts.join(',').trim()||'Казахстан';
+  await client.query('BEGIN');
+  // В форме оставлены только поля Google Формы. Старые колонки в БД
+  // сохраняются для совместимости с историческими заявками.
+  const q=await client.query(`INSERT INTO hr.trip_requests
+    (created_by_login,employee_login,employee_name,job_title,employee_category,legal_entity,
+     destination_city,destination_country,city_category,date_from,date_to,purpose,
+     days_count,daily_rate,per_diem_amount,lodging_amount,total_amount,travel_route,lodging_days,lodging_stays,status)
+    VALUES ($1,$1,$2,$3,$4,$5,$6,$7,$8,$9::date,$10::date,$11,$12,$13,$14,$15,$16,$17,$18,$19::jsonb,'submitted') RETURNING id`,
+    [login,employee,position,category,legal,city,country,cityType,from,to,purpose,
+     days,dailyRate,perDiem,lodging,perDiem+lodging,route,overnight,JSON.stringify(cleanedStays)]);
+  await client.query('INSERT INTO hr.trip_approval_log(trip_id,actor_login,action,new_status) VALUES($1,$2,$3,$4)',[q.rows[0].id,login,'submitted','submitted']);
+  const after=await client.query('SELECT request_no FROM hr.trip_requests WHERE id=$1',[q.rows[0].id]);
+  await client.query('COMMIT');
+  res.status(201).json({success:true,id:after.rows[0].request_no});
+ }catch(e){try{await client.query('ROLLBACK')}catch(_){}hrError_(res,e)}finally{client.release()}
+});
+app.post('/hr/trips/review',hrApiGuard_,async(req,res)=>{
+ const client=await pool.connect();
+ try{
+  const b=req.body||{},login=hrLogin_(b.login),id=hrClean_(b.id,80),decision=hrClean_(b.decision,20),comment=hrClean_(b.comment,1000);
+  if(login!=='k_ermek')throw Object.assign(new Error('Только директор может согласовать'),{status:403});
+  if(decision==='approve')throw Object.assign(new Error('Согласование заменено подписью ЭЦП'),{status:409});
+  if(!['reject'].includes(decision))throw Object.assign(new Error('Недопустимое действие'),{status:400});
+  if(decision==='reject'&&!comment)throw Object.assign(new Error('Укажите причину отказа'),{status:400});
+  const next=decision==='approve'?'approved':'rejected';
+  await client.query('BEGIN');
+  const updated=await client.query(`UPDATE hr.trip_requests SET status=$1,director_decided_at=now(),director_comment=$2,director_login=$4,updated_at=now()
+    WHERE request_no=$3 AND status='submitted' RETURNING id`,[next,comment,id,login]);
+  if(updated.rowCount!==1)throw Object.assign(new Error('Заявка не найдена или уже обработана'),{status:409});
+  await client.query(`INSERT INTO hr.trip_approval_log(trip_id,actor_login,action,previous_status,new_status,comment_text)
+    VALUES($1,$2,$3,'submitted',$4,$5)`,[updated.rows[0].id,login,decision==='approve'?'approved':'rejected',next,comment]);
+  await client.query('COMMIT');res.json({success:true,status:hrStatusLabel_(next)});
+ }catch(e){try{await client.query('ROLLBACK')}catch(_){}hrError_(res,e)}finally{client.release()}
+});
+
+
+// ============================================================
+
 
 // =====================================================
+// LOCAL_TRIPS_ONLY: отключены все KEDO HR endpoints.
+app.use('/hr/kedo-', (req,res)=>res.status(410).json({success:false,error:'KEDO_INTEGRATION_DISABLED'}));
+
 // KEDO: заявления «Служебная командировка» -> схема hr.
 // Новый API: /api/v1/hr/applications/management
 // Работает независимо от удалённого старого модуля HR/ЭЦП.
@@ -18557,7 +18639,7 @@ function kedoFinanceReconcile_(){
 // Once a funding pool mutation has COMMITTED, reconcile without waiting for Dudocs.
 // Never interfere with the success response or roll back an already committed change.
 function kedoFinanceOnPoolChange_(context){
-  if (process.env.KEDO_FINANCE_AUTO_SYNC !== 'true') return;
+  if (true) return; // LOCAL_TRIPS_ONLY: KEDO financial auto-sync disabled
   setImmediate(() => {
     void kedoFinanceReconcile_().catch(e =>
       console.error('[KEDO FIN] INSTANT RECONCILE ERROR', context, e.message)
@@ -18859,7 +18941,7 @@ async function kedoSync_() {
       }
     }
     console.log('[KEDO] Синхронизация заявлений завершена, обработано:', saved);
-    const finEnabled = process.env.KEDO_FINANCE_AUTO_SYNC === 'true';
+    const finEnabled = false; // LOCAL_TRIPS_ONLY
     const finDateSet = Boolean(process.env.KEDO_FINANCE_START_DATE);
     const finIdValid = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(String(process.env.KEDO_FINANCE_ONLY_APPLICATION_ID || ''));
     console.log('[KEDO FIN] GATE', JSON.stringify({enabled:finEnabled,dateSet:finDateSet,applicationIdValid:finIdValid,build:SERVICE_NS_BUILD_ID}));
@@ -18875,7 +18957,7 @@ async function kedoSync_() {
   } finally { kedoSyncBusy_ = false; }
 }
 
-if (KEDO_ROOT_ && KEDO_TOKEN_) {
+if (false && KEDO_ROOT_ && KEDO_TOKEN_) { // LOCAL_TRIPS_ONLY: KEDO sync disabled
   setTimeout(() => { void kedoSync_(); }, 12000);
   const configuredMinutes = Number(process.env.KEDO_SYNC_INTERVAL_MINUTES || 30);
   const minutes = Number.isFinite(configuredMinutes) ? Math.max(5, configuredMinutes) : 30;
