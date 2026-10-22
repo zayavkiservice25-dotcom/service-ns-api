@@ -18573,13 +18573,15 @@ function hrOrderHtml_(r,orderNo,orderDate){
  const stays=Array.isArray(r.lodging_stays)?r.lodging_stays:[];
  const types={major:'город республиканского значения (тип 1)',regional:'город областного значения (тип 2)',district:'районный центр (тип 3)',rural:'сельский населённый пункт (тип 4)'};
  const placeRows=stays.map(x=>'<li>'+e(x.city)+' — '+e(types[x.type]||x.type)+' — '+e(x.nights)+' ночей</li>').join('');
- const ns=/сервис\s*нс/i.test(String(r.legal_entity||''));
- const head=ns?'<div style="text-align:center;font-size:11px"><b>«СЕРВИС НС» Жауапкершілігі Шектеулі Серіктестігі</b><br><b>Товарищество с ограниченной ответственностью «СЕРВИС НС»</b><br>Республика Казахстан, город Астана, микрорайон Ак-Булак-3, переулок Тасшокы-2 н/п 3<br>БИН 000340005764, 8-(7172)-695-203, E-mail: too-servisns@mail.ru</div>':
- '<div style="text-align:center"><b>'+e(r.legal_entity)+'</b></div>';
+ const org=String(r.legal_entity||'').trim();
+ const isHome=/жилой\s*дом/i.test(org);
+ const head=isHome
+  ? '<div style="text-align:center;font-size:11px"><b>«СК Жилой дом» Жауапкершілігі Шектеулі Серіктестігі</b><br><b>Товарищество с ограниченной ответственностью «СК Жилой дом»</b></div>'
+  : '<div style="text-align:center;font-size:11px"><b>«СЕРВИС НС» Жауапкершілігі Шектеулі Серіктестігі</b><br><b>Товарищество с ограниченной ответственностью «СЕРВИС НС»</b></div>';
  return '<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{font-family:Arial,sans-serif;color:#171717;font-size:12pt;line-height:1.45;margin:45px 50px}h2{text-align:center;font-size:15pt;margin:36px 0 2px}h3{text-align:center;font-size:12pt;margin:0 0 30px}p{margin:9px 0}li{margin:4px 0}</style></head><body>'+head+
  '<h2>ПРИКАЗ</h2><h3>«О направлении в служебную командировку»</h3><p>Номер приказа: <b>'+e(orderNo)+'</b><br>Дата приказа: <b>'+hrOrderDate_(orderDate)+'</b></p>'+
  '<p>В соответствии со статьёй 127 Трудового кодекса Республики Казахстан и в связи с производственной необходимостью, <b>ПРИКАЗЫВАЮ:</b></p>'+
- '<p><b>1) Направить в служебную командировку:</b></p><p>Ф.И.О.: '+e(r.employee_name)+'<br>Должность: '+e(r.job_title)+'<br>Тип должности: '+e(r.employee_category)+'<br>Период: с '+hrOrderDate_(r.date_from)+' по '+hrOrderDate_(r.date_to)+'<br>Количество дней: '+e(r.days_count)+'<br>Маршрут: '+e(r.travel_route)+'<br>Цель командировки: '+e(r.purpose)+'</p>'+
+ '<p><b>1) Направить в служебную командировку:</b></p><p>Ф.И.О.: '+e(r.employee_name)+'<br>Должность: '+e(r.job_title)+'<br>Тип должности: '+e((()=>{const c=String(r.employee_category||'').trim();return c==='Начальники'?'Начальники структурных подразделений (заместители директора, начальники отделов)':c==='Руководство'?'Руководство (директор, исполнительный директор)':c})())+'<br>Период: с '+hrOrderDate_(r.date_from)+' по '+hrOrderDate_(r.date_to)+'<br>Количество дней: '+e(r.days_count)+'<br>Маршрут: '+e(r.travel_route)+'<br>Цель командировки: '+e(r.purpose)+'</p>'+
  '<p>Места пребывания и проживания:</p><ul>'+placeRows+'</ul>'+
  '<p><b>2) Отделу бухгалтерии произвести выплаты в общей сумме '+n(r.total_amount)+' тенге, в том числе:</b></p><ul><li>Суточные: '+n(r.per_diem_amount)+' тенге</li><li>Расходы по найму жилого помещения: '+n(r.lodging_amount)+' тенге</li></ul>'+
  '<p>Основание: заявка работника на командирование.</p><p style="margin-top:38px">Управляющий директор &nbsp;&nbsp;&nbsp;&nbsp; Касенов Е.Е.</p>'+
