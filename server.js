@@ -5,7 +5,7 @@
 
 require("dotenv").config();
 
-const SERVICE_NS_BUILD_ID = "SNS-HR-TRIP-TELEGRAM-20261022";
+const SERVICE_NS_BUILD_ID = "SNS-HR-INTERNAL-SIGN-20261022";
 console.log("[SNS BUILD]", SERVICE_NS_BUILD_ID);
 
 
@@ -18421,7 +18421,7 @@ function hrApiGuard_(req,res,next) {
   next();
 }
 // Локальные заявки на командировку. Dudocs не используется.
-const hrStatusLabel_ = s => ({draft:'Черновик',submitted:'Ожидает подписи',approved:'Согласовано',rejected:'Отклонено',signing:'На подписании',signed:'Подписано ЭЦП',cancelled:'Отменено'}[s]||s);
+const hrStatusLabel_ = s => ({draft:'Черновик',submitted:'Ожидает подписи',approved:'Согласовано',rejected:'Отклонено',signing:'На подписании',signed:'Подписан',cancelled:'Отменено'}[s]||s);
 const hrClean_ = (v,max=300)=>String(v??'').trim().slice(0,max);
 const hrLogin_ = v=>hrClean_(v,80).toLowerCase();
 const hrRequired_ = (v,name,max=300)=>{const s=hrClean_(v,max);if(!s)throw Object.assign(new Error('Не заполнено: '+name),{status:400});return s;};
@@ -18524,22 +18524,28 @@ app.post('/hr/trips',hrApiGuard_,async(req,res)=>{
 app.post('/hr/trips/review',hrApiGuard_,async(req,res)=>{
  const client=await pool.connect();
  try{
-  const b=req.body||{},login=hrLogin_(b.login),id=hrClean_(b.id,80),decision=hrClean_(b.decision,20),comment=hrClean_(b.comment,1000);
-  if(login!=='k_ermek')throw Object.assign(new Error('Только директор может согласовать'),{status:403});
-  if(decision==='approve')throw Object.assign(new Error('Согласование заменено подписью ЭЦП'),{status:409});
-  if(!['reject'].includes(decision))throw Object.assign(new Error('Недопустимое действие'),{status:400});
+  const b=req.body||{}, id=hrClean_(b.id,80),decision=hrClean_(b.decision,20),comment=hrClean_(b.comment,1000);
+  // Проверяем реальную сессию Render, а не логин из URL / тела запроса.
+  const user=await getAuthenticatedFtUser(req,client);
+  if(!user||hrLogin_(user.login)!=='k_ermek')
+    throw Object.assign(new Error('Требуется вход в систему под k_ermek'),{status:403});
+  if(!['sign','reject'].includes(decision))throw Object.assign(new Error('Недопустимое действие'),{status:400});
   if(decision==='reject'&&!comment)throw Object.assign(new Error('Укажите причину отказа'),{status:400});
-  const next=decision==='approve'?'approved':'rejected';
+  if(!/^\d+$/.test(id))throw Object.assign(new Error('Неверный номер заявки'),{status:400});
+  const next=decision==='sign'?'signed':'rejected';
   await client.query('BEGIN');
-  const updated=await client.query(`UPDATE hr.trip_requests SET status=$1,director_decided_at=now(),director_comment=$2,director_login=$4,updated_at=now()
-    WHERE request_no=$3 AND status='submitted' RETURNING id`,[next,comment,id,login]);
+  const updated=await client.query(`UPDATE hr.trip_requests
+    SET status=$1,director_decided_at=now(),director_comment=$2,director_login=$4,updated_at=now()
+    WHERE request_no=$3 AND status='submitted'
+    RETURNING id,director_decided_at`,[next,comment||null,id,user.login]);
   if(updated.rowCount!==1)throw Object.assign(new Error('Заявка не найдена или уже обработана'),{status:409});
   await client.query(`INSERT INTO hr.trip_approval_log(trip_id,actor_login,action,previous_status,new_status,comment_text)
-    VALUES($1,$2,$3,'submitted',$4,$5)`,[updated.rows[0].id,login,decision==='approve'?'approved':'rejected',next,comment]);
-  await client.query('COMMIT');res.json({success:true,status:hrStatusLabel_(next)});
+    VALUES($1,$2,$3,'submitted',$4,$5)`,[updated.rows[0].id,user.login,decision,next,comment||null]);
+  await client.query('COMMIT');
+  res.json({success:true,status:hrStatusLabel_(next),director_login:user.login,
+    director_decided_at:updated.rows[0].director_decided_at});
  }catch(e){try{await client.query('ROLLBACK')}catch(_){}hrError_(res,e)}finally{client.release()}
 });
-
 
 // ============================================================
 
