@@ -18421,7 +18421,7 @@ function hrApiGuard_(req,res,next) {
   next();
 }
 // Локальные заявки на командировку. Dudocs не используется.
-const hrStatusLabel_ = s => ({draft:'Черновик',submitted:'Ожидает подписи',approved:'Согласовано',rejected:'Отклонено',signing:'На подписании',signed:'Подписан',cancelled:'Отменено'}[s]||s);
+const hrStatusLabel_ = s => ({draft:'Черновик',submitted:'Ожидает подписи',approved:'Согласовано',rejected:'Отклонено',signing:'На подписании',signed:'Подписан',cancelled:'Отменено',hr_confirmed:'Подтверждено кадровиком'}[s]||s);
 const hrClean_ = (v,max=300)=>String(v??'').trim().slice(0,max);
 const hrLogin_ = v=>hrClean_(v,80).toLowerCase();
 const hrRequired_ = (v,name,max=300)=>{const s=hrClean_(v,max);if(!s)throw Object.assign(new Error('Не заполнено: '+name),{status:400});return s;};
@@ -18434,6 +18434,7 @@ const hrPublic_ = r=>({
   city_type:r.city_category||'',travel_route:r.travel_route||'',lodging_days:r.lodging_days??null,stays:r.lodging_stays||[],funding_source:r.funding_source||'',basis:r.basis_document||'',purpose:r.purpose||'',
   status:r.signature_status==='crypto_verified_pending_trust'?'Подпись получена (проверка)':hrStatusLabel_(r.status),signature_status:r.signature_status||'',created_at:r.created_at,updated_at:r.updated_at,
   reviewer:r.director_decided_at?r.director_login:'',reviewed_at:r.director_decided_at||'',review_comment:r.director_comment||'',
+  order_number:r.order_number||'',order_date:r.order_date instanceof Date?r.order_date.toISOString().slice(0,10):String(r.order_date||'').slice(0,10),order_pdf_url:r.order_pdf_url||'',
   days_count:r.days_count,per_diem_amount:r.per_diem_amount,lodging_amount:r.lodging_amount,
   travel_amount:r.travel_amount,other_amount:r.other_amount,daily_rate:r.daily_rate,total_amount:r.total_amount
 });
@@ -18442,12 +18443,13 @@ const hrError_ = (res,e)=>{const code=e.status||500;if(code>=500)console.error('
 app.get('/hr/trips',hrApiGuard_,async(req,res)=>{
  try{
   const login=hrLogin_(req.query.login);if(!login)return res.status(400).json({success:false,error:'LOGIN_REQUIRED'});
-  const director=login==='k_ermek';
-  const q=director
+  const director=login==='k_ermek';const personnel=login==='h_r';
+  if(director||personnel){const verified=await getAuthenticatedFtUser(req);if(!verified||hrLogin_(verified.login)!==login)return res.status(403).json({success:false,error:'HR_SESSION_REQUIRED'});}
+  const q=(director||personnel)
     ?'SELECT r.*,NULL::text AS signature_status FROM hr.trip_requests r ORDER BY r.created_at DESC,r.id DESC LIMIT 2000'
     :'SELECT r.*,NULL::text AS signature_status FROM hr.trip_requests r WHERE lower(btrim(r.employee_login))=$1 ORDER BY r.created_at DESC,r.id DESC LIMIT 2000';
-  const out=await pool.query(q,director?[]:[login]);
-  res.json({success:true,is_director:director,rows:out.rows.map(hrPublic_)});
+  const out=await pool.query(q,(director||personnel)?[]:[login]);
+  res.json({success:true,is_director:director,is_hr:personnel,rows:out.rows.filter(r=>!personnel||['signed','hr_confirmed'].includes(r.status)).map(hrPublic_)});
  }catch(e){hrError_(res,e)}
 });
 app.post('/hr/trips',hrApiGuard_,async(req,res)=>{
@@ -18551,6 +18553,181 @@ app.post('/hr/trips/review',hrApiGuard_,async(req,res)=>{
 
 
 // =====================================================
+
+// =====================================================
+// LOCAL HR: кадровик -> финальный PDF Drive -> ФТ -> пул -> Реестр.
+// Отдельно от KEDO. Кнопка директора = внутреннее подтверждение, НЕ ЭЦП.
+// =====================================================
+const hrOrderFolderId_ = String(process.env.GOOGLE_DRIVE_FOLDER_ID || '').trim();
+const hrOrderEsc_ = v => String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function hrOrderDate_(d) {
+  const x=String(d instanceof Date?d.toISOString().slice(0,10):d||'').slice(0,10);
+  return /^\d{4}-\d\d-\d\d$/.test(x)?x.slice(8)+'.'+x.slice(5,7)+'.'+x.slice(0,4):x;
+}
+function hrOrderDefaultNumber_(r){
+  const year=String(r.created_at instanceof Date?r.created_at.toISOString():r.created_at||new Date().toISOString()).slice(0,4);
+  return 'КМ-'+year+'-'+String(r.request_no).padStart(6,'0');
+}
+function hrOrderHtml_(r,orderNo,orderDate){
+ const e=hrOrderEsc_,n=v=>Number(v||0).toLocaleString('ru-RU',{minimumFractionDigits:0,maximumFractionDigits:2});
+ const stays=Array.isArray(r.lodging_stays)?r.lodging_stays:[];
+ const types={major:'город республиканского значения (тип 1)',regional:'город областного значения (тип 2)',district:'районный центр (тип 3)',rural:'сельский населённый пункт (тип 4)'};
+ const placeRows=stays.map(x=>'<li>'+e(x.city)+' — '+e(types[x.type]||x.type)+' — '+e(x.nights)+' ночей</li>').join('');
+ const ns=/сервис\s*нс/i.test(String(r.legal_entity||''));
+ const head=ns?'<div style="text-align:center;font-size:11px"><b>«СЕРВИС НС» Жауапкершілігі Шектеулі Серіктестігі</b><br><b>Товарищество с ограниченной ответственностью «СЕРВИС НС»</b><br>Республика Казахстан, город Астана, микрорайон Ак-Булак-3, переулок Тасшокы-2 н/п 3<br>БИН 000340005764, 8-(7172)-695-203, E-mail: too-servisns@mail.ru</div>':
+ '<div style="text-align:center"><b>'+e(r.legal_entity)+'</b></div>';
+ return '<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{font-family:Arial,sans-serif;color:#171717;font-size:12pt;line-height:1.45;margin:45px 50px}h2{text-align:center;font-size:15pt;margin:36px 0 2px}h3{text-align:center;font-size:12pt;margin:0 0 30px}p{margin:9px 0}li{margin:4px 0}</style></head><body>'+head+
+ '<h2>ПРИКАЗ</h2><h3>«О направлении в служебную командировку»</h3><p>Номер приказа: <b>'+e(orderNo)+'</b><br>Дата приказа: <b>'+hrOrderDate_(orderDate)+'</b></p>'+
+ '<p>В соответствии со статьёй 127 Трудового кодекса Республики Казахстан и в связи с производственной необходимостью, <b>ПРИКАЗЫВАЮ:</b></p>'+
+ '<p><b>1) Направить в служебную командировку:</b></p><p>Ф.И.О.: '+e(r.employee_name)+'<br>Должность: '+e(r.job_title)+'<br>Тип должности: '+e(r.employee_category)+'<br>Период: с '+hrOrderDate_(r.date_from)+' по '+hrOrderDate_(r.date_to)+'<br>Количество дней: '+e(r.days_count)+'<br>Маршрут: '+e(r.travel_route)+'<br>Цель командировки: '+e(r.purpose)+'</p>'+
+ '<p>Места пребывания и проживания:</p><ul>'+placeRows+'</ul>'+
+ '<p><b>2) Отделу бухгалтерии произвести выплаты в общей сумме '+n(r.total_amount)+' тенге, в том числе:</b></p><ul><li>Суточные: '+n(r.per_diem_amount)+' тенге</li><li>Расходы по найму жилого помещения: '+n(r.lodging_amount)+' тенге</li></ul>'+
+ '<p>Основание: заявка работника на командирование.</p><p style="margin-top:38px">Управляющий директор &nbsp;&nbsp;&nbsp;&nbsp; Касенов Е.Е.</p>'+
+ '<p style="font-size:9px;color:#555">Согласовано в системе Service NS пользователем '+e(r.director_login)+' '+e(r.director_decided_at?new Date(r.director_decided_at).toLocaleString('ru-RU',{timeZone:'Asia/Almaty'}):'')+'. Электронная цифровая подпись (ЭЦП) отсутствует.</p></body></html>';
+}
+async function hrDriveJson_(url,opts,code){const r=await fetch(url,{...opts,redirect:'error',signal:AbortSignal.timeout(65000)});if(!r.ok)throw new Error(code+'_HTTP_'+r.status);return r.json()}
+async function hrDriveMultipart_(token,name,mimeType,content,asMimeType,parent){
+ const b='hr_'+crypto.randomBytes(12).toString('hex');
+ const meta={name,mimeType:asMimeType||mimeType};if(parent)meta.parents=[parent];
+ const bytes=Buffer.isBuffer(content)?content:Buffer.from(content,'utf8');
+ const body=Buffer.concat([Buffer.from('--'+b+'\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n'+JSON.stringify(meta)+'\r\n--'+b+'\r\nContent-Type: '+mimeType+'\r\n\r\n'),bytes,Buffer.from('\r\n--'+b+'--\r\n')]);
+ return hrDriveJson_('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name',{
+   method:'POST',headers:{Authorization:'Bearer '+token,'Content-Type':'multipart/related; boundary='+b},body},'HR_DRIVE_CREATE');
+}
+async function hrDriveFind_(token,name){
+ const q="name = '"+name.replace(/'/g,"\\'")+"' and '"+hrOrderFolderId_.replace(/'/g,'')+"' in parents and trashed = false";
+ const res=await hrDriveJson_('https://www.googleapis.com/drive/v3/files?'+new URLSearchParams({q,fields:'files(id,name,mimeType)',pageSize:'100'}),{headers:{Authorization:'Bearer '+token}},'HR_DRIVE_LIST');
+ return (res.files||[]).find(x=>x.name===name&&x.mimeType==='application/pdf')?.id||null;
+}
+async function hrDriveCreatePdf_(trip,number,date){
+ if(!hrOrderFolderId_||!process.env.GOOGLE_CLIENT_ID||!process.env.GOOGLE_REFRESH_TOKEN||!process.env.GOOGLE_CLIENT_SECRET)throw new Error('HR_GOOGLE_DRIVE_ENV_MISSING');
+ const token=await kedoDriveGoogleToken_(); // общий OAuth-токен Google, НЕ подключение к Dudocs
+ const filename='Приказ_'+String(trip.id)+'_'+number.replace(/[^a-zA-Zа-яА-Я0-9_-]/gu,'_')+'.pdf';
+ let id=await hrDriveFind_(token,filename);
+ if(!id){
+   const doc=await hrDriveMultipart_(token,'hr_temp_'+trip.id+'.html','text/html',hrOrderHtml_(trip,number,date),'application/vnd.google-apps.document');
+   try {
+     const result=await fetch('https://www.googleapis.com/drive/v3/files/'+encodeURIComponent(doc.id)+'/export?mimeType=application%2Fpdf',{
+       headers:{Authorization:'Bearer '+token},redirect:'error',signal:AbortSignal.timeout(60000)});
+     if(!result.ok)throw new Error('HR_DRIVE_EXPORT_HTTP_'+result.status);
+     const pdf=Buffer.from(await result.arrayBuffer());
+     if(pdf.length>12*1024*1024||pdf.subarray(0,5).toString()!=='%PDF-')throw new Error('HR_INVALID_PDF');
+     const uploaded=await hrDriveMultipart_(token,filename,'application/pdf',pdf,'application/pdf',hrOrderFolderId_);
+     id=uploaded.id;
+   }finally{await fetch('https://www.googleapis.com/drive/v3/files/'+encodeURIComponent(doc.id),{method:'DELETE',headers:{Authorization:'Bearer '+token}}).catch(()=>{});}
+ }
+ return 'https://drive.google.com/file/d/'+encodeURIComponent(id)+'/view';
+}
+async function hrLocalFinanceInit_(){
+ await pool.query(`ALTER TABLE hr.trip_requests ADD COLUMN IF NOT EXISTS order_number text`);
+ await pool.query(`ALTER TABLE hr.trip_requests ADD COLUMN IF NOT EXISTS order_date date`);
+ await pool.query(`ALTER TABLE hr.trip_requests ADD COLUMN IF NOT EXISTS order_pdf_url text`);
+ await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS hr_trip_order_number_uniq ON hr.trip_requests(order_number) WHERE order_number IS NOT NULL`);
+ await pool.query(`CREATE TABLE IF NOT EXISTS hr.local_trip_finance_links (
+   trip_id bigint PRIMARY KEY REFERENCES hr.trip_requests(id),id_ft text UNIQUE NOT NULL,
+   zvk_row_id bigint UNIQUE NOT NULL,registry_id bigint,amount numeric(18,2) NOT NULL,
+   created_at timestamptz NOT NULL DEFAULT now())`);
+ console.log('[HR FIN] Local trip tables ready');
+}
+async function hrLocalRegistry_(c,row,source,entity){
+ const head=await c.query(`INSERT INTO public.request_head
+   (created_by,total_amount,items_count,approve_ermek_status,approve_ermek_name,approve_ermek_time,workflow_stage,agree_status)
+   VALUES('h_r',$1,1,'Согласовано','Внутреннее подтверждение',now(),'Оплата Арай','Согласовано') RETURNING id`,[row.amount]);
+ const rid=head.rows[0].id;
+ await c.query(`INSERT INTO public.request_items(request_id,zvk_row_id,id_ft,id_zvk,object,contractor,pay_purpose,dds_article,
+   contract_no,invoice_no,invoice_date,invoice_pdf,src_d,src_o,money_type,to_pay)
+   SELECT $1,$2,f.id_ft,$3,f."object",f.contractor,f.pay_purpose,f.dds_article,f.contract_no,
+   f.invoice_no,f.invoice_date,f.invoice_pdf,$4,$5,'Тек',$6 FROM public.ft f WHERE f.id_ft=$7`,
+   [rid,row.zvk_row_id,row.id_zvk,entity,source,row.amount,row.id_ft]);
+ const registry=await c.query(`INSERT INTO public.registry_head(created_by,workflow_stage,agree_status,archive_flag,total_amount,items_count)
+   VALUES('h_r','Оплата Арай','Согласовано','Нет',$1,1) RETURNING id`,[row.amount]);
+ await c.query(`INSERT INTO public.registry_items(registry_id,zvk_row_id,id_ft,id_zvk,object,contractor,pay_purpose,dds_article,
+   contract_no,invoice_no,invoice_date,invoice_pdf,src_d,src_o,to_pay)
+   SELECT $1,$2,f.id_ft,$3,f."object",f.contractor,f.pay_purpose,f.dds_article,f.contract_no,
+   f.invoice_no,f.invoice_date,f.invoice_pdf,$4,$5,$6 FROM public.ft f WHERE f.id_ft=$7`,
+   [registry.rows[0].id,row.zvk_row_id,row.id_zvk,entity,source,row.amount,row.id_ft]);
+ await markRowsAsRegistryCreated(c,[row.zvk_row_id]);
+ return registry.rows[0].id;
+}
+async function hrLocalFund_(c,row,legal){
+ const funds=await c.query(`SELECT p.id,p.source_name,
+  p.amount-COALESCE((SELECT SUM(a.amount) FROM public.zvk_funding_pool_allocations a WHERE a.funding_pool_id=p.id),0) AS free
+  FROM public.draft_funding_pool p WHERE p.is_active=true AND p.parent_pool_id IS NOT NULL
+  AND lower(btrim(p.legal_entity))=lower(btrim($1)) AND lower(btrim(p.object_name))=lower('Командировка')
+  AND lower(btrim(p.money_type))=lower('Тек') AND nullif(btrim(p.source_name),'') IS NOT NULL
+  ORDER BY free DESC,p.id FOR UPDATE OF p`,[legal]);
+ const chosen=funds.rows.find(x=>Number(x.free)>=Number(row.amount));
+ if(!chosen)return null;
+ await c.query(`INSERT INTO public.zvk_funding_pool_allocations(zvk_row_id,funding_pool_id,amount,created_by)
+ VALUES($1,$2,$3,'HR') ON CONFLICT(zvk_row_id,funding_pool_id) DO NOTHING`,[row.zvk_row_id,chosen.id,row.amount]);
+ await c.query(`UPDATE public.zvk_status SET src_o=$2,src_d=$3 WHERE zvk_row_id=$1`,[row.zvk_row_id,chosen.source_name,legal]);
+ const registryId=await hrLocalRegistry_(c,row,chosen.source_name,legal);
+ await c.query(`UPDATE hr.local_trip_finance_links SET registry_id=$2 WHERE trip_id=$1`,[row.trip_id,registryId]);
+ return registryId;
+}
+let hrLocalReconBusy_=false;
+async function hrLocalFinanceReconcile_(){
+ if(hrLocalReconBusy_)return;hrLocalReconBusy_=true;
+ try{
+  const pending=await pool.query(`SELECT l.trip_id,l.id_ft,l.zvk_row_id,l.amount,z.id_zvk,r.legal_entity
+   FROM hr.local_trip_finance_links l JOIN hr.trip_requests r ON r.id=l.trip_id
+   JOIN public.zvk z ON z.id=l.zvk_row_id WHERE l.registry_id IS NULL LIMIT 100`);
+  for(const row of pending.rows){const c=await pool.connect();try{
+    await c.query('BEGIN');await c.query('SELECT pg_advisory_xact_lock($1::bigint)',[row.trip_id]);
+    const fresh=await c.query('SELECT registry_id FROM hr.local_trip_finance_links WHERE trip_id=$1 FOR UPDATE',[row.trip_id]);
+    if(fresh.rows[0]?.registry_id){await c.query('ROLLBACK');continue;}
+    const registry=await hrLocalFund_(c,row,row.legal_entity);
+    if(registry)await c.query('COMMIT');else await c.query('ROLLBACK');
+  }catch(e){await c.query('ROLLBACK').catch(()=>{});console.error('[HR FIN] Reconcile',row.trip_id,e.message)}finally{c.release()}}
+ }finally{hrLocalReconBusy_=false}
+}
+app.post('/hr/trips/hr-confirm',hrApiGuard_,async(req,res)=>{
+ const c=await pool.connect();
+ try{
+  await hrLocalEnsureReady_();
+  const user=await getAuthenticatedFtUser(req,c);
+  if(!user||hrLogin_(user.login)!=='h_r')throw Object.assign(new Error('Доступ только кадровику h_r'),{status:403});
+  const id=Number(req.body?.id),number=hrClean_(req.body?.order_number,60),date=hrClean_(req.body?.order_date,10);
+  if(!Number.isSafeInteger(id)||id<1||!/^КМ-\d{4}-\d{6}$/.test(number)||!/^\d{4}-\d\d-\d\d$/.test(date)||!Number.isFinite(Date.parse(date+'T00:00:00Z')))
+    throw Object.assign(new Error('Некорректный номер или дата приказа'),{status:400});
+  await c.query('BEGIN');await c.query('SELECT pg_advisory_xact_lock($1::bigint)',[id]);
+  const q=await c.query(`SELECT * FROM hr.trip_requests WHERE request_no=$1 FOR UPDATE`,[id]);
+  if(!q.rowCount)throw Object.assign(new Error('Заявка не найдена'),{status:404});
+  const trip=q.rows[0];
+  if(trip.status==='hr_confirmed'){
+    const existing=await c.query('SELECT id_ft FROM hr.local_trip_finance_links WHERE trip_id=$1',[trip.id]);
+    await c.query('COMMIT');return res.json({success:true,already:true,id_ft:existing.rows[0]?.id_ft,pdf_url:trip.order_pdf_url});
+  }
+  if(trip.status!=='signed'||hrLogin_(trip.director_login)!=='k_ermek')throw Object.assign(new Error('Сначала требуется внутреннее подтверждение директора'),{status:409});
+  const unique=await c.query('SELECT id FROM hr.trip_requests WHERE order_number=$1 AND id<>$2',[number,trip.id]);
+  if(unique.rowCount)throw Object.assign(new Error('Этот номер приказа уже используется'),{status:409});
+  const pdfUrl=await hrDriveCreatePdf_(trip,number,date); // сначала PDF на Google Drive
+  const ft=await c.query(`INSERT INTO public.ft
+   (id_ft,input_date,input_name,legal_entity,"object",contractor,pay_purpose,dds_article,contract_no,invoice_no,invoice_date,invoice_pdf,sum_ft,source_type)
+   VALUES('FT'||nextval('public.ft_id_seq'),now(),'a_zaitova',$1,'Командировка',$2,$3,'103. Командировочные','Без договора',$4,$5::date,$6,$7,'HR_TRIP') RETURNING id_ft`,
+   [trip.legal_entity,trip.employee_name,'Служебная командировка: '+String(trip.travel_route||trip.destination_city||'').trim()+' с '+hrOrderDate_(trip.date_from)+' по '+hrOrderDate_(trip.date_to),number,date,pdfUrl,trip.total_amount]);
+  const idFt=ft.rows[0].id_ft;
+  const z=await c.query(`INSERT INTO public.zvk(id_ft,id_zvk,zvk_date,zvk_name,to_pay,request_flag)
+   VALUES($1,'ZFT'||nextval('public.zvk_id_seq'),now(),'h_r',$2,'Да') RETURNING id,id_zvk`,[idFt,trip.total_amount]);
+  await c.query(`INSERT INTO public.zvk_status(zvk_row_id,status_time,src_d,money_type)
+   VALUES($1,now(),$2,'Тек')`,[z.rows[0].id,trip.legal_entity]);
+  await c.query(`INSERT INTO hr.local_trip_finance_links(trip_id,id_ft,zvk_row_id,amount)
+   VALUES($1,$2,$3,$4)`,[trip.id,idFt,z.rows[0].id,trip.total_amount]);
+  const registry=await hrLocalFund_(c,{trip_id:trip.id,id_ft:idFt,zvk_row_id:z.rows[0].id,id_zvk:z.rows[0].id_zvk,amount:trip.total_amount},trip.legal_entity);
+  await c.query(`UPDATE hr.trip_requests SET status='hr_confirmed',order_number=$2,order_date=$3::date,
+    order_pdf_url=$4,updated_at=now() WHERE id=$1`,[trip.id,number,date,pdfUrl]);
+  await c.query(`INSERT INTO hr.trip_approval_log(trip_id,actor_login,action,previous_status,new_status,comment_text)
+    VALUES($1,'h_r','hr_confirm','signed','hr_confirmed',$2)`,[trip.id,'Приказ '+number]);
+  await c.query('COMMIT');
+  console.log('[HR FIN] Confirmed',trip.id,idFt,'registry',registry||'awaiting funds');
+  res.json({success:true,id_ft:idFt,registry_id:registry,pdf_url:pdfUrl,pending_funds:!registry});
+ }catch(e){await c.query('ROLLBACK').catch(()=>{});hrError_(res,e)}finally{c.release()}
+});
+let hrLocalFinReady_=false;
+async function hrLocalEnsureReady_(){if(hrLocalFinReady_)return;await hrLocalFinanceInit_();hrLocalFinReady_=true;}
+setTimeout(()=>void hrLocalEnsureReady_().then(()=>hrLocalFinanceReconcile_()).catch(e=>console.error('[HR FIN] Init',e.message)),6500);
+setInterval(()=>void hrLocalEnsureReady_().then(()=>hrLocalFinanceReconcile_()).catch(e=>console.error('[HR FIN] Retry',e.message)),60000).unref?.();
+
 // LOCAL_TRIPS_ONLY: отключены все KEDO HR endpoints.
 app.use('/hr/kedo-', (req,res)=>res.status(410).json({success:false,error:'KEDO_INTEGRATION_DISABLED'}));
 
@@ -18645,7 +18822,8 @@ function kedoFinanceReconcile_(){
 // Once a funding pool mutation has COMMITTED, reconcile without waiting for Dudocs.
 // Never interfere with the success response or roll back an already committed change.
 function kedoFinanceOnPoolChange_(context){
-  if (true) return; // LOCAL_TRIPS_ONLY: KEDO financial auto-sync disabled
+  setImmediate(() => { void hrLocalFinanceReconcile_().catch(e=>console.error('[HR FIN] Pool retry:',context,e.message)); });
+  return; // LOCAL_TRIPS_ONLY: KEDO financial auto-sync disabled
   setImmediate(() => {
     void kedoFinanceReconcile_().catch(e =>
       console.error('[KEDO FIN] INSTANT RECONCILE ERROR', context, e.message)
