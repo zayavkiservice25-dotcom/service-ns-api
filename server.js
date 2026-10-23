@@ -17060,7 +17060,7 @@ app.post("/draft-funding-pools/:poolId/allocate", async (req, res) => {
     const amount = Number(body.amount);
 
     const allocatorLogin = createdBy.toLowerCase();
-    const allowedAllocators = ["b_erkin", "s_zhasulan", "k_ermek"];
+    const allowedAllocators = ["b_erkin", "s_zhasulan", "a_zaitova", "k_ermek"];
 
     if (!allowedAllocators.includes(allocatorLogin)) {
       return res.status(403).json({
