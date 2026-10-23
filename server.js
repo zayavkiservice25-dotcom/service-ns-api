@@ -18421,18 +18421,19 @@ function hrApiGuard_(req,res,next) {
   next();
 }
 // Локальные заявки на командировку. Dudocs не используется.
-const hrStatusLabel_ = s => ({draft:'Черновик',submitted:'Ожидает подписи',approved:'Согласовано',rejected:'Отклонено',signing:'На подписании',signed:'Подписан',cancelled:'Отменено',hr_confirmed:'Подтверждено кадровиком'}[s]||s);
+const hrStatusLabel_ = s => ({draft:'Черновик',submitted:'Ожидает подписи',approved:'Согласовано',rejected:'Отклонено',signing:'На подписании',signed:'Подписан',cancelled:'Отозвана',hr_confirmed:'Подтверждено кадровиком'}[s]||s);
 const hrClean_ = (v,max=300)=>String(v??'').trim().slice(0,max);
 const hrLogin_ = v=>hrClean_(v,80).toLowerCase();
 const hrRequired_ = (v,name,max=300)=>{const s=hrClean_(v,max);if(!s)throw Object.assign(new Error('Не заполнено: '+name),{status:400});return s;};
 const hrPublic_ = r=>({
-  id:r.request_no || String(r.id), owner_login:r.employee_login, employee:r.employee_name,
+  id:r.request_no || String(r.id), owner_login:r.employee_login, created_by_login:r.created_by_login, employee:r.employee_name,
   employee_number:r.personnel_no||'',position:r.job_title||'',department:r.department||'',category:r.employee_category||'',
   legal_entity:r.legal_entity||'',destination:[r.destination_city,r.destination_country].filter(Boolean).join(', '),
   date_from:r.date_from instanceof Date?r.date_from.toISOString().slice(0,10):String(r.date_from||'').slice(0,10),
   date_to:r.date_to instanceof Date?r.date_to.toISOString().slice(0,10):String(r.date_to||'').slice(0,10),
   city_type:r.city_category||'',travel_route:r.travel_route||'',lodging_days:r.lodging_days??null,stays:r.lodging_stays||[],funding_source:r.funding_source||'',basis:r.basis_document||'',purpose:r.purpose||'',
-  status:r.signature_status==='crypto_verified_pending_trust'?'Подпись получена (проверка)':hrStatusLabel_(r.status),signature_status:r.signature_status||'',created_at:r.created_at,updated_at:r.updated_at,
+  deputy_approved:r.deputy_action==='deputy_approve',deputy_approved_at:r.deputy_action==='deputy_approve'?r.deputy_action_at:null,
+  deputy_assigned:hrDeputyCanSee_(r.employee_name),raw_status:r.status,status:r.signature_status==='crypto_verified_pending_trust'?'Подпись получена (проверка)':hrStatusLabel_(r.status),signature_status:r.signature_status||'',created_at:r.created_at,updated_at:r.updated_at,
   reviewer:r.director_decided_at?r.director_login:'',reviewed_at:r.director_decided_at||'',review_comment:r.director_comment||'',
   order_number:r.order_number||'',order_date:r.order_date instanceof Date?r.order_date.toISOString().slice(0,10):String(r.order_date||'').slice(0,10),order_pdf_url:r.order_pdf_url||'',
   days_count:r.days_count,per_diem_amount:r.per_diem_amount,lodging_amount:r.lodging_amount,
@@ -18443,20 +18444,40 @@ const hrError_ = (res,e)=>{const code=e.status||500;if(code>=500)console.error('
 app.get('/hr/trips',hrApiGuard_,async(req,res)=>{
  try{
   const login=hrLogin_(req.query.login);if(!login)return res.status(400).json({success:false,error:'LOGIN_REQUIRED'});
-  const director=login==='k_ermek';const personnel=login==='h_r';
-  if(director||personnel){const verified=await getAuthenticatedFtUser(req);if(!verified||hrLogin_(verified.login)!==login)return res.status(403).json({success:false,error:'HR_SESSION_REQUIRED'});}
-  const q=(director||personnel)
-    ?'SELECT r.*,NULL::text AS signature_status FROM hr.trip_requests r ORDER BY r.created_at DESC,r.id DESC LIMIT 2000'
-    :'SELECT r.*,NULL::text AS signature_status FROM hr.trip_requests r WHERE lower(btrim(r.employee_login))=$1 ORDER BY r.created_at DESC,r.id DESC LIMIT 2000';
-  const out=await pool.query(q,(director||personnel)?[]:[login]);
-  res.json({success:true,is_director:director,is_hr:personnel,rows:out.rows.filter(r=>!personnel||['signed','hr_confirmed'].includes(r.status)).map(hrPublic_)});
+  const director=login==='k_ermek',personnel=login==='h_r',deputy=login==='v_shevchenko';
+  if(director||personnel||deputy){
+   const verified=await getAuthenticatedFtUser(req);
+   if(!verified||hrLogin_(verified.login)!==login)return res.status(403).json({success:false,error:'HR_SESSION_REQUIRED'});
+  }
+  const where=director||personnel?'':deputy
+   ?" WHERE lower(regexp_replace(btrim(r.employee_name),'[[:space:]]+',' ','g'))=ANY($1::text[])"
+   :' WHERE lower(btrim(r.employee_login))=$1';
+  const q=`SELECT r.*,NULL::text AS signature_status,a.action AS deputy_action,a.occurred_at AS deputy_action_at
+    FROM hr.trip_requests r LEFT JOIN LATERAL (
+      SELECT action,occurred_at FROM hr.trip_approval_log
+      WHERE trip_id=r.id AND action IN ('deputy_approve','edit','withdraw')
+      ORDER BY occurred_at DESC,id DESC LIMIT 1
+    ) a ON true`+where+' ORDER BY r.created_at DESC,r.id DESC LIMIT 2000';
+  const out=await pool.query(q,(director||personnel)?[]:deputy?[hrDeputyEmployeeNames_]:[login]);
+  res.json({success:true,is_director:director,is_hr:personnel,is_deputy:deputy,rows:out.rows.map(hrPublic_)});
  }catch(e){hrError_(res,e)}
 });
-app.post('/hr/trips',hrApiGuard_,async(req,res)=>{
- const client=await pool.connect();
- try{
-  const b=req.body||{},login=hrLogin_(b.login);
-  if(!login)throw Object.assign(new Error('LOGIN_REQUIRED'),{status:400});
+
+// Справочник по списку от 23.10.2026. Различающиеся должности сохранены отдельно.
+const hrEmployeeDirectory_ = [["Абданов Аңсар Талғатұлы", "Техник-геодезист", "Специалисты", "k_ermek", ""], ["Абдухалық Баян", "Юрист", "Специалисты", "k_ermek", ""], ["Аблаев Руслан Умарбекович", "Водитель Миксера", "Специалисты", "k_ermek", ""], ["Агзамов Родислав Гиффатович", "Водитель легкового автотранспррта", "Специалисты", "k_ermek", ""], ["Айжамбаева Айгерим Нурмуханбетовна", "Инженер ПТО", "Специалисты", "k_ermek", ""], ["Аканов Нуржан Бахтиярович", "Юрист", "Специалисты", "k_ermek", ""], ["Алдияров Шадияр Даулетдиярұлы", "Геодезист", "Специалисты", "k_ermek", ""], ["Алибек Дидар Ғайдарұлы", "Геодезист", "Специалисты", "k_ermek", "v_shevchenko"], ["Альжанов Касымбек Гинаятович", "Инженер ПТО", "Специалисты", "k_ermek", "v_shevchenko"], ["Альжанова Алтынгуль Алпамысовна", "Специалист по оперучету", "Специалисты", "k_ermek", ""], ["Анашова Алия Жумакуловна", "Бухгалтер-материалист", "Специалисты", "k_ermek", ""], ["Арзаматов Ержан Борангазиевич", "Заведующий складом", "Специалисты", "k_ermek", ""], ["Асқарбай Құлыбек Ерболатұлы", "Мастер участка", "Специалисты", "k_ermek", ""], ["Асыкбеков Ерсултан Казыханович", "Инженер ПТО", "Специалисты", "k_ermek", "v_shevchenko"], ["Асылбек Сағындық Сәкенұлы", "Аналитик", "Специалисты", "k_ermek", ""], ["Аяпбергенов Нургамит Нургалиевич", "Дорожный рабочий", "Специалисты", "k_ermek", ""], ["Аяпов Болат Рспаевич", "Механик", "Специалисты", "k_ermek", ""], ["Әбдірахман Сымбат Жексенқұлқызы", "Менеджер по развитию", "Специалисты", "k_ermek", ""], ["Әбдуәли Айдәулет Нұрланұлы", "Подсобный рабочий", "Специалисты", "k_ermek", ""], ["Баймагамбетов Еркин Дукетбаевич", "Начальник планово-экономического отдела", "Начальники", "k_ermek", ""], ["Баймолдин Куаныш Маратович", "Менеджер отдела снабжения", "Специалисты", "k_ermek", "v_shevchenko"], ["Баукенов Ардак Мейрамулы", "Менеджер отдела снабжения", "Специалисты", "k_ermek", ""], ["Баянбек Тимур", "Производитель работ", "Специалисты", "k_ermek", ""], ["Бибик Людмила Сергеевна", "Заведующий складом", "Специалисты", "k_ermek", ""], ["Бижуманова Зарина Есканатовна", "Начальник производственно-технического отдела", "Начальники", "k_ermek", ""], ["Бодягин Сергей Павлович", "Машинист погрузчика", "Специалисты", "k_ermek", ""], ["Болысов Ракымжан Естемесович", "Машинист автогрейдера", "Специалисты", "k_ermek", ""], ["Булатов Алмаз Аманжолович", "Специалист по учету ГСМ", "Специалисты", "k_ermek", ""], ["Габаев Малик Борисович", "Механик", "Специалисты", "k_ermek", ""], ["Гатовский Михаил Евгеньевич", "Руководитель проекта", "Специалисты", "k_ermek", "v_shevchenko"], ["Гишкелюк Сергей Иосифович", "Руководитель проекта", "Специалисты", "k_ermek", "v_shevchenko"], ["Губская Наталья Ивановна", "HR-Специалист", "Специалисты", "k_ermek", ""], ["Днишев Темирлан Алманович", "Специалист АХЧ", "Специалисты", "k_ermek", ""], ["Дорж Омиртай", "Сторож", "Специалисты", "k_ermek", ""], ["Елеуғазиев Бақытжан Айтқазыұлы", "Геодезист", "Специалисты", "k_ermek", ""], ["Ерджанов Нуртаза Нурджанович", "Машинист экскаватора", "Специалисты", "k_ermek", ""], ["Ерисковский Виталий Евгеньевич", "Производитель работ", "Специалисты", "k_ermek", "v_shevchenko"], ["Ерлік Расул Қанатұлы", "Специалист СБ", "Специалисты", "k_ermek", ""], ["Ермагамбетова Валентина Саиновна", "Инженер ПТО", "Специалисты", "k_ermek", ""], ["Ермаганбетов Мухтар Баяндыевич", "Бухгалтер-материалист", "Специалисты", "k_ermek", ""], ["Жаишібек Елнұр Илинарұлы", "Руководитель проекта", "Специалисты", "k_ermek", "v_shevchenko"], ["Жакаева Алима Абилкановна", "Менеджер по развитию", "Специалисты", "k_ermek", ""], ["Жалмаганова Маржан Кошкимбаевна", "Специалист по государственным закупкам", "Специалисты", "k_ermek", ""], ["Жарқымбаева Қарлығаш Талғатқызы", "Ведущий инженер ПТО", "Специалисты", "k_ermek", ""], ["Жунусов Жуматай Жумашович", "Машинист автогрейдера", "Специалисты", "k_ermek", ""], ["Жұмабекұлы Айболат", "Инженер ПТО", "Специалисты", "k_ermek", "v_shevchenko"], ["Заитова Алия Исмагиловна", "Главный бухгалтер", "Начальники", "k_ermek", ""], ["Ибрашев Жомарт Бактыбаевич", "Машинист гусеничного крана", "Специалисты", "k_ermek", ""], ["Игизбаева Мадина Елюбаевна", "Офис-менеджер", "Специалисты", "k_ermek", ""], ["Ильина Галина Николаевна", "Подсобный рабочий", "Специалисты", "k_ermek", ""], ["Искаков Ерлан Муратович", "Специалист по снабжению", "Специалисты", "k_ermek", ""], ["Кайраханов Досан Бекенович", "Механик", "Специалисты", "k_ermek", "v_shevchenko"], ["Кайроллаев Темирлан Нуртаевич", "Оператор фрезы", "Специалисты", "k_ermek", ""], ["Калиев Серик Маликович", "Начальник отдела геодезии", "Начальники", "k_ermek", ""], ["Капитоненко Алексей Викторович", "Главный механик", "Начальники", "k_ermek", ""], ["Касенов Ермек Ергазыевич", "Управляющий директор", "Руководство", "k_ermek", ""], ["Касенова Арайлым Бакытбековна", "Бухгалтер", "Специалисты", "k_ermek", ""], ["Касенова Жанар Амантаевна", "Финансовый аналитик", "Специалисты", "k_ermek", ""], ["Катвалян Вардан Коляевич", "Водитель легкового автотранспррта", "Специалисты", "k_ermek", ""], ["Кенжалина Булбул Бакытжановна", "Инженер-сметчик", "Специалисты", "k_ermek", ""], ["Кенжебаева Самал Мухтаровна", "Бухгалтер-материалист", "Специалисты", "k_ermek", ""], ["Кеңесбай Дәулет Рүстемұлы", "Дорожный рабочий", "Специалисты", "k_ermek", ""], ["Койлибаев Марат Ерланович", "Директор по строительству", "Руководство", "k_ermek", ""], ["Колесников Александр Иванович", "Инженер ПТО", "Специалисты", "k_ermek", "v_shevchenko"], ["Колесниченко Владимир Борисович", "Машинист катка", "Специалисты", "k_ermek", ""], ["Комар Михаил Юрьевич", "Слесарь", "Специалисты", "k_ermek", ""], ["Кузнецов Сергей Александрович", "Начальник участка", "Начальники", "k_ermek", "v_shevchenko"], ["Локшина Нина Федоровна", "Инженер-сметчик", "Специалисты", "k_ermek", ""], ["Лопухов Александр Сергеевич", "Помощник оператора БСУ", "Специалисты", "k_ermek", ""], ["Лосев Олег Аркадьевич", "Инженер по ОТ и ТБ", "Специалисты", "k_ermek", ""], ["Майрамбаев Канат Жанкелдиулы", "Дорожный рабочий", "Специалисты", "k_ermek", ""], ["Максимов Павел Валерьевич", "Прораб (производитель работ)", "Специалисты", "k_ermek", "v_shevchenko"], ["Малгаждар Саят Зиятулы", "Заместитель начальника отдела снабжения", "Специалисты", "k_ermek", ""], ["Матолинец Дмитрий Валерьевич", "Дорожный рабочий", "Специалисты", "k_ermek", ""], ["Мешитбаева Куралай Махамбетовна", "уборщица помещений", "Специалисты", "k_ermek", ""], ["Моисеева Нина Петровна", "Инженер-сметчик", "Специалисты", "k_ermek", ""], ["Мустафин Сагдат Шахматович", "Машинист экскаватора", "Специалисты", "k_ermek", ""], ["Нагметжанов Биржан Камалович", "начальник участка", "Специалисты", "k_ermek", ""], ["Наурызов Диас Сарсенбекұлы", "Дорожный рабочий", "Специалисты", "k_ermek", ""], ["Ниязалы Әлібек Берікұлы", "Руководитель проектов", "Специалисты", "k_ermek", "v_shevchenko"], ["Ногай Василий Дмитриевич", "Руководитель проекта", "Специалисты", "k_ermek", ""], ["Омаров Мереке Оразович", "Координатор проекта", "Специалисты", "k_ermek", ""], ["Оспанов Бакытжан Султангалиевич", "Начальник отдела снабжения", "Начальники", "k_ermek", ""], ["Рахимова Гульнур Акылбаевна", "Менеджер отдела снабжения", "Специалисты", "k_ermek", ""], ["Рахманов Канат Усенбаевич", "Оператор автогрейдера", "Специалисты", "k_ermek", ""], ["Рахматуллаев Хамид Акбаралиевич", "Лаборант", "Специалисты", "k_ermek", ""], ["Рахпанов Касымхан Алпысбайулы", "Начальник отдела снабжения", "Начальники", "k_ermek", ""], ["Рыбалкин Илья Геннадьевич", "Машинист экскаватора", "Специалисты", "k_ermek", ""], ["Рыбалкина Ольга Викторовна", "Подсобный рабочий", "Специалисты", "k_ermek", ""], ["Сағат Заңгар Дінмухамедұлы", "Подсобный рабочий", "Специалисты", "k_ermek", ""], ["Сағатов Нуртөре Дінмухамедұлы", "Учетчик", "Специалисты", "k_ermek", "v_shevchenko"], ["Садуакасов Орынбасар Ардақұлы", "машинист фрезы", "Специалисты", "k_ermek", ""], ["Салкенова Молдргоз Айдаркеновна", "Инженер ПТО", "Специалисты", "k_ermek", ""], ["Сапуанов Тельман Гайсинович", "Водитель Миксера", "Специалисты", "k_ermek", ""], ["Сейткапаров Аслан Жексебаевич", "Инженер ПТО", "Специалисты", "k_ermek", ""], ["Селин Илья Александрович", "Охранник", "Специалисты", "k_ermek", ""], ["Симаков Александр Николаевич", "Мастер участка", "Специалисты", "k_ermek", "v_shevchenko"], ["Сулейменов Алмаз Омурзакович", "Инженер по ОТ и ТБ", "Специалисты", "k_ermek", ""], ["Сыздыкова Ольга Васильевна", "уборщица помещений", "Специалисты", "k_ermek", ""], ["Таймуханбетов Серик Келмуханбетович", "Сторож", "Специалисты", "k_ermek", ""], ["Танкиев Серик Орунбасович", "Финансовый менеджер", "Специалисты", "k_ermek", ""], ["Танкиева Анар Нурболатовна", "Менеджер", "Специалисты", "k_ermek", ""], ["Тасимов Еркебулан Серикович", "Прораб (производитель работ)", "Специалисты", "k_ermek", ""], ["Тасимов Ислам Серикович", "Дорожный рабочий", "Специалисты", "k_ermek", ""], ["Таубаев Жалгасбай Ахылбаевич", "Дорожный рабочий", "Специалисты", "k_ermek", ""], ["Теберіков Мадияр Сардарбекұлы", "Помошник геодезиста", "Специалисты", "k_ermek", ""], ["Тен Виталий Юрьевич", "Юрист", "Специалисты", "k_ermek", ""], ["Тлеулесов Ануар Баянбекович", "Начальник дорожной лаборатории", "Специалисты", "k_ermek", "v_shevchenko"], ["Торебеков Ержигит Муратбекович", "Начальник участка по строительству дорог", "Специалисты", "k_ermek", ""], ["Тохсанбаев Танат Толейбекулы", "Водитель легкового автотранспррта", "Специалисты", "k_ermek", ""], ["Төлеуов Рустем Наурзбайұлы", "Машинист катка", "Специалисты", "k_ermek", ""], ["Төлеухан Алмаз Амантайұлы", "Юрист", "Специалисты", "k_ermek", ""], ["Уразметов Мухаммат Жиянбаевич", "Мастер участка", "Специалисты", "k_ermek", "v_shevchenko"], ["Утегенов Даулет Мурзагалиевич", "Геодезист", "Специалисты", "k_ermek", "v_shevchenko"], ["Утельбаева Динара Бауржановна", "Менеджер по развитию", "Специалисты", "k_ermek", ""], ["Хусаинов Алмас Абдулхасенович", "и.о. начальника участка", "Специалисты", "k_ermek", "v_shevchenko"], ["Шаймерденов Зейнур Куснуллаевич", "Водитель Миксера", "Специалисты", "k_ermek", ""], ["Шалманов Бауыржан Талапович", "Начальник участка", "Специалисты", "k_ermek", ""], ["Шарипов Амангельди Нургабылович", "Начальник участка", "Специалисты", "k_ermek", ""], ["Шәріпбай Ақкенже Шәріпбайқызы", "Инженер ПТО", "Специалисты", "k_ermek", ""], ["Шевченко Владимир Викторович", "Заместитель директора по строительству", "Начальники", "k_ermek", ""], ["Шишкин Юрий Геннадьевич", "Производитель работ", "Специалисты", "k_ermek", "v_shevchenko"], ["Шіркінбай Алтынбек Еркінбекұлы", "Машинист экскаватора", "Специалисты", "k_ermek", ""], ["Шохшин Бекзат Сейсембекович", "Водитель легкового автотранспррта", "Специалисты", "k_ermek", ""], ["Шохшин Жандос Сарсенбекович", "Директор", "Руководство", "k_ermek", ""], ["Шохшина Айзат Жексенкуловна", "Бухгалтер", "Специалисты", "k_ermek", ""], ["Юкасканов Бауыржан Бекенович", "Машинист бульдозера", "Специалисты", "k_ermek", ""], ["Альжанов Жусуп Эрбатырович", "Водитель автобуса", "Специалисты", "k_ermek", ""], ["Аслан-оглы Рашид Асланович", "Оператор буровой установки", "Оператор", "k_ermek", ""], ["Аслан-оглы Хусейн Асланович", "Помощник оператора буровой установки", "Оператор", "k_ermek", ""], ["Аубакиров Ансаган Казанбаевич", "Оператор асфальтоукладчика", "Специалисты", "k_ermek", ""], ["Аубакиров Бекзат Берикович", "Оператор асфальтоукладчика", "Специалисты", "k_ermek", ""], ["Әбілкаиров Нұрбек Бейсенбайұлы", "Оператор асфальтоукладчика", "Специалисты", "k_ermek", ""], ["Байтасов Турар Керимбайулы", "Водитель грузового автомобиля", "Специалисты", "k_ermek", ""], ["Бедельбаев Канат Рафикович", "Водитель грузового автомобиля Тонар", "Специалисты", "k_ermek", ""], ["Безлер Евгений Викторович", "Водитель грузового автомобиля", "Специалисты", "k_ermek", ""], ["Беккалиев Сагындык Султанович", "Водитель грузового автомобиля Тонар", "Специалисты", "k_ermek", ""], ["Бекмагамбетов Казиз Турсунович", "Водитель грузового автомобиля", "Специалисты", "k_ermek", ""], ["Боярский Антон Петрович", "Машинист катка", "Специалисты", "k_ermek", ""], ["Бурнашов Виктор Сергеевич", "Водитель грузового автомобиля", "Специалисты", "k_ermek", ""], ["Винокуров Владимир Васильевич", "Водитель манипулятора", "Специалисты", "k_ermek", ""], ["Ескараев Нурлан Дуйсенгазиевич", "Водитель грузового автомобиля", "Специалисты", "k_ermek", ""], ["Ефименко Николай Николаевич", "Водитель грузового автомобиля Самосвал", "Специалисты", "k_ermek", ""], ["Избасаров Бауржан Тыништыкович", "Водитель грузового автомобиля", "Специалисты", "k_ermek", ""], ["Избасаров Канат Тынштыкпаевич", "Механик", "Специалисты", "k_ermek", ""], ["Илгамов Наил Нагимзянович", "Водитель грузового автомобиля Самосвал", "Специалисты", "k_ermek", ""], ["Искаков Ерлан Муратович", "Специалист отдела снабжения", "Специалисты", "k_ermek", ""], ["Карин Канат Асланович", "Диспетчер", "Специалисты", "k_ermek", ""], ["Кармажаков Сергей Львович", "Водитель грузового автомобиля", "Тралист", "k_ermek", ""], ["Кисамиденов Кожахмет Рахметоллаевич", "Оператор асфальтоукладчика", "Специалисты", "k_ermek", ""], ["Комар Владислав Юрьевич", "Слесарь", "Специалисты", "k_ermek", ""], ["Косов Асет Суюндыкович", "Водитель грузового автомобиля", "Специалисты", "k_ermek", ""], ["Крыкбаев Талимжан Амантаевич", "менеджер отдела механизации", "Специалисты", "k_ermek", ""], ["Кульсаринов Куаныш Мажитович", "Водитель грузового автомобиля Тонар", "Специалисты", "k_ermek", ""], ["Кумакбаев Амангильды Калиевич", "Водитель грузового автомобиля", "Тралист", "k_ermek", ""], ["Кучеренков Игорь Викторович", "Водитель грузового автомобиля", "Специалисты", "k_ermek", ""], ["Қасенбек Нұрбол", "оператор погрузчика", "Специалисты", "k_ermek", ""], ["Қинаят Жалғас Асхатұлы", "Машинист катка", "Специалисты", "k_ermek", ""], ["Маргун Валентина Васильевна", "медицинская сестра", "Специалисты", "k_ermek", ""], ["Машенов Бауыржан Джуматаевич", "Водитель грузового автомобиля Тонар", "Специалисты", "k_ermek", ""], ["Мельников Вадим Андреевич", "Оператор буровой установки", "Оператор", "k_ermek", ""], ["Мухаев Нурали Турсунбаевич", "Водитель грузового автомобиля", "Специалисты", "k_ermek", ""], ["Осимов Серикбек Оспанович", "Водитель грузового автомобиля", "Специалисты", "k_ermek", ""], ["Өтепберген Абзал Есқожаұлы", "Руководитель транспортной логистики", "Специалисты", "k_ermek", ""], ["Рысбаев Бекзатгали Абдирахимбаевич", "Водитель грузового автомобиля Самосвал", "Специалисты", "k_ermek", ""], ["Садыбеков Аскар Чапаевич", "Водитель грузового автомобиля", "Специалисты", "k_ermek", ""], ["Сатпеков Ансаган Ерсинович", "Машинист катка", "Специалисты", "k_ermek", ""], ["Сериков Азамат Аскарович", "Механик", "Специалисты", "k_ermek", ""], ["Серікбол Ерасыл Еркінұлы", "Машинист катка", "Специалисты", "k_ermek", ""], ["Сизихин Аркадий Валериевич", "Машинист погрузчика", "Специалисты", "k_ermek", ""], ["Сулейменов Жасулан Муратович", "Главный бухгалтер", "Начальники", "k_ermek", ""], ["Текебаев Данияр Кайратович", "Оператор асфальтоукладчика", "Специалисты", "k_ermek", ""], ["Тлеубаев Арман Азаматұлы", "Оператор асфальтоукладчика", "Специалисты", "k_ermek", ""], ["Токин Ислам Асылбекович", "Машинист катка", "Специалисты", "k_ermek", ""], ["Тукеев Асхат Амангельдаевич", "Машинист катка", "Специалисты", "k_ermek", ""], ["Тылик Константин Константинович", "Водитель грузового автомобиля", "Специалисты", "k_ermek", ""], ["Чимирюк Виктор Николаевич", "Водитель грузового автомобиля Самосвал", "Специалисты", "k_ermek", ""], ["Чимирюк Николай Иванович", "Водитель топливозаправщика", "Специалисты", "k_ermek", ""], ["Шаруда Николай Николаевич", "Водитель грузового автомобиля", "Специалисты", "k_ermek", ""], ["Шойбалсан Бәйдібек Талғатұлы", "Водитель грузового автомобиля Самосвал", "Специалисты", "k_ermek", ""], ["Шумилов Александр Владимирович", "Водитель автобуса", "Специалисты", "k_ermek", ""], ["Щучкин Александр Владимирович", "Водитель грузового автомобиля", "Тралист", "k_ermek", ""]];
+const hrEmployeeName_ = v=>String(v||'').normalize('NFC').replace(/\s+/g,' ').trim().toLocaleLowerCase('ru-RU');
+const hrDeputyEmployeeNames_ = [...new Set(hrEmployeeDirectory_.filter(r=>r[4]==='v_shevchenko').map(r=>hrEmployeeName_(r[0])))];
+const hrDeputyCanSee_ = name=>hrDeputyEmployeeNames_.includes(hrEmployeeName_(name));
+function hrDirectoryRecord_(b){
+ const matches=hrEmployeeDirectory_.filter(r=>hrEmployeeName_(r[0])===hrEmployeeName_(b.employee)
+  &&hrEmployeeName_(r[1])===hrEmployeeName_(b.position)&&hrEmployeeName_(r[2])===hrEmployeeName_(b.category));
+ if(!matches.length)throw Object.assign(new Error('Выберите сотрудника и его должность из актуального списка'),{status:400});
+ return matches[0];
+}
+
+function hrTripValidatedData_(b){
+  const entry=hrDirectoryRecord_(b);
+  b={...b,employee:entry[0],position:entry[1],category:entry[2]};
   const employee=hrRequired_(b.employee,'employee');
   const position=hrRequired_(b.position,'position');
   const category=hrRequired_(b.category,'category');
@@ -18480,7 +18501,7 @@ app.post('/hr/trips',hrApiGuard_,async(req,res)=>{
   const d1=new Date(from+'T00:00:00Z'),d2=new Date(to+'T00:00:00Z');
   if(!iso.test(from)||!iso.test(to)||Number.isNaN(d1.getTime())||Number.isNaN(d2.getTime())||d1.toISOString().slice(0,10)!==from||d2.toISOString().slice(0,10)!==to||d2<d1)throw Object.assign(new Error('Неверный период командировки'),{status:400});
   const periodDays=Math.round((d2-d1)/86400000)+1;
-  const days=b.days_count===''||b.days_count==null?periodDays:Number(b.days_count);
+  const days=periodDays;
   const overnight=cleanedStays.reduce((n,x)=>n+x.nights,0);
   if(!Number.isInteger(days)||days<1||days>366||!Number.isInteger(overnight)||overnight<0||overnight>days)
     throw Object.assign(new Error('Неверное количество суток или дней проживания'),{status:400});
@@ -18507,6 +18528,15 @@ app.post('/hr/trips',hrApiGuard_,async(req,res)=>{
 
   if(days>366)throw Object.assign(new Error('Период превышает 366 дней'),{status:400});
   const parts=destination.split(',');const city=parts.shift().trim();const country=parts.join(',').trim()||'Казахстан';
+  return {employee,position,category,legal,city,country,cityType,from,to,purpose,days,dailyRate,perDiem,lodging,route,overnight,cleanedStays};
+}
+
+app.post('/hr/trips',hrApiGuard_,async(req,res)=>{
+ const client=await pool.connect();
+ try{
+  const b=req.body||{},login=hrLogin_(b.login);
+  if(!login)throw Object.assign(new Error('LOGIN_REQUIRED'),{status:400});
+  const {employee,position,category,legal,city,country,cityType,from,to,purpose,days,dailyRate,perDiem,lodging,route,overnight,cleanedStays}=hrTripValidatedData_(b);
   await client.query('BEGIN');
   // В форме оставлены только поля Google Формы. Старые колонки в БД
   // сохраняются для совместимости с историческими заявками.
@@ -18523,6 +18553,96 @@ app.post('/hr/trips',hrApiGuard_,async(req,res)=>{
   res.status(201).json({success:true,id:after.rows[0].request_no});
  }catch(e){try{await client.query('ROLLBACK')}catch(_){}hrError_(res,e)}finally{client.release()}
 });
+// Инициатор может отозвать только свою ещё не подписанную заявку.
+app.post('/hr/trips/withdraw',hrApiGuard_,async(req,res)=>{
+ const client=await pool.connect();
+ try{
+  const user=await getAuthenticatedFtUser(req,client);
+  const login=hrLogin_(user && user.login);
+  if(!login)throw Object.assign(new Error('Войдите в Service NS заново'),{status:401});
+  const id=hrClean_((req.body||{}).id,80);
+  if(!/^\d+$/.test(id))throw Object.assign(new Error('Неверный номер заявки'),{status:400});
+  await client.query('BEGIN');
+  // UPDATE блокирует строку: одновременное подписание и отзыв не могут пройти оба.
+  const updated=await client.query(`UPDATE hr.trip_requests
+    SET status='cancelled',updated_at=now()
+    WHERE request_no=$1 AND lower(btrim(created_by_login))=$2
+      AND status='submitted' AND director_decided_at IS NULL
+    RETURNING id`,[id,login]);
+  if(updated.rowCount!==1)throw Object.assign(new Error('Можно отозвать только свою заявку, которая ещё не подписана и не обработана'),{status:409});
+  await client.query(`INSERT INTO hr.trip_approval_log
+    (trip_id,actor_login,action,previous_status,new_status,comment_text)
+    VALUES($1,$2,'withdraw','submitted','cancelled','Заявка отозвана инициатором')`,[updated.rows[0].id,login]);
+  await client.query('COMMIT');
+  res.json({success:true,status:hrStatusLabel_('cancelled')});
+ }catch(e){try{await client.query('ROLLBACK')}catch(_){}hrError_(res,e)}finally{client.release()}
+});
+
+
+// Только кадровик h_r: изменение данных без изменения автора и статуса.
+app.post('/hr/trips/update',hrApiGuard_,async(req,res)=>{
+ const client=await pool.connect();
+ try{
+  const user=await getAuthenticatedFtUser(req,client);
+  if(!user||hrLogin_(user.login)!=='h_r')
+    throw Object.assign(new Error('Редактирование доступно только кадровику h_r'),{status:403});
+  const b=req.body||{},id=hrClean_(b.id,80);
+  if(!/^\d+$/.test(id))throw Object.assign(new Error('Неверный номер заявки'),{status:400});
+  const {employee,position,category,legal,city,country,cityType,from,to,purpose,days,dailyRate,perDiem,lodging,route,overnight,cleanedStays}=hrTripValidatedData_(b);
+  await client.query('BEGIN');
+  const found=await client.query('SELECT * FROM hr.trip_requests WHERE request_no=$1 FOR UPDATE',[id]);
+  const trip=found.rows[0];
+  if(!trip)throw Object.assign(new Error('Заявка не найдена'),{status:404});
+  if(!['draft','submitted','rejected','cancelled'].includes(trip.status)||trip.order_pdf_url)
+    throw Object.assign(new Error('После подписания изменение данных запрещено'),{status:409});
+  const currentTime=new Date(trip.updated_at||trip.created_at).getTime();
+  const expectedTime=new Date(b.expected_updated_at).getTime();
+  if(!Number.isFinite(expectedTime)||expectedTime!==currentTime)
+    throw Object.assign(new Error('Заявка уже изменена. Обновите список и откройте её заново'),{status:409});
+  await client.query(`UPDATE hr.trip_requests SET
+    employee_name=$2,job_title=$3,employee_category=$4,legal_entity=$5,
+    destination_city=$6,destination_country=$7,city_category=$8,date_from=$9::date,date_to=$10::date,
+    purpose=$11,days_count=$12,daily_rate=$13,per_diem_amount=$14,lodging_amount=$15,
+    total_amount=$16,travel_route=$17,lodging_days=$18,lodging_stays=$19::jsonb,updated_at=now()
+    WHERE id=$1`,[trip.id,employee,position,category,legal,city,country,cityType,from,to,purpose,
+     days,dailyRate,perDiem,lodging,perDiem+lodging+Number(trip.travel_amount||0)+Number(trip.other_amount||0),route,overnight,JSON.stringify(cleanedStays)]);
+  await client.query(`INSERT INTO hr.trip_approval_log
+    (trip_id,actor_login,action,previous_status,new_status,comment_text)
+    VALUES($1,$2,'edit',$3,$3,'Данные заявки изменены кадровиком до подписания')`,[trip.id,user.login,trip.status]);
+  await client.query('COMMIT');
+  res.json({success:true,id:id});
+ }catch(e){try{await client.query('ROLLBACK')}catch(_){}hrError_(res,e)}finally{client.release()}
+});
+
+
+// Необязательное согласование Шевченко: статус submitted сохраняется.
+// Подпись k_ermek никогда не зависит от этого согласования.
+app.post('/hr/trips/deputy-approve',hrApiGuard_,async(req,res)=>{
+ const client=await pool.connect();
+ try{
+  const user=await getAuthenticatedFtUser(req,client);
+  if(!user||hrLogin_(user.login)!=='v_shevchenko')
+    throw Object.assign(new Error('Согласование доступно только v_shevchenko'),{status:403});
+  const id=hrClean_((req.body||{}).id,80);
+  if(!/^\d+$/.test(id))throw Object.assign(new Error('Неверный номер заявки'),{status:400});
+  await client.query('BEGIN');
+  const q=await client.query('SELECT * FROM hr.trip_requests WHERE request_no=$1 FOR UPDATE',[id]);
+  const trip=q.rows[0];
+  if(!trip||!hrDeputyCanSee_(trip.employee_name))throw Object.assign(new Error('Нет доступа к этой заявке'),{status:403});
+  if(trip.status!=='submitted'||trip.director_decided_at)
+    throw Object.assign(new Error('Согласование возможно только до подписания, пока заявка ожидает подписи'),{status:409});
+  const latest=await client.query(`SELECT action FROM hr.trip_approval_log
+    WHERE trip_id=$1 AND action IN ('deputy_approve','edit','withdraw')
+    ORDER BY occurred_at DESC,id DESC LIMIT 1`,[trip.id]);
+  if(latest.rows[0]?.action!=='deputy_approve'){
+   await client.query(`INSERT INTO hr.trip_approval_log(trip_id,actor_login,action,previous_status,new_status,comment_text)
+    VALUES($1,$2,'deputy_approve','submitted','submitted','Согласовано Шевченко. Подпись директора независима')`,[trip.id,user.login]);
+  }
+  await client.query('COMMIT');
+  res.json({success:true,deputy_approved:true});
+ }catch(e){try{await client.query('ROLLBACK')}catch(_){}hrError_(res,e)}finally{client.release()}
+});
+
 app.post('/hr/trips/review',hrApiGuard_,async(req,res)=>{
  const client=await pool.connect();
  try{
