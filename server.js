@@ -18684,6 +18684,11 @@ function hrOrderDate_(d) {
   const x=String(d instanceof Date?d.toISOString().slice(0,10):d||'').slice(0,10);
   return /^\d{4}-\d\d-\d\d$/.test(x)?x.slice(8)+'.'+x.slice(5,7)+'.'+x.slice(0,4):x;
 }
+function hrOrderDateValid_(value){
+ if(!/^\d{4}-\d{2}-\d{2}$/.test(value)||Number(value.slice(0,4))<1)return false;
+ const parsed=new Date(value+'T00:00:00Z');
+ return Number.isFinite(parsed.getTime())&&parsed.toISOString().slice(0,10)===value;
+}
 function hrOrderDefaultNumber_(r){
   const year=String(r.created_at instanceof Date?r.created_at.toISOString():r.created_at||new Date().toISOString()).slice(0,4);
   return 'КМ-'+year+'-'+String(r.request_no).padStart(6,'0');
@@ -18809,9 +18814,15 @@ app.post('/hr/trips/hr-confirm',hrApiGuard_,async(req,res)=>{
   await hrLocalEnsureReady_();
   const user=await getAuthenticatedFtUser(req,c);
   if(!user||hrLogin_(user.login)!=='h_r')throw Object.assign(new Error('Доступ только кадровику h_r'),{status:403});
-  const id=Number(req.body?.id),number=hrClean_(req.body?.order_number,60),date=hrClean_(req.body?.order_date,10);
-  if(!Number.isSafeInteger(id)||id<1||!/^КМ-\d{4}-\d{6}$/.test(number)||!/^\d{4}-\d\d-\d\d$/.test(date)||!Number.isFinite(Date.parse(date+'T00:00:00Z')))
-    throw Object.assign(new Error('Некорректный номер или дата приказа'),{status:400});
+  const id=Number(req.body?.id);
+  const number=String(req.body?.order_number??'').trim();
+  const date=String(req.body?.order_date??'').trim();
+  if(!Number.isSafeInteger(id)||id<1)
+    throw Object.assign(new Error('Некорректный номер заявки'),{status:400});
+  if(!number||number.length>60||/[\u0000-\u001f\u007f]/.test(number))
+    throw Object.assign(new Error('Укажите номер приказа: от 1 до 60 символов, без переноса строки'),{status:400});
+  if(!hrOrderDateValid_(date))
+    throw Object.assign(new Error('Укажите корректную дату приказа'),{status:400});
   await c.query('BEGIN');await c.query('SELECT pg_advisory_xact_lock($1::bigint)',[id]);
   const q=await c.query(`SELECT * FROM hr.trip_requests WHERE request_no=$1 FOR UPDATE`,[id]);
   if(!q.rowCount)throw Object.assign(new Error('Заявка не найдена'),{status:404});
