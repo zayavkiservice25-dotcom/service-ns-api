@@ -18754,6 +18754,10 @@ async function hrLocalFinanceInit_(){
    trip_id bigint PRIMARY KEY REFERENCES hr.trip_requests(id),id_ft text UNIQUE NOT NULL,
    zvk_row_id bigint UNIQUE NOT NULL,registry_id bigint,amount numeric(18,2) NOT NULL,
    created_at timestamptz NOT NULL DEFAULT now())`);
+ await pool.query(`CREATE TABLE IF NOT EXISTS hr.local_trip_shortfall_notices (
+   trip_id bigint PRIMARY KEY REFERENCES hr.trip_requests(id),
+   required numeric(18,2) NOT NULL,available numeric(18,2) NOT NULL,
+   sent_at timestamptz,attempts integer NOT NULL DEFAULT 0,last_error text)`);
  console.log('[HR FIN] Local trip tables ready');
 }
 async function hrLocalRegistry_(c,row,source,entity){
@@ -18777,6 +18781,14 @@ async function hrLocalRegistry_(c,row,source,entity){
  return registry.rows[0].id;
 }
 async function hrLocalFund_(c,row,legal){
+ // All callers hold the same transaction lock, including new HR confirmations.
+ // Separate queues by legal entity: unrelated pools do not block each other.
+ const first=await c.query(`SELECT l.trip_id FROM hr.local_trip_finance_links l
+   JOIN hr.trip_requests r ON r.id=l.trip_id WHERE l.registry_id IS NULL
+   AND lower(btrim(r.legal_entity))=lower(btrim($1))
+   ORDER BY CASE WHEN l.id_ft ~ '^FT[0-9]+$' THEN substring(l.id_ft from 3)::numeric END NULLS LAST,
+     l.created_at,l.trip_id LIMIT 1`,[legal]);
+ if(String(first.rows[0]?.trip_id)!==String(row.trip_id))return null;
  const funds=await c.query(`SELECT p.id,p.source_name,
   p.amount-COALESCE((SELECT SUM(a.amount) FROM public.zvk_funding_pool_allocations a WHERE a.funding_pool_id=p.id),0) AS free
   FROM public.draft_funding_pool p WHERE p.is_active=true AND p.parent_pool_id IS NOT NULL
@@ -18784,7 +18796,13 @@ async function hrLocalFund_(c,row,legal){
   AND lower(btrim(p.money_type))=lower('Тек') AND nullif(btrim(p.source_name),'') IS NOT NULL
   ORDER BY free DESC,p.id FOR UPDATE OF p`,[legal]);
  const chosen=funds.rows.find(x=>Number(x.free)>=Number(row.amount));
- if(!chosen)return null;
+ if(!chosen){
+  const available=Math.max(0,...funds.rows.map(x=>Number(x.free)||0));
+  await c.query(`INSERT INTO hr.local_trip_shortfall_notices(trip_id,required,available)
+    VALUES($1,$2,$3) ON CONFLICT(trip_id) DO UPDATE
+    SET required=EXCLUDED.required,available=EXCLUDED.available`,[row.trip_id,row.amount,available]);
+  return null;
+ }
  await c.query(`INSERT INTO public.zvk_funding_pool_allocations(zvk_row_id,funding_pool_id,amount,created_by)
  VALUES($1,$2,$3,'HR') ON CONFLICT(zvk_row_id,funding_pool_id) DO NOTHING`,[row.zvk_row_id,chosen.id,row.amount]);
  await c.query(`UPDATE public.zvk_status SET src_o=$2,src_d=$3 WHERE zvk_row_id=$1`,[row.zvk_row_id,chosen.source_name,legal]);
@@ -18792,21 +18810,58 @@ async function hrLocalFund_(c,row,legal){
  await c.query(`UPDATE hr.local_trip_finance_links SET registry_id=$2 WHERE trip_id=$1`,[row.trip_id,registryId]);
  return registryId;
 }
+let hrLocalShortfallBusy_=false;
+async function hrLocalShortfallDispatch_(){
+ if(hrLocalShortfallBusy_||!TELEGRAM_TOKEN_NS_)return;
+ hrLocalShortfallBusy_=true;
+ try{
+  const pending=await pool.query(`SELECT n.trip_id FROM hr.local_trip_shortfall_notices n
+    JOIN hr.local_trip_finance_links l USING(trip_id)
+    WHERE n.sent_at IS NULL AND l.registry_id IS NULL ORDER BY n.trip_id LIMIT 30`);
+  for(const item of pending.rows){
+   const c=await pool.connect();
+   try{
+    await c.query('BEGIN');
+    const q=await c.query(`SELECT n.*,l.id_ft,r.employee_name,r.legal_entity
+      FROM hr.local_trip_shortfall_notices n
+      JOIN hr.local_trip_finance_links l USING(trip_id)
+      JOIN hr.trip_requests r ON r.id=n.trip_id
+      WHERE n.trip_id=$1 AND n.sent_at IS NULL AND l.registry_id IS NULL
+      FOR UPDATE OF n SKIP LOCKED`,[item.trip_id]);
+    if(q.rows.length){
+     const n=q.rows[0];
+     const msg='Недостаточно денег в пуле командировок\nФТ: '+n.id_ft+
+       '\nОрганизация: '+n.legal_entity+'\nСотрудник: '+n.employee_name+
+       '\nТребуется: '+n.required+' ₸\nДоступно в одном подходящем пуле: '+n.available+
+       ' ₸\nФТ ожидает финансирования в очереди.';
+     const result=await telegramNsSendToLogin_('b_erkin',msg);
+     await c.query(`UPDATE hr.local_trip_shortfall_notices SET attempts=attempts+1,
+       sent_at=CASE WHEN $2 THEN now() ELSE sent_at END,last_error=$3 WHERE trip_id=$1`,
+       [n.trip_id,!!result?.sent,result?.sent?null:(result?.reason||'NOT_SENT')]);
+    }
+    await c.query('COMMIT');
+   }catch(e){await c.query('ROLLBACK').catch(()=>{});console.error('[HR FIN] Telegram shortage',item.trip_id,e.message)}
+   finally{c.release()}
+  }
+ }finally{hrLocalShortfallBusy_=false}
+}
 let hrLocalReconBusy_=false;
 async function hrLocalFinanceReconcile_(){
  if(hrLocalReconBusy_)return;hrLocalReconBusy_=true;
  try{
   const pending=await pool.query(`SELECT l.trip_id,l.id_ft,l.zvk_row_id,l.amount,z.id_zvk,r.legal_entity
    FROM hr.local_trip_finance_links l JOIN hr.trip_requests r ON r.id=l.trip_id
-   JOIN public.zvk z ON z.id=l.zvk_row_id WHERE l.registry_id IS NULL LIMIT 100`);
+   JOIN public.zvk z ON z.id=l.zvk_row_id WHERE l.registry_id IS NULL
+   ORDER BY CASE WHEN l.id_ft ~ '^FT[0-9]+$' THEN substring(l.id_ft from 3)::numeric END NULLS LAST,
+     l.created_at,l.trip_id`);
   for(const row of pending.rows){const c=await pool.connect();try{
-    await c.query('BEGIN');await c.query('SELECT pg_advisory_xact_lock($1::bigint)',[row.trip_id]);
+    await c.query('BEGIN');await c.query("SELECT pg_advisory_xact_lock(hashtext('HR_LOCAL_FINANCE_FIFO'))");await c.query('SELECT pg_advisory_xact_lock($1::bigint)',[row.trip_id]);
     const fresh=await c.query('SELECT registry_id FROM hr.local_trip_finance_links WHERE trip_id=$1 FOR UPDATE',[row.trip_id]);
     if(fresh.rows[0]?.registry_id){await c.query('ROLLBACK');continue;}
     const registry=await hrLocalFund_(c,row,row.legal_entity);
-    if(registry)await c.query('COMMIT');else await c.query('ROLLBACK');
+    await c.query('COMMIT'); // Also persist a pending shortage notice; no funds are deducted on failure.
   }catch(e){await c.query('ROLLBACK').catch(()=>{});console.error('[HR FIN] Reconcile',row.trip_id,e.message)}finally{c.release()}}
- }finally{hrLocalReconBusy_=false}
+ }finally{hrLocalReconBusy_=false;void hrLocalShortfallDispatch_().catch(e=>console.error('[HR FIN] Notice',e.message));}
 }
 app.post('/hr/trips/hr-confirm',hrApiGuard_,async(req,res)=>{
  const c=await pool.connect();
@@ -18823,7 +18878,7 @@ app.post('/hr/trips/hr-confirm',hrApiGuard_,async(req,res)=>{
     throw Object.assign(new Error('Укажите номер приказа: от 1 до 60 символов, без переноса строки'),{status:400});
   if(!hrOrderDateValid_(date))
     throw Object.assign(new Error('Укажите корректную дату приказа'),{status:400});
-  await c.query('BEGIN');await c.query('SELECT pg_advisory_xact_lock($1::bigint)',[id]);
+  await c.query('BEGIN');await c.query("SELECT pg_advisory_xact_lock(hashtext('HR_LOCAL_FINANCE_FIFO'))");await c.query('SELECT pg_advisory_xact_lock($1::bigint)',[id]);
   const q=await c.query(`SELECT * FROM hr.trip_requests WHERE request_no=$1 FOR UPDATE`,[id]);
   if(!q.rowCount)throw Object.assign(new Error('Заявка не найдена'),{status:404});
   const trip=q.rows[0];
@@ -18852,6 +18907,7 @@ app.post('/hr/trips/hr-confirm',hrApiGuard_,async(req,res)=>{
   await c.query(`INSERT INTO hr.trip_approval_log(trip_id,actor_login,action,previous_status,new_status,comment_text)
     VALUES($1,'h_r','hr_confirm','signed','hr_confirmed',$2)`,[trip.id,'Приказ '+number]);
   await c.query('COMMIT');
+  setImmediate(()=>void hrLocalFinanceReconcile_().catch(e=>console.error('[HR FIN] Confirm retry',e.message)));
   console.log('[HR FIN] Confirmed',trip.id,idFt,'registry',registry||'awaiting funds');
   res.json({success:true,id_ft:idFt,registry_id:registry,pdf_url:pdfUrl,pending_funds:!registry});
  }catch(e){await c.query('ROLLBACK').catch(()=>{});hrError_(res,e)}finally{c.release()}
