@@ -18520,11 +18520,12 @@ app.get('/hr/trips',hrApiGuard_,async(req,res)=>{
  try{
   const login=hrLogin_(req.query.login);if(!login)return res.status(400).json({success:false,error:'LOGIN_REQUIRED'});
   const director=login==='k_ermek',personnel=login==='h_r',deputy=login==='v_shevchenko';
-  if(director||personnel||deputy){
+  const viewAll=director||personnel||login==='a_zaitova';
+  if(viewAll||deputy){
    const verified=await getAuthenticatedFtUser(req);
    if(!verified||hrLogin_(verified.login)!==login)return res.status(403).json({success:false,error:'HR_SESSION_REQUIRED'});
   }
-  const where=director||personnel?'':deputy
+  const where=viewAll?'':deputy
    ?" WHERE lower(regexp_replace(btrim(r.employee_name),'[[:space:]]+',' ','g'))=ANY($1::text[])"
    :' WHERE lower(btrim(r.employee_login))=$1';
   const q=`SELECT r.*,NULL::text AS signature_status,a.action AS deputy_action,a.occurred_at AS deputy_action_at
@@ -18533,7 +18534,7 @@ app.get('/hr/trips',hrApiGuard_,async(req,res)=>{
       WHERE trip_id=r.id AND action IN ('deputy_approve','edit','withdraw')
       ORDER BY occurred_at DESC,id DESC LIMIT 1
     ) a ON true`+where+' ORDER BY r.created_at DESC,r.id DESC LIMIT 2000';
-  const out=await pool.query(q,(director||personnel)?[]:deputy?[hrDeputyEmployeeNames_]:[login]);
+  const out=await pool.query(q,viewAll?[]:deputy?[hrDeputyEmployeeNames_]:[login]);
   res.json({success:true,is_director:director,is_hr:personnel,is_deputy:deputy,rows:out.rows.map(hrPublic_)});
  }catch(e){hrError_(res,e)}
 });
