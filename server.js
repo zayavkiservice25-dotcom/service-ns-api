@@ -1956,6 +1956,7 @@ await pool.query(`
     ADD COLUMN IF NOT EXISTS supplier_name text,
     ADD COLUMN IF NOT EXISTS contract_details text,
     ADD COLUMN IF NOT EXISTS unit_price numeric(18,2),
+    ADD COLUMN IF NOT EXISTS delivery_cost numeric(18,2),
     ADD COLUMN IF NOT EXISTS payment_invoice text,
     ADD COLUMN IF NOT EXISTS delivery_terms text,
     ADD COLUMN IF NOT EXISTS payment_terms text,
@@ -11817,6 +11818,7 @@ app.get("/lzk/supply", async (req, res) => {
           s.contract_details,
           s.unit_price,
           s.total_cost,
+          s.delivery_cost,
           s.payment_invoice,
           s.delivery_terms,
           s.payment_terms,
@@ -11883,6 +11885,7 @@ app.get("/lzk/supply", async (req, res) => {
           s.contract_details,
           s.unit_price,
           s.total_cost,
+          s.delivery_cost,
           s.payment_invoice,
           s.delivery_terms,
           s.payment_terms,
@@ -11954,6 +11957,12 @@ app.post("/lzk/supply/save", async (req, res) => {
       });
     }
 
+    const hasDeliveryCost = Object.prototype.hasOwnProperty.call(body, "delivery_cost");
+    const deliveryCost = body.delivery_cost == null || String(body.delivery_cost).trim() === "" ? null : lzkNum(body.delivery_cost);
+    if (hasDeliveryCost && body.delivery_cost != null && String(body.delivery_cost).trim() !== "" &&
+        (deliveryCost === null || !Number.isFinite(deliveryCost) || deliveryCost < 0)) {
+      return res.status(400).json({success:false, error:"Стоимость доставки должна быть числом не меньше 0"});
+    }
     await client.query("BEGIN");
 
     const q = await client.query(`
@@ -11981,6 +11990,7 @@ app.post("/lzk/supply/save", async (req, res) => {
         onec_receipt_status,
         purchase_status_note,
         documents_esf,
+        delivery_cost,
         created_at,
         updated_at
       )
@@ -12008,6 +12018,7 @@ app.post("/lzk/supply/save", async (req, res) => {
         $21,
         $22,
         $23,
+        $24,
         NOW(),
         NOW()
       )
@@ -12034,6 +12045,7 @@ app.post("/lzk/supply/save", async (req, res) => {
         onec_receipt_status = EXCLUDED.onec_receipt_status,
         purchase_status_note = EXCLUDED.purchase_status_note,
         documents_esf = EXCLUDED.documents_esf,
+        delivery_cost = CASE WHEN $25::boolean THEN EXCLUDED.delivery_cost ELSE lzk.supply.delivery_cost END,
 
         updated_at = NOW()
       RETURNING *
@@ -12060,7 +12072,9 @@ app.post("/lzk/supply/save", async (req, res) => {
       (body.destination_warehouse_mol ?? null),
       (body.onec_receipt_status ?? null),
       (body.purchase_status_note ?? null),
-      (body.documents_esf ?? null)
+      (body.documents_esf ?? null),
+      deliveryCost,
+      hasDeliveryCost
     ]);
     // ВАЖНО: lzk.limits.fact_received теперь используется как "Одобрено без ЛЗК".
     // Панель снабженца больше не должна перезаписывать это ручное поле.
