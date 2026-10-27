@@ -11779,8 +11779,25 @@ app.get("/lzk/supply", async (req, res) => {
           r.deadline,
           r.documents_url,
           r.pto_status,
-          r.pto_date
+          r.pto_date,
+          CASE WHEN lim.idlzk IS NULL THEN NULL ELSE
+            LEAST(
+              GREATEST(COALESCE(r.fact_qty, 0), 0),
+              GREATEST(
+                COALESCE(lim.plan_qty, 0) - GREATEST(COALESCE(lim.fact_received, 0), 0) -
+                COALESCE(SUM(GREATEST(COALESCE(r.fact_qty, 0), 0)) OVER (
+                  PARTITION BY r.idlzk
+                  ORDER BY r.request_date ASC NULLS FIRST,
+                    NULLIF(regexp_replace(r.idzlzk, '\\D', '', 'g'), '')::bigint ASC NULLS FIRST,
+                    r.idzlzk ASC
+                  ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                ), 0),
+                0
+              )
+            )
+          END AS within_limit_qty
         FROM lzk.requests r
+        LEFT JOIN lzk.limits lim ON lim.idlzk = r.idlzk
         WHERE lower(trim(COALESCE(r.pto_status, '')))
               IN ('согласован', 'согласовано')
       ),
@@ -11794,6 +11811,7 @@ app.get("/lzk/supply", async (req, res) => {
           'base'::text AS row_type,
           a.initiator,
           a.fact_qty AS request_qty,
+          a.within_limit_qty,
           to_char(a.request_date, 'DD.MM.YYYY HH24:MI') AS request_date,
           a.object_name AS object,
           a.constructive_name AS constructive,
@@ -11862,6 +11880,7 @@ app.get("/lzk/supply", async (req, res) => {
           'component'::text AS row_type,
           a.initiator,
           a.fact_qty AS request_qty,
+          a.within_limit_qty,
           to_char(a.request_date, 'DD.MM.YYYY HH24:MI') AS request_date,
           a.object_name AS object,
           a.constructive_name AS constructive,
