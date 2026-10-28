@@ -8431,13 +8431,7 @@ app.post("/request-items-paid-bulk", async (req, res) => {
       throw new Error("Оплачено можно ставить только после утверждения Ермека");
     }
 
-    // Жасулан завершает оплату только после отметки Арай.
-    if (loginNorm === "s_zhasulan") {
-      const withoutAray = divisionCheck.rows.filter(row => String(row.aray_paid || "").trim() !== "Да");
-      if (withoutAray.length) {
-        return res.status(409).json({ success:false, error:"Сначала Арай должна поставить «Оплачено Арай = Да»" });
-      }
-    }
+    // Жасулан завершает оплату независимо от отметки Арай.
 
     if (loginNorm === "k_arailym") {
       const delegatedRows = divisionCheck.rows.filter(row =>
