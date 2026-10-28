@@ -18987,6 +18987,80 @@ async function hrLocalEnsureReady_(){if(hrLocalFinReady_)return;await hrLocalFin
 setTimeout(()=>void hrLocalEnsureReady_().then(()=>hrLocalFinanceReconcile_()).catch(e=>console.error('[HR FIN] Init',e.message)),6500);
 setInterval(()=>void hrLocalEnsureReady_().then(()=>hrLocalFinanceReconcile_()).catch(e=>console.error('[HR FIN] Retry',e.message)),60000).unref?.();
 
+
+// KEDO ORDERS SOURCE — 2026-10-28. Read-only, no finance writes.
+// This route family is separate from the disabled legacy applications API.
+let hrKedoOrdersCache_ = null;
+let hrKedoOrdersLoading_ = null;
+async function hrKedoOrdersAccess_(req,res,next){
+  try {
+    const user=await getAuthenticatedFtUser(req);
+    if(!user)return res.status(401).json({success:false,error:'HR_SESSION_REQUIRED'});
+    const allowed=new Set(['h_r','k_ermek','a_zaitova',
+      ...String(process.env.KEDO_ORDERS_READ_LOGINS||'').split(',').map(x=>x.trim().toLowerCase()).filter(Boolean)]);
+    if(!allowed.has(String(user.login).trim().toLowerCase()))
+      return res.status(403).json({success:false,error:'HR_ACCESS_DENIED'});
+    next();
+  } catch(e){res.status(500).json({success:false,error:'HR_AUTH_FAILED'});}
+}
+async function hrKedoOrderPages_(endpoint){
+  const elements=[];
+  let offset=0;
+  for(let page=0;page<1000;page++){
+    const data=await kedoDriveRequestJson_(endpoint+'&limit=100&offset='+offset);
+    elements.push(...data.elements);offset+=data.elements.length;
+    if(!data.elements.length || (Number.isFinite(Number(data.total)) && offset>=Number(data.total)))return elements;
+  }
+  throw new Error('KEDO_TOO_MANY_PAGES');
+}
+function hrKedoOrderRow_(doc){
+  const v=doc.document_values && typeof doc.document_values==='object'?doc.document_values:{};
+  return {id:String(doc.id),status:'COMPLETED',
+    order_number:v.order_number??doc.document_number??'',order_date:v.order_date??doc.document_date??'',
+    employee:v.employee_full_name_nominative||doc.employee_full_name||'',
+    organization:doc.organization_title||'',destination:v.mission_destination??'',
+    date_from:v.mission_start_date??'',date_to:v.mission_end_date??'',days_count:v.mission_days_count??'',
+    values:v};
+}
+async function hrKedoOrderRows_(){
+  if(!KEDO_ROOT_||!KEDO_TOKEN_)throw new Error('KEDO_NOT_CONFIGURED');
+  if(!/^https:\/\//i.test(KEDO_ROOT_))throw new Error('KEDO_HTTPS_REQUIRED');
+  if(hrKedoOrdersCache_ && Date.now()-hrKedoOrdersCache_.at<60000)return hrKedoOrdersCache_.rows;
+  if(hrKedoOrdersLoading_)return hrKedoOrdersLoading_;
+  hrKedoOrdersLoading_=(async()=>{
+    const from=String(process.env.KEDO_SYNC_FROM||'2026-10-01').trim();
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(from))throw new Error('INVALID_KEDO_SYNC_FROM');
+    const types=await hrKedoOrderPages_('/ext/document-types?title='+encodeURIComponent('командир'));
+    const typeIds=new Set(types.filter(t=>t.id && String(t.title||'').trim().toLowerCase()==='приказ о командировании').map(t=>String(t.id)));
+    // ID documented by KEDO; no application type IDs are used.
+    typeIds.add('00000013-0000-0000-0000-000000000002');
+    const docs=await hrKedoOrderPages_('/ext/documents?status=COMPLETED&created_at_start='+encodeURIComponent(from));
+    const unique=new Map();
+    for(const doc of docs){
+      if(!doc || !KEDO_DRIVE_UUID_RE_.test(String(doc.id||'')) || doc.status!=='COMPLETED' || !typeIds.has(String(doc.document_type_id)))continue;
+      unique.set(String(doc.id),hrKedoOrderRow_(doc));
+    }
+    const rows=[...unique.values()];
+    hrKedoOrdersCache_={at:Date.now(),rows};return rows;
+  })();
+  try{return await hrKedoOrdersLoading_;}finally{hrKedoOrdersLoading_=null;}
+}
+app.get('/hr/kedo-document-orders/summary',hrApiGuard_,hrKedoOrdersAccess_,async(req,res)=>{
+  try{res.set('Cache-Control','no-store');res.json({success:true,rows:await hrKedoOrderRows_()});}
+  catch(e){console.error('[KEDO ORDERS]',e.message);res.status(502).json({success:false,error:e.message});}
+});
+app.get('/hr/kedo-document-orders/pdf',hrApiGuard_,hrKedoOrdersAccess_,async(req,res)=>{
+  try{
+    const id=String(req.query.id||'');
+    if(!KEDO_DRIVE_UUID_RE_.test(id))return res.status(400).json({success:false,error:'INVALID_DOCUMENT_ID'});
+    const rows=await hrKedoOrderRows_();
+    if(!rows.some(r=>r.id===id))return res.status(404).json({success:false,error:'COMPLETED_ORDER_NOT_FOUND'});
+    const bytes=await kedoDriveGetPdf_(id);
+    res.set('Cache-Control','no-store');
+    res.json({success:true,filename:'KEDO_order_'+id+'.pdf',base64:bytes.toString('base64')});
+  }catch(e){console.error('[KEDO ORDERS PDF]',e.message);res.status(502).json({success:false,error:e.message});}
+});
+
 // LOCAL_TRIPS_ONLY: отключены все KEDO HR endpoints.
 app.use('/hr/kedo-', (req,res)=>res.status(410).json({success:false,error:'KEDO_INTEGRATION_DISABLED'}));
 
