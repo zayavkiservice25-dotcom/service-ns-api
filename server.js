@@ -18992,16 +18992,35 @@ setInterval(()=>void hrLocalEnsureReady_().then(()=>hrLocalFinanceReconcile_()).
 // This route family is separate from the disabled legacy applications API.
 let hrKedoOrdersCache_ = null;
 let hrKedoOrdersLoading_ = null;
+const hrKedoOrderAllReaders_ = new Set(['k_ermek','b_erkin','a_zaitova','h_r','s_zhasulan']);
 async function hrKedoOrdersAccess_(req,res,next){
   try {
     const user=await getAuthenticatedFtUser(req);
     if(!user)return res.status(401).json({success:false,error:'HR_SESSION_REQUIRED'});
-    const allowed=new Set(['h_r','k_ermek','a_zaitova',
-      ...String(process.env.KEDO_ORDERS_READ_LOGINS||'').split(',').map(x=>x.trim().toLowerCase()).filter(Boolean)]);
-    if(!allowed.has(String(user.login).trim().toLowerCase()))
-      return res.status(403).json({success:false,error:'HR_ACCESS_DENIED'});
+    req.hrKedoLogin=String(user.login||'').trim().toLowerCase();
+    req.hrKedoViewAll=hrKedoOrderAllReaders_.has(req.hrKedoLogin);
     next();
   } catch(e){res.status(500).json({success:false,error:'HR_AUTH_FAILED'});}
+}
+// Configure only after identifying the actual initiator LOGIN field in KEDO.
+// Example path syntax: document_values.<confirmed_field_name>.
+// Never infer ownership from the travelling employee's name or client login.
+function hrKedoOrderInitiator_(doc){
+  const path=String(process.env.KEDO_ORDER_INITIATOR_PATH||'').trim();
+  if(!path)return '';
+  let value=doc;
+  for(const key of path.split('.')){
+    if(!key || ['__proto__','prototype','constructor'].includes(key) ||
+       !value || typeof value!=='object' || !Object.prototype.hasOwnProperty.call(value,key))return '';
+    value=value[key];
+  }
+  return typeof value==='string'?value.trim().toLowerCase():'';
+}
+function hrKedoOrderVisible_(row,req){
+  return req.hrKedoViewAll===true || Boolean(req.hrKedoLogin && row._initiator_login && row._initiator_login===req.hrKedoLogin);
+}
+function hrKedoOrderPublic_(row){
+  const {_initiator_login,...out}=row;return out;
 }
 async function hrKedoOrderPages_(endpoint){
   const elements=[];
@@ -19015,7 +19034,7 @@ async function hrKedoOrderPages_(endpoint){
 }
 function hrKedoOrderRow_(doc){
   const v=doc.document_values && typeof doc.document_values==='object'?doc.document_values:{};
-  return {id:String(doc.id),status:'COMPLETED',
+  return {id:String(doc.id),status:'COMPLETED',_initiator_login:hrKedoOrderInitiator_(doc),
     order_number:v.order_number??doc.document_number??'',order_date:v.order_date??doc.document_date??'',
     employee:v.employee_full_name_nominative||doc.employee_full_name||'',
     organization:doc.organization_title||'',destination:v.mission_destination??'',
@@ -19046,7 +19065,15 @@ async function hrKedoOrderRows_(){
   try{return await hrKedoOrdersLoading_;}finally{hrKedoOrdersLoading_=null;}
 }
 app.get('/hr/kedo-document-orders/summary',hrApiGuard_,hrKedoOrdersAccess_,async(req,res)=>{
-  try{res.set('Cache-Control','no-store');res.json({success:true,rows:await hrKedoOrderRows_()});}
+  try{
+    const rows=await hrKedoOrderRows_();
+    const missingOwner=rows.some(r=>!r._initiator_login);
+    const message=!req.hrKedoViewAll && (!String(process.env.KEDO_ORDER_INITIATOR_PATH||'').trim() || missingOwner)
+      ?'Часть приказов скрыта: требуется сопоставление логина инициатора с полем КЭДО.' : '';
+    res.set('Cache-Control','no-store');
+    res.json({success:true,view_all:req.hrKedoViewAll,message,
+      rows:rows.filter(r=>hrKedoOrderVisible_(r,req)).map(hrKedoOrderPublic_)});
+  }
   catch(e){console.error('[KEDO ORDERS]',e.message);res.status(502).json({success:false,error:e.message});}
 });
 app.get('/hr/kedo-document-orders/pdf',hrApiGuard_,hrKedoOrdersAccess_,async(req,res)=>{
@@ -19054,7 +19081,7 @@ app.get('/hr/kedo-document-orders/pdf',hrApiGuard_,hrKedoOrdersAccess_,async(req
     const id=String(req.query.id||'');
     if(!KEDO_DRIVE_UUID_RE_.test(id))return res.status(400).json({success:false,error:'INVALID_DOCUMENT_ID'});
     const rows=await hrKedoOrderRows_();
-    if(!rows.some(r=>r.id===id))return res.status(404).json({success:false,error:'COMPLETED_ORDER_NOT_FOUND'});
+    if(!rows.some(r=>r.id===id && hrKedoOrderVisible_(r,req)))return res.status(404).json({success:false,error:'COMPLETED_ORDER_NOT_FOUND'});
     const bytes=await kedoDriveGetPdf_(id);
     res.set('Cache-Control','no-store');
     res.json({success:true,filename:'KEDO_order_'+id+'.pdf',base64:bytes.toString('base64')});
