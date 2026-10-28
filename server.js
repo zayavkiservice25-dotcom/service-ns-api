@@ -19032,14 +19032,60 @@ async function hrKedoOrderPages_(endpoint){
   }
   throw new Error('KEDO_TOO_MANY_PAGES');
 }
+// Adapter for the original trip UI and its unchanged 2026 calculation rates.
 function hrKedoOrderRow_(doc){
   const v=doc.document_values && typeof doc.document_values==='object'?doc.document_values:{};
-  return {id:String(doc.id),status:'COMPLETED',_initiator_login:hrKedoOrderInitiator_(doc),
+  const pick=(...keys)=>{for(const key of keys){if(v[key]!==null && v[key]!==undefined && v[key]!=='')return v[key];}return null;};
+  const text=x=>typeof x==='string'||typeof x==='number'?String(x):'';
+  const number=x=>{if(x===null||x===undefined||String(x).trim()==='')return null;const n=Number(String(x).replace(/\s/g,'').replace(',','.'));return Number.isFinite(n)?n:null;};
+  const date=x=>{const raw=text(x).trim();const match=/^(\d{2})\.(\d{2})\.(\d{4})$/.exec(raw);const iso=match?match[3]+'-'+match[2]+'-'+match[1]:raw.slice(0,10);if(!/^\d{4}-\d{2}-\d{2}$/.test(iso))return '';const d=new Date(iso+'T00:00:00Z');return Number.isFinite(d.getTime())&&d.toISOString().slice(0,10)===iso?iso:'';};
+  const employee=text(v.employee_full_name_nominative||doc.employee_full_name);
+  const directory=hrEmployeeDirectory_.filter(r=>hrEmployeeName_(r[0])===hrEmployeeName_(employee));
+  const entry=directory.length===1?directory[0]:null;
+  const category=text(pick('position_type','position_category','employee_category','category','job_type')||entry?.[2]);
+  const position=text(pick('position','job_title','employee_position')||entry?.[1]);
+  const from=date(pick('mission_start_date','trip_start_date')),to=date(pick('mission_end_date','trip_end_date'));
+  const days=from&&to?Math.round((Date.parse(to)-Date.parse(from))/86400000)+1:null;
+  const issues=[];
+  const stated=number(pick('mission_days_count','trip_days_count','days_count'));
+  const validDays=Number.isInteger(days)&&days>0&&days<=366;
+  if(!validDays)issues.push('Не указан корректный период командировки');
+  if(validDays&&stated!==null&&stated!==days)issues.push('Количество суток в API отличается от периода; расчёт выполнен по датам');
+  const categoryKey=/^(оператор|тралист)$/i.test(category)?'specialist':/руковод/i.test(category)?'leader':/началь/i.test(category)?'head':/специал/i.test(category)?'specialist':null;
+  if(!categoryKey)issues.push('Не определена категория сотрудника');
+  const types={major:'major',regional:'regional',district:'district',rural:'rural','1':'major','2':'regional','3':'district','4':'rural'};
+  const stayType=x=>types[text(x).trim().toLowerCase().replace(/^тип\s*/, '')]||'';
+  const stays=[];let invalidStay=false;
+  const addStay=(city,type,nights)=>{const row={city:text(city).trim(),type:stayType(type),nights:number(nights)};if(!row.city||!row.type||!Number.isInteger(row.nights)||row.nights<0||row.nights>366)invalidStay=true;else stays.push(row);};
+  const structured=pick('stays','lodging_stays');
+  if(Array.isArray(structured)){for(const row of structured){if(!row||typeof row!=='object'){invalidStay=true;continue;}addStay(row.city,row.type,row.nights);}}
+  else {
+    const ordinal=['first','second','third','fourth','fifth'];
+    for(let i=1;i<=5;i++){
+      const city=pick('type'+i,'city'+i,'city_'+i),type=pick('living_'+i,'living'+i,'city_type'+i),nights=pick(ordinal[i-1],i===4?'forth':'__unused__','days'+i,'nights'+i);
+      if(city!==null||type!==null||nights!==null)addStay(city,type,nights);
+    }
+  }
+  const nights=stays.reduce((sum,x)=>sum+x.nights,0);
+  const staysComplete=stays.length>0&&!invalidStay&&validDays&&nights<=days;
+  if(!staysComplete)issues.push('Для расчёта проживания нужны города, типы городов и количество ночей');
+  const baseRate=4325;
+  const dailyCoefficients={leader:4,head:3,specialist:2};
+  const hotelCoefficients={leader:{major:10,regional:7,district:5,rural:3},head:{major:7,regional:4,district:4,rural:3},specialist:{major:4,regional:3,district:3,rural:3}};
+  const dailyRate=categoryKey?baseRate*(/^(оператор|тралист)$/i.test(category)?4:dailyCoefficients[categoryKey]):null;
+  const perDiem=validDays&&dailyRate!==null?days*dailyRate:null;
+  const lodging=categoryKey&&staysComplete?stays.reduce((sum,x)=>sum+x.nights*baseRate*hotelCoefficients[categoryKey][x.type],0):null;
+  const owner=hrKedoOrderInitiator_(doc);
+  const destination=text(pick('mission_destination'))||stays.map(x=>x.city).join(' – ');
+  return {id:String(doc.id),status:'Подписан в КЭДО',raw_status:'COMPLETED',kedo_source:true,
+    _initiator_login:owner,created_by_login:owner,
     order_number:v.order_number??doc.document_number??'',order_date:v.order_date??doc.document_date??'',
-    employee:v.employee_full_name_nominative||doc.employee_full_name||'',
-    organization:doc.organization_title||'',destination:v.mission_destination??'',
-    date_from:v.mission_start_date??'',date_to:v.mission_end_date??'',days_count:v.mission_days_count??'',
-    values:v};
+    employee,position,category,legal_entity:doc.organization_title||'',organization:doc.organization_title||'',
+    destination,travel_route:text(pick('travel_route','route'))||destination,purpose:text(pick('mission_purpose','trip_purpose','purpose')),
+    date_from:from,date_to:to,days_count:validDays?days:null,stays,lodging_days:staysComplete?nights:null,
+    daily_rate:dailyRate,per_diem_amount:perDiem,lodging_amount:lodging,
+    total_amount:perDiem!==null&&lodging!==null?perDiem+lodging:null,
+    calculation_message:issues.join('. '),values:v};
 }
 async function hrKedoOrderRows_(){
   if(!KEDO_ROOT_||!KEDO_TOKEN_)throw new Error('KEDO_NOT_CONFIGURED');
