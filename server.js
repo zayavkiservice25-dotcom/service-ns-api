@@ -19093,32 +19093,53 @@ async function hrKedoOrderRows_(){
   if(hrKedoOrdersCache_ && Date.now()-hrKedoOrdersCache_.at<60000)return hrKedoOrdersCache_.rows;
   if(hrKedoOrdersLoading_)return hrKedoOrdersLoading_;
   hrKedoOrdersLoading_=(async()=>{
-    const from=String(process.env.KEDO_SYNC_FROM||'2026-10-01').trim();
-    if(!/^\d{4}-\d{2}-\d{2}$/.test(from))throw new Error('INVALID_KEDO_SYNC_FROM');
-    const types=await hrKedoOrderPages_('/ext/document-types?title='+encodeURIComponent('командир'));
-    const typeIds=new Set(types.filter(t=>t.id && String(t.title||'').trim().toLowerCase()==='приказ о командировании').map(t=>String(t.id)));
-    // ID documented by KEDO; no application type IDs are used.
-    typeIds.add('00000013-0000-0000-0000-000000000002');
-    const docs=await hrKedoOrderPages_('/ext/documents?status=COMPLETED&created_at_start='+encodeURIComponent(from));
+    const from=String(process.env.KEDO_SYNC_FROM||'').trim();
+    if(from && !/^\d{4}-\d{2}-\d{2}$/.test(from))throw new Error('INVALID_KEDO_SYNC_FROM');
+    // Read the live type catalog. Templates may use new IDs and longer titles.
+    const types=await hrKedoOrderPages_('/ext/document-types?title=');
+    const configured=String(process.env.KEDO_ORDER_TYPE_IDS||'').split(',').map(x=>x.trim()).filter(Boolean);
+    if(configured.some(id=>!KEDO_DRIVE_UUID_RE_.test(id)))throw new Error('INVALID_KEDO_ORDER_TYPE_IDS');
+    const typeIds=new Set(configured);
+    for(const type of types){
+      const title=String(type.title||'').normalize('NFC').toLowerCase().replace(/ё/g,'е');
+      if(type.id && /приказ/.test(title) && /командир/.test(title))typeIds.add(String(type.id));
+    }
+    const docs=await hrKedoOrderPages_('/ext/documents?status=COMPLETED'+(from?'&created_at_start='+encodeURIComponent(from):''));
     const unique=new Map();
     for(const doc of docs){
       if(!doc || !KEDO_DRIVE_UUID_RE_.test(String(doc.id||'')) || doc.status!=='COMPLETED' || !typeIds.has(String(doc.document_type_id)))continue;
       unique.set(String(doc.id),hrKedoOrderRow_(doc));
     }
     const rows=[...unique.values()];
-    hrKedoOrdersCache_={at:Date.now(),rows};return rows;
+    const counts=new Map();
+    for(const doc of docs){const id=String(doc.document_type_id||'');counts.set(id,(counts.get(id)||0)+1);}
+    const diagnostics={from:from||null,received:docs.length,matched:rows.length,
+      selected_type_ids:[...typeIds],
+      document_types:types.map(t=>({id:String(t.id||''),title:String(t.title||''),received:counts.get(String(t.id))||0})),
+      received_type_counts:[...counts].map(([id,count])=>({id,count}))};
+    console.log('[KEDO ORDER TYPES]',JSON.stringify(diagnostics));
+    hrKedoOrdersCache_={at:Date.now(),rows,diagnostics};return rows;
   })();
   try{return await hrKedoOrdersLoading_;}finally{hrKedoOrdersLoading_=null;}
 }
 app.get('/hr/kedo-document-orders/summary',hrApiGuard_,hrKedoOrdersAccess_,async(req,res)=>{
   try{
     const rows=await hrKedoOrderRows_();
-    const missingOwner=rows.some(r=>!r._initiator_login);
-    const message=!req.hrKedoViewAll && (!String(process.env.KEDO_ORDER_INITIATOR_PATH||'').trim() || missingOwner)
-      ?'Часть приказов скрыта: требуется сопоставление логина инициатора с полем КЭДО.' : '';
+    const visible=rows.filter(r=>hrKedoOrderVisible_(r,req)).map(hrKedoOrderPublic_);
+    const d=hrKedoOrdersCache_?.diagnostics;
+    let message='';
+    if(!req.hrKedoViewAll){
+      if(!String(process.env.KEDO_ORDER_INITIATOR_PATH||'').trim() || rows.some(r=>!r._initiator_login))
+        message='Не все приказы доступны: не определён логин инициатора в КЭДО.';
+      else if(!visible.length)message='Приказы, привязанные к вашему логину, не найдены.';
+    }else if(!visible.length){
+      if(!d?.selected_type_ids?.length)message='В актуальном списке КЭДО не найден тип приказа о командировке. Проверьте список типов ниже.';
+      else if(!d.received)message='КЭДО вернул 0 документов со статусом COMPLETED'+(d.from?' с '+d.from:' без ограничения даты')+'. Проверьте статус приказов и доступ пользователя токена к организации.';
+      else message='КЭДО вернул документов: '+d.received+', но ни один не прошёл фильтр типов приказа о командировке. Проверьте типы ниже.';
+    }
     res.set('Cache-Control','no-store');
-    res.json({success:true,view_all:req.hrKedoViewAll,message,
-      rows:rows.filter(r=>hrKedoOrderVisible_(r,req)).map(hrKedoOrderPublic_)});
+    res.json({success:true,view_all:req.hrKedoViewAll,message,rows:visible,
+      ...(req.hrKedoViewAll?{diagnostics:d}: {})});
   }
   catch(e){console.error('[KEDO ORDERS]',e.message);res.status(502).json({success:false,error:e.message});}
 });
