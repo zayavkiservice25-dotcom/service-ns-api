@@ -19095,14 +19095,12 @@ async function hrKedoOrderRows_(){
   hrKedoOrdersLoading_=(async()=>{
     const from=String(process.env.KEDO_SYNC_FROM||'').trim();
     if(from && !/^\d{4}-\d{2}-\d{2}$/.test(from))throw new Error('INVALID_KEDO_SYNC_FROM');
-    // Read the live type catalog. Templates may use new IDs and longer titles.
-    const types=await hrKedoOrderPages_('/ext/document-types?title=');
-    const configured=String(process.env.KEDO_ORDER_TYPE_IDS||'').split(',').map(x=>x.trim()).filter(Boolean);
-    if(configured.some(id=>!KEDO_DRIVE_UUID_RE_.test(id)))throw new Error('INVALID_KEDO_ORDER_TYPE_IDS');
-    const typeIds=new Set(configured);
+    // Actual type confirmed in the user's KEDO catalog (2 completed documents).
+    const types=await hrKedoOrderPages_('/ext/document-types?title='+encodeURIComponent('Командировка'));
+    const typeIds=new Set(['31453663-dfb7-4450-b613-dc4c5e8e5c7e']);
     for(const type of types){
-      const title=String(type.title||'').normalize('NFC').toLowerCase().replace(/ё/g,'е');
-      if(type.id && /приказ/.test(title) && /командир/.test(title))typeIds.add(String(type.id));
+      const title=String(type.title||'').normalize('NFC').trim().toLowerCase();
+      if(type.id && title==='командировка')typeIds.add(String(type.id));
     }
     const docs=await hrKedoOrderPages_('/ext/documents?status=COMPLETED'+(from?'&created_at_start='+encodeURIComponent(from):''));
     const unique=new Map();
@@ -19133,13 +19131,12 @@ app.get('/hr/kedo-document-orders/summary',hrApiGuard_,hrKedoOrdersAccess_,async
         message='Не все приказы доступны: не определён логин инициатора в КЭДО.';
       else if(!visible.length)message='Приказы, привязанные к вашему логину, не найдены.';
     }else if(!visible.length){
-      if(!d?.selected_type_ids?.length)message='В актуальном списке КЭДО не найден тип приказа о командировке. Проверьте список типов ниже.';
+      if(!d?.selected_type_ids?.length)message='В КЭДО не найден тип «Командировка».';
       else if(!d.received)message='КЭДО вернул 0 документов со статусом COMPLETED'+(d.from?' с '+d.from:' без ограничения даты')+'. Проверьте статус приказов и доступ пользователя токена к организации.';
-      else message='КЭДО вернул документов: '+d.received+', но ни один не прошёл фильтр типов приказа о командировке. Проверьте типы ниже.';
+      else message='В КЭДО не найдены завершённые документы типа «Командировка» за выбранный период.';
     }
     res.set('Cache-Control','no-store');
-    res.json({success:true,view_all:req.hrKedoViewAll,message,rows:visible,
-      ...(req.hrKedoViewAll?{diagnostics:d}: {})});
+    res.json({success:true,view_all:req.hrKedoViewAll,message,rows:visible});
   }
   catch(e){console.error('[KEDO ORDERS]',e.message);res.status(502).json({success:false,error:e.message});}
 });
