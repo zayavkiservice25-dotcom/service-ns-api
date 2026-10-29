@@ -4052,24 +4052,8 @@ app.get("/request-list", async (req, res) => {
     const params = [];
 
     if (login === "a_zaitova") {
-      // Заитова Алия видит только заявки ЮрЛицо = Сервис НС.
-      params.push("Сервис НС");
-      whereSql = `
-        WHERE EXISTS (
-          SELECT 1
-          FROM public.request_items ri
-          LEFT JOIN public.ft_zvk_current_v2 cur
-            ON cur.zvk_row_id = ri.zvk_row_id
-          WHERE ri.request_id = request_head.id
-            AND lower(trim(
-              COALESCE(
-                NULLIF(cur.legal_entity, ''),
-                NULLIF(ri.src_d, ''),
-                ''
-              )
-            )) = lower($1)
-        )
-      `;
+      // Просмотр всех ЮрЛиц. Ограничения согласования остаются в обработчике действий.
+      whereSql = "";
 
 } else if (login === "s_zhasulan") {
   // Сулейменов видит ВСЕ реестры,
