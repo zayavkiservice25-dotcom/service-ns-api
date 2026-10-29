@@ -19086,7 +19086,8 @@ function hrKedoOrderRow_(doc){
     destination,travel_route:text(pick('misstion_route','travel_route','route'))||destination,purpose:text(pick('mission_purpose','trip_purpose','purpose')),
     date_from:from,date_to:to,days_count:validDays?days:null,stays,lodging_days:stays.length>0&&!invalidNights?nights:null,
     daily_rate:dailyRate,per_diem_amount:perDiem,lodging_amount:lodging,
-    total_amount:perDiem!==null&&lodging!==null?perDiem+lodging:null,
+    // 'Суммы' is the amount provided by KEDO; do not overwrite it with a partial estimate.
+    total_amount:number(pick('Суммы','суммы','sum_amount','total_amount')) ?? (perDiem!==null&&lodging!==null?perDiem+lodging:null),
     calculation_message:issues.join('. '),values:v};
 }
 async function hrKedoOrderRows_(){
@@ -19154,6 +19155,122 @@ app.get('/hr/kedo-document-orders/pdf',hrApiGuard_,hrKedoOrdersAccess_,async(req
   }catch(e){console.error('[KEDO ORDERS PDF]',e.message);res.status(502).json({success:false,error:e.message});}
 });
 
+
+// KEDO DOCUMENT ORDERS -> FT: separate from legacy KEDO applications.
+// Explicitly opt in on Render after reviewing existing documents and funding pools.
+const KEDO_ORDER_FINANCE_ENABLED_ = process.env.KEDO_ORDER_FINANCE_ENABLED === 'true';
+let kedoOrderFinanceBusy_ = false;
+async function kedoOrderFinanceInit_(){
+  await pool.query(`CREATE SCHEMA IF NOT EXISTS hr`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS hr.kedo_order_finance_links (
+    document_id uuid PRIMARY KEY, id_ft text UNIQUE, zvk_row_id bigint UNIQUE,
+    registry_id bigint, amount numeric(18,2) NOT NULL,
+    legal_entity text NOT NULL, employee text NOT NULL,
+    missing_amount numeric(18,2) NOT NULL DEFAULT 0,
+    notice_sent boolean NOT NULL DEFAULT false, created_at timestamptz DEFAULT now())`);
+}
+function kedoOrderFinanceEntity_(name){
+  const n=String(name||'').trim().toLowerCase().replace(/ё/g,'е');
+  if(n==='сервис нс'||n==='тоо сервис нс'||n==='тоо «сервис нс»')return 'Сервис НС';
+  if(n==='жилой дом'||n==='ск жилой дом'||n==='тоо ск жилой дом')return 'Жилой Дом';
+  return null; // Never charge the wrong legal entity.
+}
+async function kedoOrderFinanceTryFund_(c,link){
+  const pools=await c.query(`SELECT p.id,p.source_name,
+    p.amount-COALESCE((SELECT SUM(a.amount) FROM public.zvk_funding_pool_allocations a WHERE a.funding_pool_id=p.id),0) AS free
+    FROM public.draft_funding_pool p
+    WHERE p.is_active=true AND p.parent_pool_id IS NOT NULL
+      AND lower(trim(p.legal_entity))=lower(trim($1))
+      AND lower(trim(p.object_name))=lower('Командировка')
+      AND lower(trim(p.money_type))=lower('Тек')
+      AND NULLIF(trim(p.source_name),'') IS NOT NULL
+    ORDER BY free DESC,p.id FOR UPDATE OF p`,[link.legal_entity]);
+  const amount=Number(link.amount);
+  const selected=pools.rows.find(x=>Number(x.free)>=amount);
+  if(!selected)return {funded:false,available:Math.max(0,...pools.rows.map(x=>Number(x.free)||0))};
+  await c.query(`INSERT INTO public.zvk_funding_pool_allocations(zvk_row_id,funding_pool_id,amount,created_by)
+    VALUES($1,$2,$3,'KEDO_ORDER') ON CONFLICT DO NOTHING`,[link.zvk_row_id,selected.id,amount]);
+  await c.query(`UPDATE public.zvk_status SET src_d=$2,src_o=$3,money_type='Тек' WHERE zvk_row_id=$1`,[link.zvk_row_id,link.legal_entity,selected.source_name]);
+  const zvk=await c.query('SELECT id_zvk FROM public.zvk WHERE id=$1',[link.zvk_row_id]);
+  if(!zvk.rowCount)throw new Error('KEDO_ORDER_ZVK_MISSING');
+  // Reuse the existing funded-registry routine, now parameterized by legal entity.
+  const registryId=link.registry_id || await kedoCreateFundedRegistry_(c,link.zvk_row_id,link.id_ft,zvk.rows[0].id_zvk,selected.source_name,amount,link.legal_entity);
+  await c.query(`UPDATE hr.kedo_order_finance_links SET registry_id=$2,missing_amount=0
+    WHERE document_id=$1::uuid`,[link.document_id,registryId]);
+  return {funded:true,registryId};
+}
+async function kedoOrderFinanceRun_(){
+  if(!KEDO_ORDER_FINANCE_ENABLED_ || kedoOrderFinanceBusy_)return;
+  kedoOrderFinanceBusy_=true;
+  try{
+    await kedoOrderFinanceInit_();
+    // Recover orders already inserted but waiting for the pool.
+    const pending=await pool.query(`SELECT * FROM hr.kedo_order_finance_links
+      WHERE registry_id IS NULL ORDER BY created_at LIMIT 100`);
+    for(const row of pending.rows){
+      const c=await pool.connect();let notice=null;
+      try{
+        await c.query('BEGIN');
+        const locked=await c.query(`SELECT * FROM hr.kedo_order_finance_links WHERE document_id=$1 FOR UPDATE`,[row.document_id]);
+        const link=locked.rows[0];if(!link||link.registry_id){await c.query('ROLLBACK');continue;}
+        const result=await kedoOrderFinanceTryFund_(c,link);
+        if(!result.funded){
+          await c.query(`UPDATE hr.kedo_order_finance_links SET missing_amount=$2 WHERE document_id=$1`,[link.document_id,Math.max(0,Number(link.amount)-result.available)]);
+          if(!link.notice_sent)notice={id:link.document_id,employee:link.employee,amount:Number(link.amount),available:result.available};
+        }
+        await c.query('COMMIT');
+      }catch(e){await c.query('ROLLBACK').catch(()=>{});console.error('[KEDO ORDER FIN] pending',row.document_id,e.message)}finally{c.release()}
+      if(notice)await kedoOrderNotify_(notice);
+    }
+    // The very same COMPLETED documents exposed by /hr/kedo-document-orders/summary.
+    const rows=await hrKedoOrderRows_();
+    for(const order of rows){
+      if(order.raw_status!=='COMPLETED'||!KEDO_DRIVE_UUID_RE_.test(order.id))continue;
+      const entity=kedoOrderFinanceEntity_(order.legal_entity);
+      const amount=Number(order.total_amount);
+      if(!entity){console.warn('[KEDO ORDER FIN] UNKNOWN_ENTITY',order.id,order.legal_entity);continue;}
+      if(!order.employee||!Number.isFinite(amount)||amount<=0){console.warn('[KEDO ORDER FIN] NO_PAYMENT',order.id);continue;}
+      const c=await pool.connect();let notice=null;
+      try{
+        await c.query('BEGIN');
+        await c.query('SELECT pg_advisory_xact_lock(hashtext($1))',[order.id]);
+        if((await c.query('SELECT 1 FROM hr.kedo_order_finance_links WHERE document_id=$1::uuid',[order.id])).rowCount){await c.query('ROLLBACK');continue;}
+        const ft=await c.query(`INSERT INTO public.ft
+          (id_ft,input_date,input_name,legal_entity,"object",contractor,pay_purpose,dds_article,contract_no,invoice_no,invoice_date,sum_ft,source_type)
+          VALUES('FT'||nextval('public.ft_id_seq'),now(),'a_zaitova',$1,'Командировка',$2,$3,'103. Командировочные','Без договора',$4,(now() AT TIME ZONE 'Asia/Almaty')::date,$5,'KEDO_ORDER') RETURNING id_ft`,
+          [entity,order.employee,'Служебная командировка: '+(order.travel_route||''),String(order.order_number||'Приказ'),amount]);
+        const idFt=ft.rows[0].id_ft;
+        const z=await c.query(`INSERT INTO public.zvk(id_ft,id_zvk,zvk_date,zvk_name,to_pay,request_flag)
+          VALUES($1,'ZFT'||nextval('public.zvk_id_seq'),now(),'a_zaitova',$2,'Да') RETURNING id`,[idFt,amount]);
+        const zid=z.rows[0].id;
+        await c.query(`INSERT INTO public.zvk_status(zvk_row_id,status_time,src_d,money_type)
+          VALUES($1,now(),$2,'Тек')`,[zid,entity]);
+        await c.query(`INSERT INTO hr.kedo_order_finance_links(document_id,id_ft,zvk_row_id,amount,legal_entity,employee)
+          VALUES($1::uuid,$2,$3,$4,$5,$6)`,[order.id,idFt,zid,amount,entity,order.employee]);
+        const result=await kedoOrderFinanceTryFund_(c,{document_id:order.id,id_ft:idFt,zvk_row_id:zid,registry_id:null,amount,legal_entity:entity,employee:order.employee});
+        if(!result.funded){
+          await c.query(`UPDATE hr.kedo_order_finance_links SET missing_amount=$2 WHERE document_id=$1::uuid`,[order.id,Math.max(0,amount-result.available)]);
+          notice={id:order.id,employee:order.employee,amount,available:result.available};
+        }
+        await c.query('COMMIT');
+        console.log('[KEDO ORDER FIN] CREATED',order.id,idFt,result.funded?'FUNDED':'WAITING');
+      }catch(e){await c.query('ROLLBACK').catch(()=>{});console.error('[KEDO ORDER FIN] create',order.id,e.message)}finally{c.release()}
+      if(notice)await kedoOrderNotify_(notice);
+    }
+  }catch(e){console.error('[KEDO ORDER FIN] run',e.message)}
+  finally{kedoOrderFinanceBusy_=false;}
+}
+async function kedoOrderNotify_(n){
+  try{
+    const sent=await telegramNsTripShortfall_(n.employee,n.amount,n.available);
+    if(sent?.sent)await pool.query(`UPDATE hr.kedo_order_finance_links SET notice_sent=true WHERE document_id=$1::uuid`,[n.id]);
+  }catch(e){console.warn('[KEDO ORDER FIN] notice',n.id,e.message)}
+}
+if(KEDO_ORDER_FINANCE_ENABLED_){
+  setTimeout(()=>void kedoOrderFinanceRun_(),15000).unref?.();
+  setInterval(()=>void kedoOrderFinanceRun_(),60000).unref?.();
+}
+
 // LOCAL_TRIPS_ONLY: отключены все KEDO HR endpoints.
 app.use('/hr/kedo-', (req,res)=>res.status(410).json({success:false,error:'KEDO_INTEGRATION_DISABLED'}));
 
@@ -19204,7 +19321,7 @@ function kedoFinanceCompute_(v,raw){
 
 // Реестр создаётся ТОЛЬКО после полного выделения денег из пула.
 // Обе операции (выделение и создание Реестра) выполняются в одной транзакции.
-async function kedoCreateFundedRegistry_(client, zid, idFt, idZvk, sourceName, amount){
+async function kedoCreateFundedRegistry_(client, zid, idFt, idZvk, sourceName, amount, legalEntity = 'Сервис НС'){
   if (!sourceName || !String(sourceName).trim()) throw new Error('KEDO: Источник Объект пустой, создание Реестра запрещено');
   const data = {total: amount};
   const adequate = {source_name: sourceName};
@@ -19219,7 +19336,7 @@ async function kedoCreateFundedRegistry_(client, zid, idFt, idZvk, sourceName, a
     contract_no,invoice_no,invoice_date,invoice_pdf,src_d,src_o,money_type,to_pay)
    SELECT $1,$2,id_ft,$7,"object",contractor,pay_purpose,dds_article,
     contract_no,invoice_no,invoice_date,invoice_pdf,$3,$4,'Тек',$5
-   FROM public.ft WHERE id_ft=$6`,[requestId,zid,'Сервис НС',adequate?.source_name||null,data.total,idFt,z.rows[0].id_zvk]);
+   FROM public.ft WHERE id_ft=$6`,[requestId,zid,legalEntity,adequate?.source_name||null,data.total,idFt,z.rows[0].id_zvk]);
   const registry=await client.query(`INSERT INTO public.registry_head
    (created_by,workflow_stage,agree_status,archive_flag,total_amount,items_count)
    VALUES('a_zaitova','Оплата Арай','Согласовано','Нет',$1,1) RETURNING id`,[data.total]);
@@ -19229,7 +19346,7 @@ async function kedoCreateFundedRegistry_(client, zid, idFt, idZvk, sourceName, a
     contract_no,invoice_no,invoice_date,invoice_pdf,src_d,src_o,to_pay)
    SELECT $1,$2,id_ft,$3,"object",contractor,pay_purpose,dds_article,
     contract_no,invoice_no,invoice_date,invoice_pdf,$4,$5,$6 FROM public.ft WHERE id_ft=$7`,
-   [registryId,zid,z.rows[0].id_zvk,'Сервис НС',adequate?.source_name||null,data.total,idFt]);
+   [registryId,zid,z.rows[0].id_zvk,legalEntity,adequate?.source_name||null,data.total,idFt]);
   await markRowsAsRegistryCreated(client,[zid]);
   return registryId;
 }
@@ -19249,6 +19366,7 @@ function kedoFinanceReconcile_(){
 // Never interfere with the success response or roll back an already committed change.
 function kedoFinanceOnPoolChange_(context){
   setImmediate(() => { void hrLocalFinanceReconcile_().catch(e=>console.error('[HR FIN] Pool retry:',context,e.message)); });
+  if(KEDO_ORDER_FINANCE_ENABLED_)setImmediate(()=>void kedoOrderFinanceRun_());
   return; // LOCAL_TRIPS_ONLY: KEDO financial auto-sync disabled
   setImmediate(() => {
     void kedoFinanceReconcile_().catch(e =>
