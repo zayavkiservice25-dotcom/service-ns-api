@@ -18496,13 +18496,12 @@ const hrError_ = (res,e)=>{const code=e.status||500;if(code>=500)console.error('
 
 app.get('/hr/trips',hrApiGuard_,async(req,res)=>{
  try{
-  const login=hrLogin_(req.query.login);if(!login)return res.status(400).json({success:false,error:'LOGIN_REQUIRED'});
+  const verified=await getAuthenticatedFtUser(req);
+  if(!verified)return res.status(401).json({success:false,error:'HR_SESSION_REQUIRED'});
+  const login=hrLogin_(verified.login);
+  if(req.query.login && hrLogin_(req.query.login)!==login)return res.status(403).json({success:false,error:'HR_SESSION_REQUIRED'});
   const director=login==='k_ermek',personnel=login==='h_r',deputy=login==='v_shevchenko';
-  const viewAll=director||personnel||login==='a_zaitova';
-  if(viewAll||deputy){
-   const verified=await getAuthenticatedFtUser(req);
-   if(!verified||hrLogin_(verified.login)!==login)return res.status(403).json({success:false,error:'HR_SESSION_REQUIRED'});
-  }
+  const viewAll=['k_ermek','b_erkin','a_zaitova','h_r','s_zhasulan'].includes(login);
   const where=viewAll?'':deputy
    ?" WHERE lower(regexp_replace(btrim(r.employee_name),'[[:space:]]+',' ','g'))=ANY($1::text[])"
    :' WHERE lower(btrim(r.employee_login))=$1';
@@ -18588,8 +18587,10 @@ function hrTripValidatedData_(b){
 app.post('/hr/trips',hrApiGuard_,async(req,res)=>{
  const client=await pool.connect();
  try{
-  const b=req.body||{},login=hrLogin_(b.login);
-  if(!login)throw Object.assign(new Error('LOGIN_REQUIRED'),{status:400});
+  const user=await getAuthenticatedFtUser(req,client);
+  if(!user)throw Object.assign(new Error('HR_SESSION_REQUIRED'),{status:401});
+  const b=req.body||{},login=hrLogin_(user.login);
+  if(b.login && hrLogin_(b.login)!==login)throw Object.assign(new Error('HR_SESSION_REQUIRED'),{status:403});
   const {employee,position,category,legal,city,country,cityType,from,to,purpose,days,dailyRate,perDiem,lodging,route,overnight,cleanedStays}=hrTripValidatedData_(b);
   await client.query('BEGIN');
   // В форме оставлены только поля Google Формы. Старые колонки в БД
