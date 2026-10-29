@@ -18501,17 +18501,17 @@ app.get('/hr/trips',hrApiGuard_,async(req,res)=>{
   const login=hrLogin_(verified.login);
   if(req.query.login && hrLogin_(req.query.login)!==login)return res.status(403).json({success:false,error:'HR_SESSION_REQUIRED'});
   const director=login==='k_ermek',personnel=login==='h_r',deputy=login==='v_shevchenko';
-  const viewAll=['k_ermek','b_erkin','a_zaitova','h_r','s_zhasulan'].includes(login);
-  const where=viewAll?'':deputy
-   ?" WHERE lower(regexp_replace(btrim(r.employee_name),'[[:space:]]+',' ','g'))=ANY($1::text[])"
-   :' WHERE lower(btrim(r.employee_login))=$1';
+  const viewAll=['b_erkin','s_zhasulan','k_ermek','h_r','a_symbat'].includes(login);
+  // Restricted users see only trips they initiated, not trips assigned to an employee.
+  // No deputy exception for list visibility; privileged logins are checked above.
+  const where=viewAll?'':' WHERE lower(btrim(r.created_by_login))=$1';
   const q=`SELECT r.*,NULL::text AS signature_status,a.action AS deputy_action,a.occurred_at AS deputy_action_at
     FROM hr.trip_requests r LEFT JOIN LATERAL (
       SELECT action,occurred_at FROM hr.trip_approval_log
       WHERE trip_id=r.id AND action IN ('deputy_approve','edit','withdraw')
       ORDER BY occurred_at DESC,id DESC LIMIT 1
     ) a ON true`+where+' ORDER BY r.created_at DESC,r.id DESC LIMIT 2000';
-  const out=await pool.query(q,viewAll?[]:deputy?[hrDeputyEmployeeNames_]:[login]);
+  const out=await pool.query(q,viewAll?[]:[login]);
   res.json({success:true,is_director:director,is_hr:personnel,is_deputy:deputy,rows:out.rows.map(hrPublic_)});
  }catch(e){hrError_(res,e)}
 });
@@ -18977,7 +18977,7 @@ setInterval(()=>void hrLocalEnsureReady_().then(()=>hrLocalFinanceReconcile_()).
 // This route family is separate from the disabled legacy applications API.
 let hrKedoOrdersCache_ = null;
 let hrKedoOrdersLoading_ = null;
-const hrKedoOrderAllReaders_ = new Set(['k_ermek','b_erkin','a_zaitova','h_r','s_zhasulan']);
+const hrKedoOrderAllReaders_ = new Set(['b_erkin','s_zhasulan','k_ermek','h_r','a_symbat']);
 async function hrKedoOrdersAccess_(req,res,next){
   try {
     const user=await getAuthenticatedFtUser(req);
