@@ -19039,18 +19039,35 @@ function hrKedoOrderRow_(doc){
   if(!categoryKey)issues.push('Не определена категория сотрудника');
   const types={major:'major',regional:'regional',district:'district',rural:'rural','1':'major','2':'regional','3':'district','4':'rural'};
   const stayType=x=>types[text(x).trim().toLowerCase().replace(/^тип\s*/, '')]||'';
-  const stays=[];let invalidStay=false;
-  const addStay=(city,type,nights)=>{const row={city:text(city).trim(),type:stayType(type),nights:number(nights)};if(!row.city||!row.type||!Number.isInteger(row.nights)||row.nights<0||row.nights>366)invalidStay=true;else stays.push(row);};
-  const structured=pick('stays','lodging_stays');
-  if(Array.isArray(structured)){for(const row of structured){if(!row||typeof row!=='object'){invalidStay=true;continue;}addStay(row.city,row.type,row.nights);}}
-  else {
+  const stays=[];let invalidStay=false,invalidNights=false;
+  const addStay=(city,type,nights)=>{
+    const row={city:text(city).trim(),type:stayType(type),nights:number(nights)};
+    const validNights=Number.isInteger(row.nights)&&row.nights>=0&&row.nights<=366;
+    if(!validNights)invalidNights=true;
+    if(!row.city||!row.type||!validNights)invalidStay=true;
+    stays.push(row);
+  };
+  // KEDO trip_locations: every element is one city; days is its night count.
+  const hasTripLocations=v.trip_locations!==undefined && v.trip_locations!==null;
+  let structured=hasTripLocations?v.trip_locations:pick('stays','lodging_stays');
+  if(typeof structured==='string'){
+    try{structured=JSON.parse(structured);}catch(_){structured=undefined;invalidStay=true;invalidNights=true;}
+  }
+  if(hasTripLocations || structured!==null){
+    if(Array.isArray(structured)){
+      for(const row of structured){
+        if(!row||typeof row!=='object'||Array.isArray(row)){invalidStay=true;invalidNights=true;continue;}
+        addStay(row.city,row.type,hasTripLocations?row.days:row.nights);
+      }
+    }else {invalidStay=true;invalidNights=true;}
+  }else {
     const ordinal=['first','second','third','fourth','fifth'];
     for(let i=1;i<=5;i++){
       const city=pick('type'+i,'city'+i,'city_'+i),type=pick('living_'+i,'living'+i,'city_type'+i),nights=pick(ordinal[i-1],i===4?'forth':'__unused__','days'+i,'nights'+i);
       if(city!==null||type!==null||nights!==null)addStay(city,type,nights);
     }
   }
-  const nights=stays.reduce((sum,x)=>sum+x.nights,0);
+  const nights=stays.reduce((sum,x)=>sum+(x.nights??0),0);
   const staysComplete=stays.length>0&&!invalidStay&&validDays&&nights<=days;
   if(!staysComplete)issues.push('Для расчёта проживания нужны города, типы городов и количество ночей');
   const baseRate=4325;
@@ -19065,8 +19082,8 @@ function hrKedoOrderRow_(doc){
     _initiator_login:owner,created_by_login:owner,
     order_number:v.order_number??doc.document_number??'',order_date:v.order_date??doc.document_date??'',
     employee,position,category,legal_entity:doc.organization_title||'',organization:doc.organization_title||'',
-    destination,travel_route:text(pick('travel_route','route'))||destination,purpose:text(pick('mission_purpose','trip_purpose','purpose')),
-    date_from:from,date_to:to,days_count:validDays?days:null,stays,lodging_days:staysComplete?nights:null,
+    destination,travel_route:text(pick('misstion_route','travel_route','route'))||destination,purpose:text(pick('mission_purpose','trip_purpose','purpose')),
+    date_from:from,date_to:to,days_count:validDays?days:null,stays,lodging_days:stays.length>0&&!invalidNights?nights:null,
     daily_rate:dailyRate,per_diem_amount:perDiem,lodging_amount:lodging,
     total_amount:perDiem!==null&&lodging!==null?perDiem+lodging:null,
     calculation_message:issues.join('. '),values:v};
