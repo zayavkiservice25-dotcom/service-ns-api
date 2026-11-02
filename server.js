@@ -19259,18 +19259,37 @@ async function kedoOrderFinanceRun_(){
     await kedoOrderFinanceInit_();
     await kedoOrderFinanceReconcileMoneyTypes_();
     // Recover orders already inserted but waiting for the pool.
-    const pending=await pool.query(`SELECT * FROM hr.kedo_order_finance_links
-      WHERE registry_id IS NULL ORDER BY created_at LIMIT 100`);
+    // Командировки финансируются по числовому номеру ZFT: ZFT9 перед ZFT10.
+    // Сортировка по строке дала бы неправильный порядок.
+    const pending=await pool.query(`SELECT l.*,z.id_zvk AS queue_zft
+      FROM hr.kedo_order_finance_links l
+      JOIN public.zvk z ON z.id=l.zvk_row_id
+      WHERE l.registry_id IS NULL
+      ORDER BY CASE WHEN z.id_zvk ~ '^ZFT[0-9]+$'
+               THEN substring(z.id_zvk from 4)::numeric ELSE NULL END ASC NULLS LAST,
+               l.created_at,l.document_id
+      LIMIT 100`);
+    // FIFO строго внутри юрлица: более поздний ZFT не обходит прежний
+    // из-за того, что его сумма меньше. Другие юрлица не блокируем.
+    const waitingEntities=new Set();
     for(const row of pending.rows){
       const c=await pool.connect();let notice=null;
       try{
         await c.query('BEGIN');
         const locked=await c.query(`SELECT * FROM hr.kedo_order_finance_links WHERE document_id=$1 FOR UPDATE`,[row.document_id]);
         const link=locked.rows[0];if(!link||link.registry_id){await c.query('ROLLBACK');continue;}
-        const result=await kedoOrderFinanceTryFund_(c,link);
+        const entityKey=kedoOrderFinanceEntityKey_(link.legal_entity);
+        const blocked=waitingEntities.has(entityKey);
+        const result=blocked ? {funded:false,available:0} : await kedoOrderFinanceTryFund_(c,link);
         if(!result.funded){
-          await c.query(`UPDATE hr.kedo_order_finance_links SET missing_amount=$2 WHERE document_id=$1`,[link.document_id,Math.max(0,Number(link.amount)-result.available)]);
-          if(!link.notice_sent)notice={id:link.document_id,employee:link.employee,amount:Number(link.amount),available:result.available};
+          waitingEntities.add(entityKey);
+          if(!blocked){
+            await c.query(`UPDATE hr.kedo_order_finance_links SET missing_amount=$2 WHERE document_id=$1`,[link.document_id,Math.max(0,Number(link.amount)-result.available)]);
+            if(!link.notice_sent)notice={id:link.document_id,employee:link.employee,amount:Number(link.amount),available:result.available};
+          }
+          console.log('[KEDO ORDER FIN] WAITING_ZFT',row.queue_zft,blocked?'OLDER_ZFT_FIRST':'INSUFFICIENT_POOL');
+        }else{
+          console.log('[KEDO ORDER FIN] FUNDED_ZFT',row.queue_zft,link.id_ft);
         }
         await c.query('COMMIT');
       }catch(e){await c.query('ROLLBACK').catch(()=>{});console.error('[KEDO ORDER FIN] pending',row.document_id,e.message)}finally{c.release()}
@@ -19313,13 +19332,12 @@ async function kedoOrderFinanceRun_(){
           VALUES($1,now(),$2,NULL)`,[zid,entity]);
         await c.query(`INSERT INTO hr.kedo_order_finance_links(document_id,id_ft,zvk_row_id,amount,legal_entity,employee)
           VALUES($1::uuid,$2,$3,$4,$5,$6)`,[order.id,idFt,zid,amount,entity,order.employee]);
-        const result=await kedoOrderFinanceTryFund_(c,{document_id:order.id,id_ft:idFt,zvk_row_id:zid,registry_id:null,amount,legal_entity:entity,employee:order.employee});
-        if(!result.funded){
-          await c.query(`UPDATE hr.kedo_order_finance_links SET missing_amount=$2 WHERE document_id=$1::uuid`,[order.id,Math.max(0,amount-result.available)]);
-          notice={id:order.id,employee:order.employee,amount,available:result.available};
-        }
+        // Новые ZFT не получают деньги впереди ранее ожидающих ZFT.
+        // Следующий проход обработает их в одной общей числовой очереди.
+        await c.query(`UPDATE hr.kedo_order_finance_links
+          SET missing_amount=$2 WHERE document_id=$1::uuid`,[order.id,amount]);
         await c.query('COMMIT');
-        console.log('[KEDO ORDER FIN] CREATED',order.id,idFt,result.funded?'FUNDED':'WAITING');
+        console.log('[KEDO ORDER FIN] CREATED',order.id,idFt,'QUEUED_BY_ZFT');
       }catch(e){await c.query('ROLLBACK').catch(()=>{});console.error('[KEDO ORDER FIN] create',order.id,e.message)}finally{c.release()}
       if(notice)await kedoOrderNotify_(notice);
     }
