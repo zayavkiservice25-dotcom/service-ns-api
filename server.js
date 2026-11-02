@@ -19082,7 +19082,7 @@ function hrKedoOrderRow_(doc){
   return {id:String(doc.id),status:'Подписан в КЭДО',raw_status:'COMPLETED',kedo_source:true,
     _initiator_login:owner,created_by_login:owner,
     order_number:v.order_number??doc.document_number??'',order_date:v.order_date??doc.document_date??'',
-    employee,position,category,legal_entity:doc.organization_title||'',organization:doc.organization_title||'',
+    employee,author:text(pick('employee')),mission_person:text(pick('mission_person')),position,category,legal_entity:doc.organization_title||'',organization:doc.organization_title||'',
     destination,travel_route:text(pick('misstion_route','travel_route','route'))||destination,purpose:text(pick('mission_purpose','trip_purpose','purpose')),
     date_from:from,date_to:to,days_count:validDays?days:null,stays,lodging_days:stays.length>0&&!invalidNights?nights:null,
     daily_rate:dailyRate,per_diem_amount:perDiem,lodging_amount:lodging,
