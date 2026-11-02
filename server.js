@@ -19201,13 +19201,12 @@ function kedoOrderFinanceEntity_(name,ftLegalEntities){
   return matches[0];
 }
 async function kedoOrderFinanceTryFund_(c,link){
-  const pools=await c.query(`SELECT p.id,p.source_name,
+  const pools=await c.query(`SELECT p.id,p.source_name,p.money_type,
     p.amount-COALESCE((SELECT SUM(a.amount) FROM public.zvk_funding_pool_allocations a WHERE a.funding_pool_id=p.id),0) AS free
     FROM public.draft_funding_pool p
     WHERE p.is_active=true AND p.parent_pool_id IS NOT NULL
       AND lower(trim(p.legal_entity))=lower(trim($1))
       AND lower(trim(p.object_name))=lower('Командировка')
-      AND lower(trim(p.money_type))=lower('Тек')
       AND NULLIF(trim(p.source_name),'') IS NOT NULL
     ORDER BY free DESC,p.id FOR UPDATE OF p`,[link.legal_entity]);
   const amount=Number(link.amount);
@@ -19215,20 +19214,47 @@ async function kedoOrderFinanceTryFund_(c,link){
   if(!selected)return {funded:false,available:Math.max(0,...pools.rows.map(x=>Number(x.free)||0))};
   await c.query(`INSERT INTO public.zvk_funding_pool_allocations(zvk_row_id,funding_pool_id,amount,created_by)
     VALUES($1,$2,$3,'KEDO_ORDER') ON CONFLICT DO NOTHING`,[link.zvk_row_id,selected.id,amount]);
-  await c.query(`UPDATE public.zvk_status SET src_d=$2,src_o=$3,money_type='Тек' WHERE zvk_row_id=$1`,[link.zvk_row_id,link.legal_entity,selected.source_name]);
+  await c.query(`UPDATE public.zvk_status SET src_d=$2,src_o=$3,money_type=$4 WHERE zvk_row_id=$1`,[link.zvk_row_id,link.legal_entity,selected.source_name,selected.money_type]);
   const zvk=await c.query('SELECT id_zvk FROM public.zvk WHERE id=$1',[link.zvk_row_id]);
   if(!zvk.rowCount)throw new Error('KEDO_ORDER_ZVK_MISSING');
   // Reuse the existing funded-registry routine, now parameterized by legal entity.
-  const registryId=link.registry_id || await kedoCreateFundedRegistry_(c,link.zvk_row_id,link.id_ft,zvk.rows[0].id_zvk,selected.source_name,amount,link.legal_entity);
+  const registryId=link.registry_id || await kedoCreateFundedRegistry_(c,link.zvk_row_id,link.id_ft,zvk.rows[0].id_zvk,selected.source_name,amount,link.legal_entity,selected.money_type);
   await c.query(`UPDATE hr.kedo_order_finance_links SET registry_id=$2,missing_amount=0
     WHERE document_id=$1::uuid`,[link.document_id,registryId]);
   return {funded:true,registryId};
+}
+// Сверка ранее созданных КЭДО-платежей: тип определяется уже выделенным пулом.
+// Затрагиваются только ZFT, связанные с hr.kedo_order_finance_links.
+// При неоднозначном распределении тип не меняем и пишем предупреждение.
+async function kedoOrderFinanceReconcileMoneyTypes_(){
+  const {rows}=await pool.query(`
+    SELECT l.document_id,l.zvk_row_id,
+           array_agg(DISTINCT p.money_type) FILTER (WHERE nullif(trim(p.money_type),'') IS NOT NULL) AS types
+    FROM hr.kedo_order_finance_links l
+    JOIN public.zvk_funding_pool_allocations a ON a.zvk_row_id=l.zvk_row_id
+    JOIN public.draft_funding_pool p ON p.id=a.funding_pool_id
+    GROUP BY l.document_id,l.zvk_row_id`);
+  for(const row of rows){
+    const types=row.types||[];
+    if(types.length!==1){
+      console.warn('[KEDO ORDER FIN] MONEY_TYPE_AMBIGUOUS',row.document_id,types);
+      continue;
+    }
+    const moneyType=types[0];
+    await pool.query(`UPDATE public.zvk_status
+      SET money_type=$2,status_time=now()
+      WHERE zvk_row_id=$1 AND money_type IS DISTINCT FROM $2`,[row.zvk_row_id,moneyType]);
+    // Для существующих строк реестра обновляем копию денежного типа.
+    await pool.query(`UPDATE public.request_items
+      SET money_type=$2 WHERE zvk_row_id=$1 AND money_type IS DISTINCT FROM $2`,[row.zvk_row_id,moneyType]);
+  }
 }
 async function kedoOrderFinanceRun_(){
   if(!KEDO_ORDER_FINANCE_ENABLED_ || kedoOrderFinanceBusy_)return;
   kedoOrderFinanceBusy_=true;
   try{
     await kedoOrderFinanceInit_();
+    await kedoOrderFinanceReconcileMoneyTypes_();
     // Recover orders already inserted but waiting for the pool.
     const pending=await pool.query(`SELECT * FROM hr.kedo_order_finance_links
       WHERE registry_id IS NULL ORDER BY created_at LIMIT 100`);
@@ -19281,7 +19307,7 @@ async function kedoOrderFinanceRun_(){
           VALUES($1,'ZFT'||nextval('public.zvk_id_seq'),now(),'a_zaitova',$2,'Да') RETURNING id`,[idFt,amount]);
         const zid=z.rows[0].id;
         await c.query(`INSERT INTO public.zvk_status(zvk_row_id,status_time,src_d,money_type)
-          VALUES($1,now(),$2,'Тек')`,[zid,entity]);
+          VALUES($1,now(),$2,NULL)`,[zid,entity]);
         await c.query(`INSERT INTO hr.kedo_order_finance_links(document_id,id_ft,zvk_row_id,amount,legal_entity,employee)
           VALUES($1::uuid,$2,$3,$4,$5,$6)`,[order.id,idFt,zid,amount,entity,order.employee]);
         const result=await kedoOrderFinanceTryFund_(c,{document_id:order.id,id_ft:idFt,zvk_row_id:zid,registry_id:null,amount,legal_entity:entity,employee:order.employee});
@@ -19358,7 +19384,7 @@ function kedoFinanceCompute_(v,raw){
 
 // Реестр создаётся ТОЛЬКО после полного выделения денег из пула.
 // Обе операции (выделение и создание Реестра) выполняются в одной транзакции.
-async function kedoCreateFundedRegistry_(client, zid, idFt, idZvk, sourceName, amount, legalEntity = 'Сервис НС'){
+async function kedoCreateFundedRegistry_(client, zid, idFt, idZvk, sourceName, amount, legalEntity = 'Сервис НС', moneyType = 'Тек'){
   if (!sourceName || !String(sourceName).trim()) throw new Error('KEDO: Источник Объект пустой, создание Реестра запрещено');
   const data = {total: amount};
   const adequate = {source_name: sourceName};
@@ -19372,8 +19398,8 @@ async function kedoCreateFundedRegistry_(client, zid, idFt, idZvk, sourceName, a
    (request_id,zvk_row_id,id_ft,id_zvk,object,contractor,pay_purpose,dds_article,
     contract_no,invoice_no,invoice_date,invoice_pdf,src_d,src_o,money_type,to_pay)
    SELECT $1,$2,id_ft,$7,"object",contractor,pay_purpose,dds_article,
-    contract_no,invoice_no,invoice_date,invoice_pdf,$3,$4,'Тек',$5
-   FROM public.ft WHERE id_ft=$6`,[requestId,zid,legalEntity,adequate?.source_name||null,data.total,idFt,z.rows[0].id_zvk]);
+    contract_no,invoice_no,invoice_date,invoice_pdf,$3,$4,$8,$5
+   FROM public.ft WHERE id_ft=$6`,[requestId,zid,legalEntity,adequate?.source_name||null,data.total,idFt,z.rows[0].id_zvk,moneyType]);
   const registry=await client.query(`INSERT INTO public.registry_head
    (created_by,workflow_stage,agree_status,archive_flag,total_amount,items_count)
    VALUES('a_zaitova','Оплата Арай','Согласовано','Нет',$1,1) RETURNING id`,[data.total]);
@@ -19883,6 +19909,69 @@ async function kedoDriveSyncSignedOrders_(){
       }catch(e){console.error('[KEDO DRIVE] ERROR',appId,e.message)}
     }
   }finally{kedoDriveBusy_=false}
+}
+
+// =====================================================
+// KEDO DOCUMENT ORDERS -> PDF приказа для существующей FT
+// Отдельно от прежних hr.kedo_applications: новые документы связаны
+// с FT через hr.kedo_order_finance_links(document_id).
+// Только заполняем пустое invoice_pdf. FT/ZFT и реестры не создаём.
+// =====================================================
+let kedoOrderPdfBusy_ = false;
+async function kedoOrderPdfSync_(){
+  if(!KEDO_ORDER_FINANCE_ENABLED_ || kedoOrderPdfBusy_)return;
+  if(!kedoDriveConfigured_()){
+    console.warn('[KEDO ORDER PDF] NOT_CONFIGURED: verify KEDO credentials and GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN, GOOGLE_DRIVE_FOLDER_ID');
+    return;
+  }
+  kedoOrderPdfBusy_ = true;
+  try{
+    // Только документы, по которым финансовая обработка уже создала FT.
+    // Ссылку пользователя никогда не перезаписываем.
+    const targets=await pool.query(`
+      SELECT l.document_id::text AS document_id, l.id_ft
+      FROM hr.kedo_order_finance_links l
+      JOIN public.ft f ON f.id_ft=l.id_ft
+      WHERE f.source_type='KEDO_ORDER'
+        AND (f.invoice_pdf IS NULL OR btrim(f.invoice_pdf)='')
+      ORDER BY l.created_at ASC
+      LIMIT 50`);
+    if(!targets.rows.length)return;
+    let googleToken=null;
+    for(const row of targets.rows){
+      try{
+        if(!KEDO_DRIVE_UUID_RE_.test(row.document_id)){
+          console.warn('[KEDO ORDER PDF] INVALID_DOCUMENT_ID',row.document_id);
+          continue;
+        }
+        const bytes=await kedoDriveGetPdf_(row.document_id);
+        if(!googleToken)googleToken=await kedoDriveGoogleToken_();
+        // Название файла зависит от ID КЭДО: повторная проверка не создаёт дубли в Drive.
+        const fileId=await kedoDriveUpload_(googleToken,row.document_id,bytes);
+        const fileUrl='https://drive.google.com/file/d/'+encodeURIComponent(fileId)+'/view';
+        const updated=await pool.query(`
+          UPDATE public.ft f SET invoice_pdf=$3
+          WHERE f.id_ft=$1 AND f.source_type='KEDO_ORDER'
+            AND (f.invoice_pdf IS NULL OR btrim(f.invoice_pdf)='')
+            AND EXISTS (
+              SELECT 1 FROM hr.kedo_order_finance_links l
+              WHERE l.id_ft=f.id_ft AND l.document_id=$2::uuid
+            )
+          RETURNING f.id_ft`,[row.id_ft,row.document_id,fileUrl]);
+        if(updated.rowCount)console.log('[KEDO ORDER PDF] ATTACHED',row.document_id,row.id_ft);
+      }catch(e){
+        // Не создаём пустой PDF и не подставляем нерабочую ссылку.
+        console.error('[KEDO ORDER PDF] ERROR',row.document_id,row.id_ft,String(e.message||e));
+      }
+    }
+  }catch(e){console.error('[KEDO ORDER PDF] SYNC_ERROR',String(e.message||e));}
+  finally{kedoOrderPdfBusy_=false;}
+}
+// Финансовая синхронизация KEDO orders работает самостоятельно; старый
+// таймер kedoSync_ отключён, поэтому PDF приказов тоже нужен свой таймер.
+if(KEDO_ORDER_FINANCE_ENABLED_){
+  setTimeout(()=>void kedoOrderPdfSync_(),45000).unref?.();
+  setInterval(()=>void kedoOrderPdfSync_(),5*60000).unref?.();
 }
 
 // =====================================================
