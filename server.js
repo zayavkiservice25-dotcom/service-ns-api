@@ -19802,14 +19802,12 @@ async function kedoDriveGetPdf_(documentId){
   const files=await kedoDriveRequestJson_('/documents/'+encodeURIComponent(documentId)+'/ext/files');
   const file=files.elements.find(f=>String(f.key||'').endsWith('/print_form.pdf'));
   if(!file)throw new Error('ORDER_PRINT_FORM_NOT_FOUND');
-  let url;
-  try{url=new URL(String(file.link||''));}catch(_){throw new Error('ORDER_PDF_LINK_MISSING')}
-  const expected='/api/v1/hr/documents/management/documents/'+documentId+'/files';
-  if(url.origin!==origin||url.protocol!=='https:'||url.pathname!==expected||
-     url.username||url.password||url.hash||url.searchParams.size!==1||
-     url.searchParams.getAll('file_key').length!==1||
-     url.searchParams.get('file_key')!==file.key)
-    throw new Error('ORDER_PDF_LINK_UNEXPECTED');
+  // Используем тот же защищённый URL, что и рабочий эндпоинт
+  // /hr/kedo-document-orders/print-pdf. В метаданных КЭДО link
+  // может отсутствовать или иметь другую форму.
+  // Не передаём User-Token по ссылке из внешнего JSON.
+  const expected='/api/v1/hr/documents/management/documents/'+encodeURIComponent(documentId)+'/files';
+  const url=origin+expected+'?file_key='+encodeURIComponent(String(file.key||''));
   const r=await fetch(url,{headers:{Authorization:'User-Token '+KEDO_TOKEN_,Accept:'application/pdf'},
     redirect:'error',signal:AbortSignal.timeout(35000)});
   if(!r.ok)throw new Error('KEDO_PRINT_PDF_HTTP_'+r.status);
@@ -19921,7 +19919,7 @@ let kedoOrderPdfBusy_ = false;
 async function kedoOrderPdfSync_(){
   if(!KEDO_ORDER_FINANCE_ENABLED_ || kedoOrderPdfBusy_)return;
   if(!kedoDriveConfigured_()){
-    console.warn('[KEDO ORDER PDF] NOT_CONFIGURED: verify KEDO credentials and GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN, GOOGLE_DRIVE_FOLDER_ID');
+    console.warn('[KEDO ORDER PDF] NOT_CONFIGURED: credentials/folder missing. Have KEDO_BASE_URL, KEDO_USER_TOKEN, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN, GOOGLE_DRIVE_FOLDER_ID in Render Environment (values not logged).');
     return;
   }
   kedoOrderPdfBusy_ = true;
@@ -19969,10 +19967,59 @@ async function kedoOrderPdfSync_(){
 }
 // Финансовая синхронизация KEDO orders работает самостоятельно; старый
 // таймер kedoSync_ отключён, поэтому PDF приказов тоже нужен свой таймер.
-if(KEDO_ORDER_FINANCE_ENABLED_){
-  setTimeout(()=>void kedoOrderPdfSync_(),45000).unref?.();
-  setInterval(()=>void kedoOrderPdfSync_(),5*60000).unref?.();
-}
+// PDF только новых командировок KEDO_ORDER теперь открывается через
+// защищённый FT API по требованию. Для других PDF/старых КЭДО схем
+// Drive-синхронизация остаётся без изменений.
+// Старый kedoOrderPdfSync_ намеренно не запускается: не трогаем
+// GOOGLE_REFRESH_TOKEN и не записываем публичные URL в invoice_pdf.
+
+
+// =====================================================
+// FT: просмотр только PDF подписанного приказа нового типа KEDO_ORDER.
+// Не затрагивает обычные invoice_pdf, LZK, MANUAL и старые KEDO.
+// Запрос: GET /ft/kedo-order-pdf?id_ft=FT1234
+// Authorization: Bearer <auth_token> серверной сессии.
+// Возвращает PDF напрямую, без Google Drive/хранения в PostgreSQL.
+// =====================================================
+app.get('/ft/kedo-order-pdf', async (req, res) => {
+  res.set('Cache-Control','private, no-store, max-age=0');
+  res.set('X-Content-Type-Options','nosniff');
+  res.set('Referrer-Policy','no-referrer');
+  try {
+    const user = await getAuthenticatedFtUser(req);
+    if (!user) return res.status(401).json({success:false,error:'FT_SESSION_REQUIRED'});
+    const idFt = String(req.query.id_ft||'').trim();
+    if (!/^FT\d{1,12}$/i.test(idFt))
+      return res.status(400).json({success:false,error:'INVALID_FT_ID'});
+    const q = await pool.query(`
+      SELECT f.id_ft, f.input_name, f.legal_entity, f.dds_article,
+             l.document_id::text AS document_id
+      FROM public.ft f
+      JOIN hr.kedo_order_finance_links l ON l.id_ft=f.id_ft
+      WHERE f.id_ft=$1 AND f.source_type='KEDO_ORDER'
+      LIMIT 1`, [idFt]);
+    if (!q.rowCount) return res.status(404).json({success:false,error:'KEDO_ORDER_FT_NOT_FOUND'});
+    const row=q.rows[0];
+    const login=String(user.login||'').trim().toLowerCase();
+    const owner=String(row.input_name||'').trim().toLowerCase();
+    const privileged=['b_erkin','s_zhasulan','k_ermek'].includes(login);
+    const zaitova=login==='a_zaitova' &&
+      String(row.legal_entity||'').trim().toLowerCase()==='сервис нс' &&
+      String(row.dds_article||'').replace(/\s+/g,'').toLowerCase()==='103.командировочные';
+    if (!(login===owner || privileged || zaitova))
+      return res.status(403).json({success:false,error:'FT_ACCESS_DENIED'});
+    if (!KEDO_DRIVE_UUID_RE_.test(row.document_id))
+      return res.status(502).json({success:false,error:'KEDO_DOCUMENT_ID_INVALID'});
+    const pdf = await kedoDriveGetPdf_(row.document_id); // существующее защищённое скачивание
+    res.set('Content-Type','application/pdf');
+    res.set('Content-Disposition','inline; filename="KEDO_order_'+row.document_id+'.pdf"');
+    res.set('Content-Length',String(pdf.length));
+    return res.status(200).end(pdf);
+  } catch(e) {
+    console.error('[FT KEDO PDF] ERROR',String(e.message||e));
+    if (!res.headersSent) return res.status(502).json({success:false,error:'FT_KEDO_PDF_UNAVAILABLE'});
+  }
+});
 
 // =====================================================
 // КОНЕЦ KEDO
