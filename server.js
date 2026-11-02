@@ -19252,10 +19252,21 @@ async function kedoOrderFinanceRun_(){
     const ftLegalEntities=await kedoOrderFinanceLegalEntities_();
     for(const order of rows){
       if(order.raw_status!=='COMPLETED'||!KEDO_DRIVE_UUID_RE_.test(order.id))continue;
+      // В ФТ контрагент — командированный (mission_person), а не автор employee.
+      const missionPerson=String(order.mission_person||'').trim();
+      if(!missionPerson){console.warn('[KEDO ORDER FIN] MISSING_MISSION_PERSON',order.id);continue;}
+      // Исправляем уже созданные ФТ по стабильной связи документа КЭДО с FT.
+      // Новые ФТ здесь НЕ создаются; чужие/ручные строки не затрагиваются.
+      const corrected=await pool.query(`UPDATE public.ft f SET contractor=$2
+        FROM hr.kedo_order_finance_links l
+        WHERE l.document_id=$1::uuid AND l.id_ft=f.id_ft
+          AND f.source_type='KEDO_ORDER'
+          AND f.contractor IS DISTINCT FROM $2 RETURNING f.id_ft`,[order.id,missionPerson]);
+      if(corrected.rowCount)console.log('[KEDO ORDER FIN] CONTRACTOR_FIXED',order.id,corrected.rows[0].id_ft);
       const entity=kedoOrderFinanceEntity_(order.legal_entity,ftLegalEntities);
       const amount=Number(order.total_amount);
       if(!entity){console.warn('[KEDO ORDER FIN] UNKNOWN_ENTITY',order.id,order.legal_entity);continue;}
-      if(!order.employee||!Number.isFinite(amount)||amount<=0){console.warn('[KEDO ORDER FIN] NO_PAYMENT',order.id);continue;}
+      if(!Number.isFinite(amount)||amount<=0){console.warn('[KEDO ORDER FIN] NO_PAYMENT',order.id);continue;}
       const c=await pool.connect();let notice=null;
       try{
         await c.query('BEGIN');
@@ -19264,7 +19275,7 @@ async function kedoOrderFinanceRun_(){
         const ft=await c.query(`INSERT INTO public.ft
           (id_ft,input_date,input_name,legal_entity,"object",contractor,pay_purpose,dds_article,contract_no,invoice_no,invoice_date,sum_ft,source_type)
           VALUES('FT'||nextval('public.ft_id_seq'),now(),'a_zaitova',$1,'Командировка',$2,$3,'103. Командировочные','Без договора',$4,(now() AT TIME ZONE 'Asia/Almaty')::date,$5,'KEDO_ORDER') RETURNING id_ft`,
-          [entity,order.employee,'Служебная командировка: '+(order.travel_route||''),String(order.order_number||'Приказ'),amount]);
+          [entity,missionPerson,'Служебная командировка: '+(order.travel_route||''),String(order.order_number||'Приказ'),amount]);
         const idFt=ft.rows[0].id_ft;
         const z=await c.query(`INSERT INTO public.zvk(id_ft,id_zvk,zvk_date,zvk_name,to_pay,request_flag)
           VALUES($1,'ZFT'||nextval('public.zvk_id_seq'),now(),'a_zaitova',$2,'Да') RETURNING id`,[idFt,amount]);
