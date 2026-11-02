@@ -5721,6 +5721,7 @@ const query = `
 
   SELECT
     v.*,
+    f_source.source_type AS source_type,
 
     -- Берём сумму ДоРеестра напрямую из живой строки public.zvk.
     -- Так отображение не зависит от того, успел ли пересоздаться VIEW.
@@ -5743,6 +5744,8 @@ const query = `
     ) AS pre_registry_sent
 
   FROM balance_rows v
+
+  LEFT JOIN public.ft f_source ON f_source.id_ft = v.id_ft
 
   LEFT JOIN LATERAL (
     SELECT string_agg(b.id_zlzk, ', ' ORDER BY b.id_zlzk) AS idzlzk_ids
