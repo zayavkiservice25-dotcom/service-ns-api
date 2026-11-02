@@ -19169,11 +19169,36 @@ async function kedoOrderFinanceInit_(){
     missing_amount numeric(18,2) NOT NULL DEFAULT 0,
     notice_sent boolean NOT NULL DEFAULT false, created_at timestamptz DEFAULT now())`);
 }
-function kedoOrderFinanceEntity_(name){
-  const n=String(name||'').trim().toLowerCase().replace(/ё/g,'е');
-  if(n==='сервис нс'||n==='тоо сервис нс'||n==='тоо «сервис нс»')return 'Сервис НС';
-  if(n==='жилой дом'||n==='ск жилой дом'||n==='тоо ск жилой дом')return 'Жилой Дом';
-  return null; // Never charge the wrong legal entity.
+// Сопоставление юрлица КЭДО с ФАКТИЧЕСКИМИ значениями public.ft.legal_entity.
+// Не используем захардкоженный список: результат совпадает со значениями ФТ.
+function kedoOrderFinanceEntityKey_(value){
+  return String(value||'')
+    .normalize('NFKC').toLowerCase().replace(/ё/g,'е')
+    .replace(/[«»"'`“”„]/g,' ')
+    .replace(/[^\p{L}\p{N}]+/gu,' ')
+    .replace(/^товарищество с ограниченной ответственностью\s+/u,'')
+    .replace(/^тоо\s+/u,'')
+    .replace(/\s+/g,' ').trim();
+}
+async function kedoOrderFinanceLegalEntities_(){
+  const {rows}=await pool.query(`SELECT DISTINCT trim(legal_entity) AS name
+    FROM public.ft WHERE legal_entity IS NOT NULL AND trim(legal_entity)<>''`);
+  const grouped=new Map();
+  for(const row of rows){
+    const name=String(row.name||'').trim();
+    const key=kedoOrderFinanceEntityKey_(name);
+    if(!key)continue;
+    if(!grouped.has(key))grouped.set(key,[]);
+    if(!grouped.get(key).includes(name))grouped.get(key).push(name);
+  }
+  return grouped;
+}
+function kedoOrderFinanceEntity_(name,ftLegalEntities){
+  const key=kedoOrderFinanceEntityKey_(name);
+  const matches=ftLegalEntities.get(key)||[];
+  // Если несколько разных значений ФТ дают один ключ, не выбираем случайное.
+  if(matches.length!==1)return null;
+  return matches[0];
 }
 async function kedoOrderFinanceTryFund_(c,link){
   const pools=await c.query(`SELECT p.id,p.source_name,
@@ -19224,9 +19249,10 @@ async function kedoOrderFinanceRun_(){
     }
     // The very same COMPLETED documents exposed by /hr/kedo-document-orders/summary.
     const rows=await hrKedoOrderRows_();
+    const ftLegalEntities=await kedoOrderFinanceLegalEntities_();
     for(const order of rows){
       if(order.raw_status!=='COMPLETED'||!KEDO_DRIVE_UUID_RE_.test(order.id))continue;
-      const entity=kedoOrderFinanceEntity_(order.legal_entity);
+      const entity=kedoOrderFinanceEntity_(order.legal_entity,ftLegalEntities);
       const amount=Number(order.total_amount);
       if(!entity){console.warn('[KEDO ORDER FIN] UNKNOWN_ENTITY',order.id,order.legal_entity);continue;}
       if(!order.employee||!Number.isFinite(amount)||amount<=0){console.warn('[KEDO ORDER FIN] NO_PAYMENT',order.id);continue;}
