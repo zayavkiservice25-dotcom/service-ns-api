@@ -1955,7 +1955,7 @@ await pool.query(`
     ADD COLUMN IF NOT EXISTS comparison_protocol text,
     ADD COLUMN IF NOT EXISTS supplier_name text,
     ADD COLUMN IF NOT EXISTS contract_details text,
-    ADD COLUMN IF NOT EXISTS unit_price numeric(18,2),
+    ADD COLUMN IF NOT EXISTS unit_price numeric(18,5),
     ADD COLUMN IF NOT EXISTS delivery_cost numeric(18,2),
     ADD COLUMN IF NOT EXISTS payment_invoice text,
     ADD COLUMN IF NOT EXISTS delivery_terms text,
@@ -1964,6 +1964,13 @@ await pool.query(`
     ADD COLUMN IF NOT EXISTS onec_receipt_status text,
     ADD COLUMN IF NOT EXISTS purchase_status_note text,
     ADD COLUMN IF NOT EXISTS documents_esf text;`);
+
+  // Цена за единицу: 5 знаков после запятой для уже существующей базы.
+  // ADD COLUMN IF NOT EXISTS не меняет тип существующего столбца.
+  await pool.query(`
+    ALTER TABLE lzk.supply
+    ALTER COLUMN unit_price TYPE numeric(18,5);
+  `);
 
   await pool.query(`
     ALTER TABLE lzk.limits
@@ -5721,7 +5728,6 @@ const query = `
 
   SELECT
     v.*,
-    f_source.source_type AS source_type,
 
     -- Берём сумму ДоРеестра напрямую из живой строки public.zvk.
     -- Так отображение не зависит от того, успел ли пересоздаться VIEW.
@@ -5744,8 +5750,6 @@ const query = `
     ) AS pre_registry_sent
 
   FROM balance_rows v
-
-  LEFT JOIN public.ft f_source ON f_source.id_ft = v.id_ft
 
   LEFT JOIN LATERAL (
     SELECT string_agg(b.id_zlzk, ', ' ORDER BY b.id_zlzk) AS idzlzk_ids
@@ -19259,37 +19263,18 @@ async function kedoOrderFinanceRun_(){
     await kedoOrderFinanceInit_();
     await kedoOrderFinanceReconcileMoneyTypes_();
     // Recover orders already inserted but waiting for the pool.
-    // Командировки финансируются по числовому номеру ZFT: ZFT9 перед ZFT10.
-    // Сортировка по строке дала бы неправильный порядок.
-    const pending=await pool.query(`SELECT l.*,z.id_zvk AS queue_zft
-      FROM hr.kedo_order_finance_links l
-      JOIN public.zvk z ON z.id=l.zvk_row_id
-      WHERE l.registry_id IS NULL
-      ORDER BY CASE WHEN z.id_zvk ~ '^ZFT[0-9]+$'
-               THEN substring(z.id_zvk from 4)::numeric ELSE NULL END ASC NULLS LAST,
-               l.created_at,l.document_id
-      LIMIT 100`);
-    // FIFO строго внутри юрлица: более поздний ZFT не обходит прежний
-    // из-за того, что его сумма меньше. Другие юрлица не блокируем.
-    const waitingEntities=new Set();
+    const pending=await pool.query(`SELECT * FROM hr.kedo_order_finance_links
+      WHERE registry_id IS NULL ORDER BY created_at LIMIT 100`);
     for(const row of pending.rows){
       const c=await pool.connect();let notice=null;
       try{
         await c.query('BEGIN');
         const locked=await c.query(`SELECT * FROM hr.kedo_order_finance_links WHERE document_id=$1 FOR UPDATE`,[row.document_id]);
         const link=locked.rows[0];if(!link||link.registry_id){await c.query('ROLLBACK');continue;}
-        const entityKey=kedoOrderFinanceEntityKey_(link.legal_entity);
-        const blocked=waitingEntities.has(entityKey);
-        const result=blocked ? {funded:false,available:0} : await kedoOrderFinanceTryFund_(c,link);
+        const result=await kedoOrderFinanceTryFund_(c,link);
         if(!result.funded){
-          waitingEntities.add(entityKey);
-          if(!blocked){
-            await c.query(`UPDATE hr.kedo_order_finance_links SET missing_amount=$2 WHERE document_id=$1`,[link.document_id,Math.max(0,Number(link.amount)-result.available)]);
-            if(!link.notice_sent)notice={id:link.document_id,employee:link.employee,amount:Number(link.amount),available:result.available};
-          }
-          console.log('[KEDO ORDER FIN] WAITING_ZFT',row.queue_zft,blocked?'OLDER_ZFT_FIRST':'INSUFFICIENT_POOL');
-        }else{
-          console.log('[KEDO ORDER FIN] FUNDED_ZFT',row.queue_zft,link.id_ft);
+          await c.query(`UPDATE hr.kedo_order_finance_links SET missing_amount=$2 WHERE document_id=$1`,[link.document_id,Math.max(0,Number(link.amount)-result.available)]);
+          if(!link.notice_sent)notice={id:link.document_id,employee:link.employee,amount:Number(link.amount),available:result.available};
         }
         await c.query('COMMIT');
       }catch(e){await c.query('ROLLBACK').catch(()=>{});console.error('[KEDO ORDER FIN] pending',row.document_id,e.message)}finally{c.release()}
@@ -19332,12 +19317,13 @@ async function kedoOrderFinanceRun_(){
           VALUES($1,now(),$2,NULL)`,[zid,entity]);
         await c.query(`INSERT INTO hr.kedo_order_finance_links(document_id,id_ft,zvk_row_id,amount,legal_entity,employee)
           VALUES($1::uuid,$2,$3,$4,$5,$6)`,[order.id,idFt,zid,amount,entity,order.employee]);
-        // Новые ZFT не получают деньги впереди ранее ожидающих ZFT.
-        // Следующий проход обработает их в одной общей числовой очереди.
-        await c.query(`UPDATE hr.kedo_order_finance_links
-          SET missing_amount=$2 WHERE document_id=$1::uuid`,[order.id,amount]);
+        const result=await kedoOrderFinanceTryFund_(c,{document_id:order.id,id_ft:idFt,zvk_row_id:zid,registry_id:null,amount,legal_entity:entity,employee:order.employee});
+        if(!result.funded){
+          await c.query(`UPDATE hr.kedo_order_finance_links SET missing_amount=$2 WHERE document_id=$1::uuid`,[order.id,Math.max(0,amount-result.available)]);
+          notice={id:order.id,employee:order.employee,amount,available:result.available};
+        }
         await c.query('COMMIT');
-        console.log('[KEDO ORDER FIN] CREATED',order.id,idFt,'QUEUED_BY_ZFT');
+        console.log('[KEDO ORDER FIN] CREATED',order.id,idFt,result.funded?'FUNDED':'WAITING');
       }catch(e){await c.query('ROLLBACK').catch(()=>{});console.error('[KEDO ORDER FIN] create',order.id,e.message)}finally{c.release()}
       if(notice)await kedoOrderNotify_(notice);
     }
@@ -19823,12 +19809,14 @@ async function kedoDriveGetPdf_(documentId){
   const files=await kedoDriveRequestJson_('/documents/'+encodeURIComponent(documentId)+'/ext/files');
   const file=files.elements.find(f=>String(f.key||'').endsWith('/print_form.pdf'));
   if(!file)throw new Error('ORDER_PRINT_FORM_NOT_FOUND');
-  // Используем тот же защищённый URL, что и рабочий эндпоинт
-  // /hr/kedo-document-orders/print-pdf. В метаданных КЭДО link
-  // может отсутствовать или иметь другую форму.
-  // Не передаём User-Token по ссылке из внешнего JSON.
-  const expected='/api/v1/hr/documents/management/documents/'+encodeURIComponent(documentId)+'/files';
-  const url=origin+expected+'?file_key='+encodeURIComponent(String(file.key||''));
+  let url;
+  try{url=new URL(String(file.link||''));}catch(_){throw new Error('ORDER_PDF_LINK_MISSING')}
+  const expected='/api/v1/hr/documents/management/documents/'+documentId+'/files';
+  if(url.origin!==origin||url.protocol!=='https:'||url.pathname!==expected||
+     url.username||url.password||url.hash||url.searchParams.size!==1||
+     url.searchParams.getAll('file_key').length!==1||
+     url.searchParams.get('file_key')!==file.key)
+    throw new Error('ORDER_PDF_LINK_UNEXPECTED');
   const r=await fetch(url,{headers:{Authorization:'User-Token '+KEDO_TOKEN_,Accept:'application/pdf'},
     redirect:'error',signal:AbortSignal.timeout(35000)});
   if(!r.ok)throw new Error('KEDO_PRINT_PDF_HTTP_'+r.status);
@@ -19940,7 +19928,7 @@ let kedoOrderPdfBusy_ = false;
 async function kedoOrderPdfSync_(){
   if(!KEDO_ORDER_FINANCE_ENABLED_ || kedoOrderPdfBusy_)return;
   if(!kedoDriveConfigured_()){
-    console.warn('[KEDO ORDER PDF] NOT_CONFIGURED: credentials/folder missing. Have KEDO_BASE_URL, KEDO_USER_TOKEN, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN, GOOGLE_DRIVE_FOLDER_ID in Render Environment (values not logged).');
+    console.warn('[KEDO ORDER PDF] NOT_CONFIGURED: verify KEDO credentials and GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN, GOOGLE_DRIVE_FOLDER_ID');
     return;
   }
   kedoOrderPdfBusy_ = true;
@@ -19988,59 +19976,10 @@ async function kedoOrderPdfSync_(){
 }
 // Финансовая синхронизация KEDO orders работает самостоятельно; старый
 // таймер kedoSync_ отключён, поэтому PDF приказов тоже нужен свой таймер.
-// PDF только новых командировок KEDO_ORDER теперь открывается через
-// защищённый FT API по требованию. Для других PDF/старых КЭДО схем
-// Drive-синхронизация остаётся без изменений.
-// Старый kedoOrderPdfSync_ намеренно не запускается: не трогаем
-// GOOGLE_REFRESH_TOKEN и не записываем публичные URL в invoice_pdf.
-
-
-// =====================================================
-// FT: просмотр только PDF подписанного приказа нового типа KEDO_ORDER.
-// Не затрагивает обычные invoice_pdf, LZK, MANUAL и старые KEDO.
-// Запрос: GET /ft/kedo-order-pdf?id_ft=FT1234
-// Authorization: Bearer <auth_token> серверной сессии.
-// Возвращает PDF напрямую, без Google Drive/хранения в PostgreSQL.
-// =====================================================
-app.get('/ft/kedo-order-pdf', async (req, res) => {
-  res.set('Cache-Control','private, no-store, max-age=0');
-  res.set('X-Content-Type-Options','nosniff');
-  res.set('Referrer-Policy','no-referrer');
-  try {
-    const user = await getAuthenticatedFtUser(req);
-    if (!user) return res.status(401).json({success:false,error:'FT_SESSION_REQUIRED'});
-    const idFt = String(req.query.id_ft||'').trim();
-    if (!/^FT\d{1,12}$/i.test(idFt))
-      return res.status(400).json({success:false,error:'INVALID_FT_ID'});
-    const q = await pool.query(`
-      SELECT f.id_ft, f.input_name, f.legal_entity, f.dds_article,
-             l.document_id::text AS document_id
-      FROM public.ft f
-      JOIN hr.kedo_order_finance_links l ON l.id_ft=f.id_ft
-      WHERE f.id_ft=$1 AND f.source_type='KEDO_ORDER'
-      LIMIT 1`, [idFt]);
-    if (!q.rowCount) return res.status(404).json({success:false,error:'KEDO_ORDER_FT_NOT_FOUND'});
-    const row=q.rows[0];
-    const login=String(user.login||'').trim().toLowerCase();
-    const owner=String(row.input_name||'').trim().toLowerCase();
-    const privileged=['b_erkin','s_zhasulan','k_ermek'].includes(login);
-    const zaitova=login==='a_zaitova' &&
-      String(row.legal_entity||'').trim().toLowerCase()==='сервис нс' &&
-      String(row.dds_article||'').replace(/\s+/g,'').toLowerCase()==='103.командировочные';
-    if (!(login===owner || privileged || zaitova))
-      return res.status(403).json({success:false,error:'FT_ACCESS_DENIED'});
-    if (!KEDO_DRIVE_UUID_RE_.test(row.document_id))
-      return res.status(502).json({success:false,error:'KEDO_DOCUMENT_ID_INVALID'});
-    const pdf = await kedoDriveGetPdf_(row.document_id); // существующее защищённое скачивание
-    res.set('Content-Type','application/pdf');
-    res.set('Content-Disposition','inline; filename="KEDO_order_'+row.document_id+'.pdf"');
-    res.set('Content-Length',String(pdf.length));
-    return res.status(200).end(pdf);
-  } catch(e) {
-    console.error('[FT KEDO PDF] ERROR',String(e.message||e));
-    if (!res.headersSent) return res.status(502).json({success:false,error:'FT_KEDO_PDF_UNAVAILABLE'});
-  }
-});
+if(KEDO_ORDER_FINANCE_ENABLED_){
+  setTimeout(()=>void kedoOrderPdfSync_(),45000).unref?.();
+  setInterval(()=>void kedoOrderPdfSync_(),5*60000).unref?.();
+}
 
 // =====================================================
 // КОНЕЦ KEDO
