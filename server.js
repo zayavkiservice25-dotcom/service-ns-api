@@ -16047,6 +16047,67 @@ app.get("/draft-funding-logins", async (req, res) => {
   }
 });
 
+// =====================================================
+// ИСТОРИЯ ОПЕРАТИВКИ ПО ПУЛАМ
+// GET /draft-funding-pools/history?login=...
+// Возвращает существующие распределения и сохранённые переводы.
+// Данные, удалённые до включения журнала, восстановить невозможно.
+// =====================================================
+app.get("/draft-funding-pools/history", async (req, res) => {
+  try {
+    const login = String(req.query.login || "").trim().toLowerCase();
+    const allowed = ["b_erkin", "s_zhasulan", "k_ermek", "a_zaitova"];
+    if (!allowed.includes(login)) {
+      return res.status(403).json({ success: false, error: "Нет доступа к истории денежных пулов" });
+    }
+
+    const result = await pool.query(`
+      SELECT * FROM (
+        SELECT
+          'Распределение'::text AS event_type,
+          child.created_at,
+          child.created_by AS actor_login,
+          child.beneficiary_login,
+          child.legal_entity,
+          child.source_name,
+          child.money_type,
+          child.object_name,
+          child.amount,
+          child.id AS event_id,
+          1 AS event_order
+        FROM public.draft_funding_pool child
+        WHERE child.parent_pool_id IS NOT NULL
+
+        UNION ALL
+
+        SELECT
+          'Перевод между пулами'::text AS event_type,
+          tr.created_at,
+          tr.created_by AS actor_login,
+          tr.beneficiary_login,
+          COALESCE(tr.to_legal_entity, tr.from_legal_entity) AS legal_entity,
+          COALESCE(source_pool.source_name, target_pool.source_name) AS source_name,
+          COALESCE(source_pool.money_type, target_pool.money_type) AS money_type,
+          CONCAT_WS(' → ', NULLIF(tr.from_object_name, ''), NULLIF(tr.to_object_name, '')) AS object_name,
+          tr.amount,
+          tr.id AS event_id,
+          2 AS event_order
+        FROM public.draft_funding_pool_transfer tr
+        LEFT JOIN public.draft_funding_pool source_pool ON source_pool.id = tr.from_pool_id
+        LEFT JOIN public.draft_funding_pool target_pool ON target_pool.id = tr.to_pool_id
+      ) history
+      ORDER BY created_at DESC NULLS LAST, event_order DESC, event_id DESC
+      LIMIT 2000
+    `);
+
+    res.set("Cache-Control", "no-store");
+    return res.json({ success: true, rows: result.rows });
+  } catch (e) {
+    console.error("DRAFT FUNDING HISTORY ERROR:", e);
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 app.get("/draft-funding-pools/manage", async (req, res) => {
   try {
     const q = await pool.query(`
