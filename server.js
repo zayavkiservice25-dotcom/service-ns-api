@@ -16452,7 +16452,7 @@ app.post("/draft-funding-pools/:poolId/return", async (req, res) => {
     const poolId = Number(req.params.poolId);
     const amount = Number(req.body?.amount);
     const login = String(req.body?.login || "").trim().toLowerCase();
-    const allowed = ["b_erkin", "s_zhasulan", "k_ermek"];
+    const allowed = ["b_erkin", "s_zhasulan", "a_zaitova", "k_ermek"];
 
     if (!allowed.includes(login)) {
       return res.status(403).json({
