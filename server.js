@@ -5793,6 +5793,77 @@ const query = `
   }
 });
 
+
+// Проверка остатка на сервере обязательна даже при обходе интерфейса.
+async function validateLzkInvoiceBalances_(db, ids, amounts) {
+  const q = await db.query(`      WITH requested AS (SELECT unnest($1::text[]) AS id_zlzk),
+      costs AS (
+        SELECT s.idzlzk AS id_zlzk,
+               SUM(COALESCE(s.total_cost,0))::numeric AS purchase_total
+        FROM lzk.supply s
+        WHERE s.idzlzk=ANY($1::text[])
+          AND (
+            (COALESCE(trim(s.idplxk),'')<>'' )
+            OR (COALESCE(trim(s.idplxk),'')='' AND NOT EXISTS (
+              SELECT 1 FROM lzk.supply c
+              WHERE c.idzlzk=s.idzlzk AND COALESCE(trim(c.idplxk),'')<>''
+            ))
+          )
+        GROUP BY s.idzlzk
+      ),
+      basis AS (
+        SELECT b.id_ft,b.id_zlzk,COALESCE(b.amount,0)::numeric AS amount,
+               NULLIF(f.sum_ft,0)::numeric AS ft_total
+        FROM public.ft_lzk_basis b JOIN public.ft f ON f.id_ft=b.id_ft
+        WHERE b.id_zlzk=ANY($1::text[])
+      ),
+      -- Берём актуальную строку на каждую ZFT, исключая обнулённые.
+      zft_current AS (
+        SELECT DISTINCT ON (z.id_ft,z.id_zvk)
+               z.id_ft,z.id_zvk,z.to_pay,z.request_flag,z.id AS row_id,
+               p.is_paid,p.registry_flag
+        FROM public.zvk z
+        LEFT JOIN public.zvk_pay p ON p.zvk_row_id=z.id
+        ORDER BY z.id_ft,z.id_zvk,z.zvk_date DESC NULLS LAST,z.id DESC
+      ),
+      paid_ft AS (
+        SELECT id_ft,SUM(GREATEST(COALESCE(to_pay,0),0))::numeric AS paid_total
+        FROM zft_current
+        WHERE is_paid='Да' AND COALESCE(request_flag,'')<>'Обнуление'
+          AND COALESCE(registry_flag,'')<>'Обнуление'
+        GROUP BY id_ft
+      ),
+      aggregated AS (
+        SELECT b.id_zlzk,
+               SUM(b.amount)::numeric AS invoiced,
+               SUM(b.amount * LEAST(COALESCE(p.paid_total,0),COALESCE(b.ft_total,0)) / b.ft_total)
+                 FILTER (WHERE b.ft_total>0)::numeric AS paid
+        FROM basis b LEFT JOIN paid_ft p ON p.id_ft=b.id_ft
+        GROUP BY b.id_zlzk
+      )
+      SELECT r.id_zlzk,
+             COALESCE(c.purchase_total,0)::numeric AS purchase_total,
+             COALESCE(a.invoiced,0)::numeric AS invoiced,
+             ROUND(COALESCE(a.paid,0),2)::numeric AS paid,
+             ROUND(COALESCE(c.purchase_total,0)-COALESCE(a.paid,0),2)::numeric AS balance,
+             ROUND(COALESCE(c.purchase_total,0)-COALESCE(a.invoiced,0),2)::numeric AS available_to_invoice,
+             (c.id_zlzk IS NOT NULL) AS has_purchase_cost
+      FROM requested r LEFT JOIN costs c ON c.id_zlzk=r.id_zlzk
+      LEFT JOIN aggregated a ON a.id_zlzk=r.id_zlzk
+      ORDER BY r.id_zlzk`, [ids]);
+  for (const row of q.rows) {
+    const id=String(row.id_zlzk);
+    const requested=Math.round(Number(amounts.get(id))*100);
+    const balance=Math.round(Number(row.balance)*100);
+    if(!row.has_purchase_cost || !Number.isFinite(balance) || balance<=0) {
+      const e=new Error('ZLZK_NO_POSITIVE_BALANCE: '+id);e.httpStatus=409;throw e;
+    }
+    if(requested>balance){
+      const e=new Error('ZLZK_AMOUNT_EXCEEDS_BALANCE: '+id);e.httpStatus=409;throw e;
+    }
+  }
+}
+
 // =====================================================
 // SAVE FT (создать FT + авто ZFT + строка СИСТЕМА)
 // =====================================================
@@ -5929,6 +6000,14 @@ app.post("/save-ft", async (req, res) => {
         await client.query("ROLLBACK");
         return res.status(400).json({ success:false, error:"Unknown idzlzk", missing });
       }
+    }
+
+    if(origin==='LZK'){
+      // Сериализация конкурирующих попыток создать счета для тех же ZLZK.
+      for(const id of [...lzkIds].sort()){
+        await client.query('SELECT pg_advisory_xact_lock(hashtext($1))',['ft-lzk:'+id]);
+      }
+      await validateLzkInvoiceBalances_(client,lzkIds,lzkAmountById);
     }
 
     // Первая проверка идемпотентности:
@@ -6094,7 +6173,7 @@ app.post("/save-ft", async (req, res) => {
     }
 
     console.error("SAVE-FT ERROR:", e);
-    return res.status(500).json({
+    return res.status(e && e.httpStatus ? e.httpStatus : 500).json({
       success:false,
       error:e && e.message ? e.message : String(e)
     });
@@ -6110,6 +6189,83 @@ app.post("/save-ft", async (req, res) => {
 // =====================================================
 // Поиск заявок для FT BASIS. Требует действующую сессию.
 // Источник — те же IDZLZK, которые сервер проверяет при сохранении.
+
+// =====================================================
+// ЛЗК: сумма закупки, оплачено по FT/ZFT, выставленные счета, остаток.
+// Оплаты частичных ZFT распределяются ПРОПОРЦИОНАЛЬНО суммам FT BASIS.
+// Не считать начисления оплатой: статус должен быть is_paid='Да'.
+// =====================================================
+app.get('/ft-lzk-balances', async (req,res) => {
+  try {
+    const actor = await getAuthenticatedFtUser(req);
+    if (!actor) return res.status(401).json({success:false,error:'AUTH_REQUIRED'});
+    const ids = String(req.query.ids||'').split(',').map(x=>x.trim()).filter(Boolean);
+    if (!ids.length || ids.length>100 || ids.some(x=>!/^ZLZK\d+$/i.test(x))) {
+      return res.status(400).json({success:false,error:'INVALID_ZLZK_IDS'});
+    }
+    const q = await pool.query(`
+      WITH requested AS (SELECT unnest($1::text[]) AS id_zlzk),
+      costs AS (
+        SELECT s.idzlzk AS id_zlzk,
+               SUM(COALESCE(s.total_cost,0))::numeric AS purchase_total
+        FROM lzk.supply s
+        WHERE s.idzlzk=ANY($1::text[])
+          AND (
+            (COALESCE(trim(s.idplxk),'')<>'' )
+            OR (COALESCE(trim(s.idplxk),'')='' AND NOT EXISTS (
+              SELECT 1 FROM lzk.supply c
+              WHERE c.idzlzk=s.idzlzk AND COALESCE(trim(c.idplxk),'')<>''
+            ))
+          )
+        GROUP BY s.idzlzk
+      ),
+      basis AS (
+        SELECT b.id_ft,b.id_zlzk,COALESCE(b.amount,0)::numeric AS amount,
+               NULLIF(f.sum_ft,0)::numeric AS ft_total
+        FROM public.ft_lzk_basis b JOIN public.ft f ON f.id_ft=b.id_ft
+        WHERE b.id_zlzk=ANY($1::text[])
+      ),
+      -- Берём актуальную строку на каждую ZFT, исключая обнулённые.
+      zft_current AS (
+        SELECT DISTINCT ON (z.id_ft,z.id_zvk)
+               z.id_ft,z.id_zvk,z.to_pay,z.request_flag,z.id AS row_id,
+               p.is_paid,p.registry_flag
+        FROM public.zvk z
+        LEFT JOIN public.zvk_pay p ON p.zvk_row_id=z.id
+        ORDER BY z.id_ft,z.id_zvk,z.zvk_date DESC NULLS LAST,z.id DESC
+      ),
+      paid_ft AS (
+        SELECT id_ft,SUM(GREATEST(COALESCE(to_pay,0),0))::numeric AS paid_total
+        FROM zft_current
+        WHERE is_paid='Да' AND COALESCE(request_flag,'')<>'Обнуление'
+          AND COALESCE(registry_flag,'')<>'Обнуление'
+        GROUP BY id_ft
+      ),
+      aggregated AS (
+        SELECT b.id_zlzk,
+               SUM(b.amount)::numeric AS invoiced,
+               SUM(b.amount * LEAST(COALESCE(p.paid_total,0),COALESCE(b.ft_total,0)) / b.ft_total)
+                 FILTER (WHERE b.ft_total>0)::numeric AS paid
+        FROM basis b LEFT JOIN paid_ft p ON p.id_ft=b.id_ft
+        GROUP BY b.id_zlzk
+      )
+      SELECT r.id_zlzk,
+             COALESCE(c.purchase_total,0)::numeric AS purchase_total,
+             COALESCE(a.invoiced,0)::numeric AS invoiced,
+             ROUND(COALESCE(a.paid,0),2)::numeric AS paid,
+             ROUND(COALESCE(c.purchase_total,0)-COALESCE(a.paid,0),2)::numeric AS balance,
+             ROUND(COALESCE(c.purchase_total,0)-COALESCE(a.invoiced,0),2)::numeric AS available_to_invoice,
+             (c.id_zlzk IS NOT NULL) AS has_purchase_cost
+      FROM requested r LEFT JOIN costs c ON c.id_zlzk=r.id_zlzk
+      LEFT JOIN aggregated a ON a.id_zlzk=r.id_zlzk
+      ORDER BY r.id_zlzk`,[ids]);
+    res.json({success:true,rows:q.rows,partial_payment_allocation:'proportional_to_ft_basis'});
+  } catch(e) {
+    console.error('FT LZK BALANCES:',e);
+    res.status(500).json({success:false,error:'FT_LZK_BALANCES_UNAVAILABLE'});
+  }
+});
+
 app.get('/ft-lzk-basis/candidates', async (req,res) => {
   try {
     const actor = await getAuthenticatedFtUser(req);
@@ -6201,11 +6357,17 @@ app.post("/ft-lzk-basis/update", async (req, res) => {
     const login = String(actor.login).trim().toLowerCase();
     await client.query("BEGIN");
     const ftResult = await client.query(
-      `SELECT id_ft, input_name FROM public.ft WHERE id_ft=$1 FOR UPDATE`, [idFt]
+      `SELECT id_ft, input_name, sum_ft FROM public.ft WHERE id_ft=$1 FOR UPDATE`, [idFt]
     );
     if (!ftResult.rowCount) {
       await client.query("ROLLBACK");
       return res.status(404).json({success:false, error:"FT_NOT_FOUND"});
+    }
+
+    // Ручная сумма FT неизменна при редактировании BASIS.
+    if (Math.round(Number(ftResult.rows[0].sum_ft || 0)*100) !== totalCents) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({success:false,error:'BASIS_SUM_MUST_EQUAL_MANUAL_FT_SUM'});
     }
 
     // Никто, включая администратора, не может менять чужой FT BASIS.
@@ -6272,7 +6434,7 @@ app.post("/ft-lzk-basis/update", async (req, res) => {
       );
     }
     for(const id of changed){await client.query(`INSERT INTO public.ft_lzk_basis_history (id_ft,id_zlzk,action,changed_by,old_amount,new_amount) VALUES ($1,$2,'AMOUNT_CHANGE',$3,$4,$5)`,[idFt,id,login,oldAmounts.get(id),amountById.get(id)]);}
-    await client.query(`UPDATE public.ft SET sum_ft=$2 WHERE id_ft=$1`,[idFt,(totalCents/100).toFixed(2)]);
+    // НЕ меняем public.ft.sum_ft: это ручная сумма счета.
     // Если к обычному FT впервые добавили основание, он становится LZK.
     // При удалении всех связей статус LZK не сбрасываем автоматически:
     // это сохраняет факт происхождения для аудита.
@@ -6281,7 +6443,7 @@ app.post("/ft-lzk-basis/update", async (req, res) => {
     }
 
     await client.query("COMMIT");
-    return res.json({success:true, id_ft:idFt, idzlzk_ids:ids, added:add, removed:remove, sum_ft:(totalCents/100).toFixed(2)});
+    return res.json({success:true, id_ft:idFt, idzlzk_ids:ids, added:add, removed:remove, sum_ft:ftResult.rows[0].sum_ft});
   } catch (e) {
     try { await client.query("ROLLBACK"); } catch (_) {}
     console.error("UPDATE FT-LZK-BASIS ERROR:", e);
