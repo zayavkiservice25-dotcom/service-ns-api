@@ -5799,8 +5799,14 @@ async function validateLzkInvoiceBalances_(db, ids, amounts) {
   const q = await db.query(`      WITH requested AS (SELECT unnest($1::text[]) AS id_zlzk),
       costs AS (
         SELECT s.idzlzk AS id_zlzk,
-               SUM(COALESCE(s.total_cost,0))::numeric AS purchase_total
+               -- Точно как «Общая стоимость» в панели снабженца:
+               -- qty * unit_price, без стоимости доставки.
+               SUM((CASE WHEN COALESCE(trim(s.idplxk),'') <> ''
+                 THEN GREATEST(COALESCE(s.ordered_qty,0),0)
+                 ELSE GREATEST(COALESCE(r.fact_qty,0),0)
+               END) * COALESCE(s.unit_price,0))::numeric AS purchase_total
         FROM lzk.supply s
+        JOIN lzk.requests r ON r.idzlzk=s.idzlzk
         WHERE s.idzlzk=ANY($1::text[])
           AND (
             (COALESCE(trim(s.idplxk),'')<>'' )
@@ -6207,8 +6213,14 @@ app.get('/ft-lzk-balances', async (req,res) => {
       WITH requested AS (SELECT unnest($1::text[]) AS id_zlzk),
       costs AS (
         SELECT s.idzlzk AS id_zlzk,
-               SUM(COALESCE(s.total_cost,0))::numeric AS purchase_total
+               -- Точно как «Общая стоимость» в панели снабженца:
+               -- qty * unit_price, без стоимости доставки.
+               SUM((CASE WHEN COALESCE(trim(s.idplxk),'') <> ''
+                 THEN GREATEST(COALESCE(s.ordered_qty,0),0)
+                 ELSE GREATEST(COALESCE(r.fact_qty,0),0)
+               END) * COALESCE(s.unit_price,0))::numeric AS purchase_total
         FROM lzk.supply s
+        JOIN lzk.requests r ON r.idzlzk=s.idzlzk
         WHERE s.idzlzk=ANY($1::text[])
           AND (
             (COALESCE(trim(s.idplxk),'')<>'' )
