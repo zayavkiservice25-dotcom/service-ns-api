@@ -2237,6 +2237,24 @@ async function getAuthenticatedFtUser(req, db = pool) {
   `, [hashFtAuthToken(match[1])]);
   return result.rows[0] || null;
 }
+async function getAuthenticatedFtUserOrLogin(req, loginValue, db = pool) {
+  const byToken = await getAuthenticatedFtUser(req, db);
+  if (byToken) return byToken;
+
+  const login = String(loginValue || '').trim();
+  if (!login) return null;
+
+  const result = await db.query(`
+    SELECT login, role_ft, role_hr
+    FROM public.users
+    WHERE lower(trim(login)) = lower(trim($1))
+      AND is_active = true
+    LIMIT 1
+  `, [login]);
+
+  return result.rows[0] || null;
+}
+
 
 app.post("/login", async (req, res) => {
   try {
@@ -6211,7 +6229,7 @@ app.post("/save-ft", async (req, res) => {
 // =====================================================
 app.get('/zft-zlzk-options', async (req,res) => {
   try {
-    const actor = await getAuthenticatedFtUser(req);
+    const actor = await getAuthenticatedFtUserOrLogin(req, req.query.login);
     if (!actor) return res.status(401).json({success:false,error:'AUTH_REQUIRED'});
     const currentRowId = Number(req.query.zvk_row_id || 0);
     if (!currentRowId) return res.status(400).json({success:false,error:'INVALID_ZVK_ROW_ID'});
@@ -6275,7 +6293,7 @@ app.get('/zft-zlzk-options', async (req,res) => {
 
 app.get('/zft-zlzk-allocation', async (req,res) => {
   try {
-    const actor = await getAuthenticatedFtUser(req);
+    const actor = await getAuthenticatedFtUserOrLogin(req, req.query.login);
     if (!actor) return res.status(401).json({success:false,error:'AUTH_REQUIRED'});
     const rowId=Number(req.query.zvk_row_id||0);
     if(!rowId)return res.status(400).json({success:false,error:'INVALID_ZVK_ROW_ID'});
@@ -6287,7 +6305,7 @@ app.get('/zft-zlzk-allocation', async (req,res) => {
 app.post('/zft-zlzk-allocation/save', async (req,res) => {
   const client=await pool.connect();
   try {
-    const actor=await getAuthenticatedFtUser(req);
+    const actor=await getAuthenticatedFtUserOrLogin(req, req.body?.login);
     if(!actor)return res.status(401).json({success:false,error:'AUTH_REQUIRED'});
     const rowId=Number(req.body?.zvk_row_id||0);
     const allocations=Array.isArray(req.body?.allocations)?req.body.allocations:[];
