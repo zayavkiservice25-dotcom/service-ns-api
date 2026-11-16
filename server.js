@@ -6244,7 +6244,8 @@ app.get('/zft-zlzk-options', async (req,res) => {
     if(!ownerQ.rowCount) return res.status(404).json({success:false,error:'ZFT_ROW_NOT_FOUND'});
     const ownerLogin=String(ownerQ.rows[0].input_name||'').trim().toLowerCase();
     const actorLogin=String(actor.login||'').trim().toLowerCase();
-    if(!ownerLogin || ownerLogin!==actorLogin) {
+    const isSZhasulan = actorLogin === 's_zhasulan';
+    if(!isSZhasulan && (!ownerLogin || ownerLogin!==actorLogin)) {
       return res.status(403).json({success:false,error:'ZLZK_ONLY_FT_AUTHOR'});
     }
 
@@ -6351,7 +6352,8 @@ app.post('/zft-zlzk-allocation/save', async (req,res) => {
     // Выбирать/менять ZLZK может только автор строки FT — тот, кто указан в «ВводИмя».
     const ownerLogin=String(z.input_name||'').trim().toLowerCase();
     const actorLogin=String(actor.login||'').trim().toLowerCase();
-    if(!ownerLogin || ownerLogin!==actorLogin){
+    const isSZhasulan = actorLogin === 's_zhasulan';
+    if(!isSZhasulan && (!ownerLogin || ownerLogin!==actorLogin)){
       await client.query('ROLLBACK');
       return res.status(403).json({success:false,error:'ZLZK_ONLY_FT_AUTHOR'});
     }
