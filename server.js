@@ -299,24 +299,10 @@ await pool.query(`
 
 // =====================================================
 // Фактическое распределение ZFT по ZLZK.
+// Таблица public.zft_zlzk_allocation создаётся ОДИН РАЗ вручную SQL-миграцией.
+// В initDb() намеренно не создаём её автоматически.
 // Старая ft_lzk_basis НЕ удаляется и используется как legacy fallback.
 // =====================================================
-await pool.query(`
-  CREATE TABLE IF NOT EXISTS public.zft_zlzk_allocation (
-    id bigserial PRIMARY KEY,
-    zvk_row_id bigint NOT NULL REFERENCES public.zvk(id) ON DELETE CASCADE,
-    id_zlzk text NOT NULL,
-    qty numeric(18,6) NOT NULL CHECK (qty > 0),
-    amount numeric(18,2) NOT NULL CHECK (amount > 0),
-    created_by text,
-    created_at timestamptz NOT NULL DEFAULT now(),
-    updated_at timestamptz NOT NULL DEFAULT now(),
-    UNIQUE (zvk_row_id, id_zlzk)
-  );
-`);
-await pool.query(`CREATE INDEX IF NOT EXISTS zft_zlzk_alloc_zlzk_idx ON public.zft_zlzk_allocation (id_zlzk);`);
-await pool.query(`CREATE INDEX IF NOT EXISTS zft_zlzk_alloc_row_idx ON public.zft_zlzk_allocation (zvk_row_id);`);
-
 
 
 // Логин инициатора, которому выделена сумма дочернего денежного пула.
@@ -6324,8 +6310,9 @@ app.post('/zft-zlzk-allocation/save', async (req,res) => {
     if(!zq.rowCount){await client.query('ROLLBACK');return res.status(404).json({success:false,error:'ZFT_ROW_NOT_FOUND'});}
     const z=zq.rows[0];
 
-    if(String(z.request_flag||'')==='Да' && Number(z.to_pay||0)>0){
-      if(!normalized.length){await client.query('ROLLBACK');return res.status(400).json({success:false,error:'ZLZK_ALLOCATION_REQUIRED'});}
+    // ZLZK для ZFT необязательны. Если распределение задано, оно должно полностью
+    // совпадать с суммой «К оплате». Пустой массив допустим и не блокирует запуск ZFT.
+    if(String(z.request_flag||'')==='Да' && Number(z.to_pay||0)>0 && normalized.length){
       const totalCents=normalized.reduce((a,x)=>a+Math.round(x.amount*100),0);
       if(totalCents!==Math.round(Number(z.to_pay||0)*100)){
         await client.query('ROLLBACK');return res.status(400).json({success:false,error:'ZLZK_ALLOCATION_SUM_MISMATCH'});
