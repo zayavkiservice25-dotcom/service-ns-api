@@ -6234,6 +6234,20 @@ app.get('/zft-zlzk-options', async (req,res) => {
     const currentRowId = Number(req.query.zvk_row_id || 0);
     if (!currentRowId) return res.status(400).json({success:false,error:'INVALID_ZVK_ROW_ID'});
 
+    const ownerQ = await pool.query(`
+      SELECT f.input_name
+      FROM public.zvk z
+      JOIN public.ft f ON f.id_ft=z.id_ft
+      WHERE z.id=$1
+      LIMIT 1
+    `,[currentRowId]);
+    if(!ownerQ.rowCount) return res.status(404).json({success:false,error:'ZFT_ROW_NOT_FOUND'});
+    const ownerLogin=String(ownerQ.rows[0].input_name||'').trim().toLowerCase();
+    const actorLogin=String(actor.login||'').trim().toLowerCase();
+    if(!ownerLogin || ownerLogin!==actorLogin) {
+      return res.status(403).json({success:false,error:'ZLZK_ONLY_FT_AUTHOR'});
+    }
+
     const q = await pool.query(`
       WITH approved AS (
         SELECT r.idzlzk AS id_zlzk,
@@ -6324,9 +6338,23 @@ app.post('/zft-zlzk-allocation/save', async (req,res) => {
       return res.status(400).json({success:false,error:'DUPLICATE_ZLZK'});
 
     await client.query('BEGIN');
-    const zq=await client.query(`SELECT id,id_ft,to_pay,request_flag FROM public.zvk WHERE id=$1 FOR UPDATE`,[rowId]);
+    const zq=await client.query(`
+      SELECT z.id,z.id_ft,z.to_pay,z.request_flag,f.input_name
+      FROM public.zvk z
+      JOIN public.ft f ON f.id_ft=z.id_ft
+      WHERE z.id=$1
+      FOR UPDATE OF z
+    `,[rowId]);
     if(!zq.rowCount){await client.query('ROLLBACK');return res.status(404).json({success:false,error:'ZFT_ROW_NOT_FOUND'});}
     const z=zq.rows[0];
+
+    // Выбирать/менять ZLZK может только автор строки FT — тот, кто указан в «ВводИмя».
+    const ownerLogin=String(z.input_name||'').trim().toLowerCase();
+    const actorLogin=String(actor.login||'').trim().toLowerCase();
+    if(!ownerLogin || ownerLogin!==actorLogin){
+      await client.query('ROLLBACK');
+      return res.status(403).json({success:false,error:'ZLZK_ONLY_FT_AUTHOR'});
+    }
 
     // ZLZK для ZFT необязательны. Если распределение задано, оно должно полностью
     // совпадать с суммой «К оплате». Пустой массив допустим и не блокирует запуск ZFT.
