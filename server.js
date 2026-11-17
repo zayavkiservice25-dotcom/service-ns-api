@@ -3780,7 +3780,7 @@ app.post("/request-created-bulk", async (req, res) => {
       });
     }
 
-    const isBerkinOrZhasulan = ["b_erkin", "s_zhasulan", "a_zaitova", "t_serik"].includes(login);
+    const isBerkinOrZhasulan = ["b_erkin", "s_zhasulan", "k_ermek", "a_zaitova", "t_serik"].includes(login);
 
     /*
       Пустое значение вручную могут устанавливать b_erkin, s_zhasulan и a_zaitova.
@@ -5425,10 +5425,10 @@ app.post("/zvk-pay-row", async (req, res) => {
       is_admin === true || is_admin === 1 || is_admin === "1" ||
       String(is_admin).toLowerCase() === "true";
 
-    const payOk = adminOk || ["b_erkin", "s_zhasulan", "a_zaitova"].includes(actor);
+    const payOk = adminOk || ["b_erkin", "s_zhasulan", "k_ermek", "a_zaitova"].includes(actor);
 
     if (!payOk) {
-      return res.status(403).json({ success:false, error:"only b_erkin/s_zhasulan/a_zaitova/admin allowed" });
+      return res.status(403).json({ success:false, error:"only b_erkin/s_zhasulan/k_ermek/a_zaitova/admin allowed" });
     }
 
     if (!zvk_row_id) {
