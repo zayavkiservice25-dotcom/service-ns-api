@@ -11500,6 +11500,8 @@ app.get("/lzk/limits", async (req, res) => {
         COALESCE(l.amount, 0) AS amount_sum,
         COALESCE(l.fact_received, 0) AS fact_received,
         COALESCE(l.note, '') AS note,
+        COALESCE(l.created_by, '') AS created_by,
+        l.created_at,
         COALESCE(pb.payment_paid_qty,0) AS payment_paid_qty,
         COALESCE(pb.payment_paid_amount,0) AS payment_paid_amount,
         COALESCE(pb.payment_pending_qty,0) AS payment_pending_qty,
@@ -11548,6 +11550,8 @@ app.get("/lzk/limits", async (req, res) => {
         l.amount,
         l.fact_received,
         l.note,
+        l.created_by,
+        l.created_at,
         pb.payment_paid_qty,
         pb.payment_paid_amount,
         pb.payment_pending_qty,
@@ -11664,7 +11668,7 @@ app.post('/lzk/limit-update', async (req, res) => {
     const materialName = lzkText(body.material_name);
     const unitName = lzkText(body.unit_name);
     const login = lzkText(body.login).toLowerCase();
-    const planQty = lzkNum(body.plan_qty);
+    const requestedPlanQty = lzkNum(body.plan_qty);
     const priceWithoutVat = lzkNum(body.price_without_vat);
     const factReceived = lzkNum(body.fact_received ?? 0);
 
@@ -11675,7 +11679,7 @@ app.post('/lzk/limit-update', async (req, res) => {
     if (!materialName) throw new Error('ТМЦ по факту не заполнено');
     if (!unitName) throw new Error('Ед.изм. не заполнена');
     if (!login) throw new Error('Логин пользователя не передан');
-    if (planQty === null || planQty < 0) throw new Error('Кол-во по плану заполнено неправильно');
+    if (login === 'z_karlygash' && (requestedPlanQty === null || requestedPlanQty < 0)) throw new Error('Кол-во по плану заполнено неправильно');
     if (priceWithoutVat === null || priceWithoutVat < 0) throw new Error('Цена без НДС заполнена неправильно');
     if (factReceived === null || factReceived < 0) throw new Error('Одобрено без ЛЗК заполнено неправильно');
 
@@ -11706,7 +11710,7 @@ app.post('/lzk/limit-update', async (req, res) => {
     await client.query('BEGIN');
 
     const limitResult = await client.query(`
-      SELECT idlzk
+      SELECT idlzk, COALESCE(plan_qty,0)::numeric AS plan_qty
       FROM lzk.limits
       WHERE idlzk = $1
       FOR UPDATE
@@ -11715,6 +11719,11 @@ app.post('/lzk/limit-update', async (req, res) => {
     if (!limitResult.rows.length) {
       throw new Error('IDLZK не найден: ' + idlzk);
     }
+
+    // Только z_karlygash меняет план. Остальные редакторы сохраняют текущее значение.
+    const planQty = login === 'z_karlygash'
+      ? requestedPlanQty
+      : Number(limitResult.rows[0].plan_qty || 0);
 
     async function findByName(table, idCol, nameCol, name) {
       const q = await client.query(
@@ -13764,11 +13773,11 @@ app.post('/lzk/limit-create', async (req, res) => {
     }
 
     const roleLzk = lzkText(userRoleResult.rows[0].role_lzk).toLowerCase();
-    const isInitiator = roleLzk === 'initiator' || roleLzk === 'инициатор';
+    const canSetPlan = login === 'z_karlygash';
 
-    // Инициатор может создать строку лимита, но план ему всегда сохраняем как 0.
-    // Для остальных ролей сохраняем введенное значение.
-    const planQty = isInitiator ? 0 : lzkNum(body.plan_qty);
+    // Создать лимит может любой активный пользователь.
+    // Кол-во по плану задаёт только z_karlygash. Для остальных сервер принудительно пишет 0.
+    const planQty = canSetPlan ? lzkNum(body.plan_qty) : 0;
 
     if (planQty === null || planQty < 0) {
       throw new Error('Кол-во по плану заполнено неправильно');
@@ -13892,8 +13901,10 @@ app.post('/lzk/limit-create', async (req, res) => {
         unit_name,
         plan_qty,
         price_without_vat,
-        amount
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+        amount,
+        created_by,
+        created_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,now())
     `, [
       idlzk,
       objectRow.id,
@@ -13908,7 +13919,8 @@ app.post('/lzk/limit-create', async (req, res) => {
       unitName,
       planQty,
       priceWithoutVat,
-      amount
+      amount,
+      login
     ]);
 
     await client.query('COMMIT');
