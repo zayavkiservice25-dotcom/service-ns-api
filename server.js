@@ -5687,7 +5687,13 @@ if (isAdmin || isAll) {
     // Вкладки взаимоисключающие. Основание — наличие привязанных ZLZK
     // либо явно отмеченный источник LZK (для старых записей).
     const lzkInvoiceCondition = `(
-      EXISTS (SELECT 1 FROM public.ft_lzk_basis fbl WHERE fbl.id_ft = v.id_ft)
+      EXISTS (
+        SELECT 1
+        FROM public.zft_zlzk_allocation zza
+        JOIN public.zvk zz ON zz.id = zza.zvk_row_id
+        WHERE zz.id_ft = v.id_ft
+      )
+      OR EXISTS (SELECT 1 FROM public.ft_lzk_basis fbl WHERE fbl.id_ft = v.id_ft)
       OR EXISTS (SELECT 1 FROM public.ft fo WHERE fo.id_ft = v.id_ft AND COALESCE(fo.source_type, 'MANUAL') = 'LZK')
     )`;
     where.push(ftView === 'lzk' ? lzkInvoiceCondition : `NOT ${lzkInvoiceCondition}`);
@@ -5777,8 +5783,19 @@ const query = `
   FROM balance_rows v
 
   LEFT JOIN LATERAL (
-    SELECT string_agg(b.id_zlzk, ', ' ORDER BY b.id_zlzk) AS idzlzk_ids
-    FROM (SELECT DISTINCT id_zlzk FROM public.ft_lzk_basis WHERE id_ft = v.id_ft) b
+    SELECT string_agg(x.id_zlzk, ', ' ORDER BY x.id_zlzk) AS idzlzk_ids
+    FROM (
+      SELECT DISTINCT zza.id_zlzk
+      FROM public.zft_zlzk_allocation zza
+      JOIN public.zvk zz ON zz.id = zza.zvk_row_id
+      WHERE zz.id_ft = v.id_ft
+
+      UNION
+
+      SELECT DISTINCT fbl.id_zlzk
+      FROM public.ft_lzk_basis fbl
+      WHERE fbl.id_ft = v.id_ft
+    ) x
   ) lzk_basis ON TRUE
 
   LEFT JOIN public.zvk zlive
