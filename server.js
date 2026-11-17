@@ -6407,16 +6407,16 @@ app.get('/ft-lzk-balances', async (req,res) => {
     const q = await pool.query(`
       WITH requested AS (SELECT unnest($1::text[]) AS id_zlzk),
       costs AS (
-        SELECT r.idzlzk AS id_zlzk,
-               MAX(COALESCE(r.fact_qty,0))::numeric AS approved_qty,
-               SUM((CASE WHEN COALESCE(trim(s.idplxk),'') <> ''
-                 THEN GREATEST(COALESCE(s.ordered_qty,0),0)
-                 ELSE GREATEST(COALESCE(r.fact_qty,0),0)
-               END) * COALESCE(s.unit_price,0))::numeric AS purchase_total
-        FROM lzk.requests r LEFT JOIN lzk.supply s ON s.idzlzk=r.idzlzk
+        SELECT
+          r.idzlzk AS id_zlzk,
+          MAX(COALESCE(r.fact_qty,0))::numeric AS approved_qty,
+          (
+            MAX(COALESCE(r.fact_qty,0)) *
+            MAX(COALESCE(lim.price_without_vat,0))
+          )::numeric AS purchase_total
+        FROM lzk.requests r
+        LEFT JOIN lzk.limits lim ON lim.idlzk = r.idlzk
         WHERE r.idzlzk=ANY($1::text[])
-          AND (s.idzlzk IS NULL OR COALESCE(trim(s.idplxk),'')<>'' OR
-              (COALESCE(trim(s.idplxk),'')='' AND NOT EXISTS(SELECT 1 FROM lzk.supply c WHERE c.idzlzk=r.idzlzk AND COALESCE(trim(c.idplxk),'')<>'')))
         GROUP BY r.idzlzk
       ),
       real_alloc AS (
@@ -6461,7 +6461,7 @@ app.get('/ft-lzk-balances', async (req,res) => {
              COALESCE(ra.paid_qty,0)::numeric AS paid_qty,
              COALESCE(ra.pending_qty,0)::numeric AS pending_qty,
              GREATEST(COALESCE(c.approved_qty,0)-COALESCE(ra.paid_qty,0)-COALESCE(ra.pending_qty,0),0)::numeric AS remaining_qty,
-             ROUND(GREATEST(COALESCE(c.purchase_total,0)-COALESCE(ra.paid,l.paid,0)-COALESCE(ra.pending,0),0),2)::numeric AS balance,
+             ROUND(COALESCE(c.purchase_total,0)-COALESCE(ra.paid,l.paid,0)-COALESCE(ra.pending,0),2)::numeric AS balance,
              ROUND(GREATEST(COALESCE(c.purchase_total,0)-CASE WHEN ra.id_zlzk IS NOT NULL THEN COALESCE(ra.paid,0)+COALESCE(ra.pending,0) ELSE COALESCE(l.invoiced,0) END,0),2)::numeric AS available_to_invoice,
              (c.id_zlzk IS NOT NULL) AS has_purchase_cost,
              CASE WHEN ra.id_zlzk IS NOT NULL THEN 'zft_zlzk_allocation' ELSE 'legacy_ft_basis' END AS allocation_mode
@@ -12171,6 +12171,7 @@ app.get("/lzk/supply", async (req, res) => {
           r.documents_url,
           r.pto_status,
           r.pto_date,
+          COALESCE(lim.price_without_vat, 0)::numeric AS limit_unit_price,
           CASE WHEN lim.idlzk IS NULL THEN NULL ELSE
             LEAST(
               GREATEST(COALESCE(r.fact_qty, 0), 0),
@@ -12226,7 +12227,8 @@ app.get("/lzk/supply", async (req, res) => {
           s.comparison_protocol,
           s.supplier_name,
           s.contract_details,
-          s.unit_price,
+          a.limit_unit_price AS limit_unit_price,
+          s.unit_price AS supply_unit_price,
           s.total_cost,
           s.delivery_cost,
           s.payment_invoice,
@@ -12295,7 +12297,8 @@ app.get("/lzk/supply", async (req, res) => {
           s.comparison_protocol,
           s.supplier_name,
           s.contract_details,
-          s.unit_price,
+          a.limit_unit_price AS limit_unit_price,
+          s.unit_price AS supply_unit_price,
           s.total_cost,
           s.delivery_cost,
           s.payment_invoice,
