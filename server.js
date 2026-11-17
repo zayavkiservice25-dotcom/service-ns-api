@@ -2742,7 +2742,7 @@ app.post("/ft-update-main", async (req, res) => {
     }
 
     // Доступ только b_erkin, s_zhasulan и a_zaitova.
-    if (!["b_erkin", "s_zhasulan", "a_zaitova"].includes(actor)) {
+    if (!["b_erkin", "s_zhasulan", "k_ermek", "a_zaitova"].includes(actor)) {
       return res.status(403).json({ success:false, error:"NO_RIGHTS" });
     }
 
@@ -2932,7 +2932,12 @@ function canSetPaid(login, roleFt) {
 }
 
 async function canEditRowByLogin(poolOrClient, zvk_row_id, login) {
-  const rid = Number(zvk_row_id);
+  
+  const normalizedLogin = String(login || "").trim().toLowerCase();
+  if (normalizedLogin === "s_zhasulan" || normalizedLogin === "k_ermek") {
+    return true;
+  }
+const rid = Number(zvk_row_id);
   const lg = normLogin(login);
 
   if (!rid || Number.isNaN(rid) || !lg) return false;
@@ -4546,7 +4551,7 @@ app.post("/zvk-save", async (req, res) => {
       isTruthy(is_admin) ||
       isTruthy(is_all) ||
       isTruthy(can_edit_all) ||
-      ["b_erkin", "s_zhasulan", "a_zaitova", "t_serik"].includes(actor.toLowerCase());
+      ["b_erkin", "s_zhasulan", "k_ermek", "a_zaitova", "t_serik"].includes(actor.toLowerCase());
 
     const ft = String(id_ft).trim();
    let flag = String(request_flag || "Нет").trim();
@@ -4911,7 +4916,7 @@ app.post("/zvk-bulk-request-flag", async (req, res) => {
       isTruthy(is_admin) ||
       isTruthy(is_all) ||
       isTruthy(can_edit_all) ||
-      ["b_erkin", "s_zhasulan", "a_zaitova", "t_serik"].includes(actor.toLowerCase());
+      ["b_erkin", "s_zhasulan", "k_ermek", "a_zaitova", "t_serik"].includes(actor.toLowerCase());
 
     if (!adminOk) {
       return res.status(403).json({ success:false, error:"NO_RIGHTS" });
@@ -5030,7 +5035,7 @@ app.post("/zvk-return-amount", async (req, res) => {
       return res.status(409).json({ success:false, error:"Возврат уже закрыт как «Полностью возвращено»" });
     }
 
-    const adminOk = ["b_erkin", "s_zhasulan", "admin", "a_zaitova"].includes(login);
+    const adminOk = ["b_erkin", "s_zhasulan", "k_ermek", "admin", "a_zaitova"].includes(login);
     if (!adminOk) {
       const ownerOk = await canEditRowByLogin(pool, rid, login);
       if (!ownerOk) {
@@ -5079,7 +5084,7 @@ app.post("/zvk-status-row", async (req, res) => {
       isTruthy(is_admin) ||
       isTruthy(can_edit_all) ||
       String(is_all || "0") === "1" ||
-      ["b_erkin", "s_zhasulan", "a_zaitova"].includes(actor.toLowerCase());
+      ["b_erkin", "s_zhasulan", "k_ermek", "a_zaitova"].includes(actor.toLowerCase());
 
     if (!adminOk) {
       const ok = await canEditRowByLogin(pool, rid, actor);
@@ -16114,7 +16119,7 @@ app.post("/zvk-funding-pools/save", async (req, res) => {
       isTruthy(req.body?.is_admin) ||
       isTruthy(req.body?.is_all) ||
       isTruthy(req.body?.can_edit_all) ||
-      ["b_erkin", "s_zhasulan", "a_zaitova", "t_serik"].includes(actor.toLowerCase());
+      ["b_erkin", "s_zhasulan", "k_ermek", "a_zaitova", "t_serik"].includes(actor.toLowerCase());
 
     if (!adminOk) {
       const ok = await canEditRowByLogin(client, rid, actor);
@@ -17896,7 +17901,7 @@ app.post("/pre-registry/amount-save", async (req, res) => {
 
     // r_gulnur сохраняет прежний полный доступ.
     // Остальные пользователи могут менять ДоРеестр только по своей строке ФТ.
-    if (actor !== "r_gulnur") {
+    if (actor !== "r_gulnur" && actor !== "s_zhasulan" && actor !== "k_ermek") {
       const ownRow = await canEditRowByLogin(pool, rowId, actor);
       if (!ownRow) {
         return res.status(403).json({
@@ -18064,7 +18069,7 @@ app.post("/pre-registry/create", async (req, res) => {
 
     // r_gulnur сохраняет прежний полный доступ.
     // Любой другой инициатор может создать ДоРеестр только по своим строкам.
-    if (actor !== "r_gulnur") {
+    if (actor !== "r_gulnur" && actor !== "s_zhasulan" && actor !== "k_ermek") {
       for (const rowId of ids) {
         const ownRow = await canEditRowByLogin(client, rowId, actor);
         if (!ownRow) {
