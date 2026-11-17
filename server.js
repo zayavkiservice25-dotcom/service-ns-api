@@ -3227,6 +3227,77 @@ async function markRowsAsRegistryCreated(client, rowIds) {
   `, [ids]);
 }
 
+
+// Предпросмотр строк перед созданием заявки.
+// Возвращает только выбранные row_ids и не создаёт request_head/request_items.
+app.post("/request-preview", async (req, res) => {
+  try {
+    const rowIds = Array.isArray(req.body?.row_ids)
+      ? [...new Set(req.body.row_ids.map(Number).filter(Boolean))]
+      : [];
+
+    const login = String(req.body?.login || "").trim();
+
+    if (!rowIds.length) {
+      return res.status(400).json({ success:false, error:"row_ids required" });
+    }
+
+    if (!login) {
+      return res.status(400).json({ success:false, error:"login required" });
+    }
+
+    const activeUser = await pool.query(`
+      SELECT login
+      FROM public.users
+      WHERE lower(trim(login)) = lower(trim($1))
+        AND COALESCE(active, true) = true
+      LIMIT 1
+    `, [login]);
+
+    if (!activeUser.rowCount) {
+      return res.status(403).json({ success:false, error:"USER_NOT_ALLOWED" });
+    }
+
+    const rows = await pool.query(`
+      SELECT
+        v.zvk_row_id,
+        v.id_ft,
+        v.id_zvk,
+        v.object,
+        v.input_name,
+        v.contractor,
+        v.pay_purpose,
+        v.dds_article,
+        v.contract_no,
+        v.invoice_no,
+        v.invoice_date,
+        v.invoice_pdf,
+        v.src_d,
+        v.src_o,
+        v.money_type,
+        v.idlzk,
+        v.to_pay,
+        COALESCE(v.esk_return, false) AS esk_return,
+        COALESCE(v.acc_buh_status, '') AS acc_buh_status
+      FROM public.ft_zvk_current_v2 v
+      WHERE v.zvk_row_id = ANY($1::bigint[])
+      ORDER BY array_position($1::bigint[], v.zvk_row_id)
+    `, [rowIds]);
+
+    if (!rows.rowCount) {
+      return res.status(404).json({ success:false, error:"Строки ФТ не найдены" });
+    }
+
+    return res.json({
+      success:true,
+      items:rows.rows
+    });
+  } catch (e) {
+    console.error("request-preview error:", e);
+    return res.status(500).json({ success:false, error:e.message || String(e) });
+  }
+});
+
 app.post("/create-request", async (req, res) => {
   const client = await pool.connect();
 
