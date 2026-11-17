@@ -11669,7 +11669,7 @@ app.post('/lzk/limit-update', async (req, res) => {
     const unitName = lzkText(body.unit_name);
     const login = lzkText(body.login).toLowerCase();
     const requestedPlanQty = lzkNum(body.plan_qty);
-    const priceWithoutVat = lzkNum(body.price_without_vat);
+    const requestedPriceWithoutVat = lzkNum(body.price_without_vat);
     const factReceived = lzkNum(body.fact_received ?? 0);
 
     if (!idlzk) throw new Error('IDLZK не передан');
@@ -11680,7 +11680,7 @@ app.post('/lzk/limit-update', async (req, res) => {
     if (!unitName) throw new Error('Ед.изм. не заполнена');
     if (!login) throw new Error('Логин пользователя не передан');
     if (login === 'z_karlygash' && (requestedPlanQty === null || requestedPlanQty < 0)) throw new Error('Кол-во по плану заполнено неправильно');
-    if (priceWithoutVat === null || priceWithoutVat < 0) throw new Error('Цена без НДС заполнена неправильно');
+    if (login === 'z_karlygash' && (requestedPriceWithoutVat === null || requestedPriceWithoutVat < 0)) throw new Error('Цена без НДС заполнена неправильно');
     if (factReceived === null || factReceived < 0) throw new Error('Одобрено без ЛЗК заполнено неправильно');
 
     const userResult = await client.query(`
@@ -11710,7 +11710,10 @@ app.post('/lzk/limit-update', async (req, res) => {
     await client.query('BEGIN');
 
     const limitResult = await client.query(`
-      SELECT idlzk, COALESCE(plan_qty,0)::numeric AS plan_qty
+      SELECT
+        idlzk,
+        COALESCE(plan_qty,0)::numeric AS plan_qty,
+        COALESCE(price_without_vat,0)::numeric AS price_without_vat
       FROM lzk.limits
       WHERE idlzk = $1
       FOR UPDATE
@@ -11720,10 +11723,15 @@ app.post('/lzk/limit-update', async (req, res) => {
       throw new Error('IDLZK не найден: ' + idlzk);
     }
 
-    // Только z_karlygash меняет план. Остальные редакторы сохраняют текущее значение.
+    // Только z_karlygash меняет план и цену.
+    // Остальные редакторы сохраняют текущие значения из БД.
     const planQty = login === 'z_karlygash'
       ? requestedPlanQty
       : Number(limitResult.rows[0].plan_qty || 0);
+
+    const priceWithoutVat = login === 'z_karlygash'
+      ? requestedPriceWithoutVat
+      : Number(limitResult.rows[0].price_without_vat || 0);
 
     async function findByName(table, idCol, nameCol, name) {
       const q = await client.query(
@@ -13750,7 +13758,6 @@ app.post('/lzk/limit-create', async (req, res) => {
     const materialName = lzkText(body.material_name);
     const unitName = lzkText(body.unit_name);
     const login = lzkText(body.login).toLowerCase();
-    const priceWithoutVat = lzkNum(body.price_without_vat);
 
     if (!objectName) throw new Error('Объект не заполнен');
     if (!constructiveName) throw new Error('Конструктив не заполнен');
@@ -13758,7 +13765,6 @@ app.post('/lzk/limit-create', async (req, res) => {
     if (!materialName) throw new Error('ТМЦ по факту не заполнено');
     if (!unitName) throw new Error('Ед.изм. не заполнена');
     if (!login) throw new Error('Логин пользователя не передан');
-    if (priceWithoutVat === null || priceWithoutVat < 0) throw new Error('Цена без НДС заполнена неправильно');
 
     // Роль определяем на сервере из public.users, а не доверяем роли из браузера.
     const userRoleResult = await client.query(`
@@ -13773,14 +13779,19 @@ app.post('/lzk/limit-create', async (req, res) => {
     }
 
     const roleLzk = lzkText(userRoleResult.rows[0].role_lzk).toLowerCase();
-    const canSetPlan = login === 'z_karlygash';
+    const canSetPlanPrice = login === 'z_karlygash';
 
     // Создать лимит может любой активный пользователь.
-    // Кол-во по плану задаёт только z_karlygash. Для остальных сервер принудительно пишет 0.
-    const planQty = canSetPlan ? lzkNum(body.plan_qty) : 0;
+    // Кол-во по плану и Цена без НДС задаются только z_karlygash.
+    // Для остальных сервер принудительно сохраняет 0.
+    const planQty = canSetPlanPrice ? lzkNum(body.plan_qty) : 0;
+    const priceWithoutVat = canSetPlanPrice ? lzkNum(body.price_without_vat) : 0;
 
     if (planQty === null || planQty < 0) {
       throw new Error('Кол-во по плану заполнено неправильно');
+    }
+    if (priceWithoutVat === null || priceWithoutVat < 0) {
+      throw new Error('Цена без НДС заполнена неправильно');
     }
 
     await client.query('BEGIN');
