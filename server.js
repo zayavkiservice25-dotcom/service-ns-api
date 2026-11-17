@@ -2742,7 +2742,7 @@ app.post("/ft-update-main", async (req, res) => {
     }
 
     // Доступ только b_erkin, s_zhasulan и a_zaitova.
-    if (!["b_erkin", "s_zhasulan", "a_zaitova"].includes(actor)) {
+    if (!["b_erkin", "s_zhasulan", "k_ermek", "a_zaitova"].includes(actor)) {
       return res.status(403).json({ success:false, error:"NO_RIGHTS" });
     }
 
@@ -2932,7 +2932,12 @@ function canSetPaid(login, roleFt) {
 }
 
 async function canEditRowByLogin(poolOrClient, zvk_row_id, login) {
-  const rid = Number(zvk_row_id);
+  
+  const normalizedLogin = String(login || "").trim().toLowerCase();
+  if (normalizedLogin === "s_zhasulan" || normalizedLogin === "k_ermek") {
+    return true;
+  }
+const rid = Number(zvk_row_id);
   const lg = normLogin(login);
 
   if (!rid || Number.isNaN(rid) || !lg) return false;
@@ -3250,6 +3255,7 @@ app.post("/request-preview", async (req, res) => {
       SELECT login
       FROM public.users
       WHERE lower(trim(login)) = lower(trim($1))
+        AND COALESCE(active, true) = true
       LIMIT 1
     `, [login]);
 
@@ -3779,7 +3785,7 @@ app.post("/request-created-bulk", async (req, res) => {
       });
     }
 
-    const isBerkinOrZhasulan = ["b_erkin", "s_zhasulan", "a_zaitova", "t_serik"].includes(login);
+    const isBerkinOrZhasulan = ["b_erkin", "s_zhasulan", "k_ermek", "a_zaitova", "t_serik"].includes(login);
 
     /*
       Пустое значение вручную могут устанавливать b_erkin, s_zhasulan и a_zaitova.
@@ -4545,7 +4551,7 @@ app.post("/zvk-save", async (req, res) => {
       isTruthy(is_admin) ||
       isTruthy(is_all) ||
       isTruthy(can_edit_all) ||
-      ["b_erkin", "s_zhasulan", "a_zaitova", "t_serik"].includes(actor.toLowerCase());
+      ["b_erkin", "s_zhasulan", "k_ermek", "a_zaitova", "t_serik"].includes(actor.toLowerCase());
 
     const ft = String(id_ft).trim();
    let flag = String(request_flag || "Нет").trim();
@@ -4910,7 +4916,7 @@ app.post("/zvk-bulk-request-flag", async (req, res) => {
       isTruthy(is_admin) ||
       isTruthy(is_all) ||
       isTruthy(can_edit_all) ||
-      ["b_erkin", "s_zhasulan", "a_zaitova", "t_serik"].includes(actor.toLowerCase());
+      ["b_erkin", "s_zhasulan", "k_ermek", "a_zaitova", "t_serik"].includes(actor.toLowerCase());
 
     if (!adminOk) {
       return res.status(403).json({ success:false, error:"NO_RIGHTS" });
@@ -5029,7 +5035,7 @@ app.post("/zvk-return-amount", async (req, res) => {
       return res.status(409).json({ success:false, error:"Возврат уже закрыт как «Полностью возвращено»" });
     }
 
-    const adminOk = ["b_erkin", "s_zhasulan", "admin", "a_zaitova"].includes(login);
+    const adminOk = ["b_erkin", "s_zhasulan", "k_ermek", "admin", "a_zaitova"].includes(login);
     if (!adminOk) {
       const ownerOk = await canEditRowByLogin(pool, rid, login);
       if (!ownerOk) {
@@ -5078,7 +5084,7 @@ app.post("/zvk-status-row", async (req, res) => {
       isTruthy(is_admin) ||
       isTruthy(can_edit_all) ||
       String(is_all || "0") === "1" ||
-      ["b_erkin", "s_zhasulan", "a_zaitova"].includes(actor.toLowerCase());
+      ["b_erkin", "s_zhasulan", "k_ermek", "a_zaitova"].includes(actor.toLowerCase());
 
     if (!adminOk) {
       const ok = await canEditRowByLogin(pool, rid, actor);
@@ -5424,10 +5430,10 @@ app.post("/zvk-pay-row", async (req, res) => {
       is_admin === true || is_admin === 1 || is_admin === "1" ||
       String(is_admin).toLowerCase() === "true";
 
-    const payOk = adminOk || ["b_erkin", "s_zhasulan", "a_zaitova"].includes(actor);
+    const payOk = adminOk || ["b_erkin", "s_zhasulan", "k_ermek", "a_zaitova"].includes(actor);
 
     if (!payOk) {
-      return res.status(403).json({ success:false, error:"only b_erkin/s_zhasulan/a_zaitova/admin allowed" });
+      return res.status(403).json({ success:false, error:"only b_erkin/s_zhasulan/k_ermek/a_zaitova/admin allowed" });
     }
 
     if (!zvk_row_id) {
@@ -6383,8 +6389,6 @@ app.get('/zft-zlzk-options', async (req,res) => {
              GREATEST(COALESCE(ap.purchase_total,0)-COALESCE(al.paid_amount,0)-COALESCE(al.pending_amount,0),0)::numeric AS remaining_amount
       FROM approved ap
       LEFT JOIN alloc al ON al.id_zlzk=ap.id_zlzk
-      WHERE ap.approved_qty>COALESCE(al.paid_qty,0)+COALESCE(al.pending_qty,0)
-         OR COALESCE(ap.purchase_total,0)>COALESCE(al.paid_amount,0)+COALESCE(al.pending_amount,0)
       ORDER BY ap.id_zlzk`, [currentRowId]);
     return res.json({success:true,rows:q.rows});
   } catch(e) {
@@ -6417,12 +6421,11 @@ app.post('/zft-zlzk-allocation/save', async (req,res) => {
 
     const normalized=allocations.map(x=>({
       id_zlzk:String(x?.id_zlzk||'').trim().toUpperCase(),
-      qty:Number(String(x?.qty??'').replace(',','.')),
+      qty:0,
       amount:Number(String(x?.amount??'').replace(',','.'))
     }));
     if(normalized.some(x=>
       !/^ZLZK\d+$/i.test(x.id_zlzk) ||
-      !Number.isFinite(x.qty) || x.qty<=0 ||
       !Number.isFinite(x.amount) || x.amount<=0
     ))
       return res.status(400).json({success:false,error:'INVALID_ZLZK_ALLOCATION'});
@@ -6443,42 +6446,21 @@ app.post('/zft-zlzk-allocation/save', async (req,res) => {
     // Выбирать/менять ZLZK может только автор строки FT — тот, кто указан в «ВводИмя».
     const ownerLogin=String(z.input_name||'').trim().toLowerCase();
     const actorLogin=String(actor.login||'').trim().toLowerCase();
-    const isSZhasulan = actorLogin === 's_zhasulan';
-    if(!isSZhasulan && (!ownerLogin || ownerLogin!==actorLogin)){
+    const isFullZlzkEditor = actorLogin === 's_zhasulan' || actorLogin === 'k_ermek';
+    if(!isFullZlzkEditor && (!ownerLogin || ownerLogin!==actorLogin)){
       await client.query('ROLLBACK');
       return res.status(403).json({success:false,error:'ZLZK_ONLY_FT_AUTHOR'});
     }
 
-    // ZLZK для ZFT необязательны.
-    // Пользователь указывает только количество. Денежного лимита здесь нет.
+    // ZLZK для ZFT необязательны. По каждой выбранной ZLZK хранится только сумма.
+    // qty сохраняется как 0 только для совместимости со старой структурой таблицы.
+    // Денежного лимита по конкретной ZLZK нет; общий предел контролируется суммой FT на фронте.
 
     for(const x of normalized.sort((a,b)=>a.id_zlzk.localeCompare(b.id_zlzk))){
-      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))',['zft-zlzk:'+x.id_zlzk]);
-      const rq=await client.query(`SELECT idzlzk,COALESCE(fact_qty,0)::numeric AS approved_qty FROM lzk.requests WHERE idzlzk=$1 AND lower(trim(COALESCE(pto_status,''))) IN ('согласован','согласовано') LIMIT 1`,[x.id_zlzk]);
-      if(!rq.rowCount){await client.query('ROLLBACK');return res.status(400).json({success:false,error:'ZLZK_NOT_APPROVED',id_zlzk:x.id_zlzk});}
-      const used=await client.query(`
-        SELECT COALESCE(SUM(a.qty),0)::numeric AS qty
-        FROM public.zft_zlzk_allocation a
-        JOIN public.zvk zz ON zz.id=a.zvk_row_id
-        LEFT JOIN public.zvk_pay p ON p.zvk_row_id=zz.id
-        WHERE a.id_zlzk=$1
-          AND a.zvk_row_id<>$2
-          AND COALESCE(zz.request_flag,'')='Да'
-          AND COALESCE(p.registry_flag,'')<>'Обнуление'
-      `,[x.id_zlzk,rowId]);
-
-      const approvedQty=Number(rq.rows[0].approved_qty||0);
-      const usedQty=Number(used.rows[0].qty||0);
-      const remainingQty=approvedQty-usedQty;
-
-      if(x.qty>remainingQty+1e-9){
+      const rq=await client.query(`SELECT idzlzk FROM lzk.requests WHERE idzlzk=$1 AND lower(trim(COALESCE(pto_status,''))) IN ('согласован','согласовано') LIMIT 1`,[x.id_zlzk]);
+      if(!rq.rowCount){
         await client.query('ROLLBACK');
-        return res.status(400).json({
-          success:false,
-          error:'ZLZK_QTY_EXCEEDED',
-          id_zlzk:x.id_zlzk,
-          remaining_qty:remainingQty
-        });
+        return res.status(400).json({success:false,error:'ZLZK_NOT_APPROVED',id_zlzk:x.id_zlzk});
       }
     }
 
@@ -16113,7 +16095,7 @@ app.post("/zvk-funding-pools/save", async (req, res) => {
       isTruthy(req.body?.is_admin) ||
       isTruthy(req.body?.is_all) ||
       isTruthy(req.body?.can_edit_all) ||
-      ["b_erkin", "s_zhasulan", "a_zaitova", "t_serik"].includes(actor.toLowerCase());
+      ["b_erkin", "s_zhasulan", "k_ermek", "a_zaitova", "t_serik"].includes(actor.toLowerCase());
 
     if (!adminOk) {
       const ok = await canEditRowByLogin(client, rid, actor);
@@ -17895,7 +17877,7 @@ app.post("/pre-registry/amount-save", async (req, res) => {
 
     // r_gulnur сохраняет прежний полный доступ.
     // Остальные пользователи могут менять ДоРеестр только по своей строке ФТ.
-    if (actor !== "r_gulnur") {
+    if (actor !== "r_gulnur" && actor !== "s_zhasulan" && actor !== "k_ermek") {
       const ownRow = await canEditRowByLogin(pool, rowId, actor);
       if (!ownRow) {
         return res.status(403).json({
@@ -18063,7 +18045,7 @@ app.post("/pre-registry/create", async (req, res) => {
 
     // r_gulnur сохраняет прежний полный доступ.
     // Любой другой инициатор может создать ДоРеестр только по своим строкам.
-    if (actor !== "r_gulnur") {
+    if (actor !== "r_gulnur" && actor !== "s_zhasulan" && actor !== "k_ermek") {
       for (const rowId of ids) {
         const ownRow = await canEditRowByLogin(client, rowId, actor);
         if (!ownRow) {
