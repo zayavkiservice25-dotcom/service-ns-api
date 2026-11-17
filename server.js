@@ -6333,7 +6333,11 @@ app.post('/zft-zlzk-allocation/save', async (req,res) => {
       qty:Number(String(x?.qty??'').replace(',','.')),
       amount:Number(String(x?.amount??'').replace(',','.'))
     }));
-    if(normalized.some(x=>!/^ZLZK\d+$/i.test(x.id_zlzk)||!Number.isFinite(x.qty)||x.qty<=0||!Number.isFinite(x.amount)||x.amount<=0))
+    if(normalized.some(x=>
+      !/^ZLZK\d+$/i.test(x.id_zlzk) ||
+      !Number.isFinite(x.qty) || x.qty<=0 ||
+      !Number.isFinite(x.amount) || x.amount<=0
+    ))
       return res.status(400).json({success:false,error:'INVALID_ZLZK_ALLOCATION'});
     if(new Set(normalized.map(x=>x.id_zlzk)).size!==normalized.length)
       return res.status(400).json({success:false,error:'DUPLICATE_ZLZK'});
@@ -6358,29 +6362,46 @@ app.post('/zft-zlzk-allocation/save', async (req,res) => {
       return res.status(403).json({success:false,error:'ZLZK_ONLY_FT_AUTHOR'});
     }
 
-    // ZLZK для ZFT необязательны. Если распределение задано, оно должно полностью
-    // совпадать с суммой «К оплате». Пустой массив допустим и не блокирует запуск ZFT.
-    if(String(z.request_flag||'')==='Да' && Number(z.to_pay||0)>0 && normalized.length){
-      const totalCents=normalized.reduce((a,x)=>a+Math.round(x.amount*100),0);
-      if(totalCents!==Math.round(Number(z.to_pay||0)*100)){
-        await client.query('ROLLBACK');return res.status(400).json({success:false,error:'ZLZK_ALLOCATION_SUM_MISMATCH'});
-      }
-    }
+    // ZLZK для ZFT необязательны.
+    // Пользователь указывает только количество. Денежного лимита здесь нет.
 
     for(const x of normalized.sort((a,b)=>a.id_zlzk.localeCompare(b.id_zlzk))){
       await client.query('SELECT pg_advisory_xact_lock(hashtext($1))',['zft-zlzk:'+x.id_zlzk]);
       const rq=await client.query(`SELECT idzlzk,COALESCE(fact_qty,0)::numeric AS approved_qty FROM lzk.requests WHERE idzlzk=$1 AND lower(trim(COALESCE(pto_status,''))) IN ('согласован','согласовано') LIMIT 1`,[x.id_zlzk]);
       if(!rq.rowCount){await client.query('ROLLBACK');return res.status(400).json({success:false,error:'ZLZK_NOT_APPROVED',id_zlzk:x.id_zlzk});}
-      const cq=await client.query(`SELECT COALESCE(SUM((CASE WHEN COALESCE(trim(s.idplxk),'')<>'' THEN GREATEST(COALESCE(s.ordered_qty,0),0) ELSE GREATEST(COALESCE(r.fact_qty,0),0) END)*COALESCE(s.unit_price,0)),0)::numeric AS purchase_total FROM lzk.requests r LEFT JOIN lzk.supply s ON s.idzlzk=r.idzlzk WHERE r.idzlzk=$1 AND (s.idzlzk IS NULL OR COALESCE(trim(s.idplxk),'')<>'' OR (COALESCE(trim(s.idplxk),'')='' AND NOT EXISTS(SELECT 1 FROM lzk.supply c WHERE c.idzlzk=r.idzlzk AND COALESCE(trim(c.idplxk),'')<>'')))`,[x.id_zlzk]);
-      const used=await client.query(`SELECT COALESCE(SUM(a.qty),0)::numeric AS qty,COALESCE(SUM(a.amount),0)::numeric AS amount FROM public.zft_zlzk_allocation a JOIN public.zvk zz ON zz.id=a.zvk_row_id LEFT JOIN public.zvk_pay p ON p.zvk_row_id=zz.id WHERE a.id_zlzk=$1 AND a.zvk_row_id<>$2 AND COALESCE(zz.request_flag,'')='Да' AND COALESCE(p.registry_flag,'')<>'Обнуление'`,[x.id_zlzk,rowId]);
-      const approvedQty=Number(rq.rows[0].approved_qty||0), purchaseTotal=Number(cq.rows[0].purchase_total||0), usedQty=Number(used.rows[0].qty||0), usedAmount=Number(used.rows[0].amount||0);
-      if(x.qty>approvedQty-usedQty+1e-9){await client.query('ROLLBACK');return res.status(400).json({success:false,error:'ZLZK_QTY_EXCEEDED',id_zlzk:x.id_zlzk,remaining_qty:approvedQty-usedQty});}
-      if(x.amount>purchaseTotal-usedAmount+0.009){await client.query('ROLLBACK');return res.status(400).json({success:false,error:'ZLZK_AMOUNT_EXCEEDED',id_zlzk:x.id_zlzk,remaining_amount:purchaseTotal-usedAmount});}
+      const used=await client.query(`
+        SELECT COALESCE(SUM(a.qty),0)::numeric AS qty
+        FROM public.zft_zlzk_allocation a
+        JOIN public.zvk zz ON zz.id=a.zvk_row_id
+        LEFT JOIN public.zvk_pay p ON p.zvk_row_id=zz.id
+        WHERE a.id_zlzk=$1
+          AND a.zvk_row_id<>$2
+          AND COALESCE(zz.request_flag,'')='Да'
+          AND COALESCE(p.registry_flag,'')<>'Обнуление'
+      `,[x.id_zlzk,rowId]);
+
+      const approvedQty=Number(rq.rows[0].approved_qty||0);
+      const usedQty=Number(used.rows[0].qty||0);
+      const remainingQty=approvedQty-usedQty;
+
+      if(x.qty>remainingQty+1e-9){
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          success:false,
+          error:'ZLZK_QTY_EXCEEDED',
+          id_zlzk:x.id_zlzk,
+          remaining_qty:remainingQty
+        });
+      }
     }
 
     await client.query(`DELETE FROM public.zft_zlzk_allocation WHERE zvk_row_id=$1`,[rowId]);
     for(const x of normalized){
-      await client.query(`INSERT INTO public.zft_zlzk_allocation(zvk_row_id,id_zlzk,qty,amount,created_by,updated_at) VALUES($1,$2,$3,$4,$5,now())`,[rowId,x.id_zlzk,x.qty,x.amount,login]);
+      await client.query(`
+        INSERT INTO public.zft_zlzk_allocation
+          (zvk_row_id,id_zlzk,qty,amount,created_by,updated_at)
+        VALUES($1,$2,$3,$4,$5,now())
+      `,[rowId,x.id_zlzk,x.qty,x.amount,login]);
     }
     await client.query('COMMIT');
     return res.json({success:true,zvk_row_id:rowId,count:normalized.length});
@@ -6420,15 +6441,30 @@ app.get('/ft-lzk-balances', async (req,res) => {
         GROUP BY r.idzlzk
       ),
       real_alloc AS (
-        SELECT a.id_zlzk,
-               SUM(CASE WHEN p.is_paid='Да' THEN a.qty ELSE 0 END)::numeric AS paid_qty,
-               SUM(CASE WHEN p.is_paid='Да' THEN a.amount ELSE 0 END)::numeric AS paid,
-               SUM(CASE WHEN COALESCE(p.is_paid,'')<>'Да' AND COALESCE(z.request_flag,'')='Да' THEN a.qty ELSE 0 END)::numeric AS pending_qty,
-               SUM(CASE WHEN COALESCE(p.is_paid,'')<>'Да' AND COALESCE(z.request_flag,'')='Да' THEN a.amount ELSE 0 END)::numeric AS pending
+        SELECT
+          a.id_zlzk,
+          SUM(CASE WHEN p.is_paid='Да' THEN a.qty ELSE 0 END)::numeric AS paid_qty,
+          SUM(CASE WHEN p.is_paid='Да' THEN a.amount ELSE 0 END)::numeric AS paid,
+          SUM(
+            CASE WHEN COALESCE(p.is_paid,'')<>'Да'
+                   AND COALESCE(z.request_flag,'')='Да'
+              THEN a.qty
+              ELSE 0
+            END
+          )::numeric AS pending_qty,
+          SUM(
+            CASE WHEN COALESCE(p.is_paid,'')<>'Да'
+                   AND COALESCE(z.request_flag,'')='Да'
+              THEN a.amount
+              ELSE 0
+            END
+          )::numeric AS pending
         FROM public.zft_zlzk_allocation a
         JOIN public.zvk z ON z.id=a.zvk_row_id
         LEFT JOIN public.zvk_pay p ON p.zvk_row_id=z.id
-        WHERE a.id_zlzk=ANY($1::text[]) AND COALESCE(z.request_flag,'')<>'Обнуление' AND COALESCE(p.registry_flag,'')<>'Обнуление'
+        WHERE a.id_zlzk=ANY($1::text[])
+          AND COALESCE(z.request_flag,'')<>'Обнуление'
+          AND COALESCE(p.registry_flag,'')<>'Обнуление'
         GROUP BY a.id_zlzk
       ),
       basis AS (
