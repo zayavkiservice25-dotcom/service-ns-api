@@ -19494,7 +19494,7 @@ async function hrLocalShortfallDispatch_(){
        '\nОрганизация: '+n.legal_entity+'\nСотрудник: '+n.employee_name+
        '\nТребуется: '+n.required+' ₸\nДоступно в одном подходящем пуле: '+n.available+
        ' ₸\nФТ ожидает финансирования в очереди.';
-     const result=await telegramNsSendToLogin_('b_erkin',msg);
+     const result=await telegramNsSendToLogin_('h_r',msg);
      await c.query(`UPDATE hr.local_trip_shortfall_notices SET attempts=attempts+1,
        sent_at=CASE WHEN $2 THEN now() ELSE sent_at END,last_error=$3 WHERE trip_id=$1`,
        [n.trip_id,!!result?.sent,result?.sent?null:(result?.reason||'NOT_SENT')]);
@@ -20862,6 +20862,84 @@ async function telegramNsSendToLogin_(login, message) {
   await telegramNsSend_(rows.rows[0].chat_id,message);
   return {sent:true};
 }
+// ============================================================
+// HR: предупреждение, если свободный остаток пула командировок
+// опустился НИЖЕ 300 000 ₸. Одно сообщение за период низкого
+// остатка; повтор после восстановления до >=300 000 ₸.
+// Каждый активный дочерний пул учитывается отдельно.
+// ============================================================
+const HR_TRIP_LOW_BALANCE_LIMIT_ = 300000;
+let hrTripLowBalanceBusy_ = false;
+async function hrTripLowBalanceCheck_() {
+  if (hrTripLowBalanceBusy_ || !TELEGRAM_TOKEN_NS_) return;
+  hrTripLowBalanceBusy_ = true;
+  try {
+    await pool.query(`CREATE TABLE IF NOT EXISTS hr.trip_pool_low_balance_alerts (
+      funding_pool_id bigint PRIMARY KEY,
+      is_low boolean NOT NULL DEFAULT false,
+      last_sent_at timestamptz,
+      last_checked_at timestamptz NOT NULL DEFAULT now(),
+      last_free numeric(18,2),
+      attempts integer NOT NULL DEFAULT 0,
+      last_error text
+    )`);
+    const pools = await pool.query(`
+      SELECT p.id,p.legal_entity,p.source_name,p.object_name,
+        (p.amount - COALESCE((SELECT SUM(a.amount)
+          FROM public.zvk_funding_pool_allocations a
+          WHERE a.funding_pool_id = p.id),0)) AS free
+      FROM public.draft_funding_pool p
+      WHERE p.is_active = true AND p.parent_pool_id IS NOT NULL
+        AND lower(btrim(p.object_name)) = lower('Командировка')
+        AND lower(btrim(p.money_type)) = lower('Тек')
+      ORDER BY p.id`);
+    for (const p of pools.rows) {
+      const free = Number(p.free);
+      if (!Number.isFinite(free)) continue;
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        await client.query(`INSERT INTO hr.trip_pool_low_balance_alerts(funding_pool_id)
+          VALUES($1) ON CONFLICT(funding_pool_id) DO NOTHING`,[p.id]);
+        const old = await client.query(`SELECT is_low FROM hr.trip_pool_low_balance_alerts
+          WHERE funding_pool_id=$1 FOR UPDATE`,[p.id]);
+        if (free >= HR_TRIP_LOW_BALANCE_LIMIT_) {
+          // Восстановление: новая тревога разрешена при следующем снижении.
+          await client.query(`UPDATE hr.trip_pool_low_balance_alerts
+            SET is_low=false,last_checked_at=now(),last_free=$2,last_error=NULL
+            WHERE funding_pool_id=$1`,[p.id,free]);
+        } else if (!old.rows[0]?.is_low) {
+          const money=x=>Number(x).toLocaleString('ru-RU',{
+            minimumFractionDigits:2,maximumFractionDigits:2})+' ₸';
+          const msg='⚠️ Деньги на командировки заканчиваются\n'
+            +'Организация: '+String(p.legal_entity||'—')+'\n'
+            +'Источник: '+String(p.source_name||'—')+'\n'
+            +'Пул: #'+p.id+' (Командировка / Тек)\n'
+            +'Свободный остаток: '+money(free)+'\n'
+            +'Порог предупреждения: '+money(HR_TRIP_LOW_BALANCE_LIMIT_)+'\n'
+            +'Рекомендуется пополнить пул.';
+          const result=await telegramNsSendToLogin_('h_r',msg);
+          await client.query(`UPDATE hr.trip_pool_low_balance_alerts
+            SET is_low=$2,last_sent_at=CASE WHEN $2 THEN now() ELSE last_sent_at END,
+                last_checked_at=now(),last_free=$3,attempts=attempts+1,last_error=$4
+            WHERE funding_pool_id=$1`,
+            [p.id,!!result?.sent,free,result?.sent?null:(result?.reason||'NOT_SENT')]);
+        } else {
+          await client.query(`UPDATE hr.trip_pool_low_balance_alerts
+            SET last_checked_at=now(),last_free=$2 WHERE funding_pool_id=$1`,[p.id,free]);
+        }
+        await client.query('COMMIT');
+      } catch (e) {
+        await client.query('ROLLBACK').catch(()=>{});
+        console.error('[HR FIN] Low balance notification pool',p.id,e.message);
+      } finally { client.release(); }
+    }
+  } catch (e) { console.error('[HR FIN] Low balance check:',e.message); }
+  finally { hrTripLowBalanceBusy_ = false; }
+}
+setTimeout(()=>void hrTripLowBalanceCheck_(),12000);
+setInterval(()=>void hrTripLowBalanceCheck_(),60000).unref?.();
+
 // Вызов для будущей логики проверки денег: сумма дефицита рассчитывается
 // из действительного остатка, а не из отправленного пользователем текста.
 async function telegramNsTripShortfall_(employee,required,available){
@@ -20873,7 +20951,7 @@ async function telegramNsTripShortfall_(employee,required,available){
     +'Объект: Командировка\nТип: Тек\n'
     +'Требуется: '+money(need)+'\nДоступно: '+money(free)+'\n'
     +'Не хватает: '+money(need-free);
-  return telegramNsSendToLogin_('b_erkin',msg);
+  return telegramNsSendToLogin_('h_r',msg);
 }
 
 app.post(TELEGRAM_HOOK_PATH_NS_,async(req,res)=>{
@@ -20896,8 +20974,8 @@ app.post(TELEGRAM_HOOK_PATH_NS_,async(req,res)=>{
 // Тест отправки конкретному сотруднику. Защищено X-HR-API-KEY.
 app.post('/hr/telegram/test',hrApiGuard_,async(req,res)=>{
   try{
-    const login=String(req.body?.login||'b_erkin').trim().toLowerCase();
-    if(login!=='b_erkin')return res.status(400).json({success:false,error:'ONLY_B_ERKIN_FOR_TEST'});
+    const login=String(req.body?.login||'h_r').trim().toLowerCase();
+    if(login!=='h_r')return res.status(400).json({success:false,error:'ONLY_H_R_FOR_TEST'});
     const result=await telegramNsSendToLogin_(login,'✅ Service NS Finance: тестовое уведомление. Подключение Telegram работает.');
     res.status(result.sent?200:404).json({success:result.sent,...result});
   }catch(e){console.error('[TELEGRAM SNS] test failed:',e.message);res.status(502).json({success:false,error:'TELEGRAM_SEND_FAILED'});}
