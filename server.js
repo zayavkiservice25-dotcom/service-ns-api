@@ -300,9 +300,28 @@ await pool.query(`
 // =====================================================
 // Фактическое распределение ZFT по ZLZK.
 // Таблица public.zft_zlzk_allocation создаётся ОДИН РАЗ вручную SQL-миграцией.
-// В initDb() намеренно не создаём её автоматически.
 // Старая ft_lzk_basis НЕ удаляется и используется как legacy fallback.
+//
+// НОВАЯ СХЕМА: распределение выполняется только по сумме.
+// qty оставляем техническим полем для совместимости и сохраняем 0.
+// Старый CHECK qty > 0 мешает этой схеме, поэтому разрешаем qty = 0.
 // =====================================================
+await pool.query(`
+  DO $$
+  BEGIN
+    IF to_regclass('public.zft_zlzk_allocation') IS NOT NULL THEN
+      ALTER TABLE public.zft_zlzk_allocation
+        DROP CONSTRAINT IF EXISTS zft_zlzk_allocation_qty_check;
+
+      ALTER TABLE public.zft_zlzk_allocation
+        ALTER COLUMN qty SET DEFAULT 0;
+
+      ALTER TABLE public.zft_zlzk_allocation
+        ADD CONSTRAINT zft_zlzk_allocation_qty_check
+        CHECK (qty >= 0);
+    END IF;
+  END $$;
+`);
 
 
 // Логин инициатора, которому выделена сумма дочернего денежного пула.
