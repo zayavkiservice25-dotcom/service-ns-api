@@ -2257,21 +2257,14 @@ async function getAuthenticatedFtUser(req, db = pool) {
   return result.rows[0] || null;
 }
 async function getAuthenticatedFtUserOrLogin(req, loginValue, db = pool) {
+  // SECURITY: Login alone is not proof of identity. Only a valid Bearer token is accepted.
+  // The loginValue parameter remains for compatibility with existing call sites.
   const byToken = await getAuthenticatedFtUser(req, db);
-  if (byToken) return byToken;
-
-  const login = String(loginValue || '').trim();
-  if (!login) return null;
-
-  const result = await db.query(`
-    SELECT login, role_ft, role_hr
-    FROM public.users
-    WHERE lower(trim(login)) = lower(trim($1))
-      AND is_active = true
-    LIMIT 1
-  `, [login]);
-
-  return result.rows[0] || null;
+  if (!byToken) return null;
+  if (loginValue && String(loginValue).trim().toLowerCase() !== String(byToken.login).trim().toLowerCase()) {
+    return null;
+  }
+  return byToken;
 }
 
 
@@ -7592,6 +7585,14 @@ app.post("/change-password", async (req, res) => {
       SET password = $1
       WHERE id = $2
     `, [newPass, user.id]);
+
+    // Revoke every previously issued session for this user after password change.
+    await pool.query(`
+      DELETE FROM public.app_sessions
+      WHERE lower(trim(user_login)) = (
+        SELECT lower(trim(login)) FROM public.users WHERE id = $1
+      )
+    `, [user.id]);
 
     res.json({ success: true });
 
