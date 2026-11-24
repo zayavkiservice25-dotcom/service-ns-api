@@ -923,6 +923,7 @@ await pool.query(`
   await pool.query(`ALTER TABLE public.request_items ADD COLUMN IF NOT EXISTS aray_paid_by text;`);
   // Фиксируем признак «Возврат ЭСК» в строке созданного Реестра.
   await pool.query(`ALTER TABLE public.request_items ADD COLUMN IF NOT EXISTS money_type text;`);
+  await pool.query(`ALTER TABLE public.request_items ADD COLUMN IF NOT EXISTS idzlzk text;`);
   await pool.query(`ALTER TABLE public.request_items ADD COLUMN IF NOT EXISTS esk_return boolean DEFAULT false;`);
 
   await pool.query(`
@@ -3315,6 +3316,41 @@ app.post("/request-preview", async (req, res) => {
   }
 });
 
+// Те же признаки, что в getDicts() формы ФТ.
+let ftZlzkRulesCache;
+async function ftZlzkRules() {
+  if (ftZlzkRulesCache && Date.now() < ftZlzkRulesCache.expires) return ftZlzkRulesCache;
+  async function allowed(sheet, nameCol, flagCol) {
+    const url = 'https://docs.google.com/spreadsheets/d/' + ISMAGULOV_DDS_SPREADSHEET_ID +
+      '/gviz/tq?tqx=out:csv&headers=1&sheet=' + encodeURIComponent(sheet);
+    const response = await fetch(url, {signal: AbortSignal.timeout(10000)});
+    const csv = await response.text();
+    const [header, ...rows] = parseSimpleCsv(csv);
+    if (!response.ok || csv.trimStart().startsWith('<') || !header || header.length <= flagCol)
+      throw new Error('Не удалось проверить справочник «' + sheet + '». Повторите сохранение.');
+    return new Set(rows.filter(r => normalizeRequestDds(r[flagCol]) === 'да')
+      .map(r => normalizeRequestDds(r[nameCol])).filter(Boolean));
+  }
+  const [objects, articles] = await Promise.all([allowed('Объект',0,3), allowed('Статья ДДС',1,6)]);
+  ftZlzkRulesCache = {objects, articles, expires:Date.now()+60000};
+  return ftZlzkRulesCache;
+}
+
+async function checkFtZlzkRows(db, ids, {idFt=null, clearing=false}={}) {
+  // Вызовы со строками выполняются в транзакции с той же блокировкой, что запись распределения.
+  if (ids.length) await db.query('SELECT id FROM public.zvk WHERE id=ANY($1::bigint[]) ORDER BY id FOR UPDATE',[ids]);
+  const {rows} = ids.length ? await db.query(`
+    SELECT z.id_zvk AS label,f.object,f.dds_article FROM public.zvk z JOIN public.ft f ON f.id_ft=z.id_ft
+    WHERE z.id=ANY($1::bigint[]) AND ($2 OR NOT EXISTS (
+      SELECT 1 FROM public.zft_zlzk_allocation a WHERE a.zvk_row_id=z.id AND a.amount>0))`,[ids,clearing])
+    : await db.query('SELECT id_ft AS label,object,dds_article FROM public.ft WHERE id_ft=$1',[idFt]);
+  if (!rows.length) return;
+  const rules = await ftZlzkRules();
+  const missing = rows.find(r => rules.objects.has(normalizeRequestDds(r.object)) &&
+                                  rules.articles.has(normalizeRequestDds(r.dds_article)));
+  if (missing) throw Object.assign(new Error(missing.label + ' — выберите хотя бы одну ЗЛЗК.'),{status:400});
+}
+
 app.post("/create-request", async (req, res) => {
   const client = await pool.connect();
 
@@ -3340,6 +3376,7 @@ app.post("/create-request", async (req, res) => {
     }
 
     await client.query("BEGIN");
+    await checkFtZlzkRows(client, ids);
 
     const createdRequests = [];
 
@@ -3375,6 +3412,7 @@ app.post("/create-request", async (req, res) => {
           src_o,
           money_type,
           idlzk,
+          idzlzk,
           to_pay,
           esk_return
         )
@@ -3396,6 +3434,11 @@ app.post("/create-request", async (req, res) => {
           v.src_o,
           v.money_type,
           v.idlzk,
+          COALESCE((
+            SELECT string_agg(DISTINCT a.id_zlzk, ', ' ORDER BY a.id_zlzk)
+            FROM public.zft_zlzk_allocation a
+            WHERE a.zvk_row_id = v.zvk_row_id
+          ), ''),
           v.to_pay,
           COALESCE(v.esk_return, false)
         FROM public.ft_zvk_current_v2 v
@@ -3535,7 +3578,7 @@ createdRequests.push({
 
     console.error("CREATE-REQUEST ERROR:", e);
 
-    return res.status(500).json({
+    return res.status(e.status || 500).json({
       success: false,
       error: e.message
     });
@@ -3570,6 +3613,7 @@ app.post("/create-registry", async (req, res) => {
     }
 
     await client.query("BEGIN");
+    await checkFtZlzkRows(client, ids);
 
     const head = await client.query(`
       INSERT INTO public.registry_head
@@ -3656,7 +3700,7 @@ app.post("/create-registry", async (req, res) => {
 
     console.error("CREATE-REGISTRY ERROR:", e);
 
-    return res.status(500).json({
+    return res.status(e.status || 500).json({
       success: false,
       error: e.message
     });
@@ -4360,6 +4404,11 @@ app.get("/request-list", async (req, res) => {
           cur.idlzk,
           ''
         ) AS idlzk,
+        COALESCE(i.idzlzk, (
+            SELECT string_agg(DISTINCT a.id_zlzk, ', ' ORDER BY a.id_zlzk)
+            FROM public.zft_zlzk_allocation a
+            WHERE a.zvk_row_id = i.zvk_row_id
+          ), '') AS idzlzk,
 
         COALESCE(cur.to_pay, i.to_pay) AS to_pay,
         COALESCE(cur.esk_return, i.esk_return, false) AS esk_return,
@@ -4535,7 +4584,11 @@ async function getFtAvailableAmount(client, idFt, excludeRowId = null) {
 }
 
 app.post("/zvk-save", async (req, res) => {
+  const client = await pool.connect();
+  let transaction = false;
   try {
+    await client.query("BEGIN");
+    transaction = true;
     const {
       id_ft,
       zvk_row_id,
@@ -4611,7 +4664,7 @@ const toPayNum = isNoRequest
       }
 
       if (!adminOk) {
-        const ok = await canEditRowByLogin(pool, rid, actor);
+        const ok = await canEditRowByLogin(client, rid, actor);
         if (!ok) {
           return res.status(403).json({ success:false, error:"NO_RIGHTS_THIS_ROW" });
         }
@@ -4624,7 +4677,8 @@ const toPayNum = isNoRequest
       // Серверная защита от превышения остатка.
       // Считаем по ВСЕЙ истории FT, а текущую редактируемую строку исключаем.
       if (flag === "Да") {
-        const balance = await getFtAvailableAmount(pool, ft, rid);
+        await checkFtZlzkRows(client,[rid]);
+        const balance = await getFtAvailableAmount(client, ft, rid);
 
         if (!balance.exists) {
           return res.status(404).json({ success:false, error:"FT_NOT_FOUND" });
@@ -4641,7 +4695,7 @@ const toPayNum = isNoRequest
         }
       }
 
-      const upd = await pool.query(`
+      const upd = await client.query(`
         UPDATE public.zvk
            SET request_flag = $1,
                to_pay       = $2,
@@ -4672,7 +4726,7 @@ const toPayNum = isNoRequest
       // 2) очищаем Источник Объект;
       // 3) очищаем РеестрСоздано.
       if (flag === "Нет") {
-        await pool.query(`
+        await client.query(`
           INSERT INTO public.zvk_status (zvk_row_id, src_o, chief_approved, status_time)
           VALUES ($1, '', NULL, NOW())
           ON CONFLICT (zvk_row_id)
@@ -4688,9 +4742,11 @@ const toPayNum = isNoRequest
       // Поэтому при Заявка=Нет его запускать нельзя, иначе ZFT3200 станет ZFT3344.
 const rebuild =
   flag === "Да" && toPayNum > 0
-    ? await rebuildFtTail(pool, rid)
+    ? await rebuildFtTail(client, rid)
     : null;
 
+      await client.query("COMMIT");
+      transaction = false;
       return res.json({
         success: true,
         updated: true,
@@ -4704,7 +4760,7 @@ const rebuild =
     // ✅ если zvk_row_id не пришёл, но админ/система ставит Заявка=Нет,
     // обновляем последнюю строку этого id_ft и НЕ создаём новый ZFT.
     if (flag === "Нет") {
-      const lastExisting = await pool.query(
+      const lastExisting = await client.query(
         `
         SELECT z.id
         FROM public.zvk z
@@ -4721,13 +4777,13 @@ const rebuild =
 
       if (lastRid) {
         if (!adminOk) {
-          const ok = await canEditRowByLogin(pool, lastRid, actor);
+          const ok = await canEditRowByLogin(client, lastRid, actor);
           if (!ok) {
             return res.status(403).json({ success:false, error:"NO_RIGHTS_THIS_ROW" });
           }
         }
 
-        const updNoId = await pool.query(`
+        const updNoId = await client.query(`
           UPDATE public.zvk
              SET request_flag = 'Нет',
                  to_pay       = 0,
@@ -4739,7 +4795,7 @@ const rebuild =
            RETURNING id, id_zvk, id_ft, zvk_date, zvk_name, to_pay, request_flag
         `, [lastRid]);
 
-        await pool.query(`
+        await client.query(`
           INSERT INTO public.zvk_status (zvk_row_id, src_o, chief_approved, status_time)
           VALUES ($1, '', NULL, NOW())
           ON CONFLICT (zvk_row_id)
@@ -4749,6 +4805,8 @@ const rebuild =
             status_time = NOW()
         `, [lastRid]);
 
+        await client.query("COMMIT");
+        transaction = false;
         return res.json({
           success: true,
           updated: true,
@@ -4763,13 +4821,13 @@ const rebuild =
 
     // ✅ ниже старая логика создания новой строки, если zvk_row_id не пришёл
     if (!adminOk) {
-      const ok = await canEditFtByLogin(pool, id_ft, actor);
+      const ok = await canEditFtByLogin(client, id_ft, actor);
       if (!ok) {
         return res.status(403).json({ success:false, error:"NO_RIGHTS_THIS_FT" });
       }
     }
 
-    const exists = await pool.query(
+    const exists = await client.query(
       `SELECT 1 FROM public.zvk WHERE id_ft = $1 LIMIT 1`,
       [ft]
     );
@@ -4794,7 +4852,7 @@ const rebuild =
       finalFlag = flag;
     }
 
-    const lastCycle = await pool.query(
+    const lastCycle = await client.query(
       `
       SELECT z.id_zvk
       FROM public.zvk z
@@ -4811,7 +4869,7 @@ const rebuild =
     let id_zvk = lastCycle.rows[0]?.id_zvk || null;
 
     if (id_zvk) {
-      const lastRow = await pool.query(
+      const lastRow = await client.query(
         `
         SELECT z.id
         FROM public.zvk z
@@ -4825,7 +4883,7 @@ const rebuild =
       const lastRowId = lastRow.rows[0]?.id || null;
 
       if (lastRowId) {
-        const paid = await pool.query(
+        const paid = await client.query(
           `SELECT is_paid FROM public.zvk_pay WHERE zvk_row_id = $1`,
           [Number(lastRowId)]
         );
@@ -4837,14 +4895,15 @@ const rebuild =
     }
 
     if (!id_zvk) {
-      const created = await pool.query(
+      const created = await client.query(
         `SELECT 'ZFT' || nextval('public.zvk_id_seq')::text AS id_zvk`
       );
       id_zvk = created.rows[0].id_zvk;
     }
 
     if (finalFlag === "Да") {
-      const balance = await getFtAvailableAmount(pool, ft, null);
+      await checkFtZlzkRows(client,[],{idFt:ft});
+      const balance = await getFtAvailableAmount(client, ft, null);
 
       if (!balance.exists) {
         return res.status(404).json({ success:false, error:"FT_NOT_FOUND" });
@@ -4861,7 +4920,7 @@ const rebuild =
       }
     }
 
-    const r = await pool.query(
+    const r = await client.query(
       `
       INSERT INTO public.zvk
         (id_zvk, id_ft, zvk_date, zvk_name, to_pay, return_amount, esk_return, request_flag)
@@ -4883,9 +4942,11 @@ const rebuild =
     let rebuild = null;
 
     if (finalFlag === "Да") {
-      rebuild = await rebuildFtTail(pool, Number(r.rows[0].id));
+      rebuild = await rebuildFtTail(client, Number(r.rows[0].id));
     }
 
+    await client.query("COMMIT");
+    transaction = false;
     return res.json({
       success: true,
       row: r.rows[0],
@@ -4896,7 +4957,9 @@ const rebuild =
 
   } catch (e) {
     console.error("ZVK-SAVE ERROR:", e);
-    return res.status(500).json({ success:false, error:e.message });
+    return res.status(e.status || 500).json({ success:false, error:e.message });
+  } finally {
+    try { if (transaction) await client.query("ROLLBACK"); } finally { client.release(); }
   }
 });
 app.post("/zvk-bulk-request-flag", async (req, res) => {
@@ -4935,6 +4998,7 @@ app.post("/zvk-bulk-request-flag", async (req, res) => {
     }
 
     await client.query("BEGIN");
+    if (flag === "Да") await checkFtZlzkRows(client, ids);
 
     await client.query(`
       UPDATE public.zvk
@@ -4990,7 +5054,7 @@ app.post("/zvk-bulk-request-flag", async (req, res) => {
   } catch (e) {
     try { await client.query("ROLLBACK"); } catch (_) {}
     console.error("zvk-bulk-request-flag error:", e);
-    return res.status(500).json({ success:false, error:e.message });
+    return res.status(e.status || 500).json({ success:false, error:e.message });
   } finally {
     client.release();
   }
@@ -5464,6 +5528,8 @@ app.post("/zvk-pay-row", async (req, res) => {
         ? null
         : rawReg;
 
+    if (reg === "Да") await checkFtZlzkRows(client,[Number(zvk_row_id)]);
+
     const rawPaid =
       is_paid === undefined || is_paid === null
         ? ""
@@ -5537,7 +5603,7 @@ app.post("/zvk-pay-row", async (req, res) => {
   } catch (e) {
     await client.query("ROLLBACK");
     console.error("ZVK-PAY-ROW ERROR:", e);
-    return res.status(500).json({ success:false, error:e.message });
+    return res.status(e.status || 500).json({ success:false, error:e.message });
   } finally {
     client.release();
   }
@@ -6468,6 +6534,8 @@ app.post('/zft-zlzk-allocation/save', async (req,res) => {
     // qty сохраняется как 0 только для совместимости со старой структурой таблицы.
     // Денежного лимита по конкретной ZLZK нет; общий предел контролируется суммой FT на фронте.
 
+    if (!normalized.length && z.request_flag === 'Да') await checkFtZlzkRows(client,[rowId],{clearing:true});
+
     for(const x of normalized.sort((a,b)=>a.id_zlzk.localeCompare(b.id_zlzk))){
       const rq=await client.query(`SELECT idzlzk FROM lzk.requests WHERE idzlzk=$1 AND lower(trim(COALESCE(pto_status,''))) IN ('согласован','согласовано') LIMIT 1`,[x.id_zlzk]);
       if(!rq.rowCount){
@@ -6489,7 +6557,7 @@ app.post('/zft-zlzk-allocation/save', async (req,res) => {
   }catch(e){
     try{await client.query('ROLLBACK');}catch(_){}
     console.error('zft-zlzk-allocation/save error',e);
-    return res.status(500).json({success:false,error:e.message});
+    return res.status(e.status || 500).json({success:false,error:e.message});
   }finally{client.release();}
 });
 
@@ -7789,6 +7857,11 @@ app.get("/request-card", async (req, res) => {
           ''
         ) AS money_type,
         COALESCE(NULLIF(i.idlzk, ''), cur.idlzk, '') AS idlzk,
+        COALESCE(i.idzlzk, (
+            SELECT string_agg(DISTINCT a.id_zlzk, ', ' ORDER BY a.id_zlzk)
+            FROM public.zft_zlzk_allocation a
+            WHERE a.zvk_row_id = i.zvk_row_id
+          ), '') AS idzlzk,
         COALESCE(cur.to_pay, i.to_pay) AS to_pay,
         COALESCE(cur.esk_return, i.esk_return, false) AS esk_return,
         COALESCE(cur.return_amount, 0) AS return_amount,
