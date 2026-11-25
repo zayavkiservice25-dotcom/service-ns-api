@@ -5914,6 +5914,8 @@ const query = `
   SELECT
     v.*,
 
+    ft_origin.source_type AS source_type,
+
     -- Берём сумму ДоРеестра напрямую из живой строки public.zvk.
     -- Так отображение не зависит от того, успел ли пересоздаться VIEW.
     zlive.pre_registry_amount AS pre_registry_amount_live,
@@ -5935,6 +5937,7 @@ const query = `
     ) AS pre_registry_sent
 
   FROM balance_rows v
+  JOIN public.ft ft_origin ON ft_origin.id_ft = v.id_ft
 
   LEFT JOIN LATERAL (
     SELECT string_agg(x.id_zlzk, ', ' ORDER BY x.id_zlzk) AS idzlzk_ids
@@ -19841,6 +19844,44 @@ app.get('/hr/kedo-document-orders/summary',hrApiGuard_,hrKedoOrdersAccess_,async
   }
   catch(e){console.error('[KEDO ORDERS]',e.message);res.status(502).json({success:false,error:e.message});}
 });
+app.get('/ft/kedo-order-pdf', async (req, res) => {
+  res.set('Cache-Control', 'private, no-store');
+  try {
+    const user = await getAuthenticatedFtUser(req);
+    if (!user) return res.status(401).json({error: 'Войдите в систему повторно'});
+    const idFt = String(req.query.id_ft || '').trim().toUpperCase();
+    if (!/^FT[0-9]{1,12}$/.test(idFt)) {
+      return res.status(400).json({error: 'Некорректный номер ФТ'});
+    }
+
+    const result = await pool.query(`
+      SELECT l.document_id, f.input_name, f."object" AS object_name
+      FROM public.ft f
+      JOIN hr.kedo_order_finance_links l ON l.id_ft = f.id_ft
+      WHERE f.id_ft = $1 AND f.source_type = 'KEDO_ORDER'
+    `, [idFt]);
+    const row = result.rows[0];
+    if (!row) return res.status(404).json({error: 'Приказ не найден'});
+
+    const login = String(user.login).trim().toLowerCase();
+    const role = String(user.role_ft || '').trim().toLowerCase();
+    const own = String(row.input_name || '').trim().toLowerCase() === login;
+    const objectName = String(row.object_name || '').trim().toLowerCase();
+    const mayReadOthers = login === 'zh_elnur'
+      ? ['67-м-акт. жем', '33-д-пвл. ленинский'].includes(objectName)
+      : ['admin', 'operator', 'supervisor'].includes(role)
+        || ['a_zaitova', 't_serik'].includes(login);
+    if (!own && !mayReadOthers) return res.status(404).json({error: 'Приказ не найден'});
+
+    const pdf = await kedoDriveGetPdf_(row.document_id);
+    res.set('Content-Disposition', 'attachment; filename="' + idFt + '_KEDO.pdf"');
+    res.type('application/pdf').send(pdf);
+  } catch (error) {
+    console.error('[FT KEDO PDF]', error.message);
+    res.status(502).json({error: 'Не удалось получить приказ. Повторите позже.'});
+  }
+});
+
 app.get('/hr/kedo-document-orders/pdf',hrApiGuard_,hrKedoOrdersAccess_,async(req,res)=>{
   try{
     const id=String(req.query.id||'');
