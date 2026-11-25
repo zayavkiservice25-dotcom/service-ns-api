@@ -19777,7 +19777,16 @@ function hrKedoOrderRow_(doc){
   const hotelCoefficients={leader:{major:10,regional:7,district:5,rural:3},head:{major:7,regional:4,district:4,rural:3},specialist:{major:4,regional:3,district:3,rural:3}};
   const dailyRate=categoryKey?baseRate*(/^(оператор|тралист)$/i.test(category)?4:dailyCoefficients[categoryKey]):null;
   const perDiem=validDays&&dailyRate!==null?days*dailyRate:null;
-  const lodging=categoryKey&&staysComplete?stays.reduce((sum,x)=>sum+x.nights*baseRate*hotelCoefficients[categoryKey][x.type],0):null;
+  const lodgingByRate=new Map();
+  if(categoryKey && staysComplete){
+    for(const stay of stays){
+      const rate=baseRate*hotelCoefficients[categoryKey][stay.type];
+      if(stay.nights) lodgingByRate.set(rate,(lodgingByRate.get(rate)||0)+stay.nights);
+    }
+  }
+  const lodging=categoryKey && staysComplete
+    ? Array.from(lodgingByRate).reduce((sum,[rate,count])=>sum+rate*count,0)
+    : null;
   const owner=hrKedoOrderInitiator_(doc);
   const destination=text(pick('mission_destination'))||stays.map(x=>x.city).join(' – ');
   return {id:String(doc.id),status:'Подписан в КЭДО',raw_status:'COMPLETED',kedo_source:true,
@@ -19786,10 +19795,33 @@ function hrKedoOrderRow_(doc){
     employee,author:text(pick('employee')),mission_person:text(pick('mission_person')),position,category,legal_entity:doc.organization_title||'',organization:doc.organization_title||'',
     destination,travel_route:text(pick('misstion_route','travel_route','route'))||destination,purpose:text(pick('mission_purpose','trip_purpose','purpose')),
     date_from:from,date_to:to,days_count:validDays?days:null,stays,lodging_days:stays.length>0&&!invalidNights?nights:null,
+    lodging_by_rate:Array.from(lodgingByRate),
     daily_rate:dailyRate,per_diem_amount:perDiem,lodging_amount:lodging,
     // 'Суммы' is the amount provided by KEDO; do not overwrite it with a partial estimate.
     total_amount:number(pick('Суммы','суммы','sum_amount','total_amount')) ?? (perDiem!==null&&lodging!==null?perDiem+lodging:null),
     calculation_message:issues.join('. '),values:v};
+}
+function kedoOrderPaymentPurpose_(order){
+  const format=value=>Number(value).toLocaleString('ru-RU',{maximumFractionDigits:2}).replace(/[\u00a0\u202f]/g,' ');
+  const route=String(order.travel_route||'').trim().replace(/\.+$/,'');
+  const parts=[route?'Служебная командировка: '+route:'Служебная командировка'];
+  if(order.per_diem_amount!=null){
+    parts.push('Суточные: '+order.days_count+' дн. × '+format(order.daily_rate)+' = '+format(order.per_diem_amount)+' тг');
+  }
+  if(order.lodging_amount!=null){
+    const terms=order.lodging_by_rate.map(([rate,nights])=>nights+' ноч. × '+format(rate));
+    parts.push('Проживание: '+(terms.length?terms.join(' + ')+' = ':'0 ноч. = ')+format(order.lodging_amount)+' тг');
+  }
+  if(order.per_diem_amount!=null && order.lodging_amount!=null){
+    const calculated=order.per_diem_amount+order.lodging_amount;
+    if(order.total_amount!==calculated) parts.push('Итого по расчёту: '+format(calculated)+' тг');
+  }
+  if(order.total_amount!=null){
+    const matches=order.per_diem_amount!=null && order.lodging_amount!=null &&
+      order.total_amount===order.per_diem_amount+order.lodging_amount;
+    parts.push((matches?'Итого: ':'Сумма по приказу: ')+format(order.total_amount)+' тг');
+  }
+  return parts.join('. ')+'.';
 }
 async function hrKedoOrderRows_(){
   if(!KEDO_ROOT_||!KEDO_TOKEN_)throw new Error('KEDO_NOT_CONFIGURED');
@@ -20022,11 +20054,15 @@ async function kedoOrderFinanceRun_(){
       if(!missionPerson){console.warn('[KEDO ORDER FIN] MISSING_MISSION_PERSON',order.id);continue;}
       // Исправляем уже созданные ФТ по стабильной связи документа КЭДО с FT.
       // Новые ФТ здесь НЕ создаются; чужие/ручные строки не затрагиваются.
-      const corrected=await pool.query(`UPDATE public.ft f SET contractor=$2
+      const purpose=kedoOrderPaymentPurpose_(order);
+      const oldPurpose='Служебная командировка: '+(order.travel_route||'');
+      const corrected=await pool.query(`UPDATE public.ft f SET contractor=$2,
+          pay_purpose=CASE WHEN f.pay_purpose=$3 AND f.sum_ft=$5 THEN $4 ELSE f.pay_purpose END
         FROM hr.kedo_order_finance_links l
         WHERE l.document_id=$1::uuid AND l.id_ft=f.id_ft
           AND f.source_type='KEDO_ORDER'
-          AND f.contractor IS DISTINCT FROM $2 RETURNING f.id_ft`,[order.id,missionPerson]);
+          AND (f.contractor IS DISTINCT FROM $2 OR (f.pay_purpose=$3 AND f.sum_ft=$5 AND f.pay_purpose IS DISTINCT FROM $4))
+          RETURNING f.id_ft`,[order.id,missionPerson,oldPurpose,purpose,order.total_amount]);
       if(corrected.rowCount)console.log('[KEDO ORDER FIN] CONTRACTOR_FIXED',order.id,corrected.rows[0].id_ft);
       const entity=kedoOrderFinanceEntity_(order.legal_entity,ftLegalEntities);
       const amount=Number(order.total_amount);
@@ -20040,7 +20076,7 @@ async function kedoOrderFinanceRun_(){
         const ft=await c.query(`INSERT INTO public.ft
           (id_ft,input_date,input_name,legal_entity,"object",contractor,pay_purpose,dds_article,contract_no,invoice_no,invoice_date,sum_ft,source_type)
           VALUES('FT'||nextval('public.ft_id_seq'),now(),'a_zaitova',$1,'Командировка',$2,$3,'103. Командировочные','Без договора',$4,(now() AT TIME ZONE 'Asia/Almaty')::date,$5,'KEDO_ORDER') RETURNING id_ft`,
-          [entity,missionPerson,'Служебная командировка: '+(order.travel_route||''),String(order.order_number||'Приказ'),amount]);
+          [entity,missionPerson,purpose,String(order.order_number||'Приказ'),amount]);
         const idFt=ft.rows[0].id_ft;
         const z=await c.query(`INSERT INTO public.zvk(id_ft,id_zvk,zvk_date,zvk_name,to_pay,request_flag)
           VALUES($1,'ZFT'||nextval('public.zvk_id_seq'),now(),'a_zaitova',$2,'Да') RETURNING id`,[idFt,amount]);
