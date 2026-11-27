@@ -21300,6 +21300,34 @@ app.post('/lzk/receipt/create',receiptRoute(async(req,db,login)=>{
  return act;
 },true));
 app.get('/lzk/receipt/list',receiptRoute(async(req,db,login)=>{return {login,rows:(await db.query(`SELECT a.*,i.id,i.idzlzk,i.idplxk,i.object_name,i.material_name,i.unit,i.request_qty,i.previous_qty,i.issued_qty,i.received_qty,i.difference,coalesce(s.received_qty,0) AS cumulative_qty,i.request_qty-coalesce(s.received_qty,0) AS remaining_qty FROM lzk.receipt_acts a JOIN lzk.receipt_act_items i USING(idakt) LEFT JOIN lzk.supply s ON s.idzlzk=i.idzlzk AND s.idplxk=i.idplxk WHERE $1='r_gulnur' OR a.recipient_login=$1 ORDER BY a.created_at DESC,i.id`,[login])).rows};}));
+// История подтвержденных приемок в Панели снабженца.
+app.get('/lzk/receipt/history',receiptRoute(async(req,db,login)=>{
+ const z=String(req.query.idzlzk||'').trim(), p=String(req.query.idplxk||'').trim();
+ if(!z||z.length>100||p.length>100)receiptError('Некорректная строка');
+ const user=(await db.query(`SELECT lower(trim(coalesce(role_lzk,''))) AS role FROM public.users WHERE lower(trim(login))=$1 AND is_active=true`,[login])).rows[0];
+ const role=user?.role||'';
+ const allowed=['admin','админ','администратор','editor','редактор','operator','оператор','supervisor','супервайзер','supplier','снабженец','pto','пто','initiator','инициатор'];
+ if(login!=='r_gulnur'&&!allowed.includes(role))receiptError('Нет доступа',403);
+ const q=await db.query(`WITH base AS (
+ SELECT r.idzlzk, CASE WHEN $2='' THEN r.fact_qty ELSE s.ordered_qty END AS request_qty,
+ coalesce(s.received_qty,0) AS total_qty
+ FROM lzk.requests r LEFT JOIN lzk.supply s ON s.idzlzk=r.idzlzk AND coalesce(trim(s.idplxk),'')=$2
+ WHERE r.idzlzk=$1 AND lower(trim(coalesce(r.pto_status,''))) IN ('согласован','согласовано')
+ AND ($2='' OR s.idzlzk IS NOT NULL)
+ AND ($3=false OR lower(trim(coalesce(r.initiator,'')))=$4)
+ ), history AS (
+ SELECT a.idakt,a.accepted_at,a.accepted_by,a.recipient_login,i.issued_qty,i.received_qty,i.difference,
+ coalesce(nullif(trim(concat_ws(' ',u.last_name,u.first_name,u.middle_name)),''),a.recipient_login) AS recipient_name
+ FROM lzk.receipt_act_items i JOIN lzk.receipt_acts a USING(idakt)
+ LEFT JOIN public.users u ON lower(trim(u.login))=lower(trim(a.recipient_login))
+ WHERE i.idzlzk=$1 AND i.idplxk=$2 AND a.status IN ('accepted','accepted_difference') AND i.received_qty IS NOT NULL
+ ) SELECT base.*, base.request_qty-base.total_qty AS remaining_qty,
+ coalesce((SELECT sum(received_qty) FROM history),0) AS acts_qty,
+ base.total_qty-coalesce((SELECT sum(received_qty) FROM history),0) AS legacy_qty,
+ coalesce((SELECT json_agg(history ORDER BY accepted_at,idakt) FROM history),'[]'::json) AS rows FROM base`,[z,p,login!=='r_gulnur'&&['initiator','инициатор'].includes(role),login]);
+ if(!q.rowCount)receiptError('Строка недоступна',404);
+ return q.rows[0];
+}));
 app.post('/lzk/receipt/accept',receiptRoute(async(req,db,login)=>{const id=String(req.body?.idakt||''),items=req.body?.items; const a=(await db.query('SELECT * FROM lzk.receipt_acts WHERE idakt=$1 FOR UPDATE',[id])).rows[0]; if(!a||a.recipient_login!==login)receiptError('Нет доступа',403); if(a.status!=='pending')receiptError('Акт уже принят',409); const rows=(await db.query('SELECT * FROM lzk.receipt_act_items WHERE idakt=$1 ORDER BY id',[id])).rows; if(!Array.isArray(items)||items.length!==rows.length||new Set(items.map(i=>String(i.id))).size!==rows.length)receiptError('Заполните все строки'); let diff=false;
  for(const r of rows){const i=items.find(x=>String(x.id)===String(r.id)); if(!i)receiptError('Неверная строка');const qty=receiptQty(i.received_qty); if(Number(qty)>Number(r.issued_qty))receiptError('Получено больше выставленного'); if(Number(qty)!==Number(r.issued_qty))diff=true;
  await db.query(`INSERT INTO lzk.supply(idzlzk,idplxk,received_qty,created_at,updated_at) VALUES($1,$2,$3,now(),now()) ON CONFLICT(idzlzk,idplxk) DO UPDATE SET received_qty=coalesce(lzk.supply.received_qty,0)+EXCLUDED.received_qty,updated_at=now()`,[r.idzlzk,r.idplxk,qty]);
