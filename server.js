@@ -21130,6 +21130,7 @@ app.post(TELEGRAM_HOOK_PATH_NS_,async(req,res)=>{
   // Сначала отвечаем Telegram, затем обрабатываем сообщение.
   res.json({ok:true});
   try {
+    if(await receiptBotUpdate_(req.body))return;
     const message=req.body?.message;
     if(!message?.chat?.id || message.chat.type!=='private')return;
     const txt=String(message.text||'').trim();
@@ -21271,7 +21272,7 @@ async function telegramNsInit_(){
     await telegramNsQuery_('setWebhook',{
       url:url.origin+TELEGRAM_HOOK_PATH_NS_,
       secret_token:TELEGRAM_SECRET_NS_,
-      allowed_updates:['message'],drop_pending_updates:false
+      allowed_updates:['message','callback_query'],drop_pending_updates:false
     });
     console.log('[TELEGRAM SNS] Webhook ready:',url.origin+TELEGRAM_HOOK_PATH_NS_);
   }catch(e){console.error('[TELEGRAM SNS] Init failed:',e.message)}
@@ -21282,7 +21283,38 @@ setTimeout(()=>{void telegramNsInit_()},3000);
 // Приемка ТМЦ: таблицы создаются вручную в PostgreSQL.
 function receiptError(message, status=400) { const e=new Error(message); e.status=status; throw e; }
 function receiptQty(v, positive=false) { const s=String(v??'').trim().replace(',','.'); if(!/^\d{1,12}(\.\d{1,6})?$/.test(s) || (positive && Number(s)<=0)) receiptError('Некорректное количество'); return s; }
-function receiptRoute(fn, write=false) { return async (req,res)=> { let db; try { db=await pool.connect(); const u=await getAuthenticatedFtUser(req,db); if(!u) receiptError('Войдите заново в приложение',401); const login=u.login.trim().toLowerCase(); if(write){await db.query('BEGIN'); await db.query('SELECT pg_advisory_xact_lock(872601)');} const data=await fn(req,db,login); if(write) await db.query('COMMIT'); res.json({success:true,...data}); } catch(e){if(db&&write) await db.query('ROLLBACK').catch(()=>{}); console.error('RECEIPT',e.message); res.status(e.status||500).json({success:false,error:e.status?e.message:'Ошибка базы приемки ТМЦ'});} finally{if(db)db.release();} }; }
+function receiptRoute(fn, write=false) { return async (req,res)=> { let db; try { db=await pool.connect(); const u=await getAuthenticatedFtUser(req,db); if(!u) receiptError('Войдите заново в приложение',401); const login=u.login.trim().toLowerCase(); if(write){await db.query('BEGIN'); await db.query('SELECT pg_advisory_xact_lock(872601)');} const data=await fn(req,db,login); if(write) await db.query('COMMIT');
+ const event=data.receiptNotification; delete data.receiptNotification;
+ if(event){db.release();db=null;data.telegram=await receiptNotify_(event);}
+ res.json({success:true,...data}); } catch(e){if(db&&write) await db.query('ROLLBACK').catch(()=>{}); console.error('RECEIPT',e.message); res.status(e.status||500).json({success:false,error:e.status?e.message:'Ошибка базы приемки ТМЦ'});} finally{if(db)db.release();} }; }
+// Telegram отправляется только после COMMIT; сбой Telegram не отменяет акт.
+async function receiptNotify_(event){
+ try {
+  const q=await pool.query(`SELECT a.idakt,a.created_by,a.recipient_login,a.status,a.accepted_at,
+   coalesce(nullif(trim(concat_ws(' ',u.last_name,u.first_name,u.middle_name)),''),a.recipient_login) AS recipient_name,
+   i.idzlzk,i.idplxk,i.object_name,i.material_name,i.unit,i.issued_qty,i.received_qty,i.difference
+   FROM lzk.receipt_acts a JOIN lzk.receipt_act_items i USING(idakt)
+   LEFT JOIN public.users u ON lower(trim(u.login))=a.recipient_login
+   WHERE a.idakt=$1 ORDER BY i.id`,[event.idakt]);
+  if(!q.rowCount)throw Error('ACT_NOT_FOUND');
+  const a=q.rows[0], create=event.kind==='created';
+  const fmt=v=>v==null?'—':String(v).replace(/(\.\d*?[1-9])0+$|\.0+$/,'$1').replace('.',',');
+  const header=[create?'📦 Новый акт приема ТМЦ':a.status==='accepted_difference'?'⚠️ Акт принят с расхождениями':'✅ Акт приема ТМЦ принят',
+   'IDAKT: '+a.idakt,'Отправитель: '+a.created_by,'Получатель: '+a.recipient_name,
+   ...(create?[]:['Дата приемки: '+new Date(a.accepted_at).toLocaleString('ru-RU',{timeZone:'Asia/Almaty'})])].join('\n');
+  const lines=q.rows.map(r=>{
+   const label=[r.idzlzk+(r.idplxk?' / '+r.idplxk:''),r.object_name,r.material_name].filter(Boolean).join(' · ').slice(0,350);
+   const unit=r.unit?' '+String(r.unit).slice(0,40):'';
+   return create?label+'\nВыставлено: '+fmt(r.issued_qty)+unit:label+'\nВыставлено: '+fmt(r.issued_qty)+unit+'; принято: '+fmt(r.received_qty)+unit+(Number(r.difference)!==0?'\n⚠️ Разница: '+fmt(r.difference)+unit:'');
+  });
+  const footer=create?'\n\nНачните приемку в боте или на странице «Приемка ТМЦ».':'';
+  const login=create?a.recipient_login:a.created_by;
+  let message=header, sent=0;
+  for(const line of lines){if(message.length+line.length+footer.length+2>3600){const result=await telegramNsSendToLogin_(login,message);if(!result.sent)return {...result,parts_sent:sent};sent++;message=header;}message+='\n\n'+line;}
+  const result=create?await receiptBotSendStart_(login,message+footer,event.idakt):await telegramNsSendToLogin_(login,message+footer);
+  return {...result,parts_sent:sent+(result.sent?1:0)};
+ }catch(e){console.error('[RECEIPT TELEGRAM]',event.idakt,e.message);return {sent:false,reason:'TELEGRAM_SEND_FAILED'};}
+}
 app.get('/lzk/receipt/recipients',receiptRoute(async(req,db,login)=>{if(login!=='r_gulnur')receiptError('Нет доступа',403); return {rows:(await db.query(`SELECT login, concat_ws(' ',last_name,first_name,middle_name) AS name FROM public.users WHERE is_active=true AND trim(coalesce(login,''))<>'' ORDER BY name,login`)).rows};}));
 app.post('/lzk/receipt/create',receiptRoute(async(req,db,login)=>{
  if(login!=='r_gulnur')receiptError('Нет доступа',403);
@@ -21297,7 +21329,7 @@ app.post('/lzk/receipt/create',receiptRoute(async(req,db,login)=>{
  const prev=(await db.query(`SELECT coalesce((SELECT received_qty FROM lzk.supply WHERE idzlzk=$1 AND idplxk=$2),0) AS qty`,[z,p])).rows[0].qty;
  const check=(await db.query(`SELECT $1::numeric <= $2::numeric-$3::numeric-coalesce(sum(i.issued_qty),0) AS ok FROM lzk.receipt_act_items i JOIN lzk.receipt_acts a USING(idakt) WHERE i.idzlzk=$4 AND i.idplxk=$5 AND a.status='pending'`,[qty,r.request_qty,prev,z,p])).rows[0]; if(!check.ok)receiptError('Количество превышает свободный остаток: '+z);
  await db.query(`INSERT INTO lzk.receipt_act_items(idakt,idzlzk,idplxk,object_name,material_name,unit,request_qty,previous_qty,issued_qty) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`,[act.idakt,z,p,r.object_name,r.material_name,r.unit,r.request_qty,prev,qty]); }
- return act;
+ return {...act,receiptNotification:{kind:"created",idakt:act.idakt}};
 },true));
 app.get('/lzk/receipt/list',receiptRoute(async(req,db,login)=>{return {login,rows:(await db.query(`SELECT a.*,i.id,i.idzlzk,i.idplxk,i.object_name,i.material_name,i.unit,i.request_qty,i.previous_qty,i.issued_qty,i.received_qty,i.difference,coalesce(s.received_qty,0) AS cumulative_qty,i.request_qty-coalesce(s.received_qty,0) AS remaining_qty FROM lzk.receipt_acts a JOIN lzk.receipt_act_items i USING(idakt) LEFT JOIN lzk.supply s ON s.idzlzk=i.idzlzk AND s.idplxk=i.idplxk WHERE $1='r_gulnur' OR a.recipient_login=$1 ORDER BY a.created_at DESC,i.id`,[login])).rows};}));
 // История подтвержденных приемок в Панели снабженца.
@@ -21328,10 +21360,81 @@ app.get('/lzk/receipt/history',receiptRoute(async(req,db,login)=>{
  if(!q.rowCount)receiptError('Строка недоступна',404);
  return q.rows[0];
 }));
-app.post('/lzk/receipt/accept',receiptRoute(async(req,db,login)=>{const id=String(req.body?.idakt||''),items=req.body?.items; const a=(await db.query('SELECT * FROM lzk.receipt_acts WHERE idakt=$1 FOR UPDATE',[id])).rows[0]; if(!a||a.recipient_login!==login)receiptError('Нет доступа',403); if(a.status!=='pending')receiptError('Акт уже принят',409); const rows=(await db.query('SELECT * FROM lzk.receipt_act_items WHERE idakt=$1 ORDER BY id',[id])).rows; if(!Array.isArray(items)||items.length!==rows.length||new Set(items.map(i=>String(i.id))).size!==rows.length)receiptError('Заполните все строки'); let diff=false;
+async function receiptAcceptShared_(req,db,login){const id=String(req.body?.idakt||''),items=req.body?.items; const a=(await db.query('SELECT * FROM lzk.receipt_acts WHERE idakt=$1 FOR UPDATE',[id])).rows[0]; if(!a||a.recipient_login!==login)receiptError('Нет доступа',403); if(a.status!=='pending')receiptError('Акт уже принят',409); const rows=(await db.query('SELECT * FROM lzk.receipt_act_items WHERE idakt=$1 ORDER BY id',[id])).rows; if(!Array.isArray(items)||items.length!==rows.length||new Set(items.map(i=>String(i.id))).size!==rows.length)receiptError('Заполните все строки'); let diff=false;
  for(const r of rows){const i=items.find(x=>String(x.id)===String(r.id)); if(!i)receiptError('Неверная строка');const qty=receiptQty(i.received_qty); if(Number(qty)>Number(r.issued_qty))receiptError('Получено больше выставленного'); if(Number(qty)!==Number(r.issued_qty))diff=true;
  await db.query(`INSERT INTO lzk.supply(idzlzk,idplxk,received_qty,created_at,updated_at) VALUES($1,$2,$3,now(),now()) ON CONFLICT(idzlzk,idplxk) DO UPDATE SET received_qty=coalesce(lzk.supply.received_qty,0)+EXCLUDED.received_qty,updated_at=now()`,[r.idzlzk,r.idplxk,qty]);
  await db.query('UPDATE lzk.receipt_act_items SET received_qty=$1 WHERE id=$2',[qty,r.id]); }
- await db.query('UPDATE lzk.receipt_acts SET status=$1,accepted_by=$2,accepted_at=now() WHERE idakt=$3',[diff?'accepted_difference':'accepted',login,id]); return {idakt:id};},true));
+ await db.query('UPDATE lzk.receipt_acts SET status=$1,accepted_by=$2,accepted_at=now() WHERE idakt=$3',[diff?'accepted_difference':'accepted',login,id]); return {idakt:id,receiptNotification:{kind:"accepted",idakt:id}};}
+app.post('/lzk/receipt/accept',receiptRoute(receiptAcceptShared_,true));
+
+
+// Telegram receipt workflow. Existing HR notifications and /start,/id are unchanged.
+const receiptBotSessions_=new Map();
+const receiptBotLocks_=new Set();
+const receiptBotTtl_=30*60*1000;
+async function receiptBotSend_(chat,text,buttons){
+ return telegramNsQuery_('sendMessage',{chat_id:String(chat),text:String(text).slice(0,3900),...(buttons?{reply_markup:{inline_keyboard:buttons}}:{})});
+}
+async function receiptBotSendStart_(login,message,id){
+ const q=await pool.query('SELECT chat_id::text AS chat_id FROM public.telegram_users WHERE login=$1',[login]);
+ if(!q.rowCount)return {sent:false,reason:'TELEGRAM_CHAT_NOT_LINKED'};
+ await receiptBotSend_(q.rows[0].chat_id,message,[[{text:'Заполнить приемку',callback_data:'rc:start:'+id}]]);return {sent:true};
+}
+async function receiptBotLogin_(chat){
+ const q=await pool.query(`SELECT lower(trim(t.login)) AS login FROM public.telegram_users t JOIN public.users u ON lower(trim(u.login))=lower(trim(t.login)) WHERE t.chat_id=$1 AND u.is_active=true`,[chat]);return q.rows[0]?.login;
+}
+function receiptBotButton_(text,action){return {text,callback_data:'rc:'+action};}
+async function receiptBotList_(chat,login){
+ const q=await pool.query(`SELECT a.idakt,count(*)::int AS n FROM lzk.receipt_acts a JOIN lzk.receipt_act_items i USING(idakt) WHERE a.recipient_login=$1 AND a.status='pending' GROUP BY a.idakt,a.created_at ORDER BY a.created_at DESC LIMIT 50`,[login]);
+ await receiptBotSend_(chat,q.rowCount?'Выберите акт приема ТМЦ (последние 50):':'Нет актов, ожидающих приемки.',q.rows.map(r=>[receiptBotButton_(r.idakt+' · строк: '+r.n,'start:'+r.idakt)]));
+}
+async function receiptBotPrompt_(chat,state){
+ state.expires=Date.now()+receiptBotTtl_;
+ const r=state.rows[state.index];
+ if(!r){const lines=state.rows.map((x,i)=>x.idzlzk+(x.idplxk?' / '+x.idplxk:'')+': '+state.values[i]+' из '+x.issued_qty);
+ let part='Акт '+state.id+' — проверьте количество:';for(const line of lines){if(part.length+line.length>3500){await receiptBotSend_(chat,part);part='Продолжение '+state.id;}part+='\n'+line;}
+ await receiptBotSend_(chat,part+'\nПодтвердить приемку?',[[receiptBotButton_('✓ Принять акт','confirm:'+state.nonce)],[receiptBotButton_('Изменить количество','edit:'+state.nonce),receiptBotButton_('Отмена','cancel:'+state.nonce)]]);return;}
+ await receiptBotSend_(chat,`Акт ${state.id}\nМатериал ${state.index+1} из ${state.rows.length}\n${r.idzlzk}${r.idplxk?' / '+r.idplxk:''}\n${String(r.material_name||'').slice(0,500)}\nВыставлено: ${r.issued_qty} ${r.unit||''}\nВведите фактическое количество сообщением.`,[[receiptBotButton_('Получено полностью','full:'+state.nonce+':'+state.index)],[receiptBotButton_('Не получено — 0','zero:'+state.nonce+':'+state.index)],[receiptBotButton_('Отмена','cancel:'+state.nonce)]]);
+}
+async function receiptBotConfirm_(chat,login,state){
+ let db=await pool.connect(), data;
+ try{await db.query('BEGIN');await db.query('SELECT pg_advisory_xact_lock(872601)');
+ const current=await db.query(`SELECT 1 FROM public.telegram_users t JOIN public.users u ON lower(trim(u.login))=lower(trim(t.login)) WHERE t.chat_id=$1 AND lower(trim(t.login))=$2 AND u.is_active=true`,[chat,login]);if(!current.rowCount)receiptError('Нет доступа',403);
+ data=await receiptAcceptShared_({body:{idakt:state.id,items:state.rows.map((r,i)=>({id:r.id,received_qty:state.values[i]}))}},db,login);await db.query('COMMIT');
+ }catch(e){await db.query('ROLLBACK').catch(()=>{});throw e;}finally{db.release();}
+ receiptBotSessions_.delete(chat);const notify=await receiptNotify_(data.receiptNotification);
+ await receiptBotSend_(chat,'✅ Акт '+state.id+' принят. '+(notify.sent?'Гулнур уведомлена.':'Не удалось доставить уведомление Гулнур.'));
+}
+async function receiptBotUpdate_(update){
+ const cb=update?.callback_query,m=cb?.message||update?.message;
+ if(m?.chat?.type!=='private')return false;
+ const chat=String(m.chat.id),txt=String(update?.message?.text||'').trim(),action=String(cb?.data||'');
+ let st=receiptBotSessions_.get(chat);if(st&&st.expires<Date.now()){receiptBotSessions_.delete(chat);st=null;}
+ if(!action.startsWith('rc:')&&!/^\/receipt(?:@\w+)?(?:\s|$)/i.test(txt)&&!(st&&txt&&!txt.startsWith('/')))return false;
+ if(String((cb?.from||update?.message?.from)?.id)!==chat)return true;
+ if(cb)await telegramNsQuery_('answerCallbackQuery',{callback_query_id:cb.id}).catch(()=>{});
+ if(receiptBotLocks_.has(chat)){await receiptBotSend_(chat,'Предыдущая операция еще выполняется.');return true;}
+ receiptBotLocks_.add(chat);
+ try{
+ const login=await receiptBotLogin_(chat);if(!login){await receiptBotSend_(chat,'Ваш Telegram не привязан к действующему рабочему логину.');return true;}
+ if(/^\/receipt(?:@\w+)?(?:\s|$)/i.test(txt)){receiptBotSessions_.delete(chat);await receiptBotList_(chat,login);return true;}
+ if(action.startsWith('rc:start:')){
+ const id=action.split(':')[2];if(!/^AKT\d+$/.test(id))return true;
+ const q=await pool.query(`SELECT i.* FROM lzk.receipt_act_items i JOIN lzk.receipt_acts a USING(idakt) WHERE a.idakt=$1 AND a.recipient_login=$2 AND a.status='pending' ORDER BY i.id`,[id,login]);
+ if(!q.rowCount){await receiptBotSend_(chat,'Акт уже принят или недоступен.');return true;}
+ st={id,login,rows:q.rows,index:0,values:[],nonce:crypto.randomBytes(8).toString('hex')};receiptBotSessions_.set(chat,st);await receiptBotPrompt_(chat,st);return true;}
+ if(!st||st.login!==login){await receiptBotSend_(chat,'Сессия завершена. Нажмите «Заполнить приемку» в исходном уведомлении.');return true;}
+ const parts=action.split(':');if(cb&&parts[2]!==st.nonce){await receiptBotSend_(chat,'Эта кнопка устарела. Используйте последнее сообщение.');return true;}
+ if(parts[1]==='cancel'){receiptBotSessions_.delete(chat);await receiptBotSend_(chat,'Ввод отменен. Акт не изменен.');return true;}
+ if(parts[1]==='edit'&&st.index===st.rows.length){st.index=0;st.values=[];st.nonce=crypto.randomBytes(8).toString('hex');await receiptBotPrompt_(chat,st);return true;}
+ if(parts[1]==='confirm'&&st.index===st.rows.length){await receiptBotConfirm_(chat,login,st);return true;}
+ const r=st.rows[st.index];if(!r){await receiptBotSend_(chat,'Используйте кнопку подтверждения или изменения.');return true;}
+ if(cb&&(!['full','zero'].includes(parts[1])||Number(parts[3])!==st.index))return true;
+ const qty=receiptQty(cb?(parts[1]==='full'?r.issued_qty:'0'):txt);if(Number(qty)>Number(r.issued_qty))receiptError('Количество больше выставленного. Введите другое значение.');
+ st.values[st.index]=qty;st.index++;await receiptBotPrompt_(chat,st);
+ }catch(e){console.error('[RECEIPT BOT]',e.message);await receiptBotSend_(chat,e.status?e.message:'Ошибка приемки. Проверьте статус на сайте или через /receipt.').catch(()=>{});}
+ finally{receiptBotLocks_.delete(chat);}return true;
+}
+setInterval(()=>{for(const [chat,s] of receiptBotSessions_)if(s.expires<Date.now()&&!receiptBotLocks_.has(chat))receiptBotSessions_.delete(chat);},60000).unref();
 
 app.listen(PORT, () => console.log("Server started on port " + PORT));
