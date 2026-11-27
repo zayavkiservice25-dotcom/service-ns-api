@@ -21388,13 +21388,23 @@ async function receiptBotList_(chat,login){
  const q=await pool.query(`SELECT a.idakt,count(*)::int AS n FROM lzk.receipt_acts a JOIN lzk.receipt_act_items i USING(idakt) WHERE a.recipient_login=$1 AND a.status='pending' GROUP BY a.idakt,a.created_at ORDER BY a.created_at DESC LIMIT 50`,[login]);
  await receiptBotSend_(chat,q.rowCount?'Выберите акт приема ТМЦ (последние 50):':'Нет актов, ожидающих приемки.',q.rows.map(r=>[receiptBotButton_(r.idakt+' · строк: '+r.n,'start:'+r.idakt)]));
 }
+function receiptBotFormatQty_(v){return Number(v).toLocaleString('ru-RU',{maximumFractionDigits:6,useGrouping:false});}
+async function receiptBotEditMenu_(chat,state){
+ state.expires=Date.now()+receiptBotTtl_;
+ state.nonce=crypto.randomBytes(8).toString('hex');
+ const start=state.editPage||0, end=Math.min(start+20,state.rows.length);
+ const buttons=state.rows.slice(start,end).map((r,i)=>[receiptBotButton_(r.idzlzk+(r.idplxk?' / '+r.idplxk:'')+' — '+receiptBotFormatQty_(state.values[start+i]),'pick:'+state.nonce+':'+(start+i))]);
+ const nav=[];if(start>0)nav.push(receiptBotButton_('← Назад','page:'+state.nonce+':'+(start-20)));if(end<state.rows.length)nav.push(receiptBotButton_('Далее →','page:'+state.nonce+':'+end));if(nav.length)buttons.push(nav);
+ buttons.push([receiptBotButton_('К подтверждению','review:'+state.nonce)]);
+ await receiptBotSend_(chat,'Акт '+state.id+' — выберите позицию для изменения количества:',buttons);
+}
 async function receiptBotPrompt_(chat,state){
  state.expires=Date.now()+receiptBotTtl_;
  const r=state.rows[state.index];
- if(!r){const lines=state.rows.map((x,i)=>x.idzlzk+(x.idplxk?' / '+x.idplxk:'')+': '+state.values[i]+' из '+x.issued_qty);
+ if(!r){const lines=state.rows.map((x,i)=>x.idzlzk+(x.idplxk?' / '+x.idplxk:'')+': '+receiptBotFormatQty_(state.values[i])+' из '+receiptBotFormatQty_(x.issued_qty));
  let part='Акт '+state.id+' — проверьте количество:';for(const line of lines){if(part.length+line.length>3500){await receiptBotSend_(chat,part);part='Продолжение '+state.id;}part+='\n'+line;}
  await receiptBotSend_(chat,part+'\nПодтвердить приемку?',[[receiptBotButton_('✓ Принять акт','confirm:'+state.nonce)],[receiptBotButton_('Изменить количество','edit:'+state.nonce),receiptBotButton_('Отмена','cancel:'+state.nonce)]]);return;}
- await receiptBotSend_(chat,`Акт ${state.id}\nМатериал ${state.index+1} из ${state.rows.length}\n${r.idzlzk}${r.idplxk?' / '+r.idplxk:''}\n${String(r.material_name||'').slice(0,500)}\nВыставлено: ${r.issued_qty} ${r.unit||''}\nВведите фактическое количество сообщением.`,[[receiptBotButton_('Получено полностью','full:'+state.nonce+':'+state.index)],[receiptBotButton_('Не получено — 0','zero:'+state.nonce+':'+state.index)],[receiptBotButton_('Отмена','cancel:'+state.nonce)]]);
+ await receiptBotSend_(chat,`Акт ${state.id}\nМатериал ${state.index+1} из ${state.rows.length}\n${r.idzlzk}${r.idplxk?' / '+r.idplxk:''}\n${String(r.material_name||'').slice(0,500)}\nВыставлено: ${receiptBotFormatQty_(r.issued_qty)} ${r.unit||''}\n${state.editing?'Ранее введено: '+receiptBotFormatQty_(state.values[state.index])+'\nВведите новое количество в поле «Сообщение» и отправьте.':'Введите фактическое количество в поле «Сообщение» и отправьте.'}`,[[receiptBotButton_('Получено полностью','full:'+state.nonce+':'+state.index)],[receiptBotButton_('Не получено — 0','zero:'+state.nonce+':'+state.index)],[receiptBotButton_('Отмена','cancel:'+state.nonce)]]);
 }
 async function receiptBotConfirm_(chat,login,state){
  let db=await pool.connect(), data;
@@ -21426,12 +21436,15 @@ async function receiptBotUpdate_(update){
  if(!st||st.login!==login){await receiptBotSend_(chat,'Сессия завершена. Нажмите «Заполнить приемку» в исходном уведомлении.');return true;}
  const parts=action.split(':');if(cb&&parts[2]!==st.nonce){await receiptBotSend_(chat,'Эта кнопка устарела. Используйте последнее сообщение.');return true;}
  if(parts[1]==='cancel'){receiptBotSessions_.delete(chat);await receiptBotSend_(chat,'Ввод отменен. Акт не изменен.');return true;}
- if(parts[1]==='edit'&&st.index===st.rows.length){st.index=0;st.values=[];st.nonce=crypto.randomBytes(8).toString('hex');await receiptBotPrompt_(chat,st);return true;}
+ if(parts[1]==='edit'&&st.index===st.rows.length){st.editPage=0;await receiptBotEditMenu_(chat,st);return true;}
+ if(parts[1]==='page'&&st.index===st.rows.length){const n=Number(parts[3]);if(Number.isInteger(n)&&n>=0&&n<st.rows.length&&n%20===0){st.editPage=n;await receiptBotEditMenu_(chat,st);}return true;}
+ if(parts[1]==='pick'&&st.index===st.rows.length){const n=Number(parts[3]);if(Number.isInteger(n)&&n>=0&&n<st.rows.length){st.index=n;st.editing=true;st.nonce=crypto.randomBytes(8).toString('hex');await receiptBotPrompt_(chat,st);}return true;}
+ if(parts[1]==='review'&&st.index===st.rows.length){st.nonce=crypto.randomBytes(8).toString('hex');await receiptBotPrompt_(chat,st);return true;}
  if(parts[1]==='confirm'&&st.index===st.rows.length){await receiptBotConfirm_(chat,login,st);return true;}
  const r=st.rows[st.index];if(!r){await receiptBotSend_(chat,'Используйте кнопку подтверждения или изменения.');return true;}
  if(cb&&(!['full','zero'].includes(parts[1])||Number(parts[3])!==st.index))return true;
  const qty=receiptQty(cb?(parts[1]==='full'?r.issued_qty:'0'):txt);if(Number(qty)>Number(r.issued_qty))receiptError('Количество больше выставленного. Введите другое значение.');
- st.values[st.index]=qty;st.index++;await receiptBotPrompt_(chat,st);
+ st.values[st.index]=qty;if(st.editing){st.editing=false;st.index=st.rows.length;st.nonce=crypto.randomBytes(8).toString('hex');}else{st.index++;}await receiptBotPrompt_(chat,st);
  }catch(e){console.error('[RECEIPT BOT]',e.message);await receiptBotSend_(chat,e.status?e.message:'Ошибка приемки. Проверьте статус на сайте или через /receipt.').catch(()=>{});}
  finally{receiptBotLocks_.delete(chat);}return true;
 }
