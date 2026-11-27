@@ -21305,7 +21305,7 @@ async function receiptNotify_(event){
   const lines=q.rows.map(r=>{
    const label=[r.idzlzk+(r.idplxk?' / '+r.idplxk:''),r.object_name,r.material_name].filter(Boolean).join(' · ').slice(0,350);
    const unit=r.unit?' '+String(r.unit).slice(0,40):'';
-   return create?label+'\nВыставлено: '+fmt(r.issued_qty)+unit:label+'\nВыставлено: '+fmt(r.issued_qty)+unit+'; принято: '+fmt(r.received_qty)+unit+(Number(r.difference)!==0?'\n⚠️ Разница: '+fmt(r.difference)+unit:'');
+   return create?label+'\nВыставлено: '+fmt(r.issued_qty)+unit:label+'\nВыставлено: '+fmt(r.issued_qty)+unit+'; принято: '+fmt(r.received_qty)+unit+(Number(r.difference)!==0?'\n⚠️ '+(Number(r.difference)>0?'Недостача: ':'Излишек: ')+fmt(String(r.difference).replace(/^-/ ,''))+unit+' (разница: '+fmt(r.difference)+')':'');
   });
   const footer=create?'\n\nНачните приемку в боте или на странице «Приемка ТМЦ».':'';
   const login=create?a.recipient_login:a.created_by;
@@ -21361,7 +21361,7 @@ app.get('/lzk/receipt/history',receiptRoute(async(req,db,login)=>{
  return q.rows[0];
 }));
 async function receiptAcceptShared_(req,db,login){const id=String(req.body?.idakt||''),items=req.body?.items; const a=(await db.query('SELECT * FROM lzk.receipt_acts WHERE idakt=$1 FOR UPDATE',[id])).rows[0]; if(!a||a.recipient_login!==login)receiptError('Нет доступа',403); if(a.status!=='pending')receiptError('Акт уже принят',409); const rows=(await db.query('SELECT * FROM lzk.receipt_act_items WHERE idakt=$1 ORDER BY id',[id])).rows; if(!Array.isArray(items)||items.length!==rows.length||new Set(items.map(i=>String(i.id))).size!==rows.length)receiptError('Заполните все строки'); let diff=false;
- for(const r of rows){const i=items.find(x=>String(x.id)===String(r.id)); if(!i)receiptError('Неверная строка');const qty=receiptQty(i.received_qty); if(Number(qty)>Number(r.issued_qty))receiptError('Получено больше выставленного'); if(Number(qty)!==Number(r.issued_qty))diff=true;
+ for(const r of rows){const i=items.find(x=>String(x.id)===String(r.id)); if(!i)receiptError('Неверная строка');const qty=receiptQty(i.received_qty); if(Number(qty)!==Number(r.issued_qty))diff=true;
  await db.query(`INSERT INTO lzk.supply(idzlzk,idplxk,received_qty,created_at,updated_at) VALUES($1,$2,$3,now(),now()) ON CONFLICT(idzlzk,idplxk) DO UPDATE SET received_qty=coalesce(lzk.supply.received_qty,0)+EXCLUDED.received_qty,updated_at=now()`,[r.idzlzk,r.idplxk,qty]);
  await db.query('UPDATE lzk.receipt_act_items SET received_qty=$1 WHERE id=$2',[qty,r.id]); }
  await db.query('UPDATE lzk.receipt_acts SET status=$1,accepted_by=$2,accepted_at=now() WHERE idakt=$3',[diff?'accepted_difference':'accepted',login,id]); return {idakt:id,receiptNotification:{kind:"accepted",idakt:id}};}
@@ -21443,7 +21443,7 @@ async function receiptBotUpdate_(update){
  if(parts[1]==='confirm'&&st.index===st.rows.length){await receiptBotConfirm_(chat,login,st);return true;}
  const r=st.rows[st.index];if(!r){await receiptBotSend_(chat,'Используйте кнопку подтверждения или изменения.');return true;}
  if(cb&&(!['full','zero'].includes(parts[1])||Number(parts[3])!==st.index))return true;
- const qty=receiptQty(cb?(parts[1]==='full'?r.issued_qty:'0'):txt);if(Number(qty)>Number(r.issued_qty))receiptError('Количество больше выставленного. Введите другое значение.');
+ const qty=receiptQty(cb?(parts[1]==='full'?r.issued_qty:'0'):txt);
  st.values[st.index]=qty;if(st.editing){st.editing=false;st.index=st.rows.length;st.nonce=crypto.randomBytes(8).toString('hex');}else{st.index++;}await receiptBotPrompt_(chat,st);
  }catch(e){console.error('[RECEIPT BOT]',e.message);await receiptBotSend_(chat,e.status?e.message:'Ошибка приемки. Проверьте статус на сайте или через /receipt.').catch(()=>{});}
  finally{receiptBotLocks_.delete(chat);}return true;
