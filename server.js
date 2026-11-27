@@ -12662,7 +12662,7 @@ app.post("/lzk/supply/save", async (req, res) => {
         payment_status = EXCLUDED.payment_status,
         documents_status = EXCLUDED.documents_status,
         receive_status = EXCLUDED.receive_status,
-        received_qty = EXCLUDED.received_qty,
+        received_qty = lzk.supply.received_qty,
         trust_qty = EXCLUDED.trust_qty,
         trust_from = EXCLUDED.trust_from,
         trust_invoice = EXCLUDED.trust_invoice,
@@ -12690,7 +12690,7 @@ app.post("/lzk/supply/save", async (req, res) => {
       body.payment || null,
       body.documents || null,
       body.receive_tmc || null,
-      receivedQty,
+      0,
       body.trust_qty || null,
       body.trust_who || null,
       body.trust_invoice || null,
@@ -12717,7 +12717,7 @@ app.post("/lzk/supply/save", async (req, res) => {
     res.json({
       success: true,
       row: q.rows[0],
-      received_qty: receivedQty
+      received_qty: q.rows[0].received_qty
     });
 
   } catch (e) {
@@ -21278,5 +21278,32 @@ async function telegramNsInit_(){
 }
 // Не удалять таблицы при запуске: старый код HR и финансов может на них ссылаться.
 setTimeout(()=>{void telegramNsInit_()},3000);
+
+// Приемка ТМЦ: таблицы создаются вручную в PostgreSQL.
+function receiptError(message, status=400) { const e=new Error(message); e.status=status; throw e; }
+function receiptQty(v, positive=false) { const s=String(v??'').trim().replace(',','.'); if(!/^\d{1,12}(\.\d{1,6})?$/.test(s) || (positive && Number(s)<=0)) receiptError('Некорректное количество'); return s; }
+function receiptRoute(fn, write=false) { return async (req,res)=> { let db; try { db=await pool.connect(); const u=await getAuthenticatedFtUser(req,db); if(!u) receiptError('Войдите заново в приложение',401); const login=u.login.trim().toLowerCase(); if(write){await db.query('BEGIN'); await db.query('SELECT pg_advisory_xact_lock(872601)');} const data=await fn(req,db,login); if(write) await db.query('COMMIT'); res.json({success:true,...data}); } catch(e){if(db&&write) await db.query('ROLLBACK').catch(()=>{}); console.error('RECEIPT',e.message); res.status(e.status||500).json({success:false,error:e.status?e.message:'Ошибка базы приемки ТМЦ'});} finally{if(db)db.release();} }; }
+app.get('/lzk/receipt/recipients',receiptRoute(async(req,db,login)=>{if(login!=='r_gulnur')receiptError('Нет доступа',403); return {rows:(await db.query(`SELECT login, concat_ws(' ',last_name,first_name,middle_name) AS name FROM public.users WHERE is_active=true AND trim(coalesce(login,''))<>'' ORDER BY name,login`)).rows};}));
+app.post('/lzk/receipt/create',receiptRoute(async(req,db,login)=>{
+ if(login!=='r_gulnur')receiptError('Нет доступа',403);
+ const recipient=String(req.body?.recipient||'').trim().toLowerCase(), items=req.body?.items;
+ if(!Array.isArray(items)||!items.length||items.length>500)receiptError('Выберите материалы');
+ if(!(await db.query('SELECT 1 FROM public.users WHERE lower(trim(login))=$1 AND is_active=true',[recipient])).rowCount)receiptError('Получатель не найден');
+ const act=(await db.query('INSERT INTO lzk.receipt_acts(created_by,recipient_login) VALUES($1,$2) RETURNING idakt',[login,recipient])).rows[0];
+ const seen=new Set();
+ for(const i of items){const z=String(i.idzlzk||'').trim(), p=String(i.idplxk||'').trim(), qty=receiptQty(i.issued_qty,true), key=JSON.stringify([z,p]); if(seen.has(key))receiptError('Повтор строки'); seen.add(key);
+ const r=(await db.query(`SELECT r.object_name,r.unit,CASE WHEN $2='' THEN r.material_name ELSE s.component END AS material_name,CASE WHEN $2='' THEN r.fact_qty ELSE s.ordered_qty END AS request_qty FROM lzk.requests r LEFT JOIN lzk.supply s ON s.idzlzk=r.idzlzk AND coalesce(trim(s.idplxk),'')=$2 WHERE r.idzlzk=$1 AND lower(trim(coalesce(r.pto_status,''))) IN ('согласован','согласовано') AND ($2='' OR s.idzlzk IS NOT NULL) AND ($2<>'' OR NOT EXISTS(SELECT 1 FROM lzk.supply x WHERE x.idzlzk=r.idzlzk AND coalesce(trim(x.idplxk),'')<>''))`,[z,p])).rows[0];
+ if(!r||Number(r.request_qty)<=0)receiptError('Заявка недоступна: '+z);
+ const prev=(await db.query(`SELECT coalesce((SELECT received_qty FROM lzk.supply WHERE idzlzk=$1 AND idplxk=$2),0) AS qty`,[z,p])).rows[0].qty;
+ const check=(await db.query(`SELECT $1::numeric <= $2::numeric-$3::numeric-coalesce(sum(i.issued_qty),0) AS ok FROM lzk.receipt_act_items i JOIN lzk.receipt_acts a USING(idakt) WHERE i.idzlzk=$4 AND i.idplxk=$5 AND a.status='pending'`,[qty,r.request_qty,prev,z,p])).rows[0]; if(!check.ok)receiptError('Количество превышает свободный остаток: '+z);
+ await db.query(`INSERT INTO lzk.receipt_act_items(idakt,idzlzk,idplxk,object_name,material_name,unit,request_qty,previous_qty,issued_qty) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`,[act.idakt,z,p,r.object_name,r.material_name,r.unit,r.request_qty,prev,qty]); }
+ return act;
+},true));
+app.get('/lzk/receipt/list',receiptRoute(async(req,db,login)=>{return {login,rows:(await db.query(`SELECT a.*,i.id,i.idzlzk,i.idplxk,i.object_name,i.material_name,i.unit,i.request_qty,i.previous_qty,i.issued_qty,i.received_qty,i.difference,coalesce(s.received_qty,0) AS cumulative_qty,i.request_qty-coalesce(s.received_qty,0) AS remaining_qty FROM lzk.receipt_acts a JOIN lzk.receipt_act_items i USING(idakt) LEFT JOIN lzk.supply s ON s.idzlzk=i.idzlzk AND s.idplxk=i.idplxk WHERE $1='r_gulnur' OR a.recipient_login=$1 ORDER BY a.created_at DESC,i.id`,[login])).rows};}));
+app.post('/lzk/receipt/accept',receiptRoute(async(req,db,login)=>{const id=String(req.body?.idakt||''),items=req.body?.items; const a=(await db.query('SELECT * FROM lzk.receipt_acts WHERE idakt=$1 FOR UPDATE',[id])).rows[0]; if(!a||a.recipient_login!==login)receiptError('Нет доступа',403); if(a.status!=='pending')receiptError('Акт уже принят',409); const rows=(await db.query('SELECT * FROM lzk.receipt_act_items WHERE idakt=$1 ORDER BY id',[id])).rows; if(!Array.isArray(items)||items.length!==rows.length||new Set(items.map(i=>String(i.id))).size!==rows.length)receiptError('Заполните все строки'); let diff=false;
+ for(const r of rows){const i=items.find(x=>String(x.id)===String(r.id)); if(!i)receiptError('Неверная строка');const qty=receiptQty(i.received_qty); if(Number(qty)>Number(r.issued_qty))receiptError('Получено больше выставленного'); if(Number(qty)!==Number(r.issued_qty))diff=true;
+ await db.query(`INSERT INTO lzk.supply(idzlzk,idplxk,received_qty,created_at,updated_at) VALUES($1,$2,$3,now(),now()) ON CONFLICT(idzlzk,idplxk) DO UPDATE SET received_qty=coalesce(lzk.supply.received_qty,0)+EXCLUDED.received_qty,updated_at=now()`,[r.idzlzk,r.idplxk,qty]);
+ await db.query('UPDATE lzk.receipt_act_items SET received_qty=$1 WHERE id=$2',[qty,r.id]); }
+ await db.query('UPDATE lzk.receipt_acts SET status=$1,accepted_by=$2,accepted_at=now() WHERE idakt=$3',[diff?'accepted_difference':'accepted',login,id]); return {idakt:id};},true));
 
 app.listen(PORT, () => console.log("Server started on port " + PORT));
